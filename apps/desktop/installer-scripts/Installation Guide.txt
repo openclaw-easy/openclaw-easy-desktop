@@ -1,0 +1,62 @@
+Openclaw Easy - Native Installation Guide
+========================================
+
+Thank you for downloading Openclaw Easy with embedded OpenClaw!
+
+WHAT IS OPENCLAW EASY?
+--------------------
+Openclaw Easy is a user-friendly desktop application with OpenClaw AI assistant built-in. It provides a native dashboard interface for managing your AI assistant without any external dependencies. Perfect for messaging apps like WhatsApp, Telegram, and Discord.
+
+INSTALLATION REQUIREMENTS:
+--------------------------
+• macOS 10.15 (Catalina) or later
+• At least 1GB free disk space
+• No internet connection required (OpenClaw is embedded!)
+• No Node.js installation needed (runs in Electron)
+
+INSTALLATION PROCESS:
+--------------------
+1. Run "Openclaw Easy Native Installer.pkg" (recommended)
+   - Quick installation with embedded OpenClaw
+   - No internet connection required
+   - Installation takes 1-2 minutes
+
+2. Alternative: Drag "Openclaw Easy.app" to Applications
+   - Direct app installation
+   - OpenClaw already embedded - no configuration needed
+
+AFTER INSTALLATION:
+------------------
+1. Open Openclaw Easy from Applications folder
+2. Click "Launch Assistant" to access the native dashboard
+3. Configure your AI provider API key (Anthropic, OpenAI, etc.)
+4. Start using your AI assistant immediately!
+
+WHAT GETS INSTALLED:
+-------------------
+• Openclaw Easy.app - Desktop interface with embedded OpenClaw
+• Native dashboard - Integrated AI management interface
+• Configuration templates - Ready-to-use AI settings
+• No external dependencies - Everything is self-contained
+
+TROUBLESHOOTING:
+---------------
+• If installation fails, check available disk space
+• For "Launch Assistant" issues, restart the application
+• For API key configuration, use the built-in settings interface
+• Visit documentation for detailed configuration guides
+
+GETTING HELP:
+------------
+• Built-in help in Openclaw Easy dashboard
+• OpenClaw documentation: https://docs.openclaw.ai/
+• Community support via Discord/GitHub
+
+UNINSTALLING:
+------------
+1. Delete Openclaw Easy.app from Applications
+2. Remove: ~/Library/Application Support/Openclaw Easy
+   (This removes all configuration and data)
+3. No additional cleanup needed - everything is self-contained
+
+Enjoy your AI assistant!

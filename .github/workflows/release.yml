@@ -1,0 +1,67 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20.x'
+        cache: 'npm'
+
+    - name: Install pnpm
+      uses: pnpm/action-setup@v3
+      with:
+        version: 8.15.0
+
+    - name: Install dependencies
+      run: pnpm install
+
+    - name: Build shared package
+      run: pnpm --filter @moltbot-easy/shared build
+
+    - name: Build desktop app
+      run: pnpm --filter moltbot-easy-desktop build
+
+    - name: Package and publish (Windows)
+      if: matrix.os == 'windows-latest'
+      run: pnpm --filter moltbot-easy-desktop package:win
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Package and publish (macOS)
+      if: matrix.os == 'macos-latest'
+      run: pnpm --filter moltbot-easy-desktop package:mac
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        CSC_LINK: ${{ secrets.APPLE_CERTIFICATE }}
+        CSC_KEY_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        APPLE_ID: ${{ secrets.APPLE_ID }}
+        APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+
+    - name: Package and publish (Linux)
+      if: matrix.os == 'ubuntu-latest'
+      run: pnpm --filter moltbot-easy-desktop package:linux
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Upload release artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: release-${{ matrix.os }}
+        path: apps/desktop/dist-electron/

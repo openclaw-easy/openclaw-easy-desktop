@@ -1,0 +1,4 @@
+Icon placeholder - replace with actual icons:
+- icon.ico (Windows - 256x256)
+- icon.icns (macOS - 1024x1024)
+- icon.png (Linux - 512x512)

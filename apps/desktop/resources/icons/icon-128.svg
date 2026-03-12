@@ -1,0 +1,24 @@
+<svg width="128" height="128" viewBox="0 0 128 128" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <style>
+      .bg { fill: #2f3136; }
+      .border { stroke: #5865F2; stroke-width: 2; fill: none; }
+      .lobster {
+        font-family: "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", "Helvetica", sans-serif;
+        font-size: 76.8px;
+        text-anchor: middle;
+        dominant-baseline: central;
+        fill: white;
+      }
+    </style>
+  </defs>
+
+  <!-- Background -->
+  <rect x="0" y="0" width="128" height="128" rx="12.8" class="bg"/>
+
+  <!-- Border -->
+  <rect x="2" y="2" width="124" height="124" rx="12.8" class="border"/>
+
+  <!-- Lobster emoji -->
+  <text x="64" y="64" class="lobster">🦞</text>
+</svg>

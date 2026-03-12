@@ -1,0 +1,119 @@
+appId: com.openclaw-easy.app
+productName: Openclaw Easy
+directories:
+  output: dist-installers
+  buildResources: installer-resources
+
+files:
+  - out/**/*
+  - resources/**/*
+  - node_modules/**/*
+  - "!**/*.ts"
+  - "!**/*.map"
+  - "!src/**/*"
+
+afterPack: ./scripts/after-pack.cjs
+
+extraResources:
+  # Bundle Bun runtime (arm64 + x64 binaries) — required by process-manager and command-executor
+  - from: installer-resources/bun
+    to: bun
+  # Bundle OpenClaw with pre-installed dependencies
+  - from: installer-resources/openclaw
+    to: openclaw
+  # Bundle installation guide
+  - from: installer-resources/Installation Guide.txt
+    to: Installation Guide.txt
+
+# macOS Configuration
+mac:
+  target:
+    - target: pkg
+      arch:
+        - universal
+    - target: dmg
+      arch:
+        - x64
+        - arm64
+  icon: resources/icons/icon.icns
+  category: public.app-category.productivity
+  identity: null  # Set your Apple Developer identity for code signing
+  hardenedRuntime: true
+  gatekeeperAssess: false
+  entitlements: installer-resources/entitlements.mac.plist
+  entitlementsInherit: installer-resources/entitlements.mac.plist
+  type: distribution
+  extendInfo:
+    NSMicrophoneUsageDescription: Openclaw Easy uses the microphone for voice input when interacting with AI agents.
+    NSCameraUsageDescription: Openclaw Easy uses the camera to scan QR codes for connecting messaging platforms like WhatsApp.
+    NSScreenRecordingUsageDescription: Openclaw Easy may capture screen content to provide AI-assisted context when answering questions.
+    NSAppleEventsUsageDescription: Openclaw Easy uses Apple Events to automate interactions with other applications on your behalf.
+
+pkg:
+  installLocation: /Applications
+  allowCurrentUserHome: false
+  allowRootDirectory: false
+  isVersionChecked: true
+  isRelocatable: false
+  overwriteAction: upgrade
+  scripts: installer-resources/scripts/mac
+  artifactName: Openclaw-Easy-Installer-${version}.pkg
+
+dmg:
+  background: resources/dmg-background.png
+  window:
+    width: 600
+    height: 450
+  contents:
+    # Standalone app (drag to Applications)
+    - x: 150
+      y: 220
+      type: file
+      name: Openclaw Easy.app
+    # Applications link
+    - x: 450
+      y: 220
+      type: link
+      path: /Applications
+  artifactName: Openclaw-Easy-${version}-${arch}.dmg
+  title: Openclaw Easy ${version}
+  format: UDZO
+
+
+# Auto-update configuration
+publish:
+  - provider: github
+    owner: openclaw-easy
+    repo: desktop-app
+    releaseType: release
+  - provider: generic
+    url: https://updates.openclaw-easy.com
+    channel: latest
+
+# Windows Configuration
+win:
+  target:
+    - target: nsis
+      arch:
+        - x64
+  icon: resources/icons/icon.ico
+  artifactName: Openclaw-Easy-${version}-Setup.exe
+
+nsis:
+  oneClick: true
+  perMachine: false
+  allowElevation: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: Openclaw Easy
+  artifactName: OpenclawEasy-Setup.exe
+  include: installer-resources/installer.nsh
+
+# Build configuration
+electronDownload:
+  cache: .cache/electron
+  mirror: https://npmmirror.com/mirrors/electron/
+
+npmRebuild: false
+buildDependenciesFromSource: false
+nodeGypRebuild: false

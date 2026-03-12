@@ -1,0 +1,100 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        node-version: [20.x]
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ matrix.node-version }}
+        cache: 'npm'
+
+    - name: Install pnpm
+      uses: pnpm/action-setup@v3
+      with:
+        version: 8.15.0
+
+    - name: Install dependencies
+      run: pnpm install
+
+    - name: Lint
+      run: pnpm lint
+
+    - name: Build shared package
+      run: pnpm --filter @moltbot-easy/shared build
+
+    - name: Build backend
+      run: pnpm --filter backend build
+
+    - name: Build desktop
+      run: pnpm --filter moltbot-easy-desktop build
+
+    - name: Run tests
+      run: pnpm test
+
+  build-desktop:
+    needs: test
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20.x'
+        cache: 'npm'
+
+    - name: Install pnpm
+      uses: pnpm/action-setup@v3
+      with:
+        version: 8.15.0
+
+    - name: Install dependencies
+      run: pnpm install
+
+    - name: Build shared package
+      run: pnpm --filter @moltbot-easy/shared build
+
+    - name: Build desktop app
+      run: pnpm --filter moltbot-easy-desktop build
+
+    - name: Package desktop app (Windows)
+      if: matrix.os == 'windows-latest'
+      run: pnpm --filter moltbot-easy-desktop package:win
+
+    - name: Package desktop app (macOS)
+      if: matrix.os == 'macos-latest'
+      run: pnpm --filter moltbot-easy-desktop package:mac
+
+    - name: Package desktop app (Linux)
+      if: matrix.os == 'ubuntu-latest'
+      run: pnpm --filter moltbot-easy-desktop package:linux
+
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: desktop-app-${{ matrix.os }}
+        path: |
+          apps/desktop/dist-electron/
+          !apps/desktop/dist-electron/builder-debug.yml

@@ -1,0 +1,31 @@
+.DS_Store
+OPEN-SOURCE-PLAN.md
+node_modules
+**/node_modules/
+dist
+coverage
+.tsbuildinfo
+.pnpm-store
+bun.lock
+bun.lockb
+.env
+.idea
+.vscode/
+.claude/
+.agents/
+*.pyc
+__pycache__/
+
+# Desktop build artifacts
+apps/desktop/out/
+apps/desktop/dist-installers/
+apps/desktop/dist-release/
+apps/desktop/dist-electron/
+apps/desktop/installer-resources/
+apps/desktop/installer-build/
+apps/desktop/.cache/
+apps/desktop/resources/bun/
+apps/desktop/resources/openclaw/
+
+# OpenClaw build artifacts
+openclaw/dist/
