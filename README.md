@@ -12,7 +12,7 @@
   <a href="https://github.com/openclaw-easy/openclaw-easy-desktop/stargazers"><img src="https://img.shields.io/github/stars/openclaw-easy/openclaw-easy-desktop?style=social" alt="GitHub Stars" /></a>
   <a href="https://github.com/openclaw-easy/openclaw-easy-desktop/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="License" /></a>
   <a href="https://openclaw-easy.com"><img src="https://img.shields.io/badge/website-openclaw--easy.com-brightgreen" alt="Website" /></a>
-  <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-lightgrey" alt="Platform" />
+  <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Windows-lightgrey" alt="Platform" />
   <img src="https://img.shields.io/badge/electron-latest-9feaf9?logo=electron&logoColor=white" alt="Electron" />
   <img src="https://img.shields.io/badge/TypeScript-5.x-3178C6?logo=typescript&logoColor=white" alt="TypeScript" />
   <img src="https://img.shields.io/badge/React-18-61DAFB?logo=react&logoColor=white" alt="React" />
@@ -50,7 +50,7 @@
 | | Feature | Details |
 |---|---|---|
 | :zap: | **Zero Setup** | No terminal, no config files, no dependencies. Download, install, done. |
-| :package: | **One-Click Install** | macOS DMG, Windows EXE, Linux AppImage. Drag-and-drop or double-click. |
+| :package: | **One-Click Install** | macOS DMG or Windows EXE. Drag-and-drop or double-click. |
 | :iphone: | **WhatsApp in 60 Seconds** | Just scan a QR code. No bot tokens, no webhooks, no server. |
 | :brain: | **All Major AI Models** | Claude, ChatGPT, Gemini, DeepSeek, Llama, and more. |
 | :house: | **Local AI with Ollama** | Run models 100% offline on your machine. No API keys needed. |
@@ -68,8 +68,6 @@
   <img src="https://img.shields.io/badge/Slack-4A154B?style=for-the-badge&logo=slack&logoColor=white" alt="Slack" />
   <img src="https://img.shields.io/badge/LINE-00C300?style=for-the-badge&logo=line&logoColor=white" alt="LINE" />
   <img src="https://img.shields.io/badge/Feishu-3370FF?style=for-the-badge&logo=bytedance&logoColor=white" alt="Feishu" />
-  <img src="https://img.shields.io/badge/MS%20Teams-6264A7?style=for-the-badge&logo=microsoftteams&logoColor=white" alt="MS Teams" />
-  <img src="https://img.shields.io/badge/Matrix-000000?style=for-the-badge&logo=matrix&logoColor=white" alt="Matrix" />
 </p>
 
 ## Supported AI Providers
@@ -93,13 +91,13 @@
 - :alarm_clock: **Cron jobs** -- Schedule recurring AI tasks
 - :shield: **Tools & permissions** -- Fine-grained control over what your AI can do
 - :speech_balloon: **Built-in chat** -- Chat with your AI directly in the app
-- :desktop_computer: **Cross-platform** -- macOS (Apple Silicon + Intel), Windows, and Linux
+- :desktop_computer: **Cross-platform** -- macOS (Apple Silicon + Intel) and Windows
 
 ## Quick Start
 
 ### Download the App
 
-> :arrow_down: **Get started now at [openclaw-easy.com](https://openclaw-easy.com)** -- download the latest installer for macOS, Windows, or Linux. Free!
+> :arrow_down: **Get started now at [openclaw-easy.com](https://openclaw-easy.com)** -- download the latest installer for macOS or Windows. Free!
 
 ### Build from Source
 
