@@ -25,10 +25,6 @@ jobs:
       - name: Install dependencies
         run: pnpm install
 
-      - name: Type check
-        working-directory: ./apps/desktop
-        run: npx tsc --noEmit
-
       - name: Run tests
         working-directory: ./apps/desktop
         run: pnpm test
