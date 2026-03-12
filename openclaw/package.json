@@ -401,7 +401,7 @@
     "@vitest/coverage-v8": "^4.0.18",
     "jscpd": "4.0.8",
     "lit": "^3.3.2",
-    "oxfmt": "0.36.0",
+    "oxfmt": "0.40.0",
     "oxlint": "^1.51.0",
     "oxlint-tsgolint": "^0.16.0",
     "signal-utils": "0.21.1",

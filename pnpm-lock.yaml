@@ -176,7 +176,7 @@ importers:
         version: 3.1008.0
       '@buape/carbon':
         specifier: 0.0.0-beta-20260216184201
-        version: 0.0.0-beta-20260216184201(hono@4.11.9)(opusscript@0.1.1)
+        version: 0.0.0-beta-20260216184201(hono@4.12.7)(opusscript@0.1.1)
       '@clack/prompts':
         specifier: ^1.1.0
         version: 1.1.0
@@ -371,8 +371,8 @@ importers:
         specifier: ^3.3.2
         version: 3.3.2
       oxfmt:
-        specifier: 0.36.0
-        version: 0.36.0
+        specifier: 0.40.0
+        version: 0.40.0
       oxlint:
         specifier: ^1.51.0
         version: 1.55.0(oxlint-tsgolint@0.16.0)
@@ -483,7 +483,7 @@ importers:
         version: 10.6.1
       openclaw:
         specifier: '>=2026.3.7'
-        version: 2026.3.11(@napi-rs/canvas@0.1.91)(@types/express@5.0.6)(node-llama-cpp@3.16.2)
+        version: 2026.3.11(@napi-rs/canvas@0.1.96)(@types/express@5.0.6)(node-llama-cpp@3.16.2)
 
   openclaw/extensions/imessage: {}
 
@@ -544,7 +544,7 @@ importers:
     dependencies:
       openclaw:
         specifier: '>=2026.3.7'
-        version: 2026.3.11(@napi-rs/canvas@0.1.91)(@types/express@5.0.6)(node-llama-cpp@3.16.2)
+        version: 2026.3.11(@napi-rs/canvas@0.1.96)(@types/express@5.0.6)(node-llama-cpp@3.16.2)
 
   openclaw/extensions/memory-lancedb:
     dependencies:
@@ -2218,28 +2218,6 @@ packages:
     resolution: {integrity: sha512-DDaRehssg1aNrH4+2hnj1B7vnUGEjU6OIlyRdkMd0aUdIUvKXrJfXsy8LVtXAy7DRvYVluWbMspsRhz2lcW0mQ==}
     dev: false
 
-  /@buape/carbon@0.0.0-beta-20260216184201(hono@4.11.9)(opusscript@0.1.1):
-    resolution: {integrity: sha512-u5mgYcigfPVqT7D9gVTGd+3YSflTreQmrWog7ORbb0z5w9eT8ft4rJOdw9fGwr75zMu9kXpSBaAcY2eZoJFSdA==}
-    dependencies:
-      '@types/node': 25.5.0
-      discord-api-types: 0.38.37
-    optionalDependencies:
-      '@cloudflare/workers-types': 4.20260120.0
-      '@discordjs/voice': 0.19.0(opusscript@0.1.1)
-      '@hono/node-server': 1.19.9(hono@4.11.9)
-      '@types/bun': 1.3.9
-      '@types/ws': 8.18.1
-      ws: 8.19.0
-    transitivePeerDependencies:
-      - '@discordjs/opus'
-      - bufferutil
-      - ffmpeg-static
-      - hono
-      - node-opus
-      - opusscript
-      - utf-8-validate
-    dev: false
-
   /@buape/carbon@0.0.0-beta-20260216184201(hono@4.12.7)(opusscript@0.1.1):
     resolution: {integrity: sha512-u5mgYcigfPVqT7D9gVTGd+3YSflTreQmrWog7ORbb0z5w9eT8ft4rJOdw9fGwr75zMu9kXpSBaAcY2eZoJFSdA==}
     dependencies:
@@ -2512,8 +2490,8 @@ packages:
       tslib: 2.8.1
     optional: true
 
-  /@emnapi/runtime@1.8.1:
-    resolution: {integrity: sha512-mehfKSMWjjNol8659Z8KxEMrdSJDDot5SXMq00dM8BN4o+CLNXQ0xH2V7EchNHV4RmbZLmmPdEaXZc5H2FXmDg==}
+  /@emnapi/runtime@1.9.0:
+    resolution: {integrity: sha512-QN75eB0IH2ywSpRpNddCRfQIhmJYBCJ1x5Lb3IscKAL8bMnVAKnRg8dCoXbHzVLLH7P38N2Z3mtulB7W0J0FKw==}
     requiresBuild: true
     dependencies:
       tslib: 2.8.1
@@ -3088,17 +3066,6 @@ packages:
       - supports-color
     dev: false
 
-  /@hono/node-server@1.19.9(hono@4.11.9):
-    resolution: {integrity: sha512-vHL6w3ecZsky+8P5MD+eFfaGTyCeOHUIFYMGpQGbrBTSmNNoxv0if69rEZ5giu36weC5saFuznL411gRX7bJDw==}
-    engines: {node: '>=18.14.1'}
-    requiresBuild: true
-    peerDependencies:
-      hono: ^4
-    dependencies:
-      hono: 4.11.9
-    dev: false
-    optional: true
-
   /@hono/node-server@1.19.9(hono@4.12.7):
     resolution: {integrity: sha512-vHL6w3ecZsky+8P5MD+eFfaGTyCeOHUIFYMGpQGbrBTSmNNoxv0if69rEZ5giu36weC5saFuznL411gRX7bJDw==}
     engines: {node: '>=18.14.1'}
@@ -3338,7 +3305,7 @@ packages:
     cpu: [wasm32]
     requiresBuild: true
     dependencies:
-      '@emnapi/runtime': 1.8.1
+      '@emnapi/runtime': 1.9.0
     dev: false
     optional: true
 
@@ -3566,7 +3533,6 @@ packages:
   /@lancedb/lancedb@0.26.2(apache-arrow@18.1.0):
     resolution: {integrity: sha512-umk4WMCTwJntLquwvUbpqE+TXREolcQVL9MHcxr8EhRjsha88+ATJ4QuS/hpyiE1CG3R/XcgrMgJAGkziPC/gA==}
     engines: {node: '>= 18'}
-    cpu: [x64, arm64]
     os: [darwin, linux, win32]
     peerDependencies:
       apache-arrow: '>=15.0.0 <=18.1.0'
@@ -3605,7 +3571,7 @@ packages:
     dependencies:
       '@types/node': 24.10.12
     optionalDependencies:
-      axios: 1.13.4
+      axios: 1.13.6
     transitivePeerDependencies:
       - debug
     dev: false
@@ -4201,14 +4167,13 @@ packages:
       '@napi-rs/canvas-win32-arm64-msvc': 0.1.96
       '@napi-rs/canvas-win32-x64-msvc': 0.1.96
     dev: false
-    optional: true
 
   /@napi-rs/wasm-runtime@1.1.1:
     resolution: {integrity: sha512-p64ah1M1ld8xjWv3qbvFwHiFVWrq1yFvV4f7w+mzaqiR4IlSgkqhcRdHwsGgomwzBH51sRY4NEowLxnaBjcW/A==}
     requiresBuild: true
     dependencies:
       '@emnapi/core': 1.9.0
-      '@emnapi/runtime': 1.8.1
+      '@emnapi/runtime': 1.9.0
       '@tybys/wasm-util': 0.10.1
     optional: true
 
@@ -4980,8 +4945,8 @@ packages:
     resolution: {integrity: sha512-4n91DKnebUS4yjUHl2g3/b2T+IUdCfmoZGhmwsovZCDaJSs+QkVAM+0AqqTxHSsHfeiMuueT75cZaZcT/m0pSw==}
     dev: true
 
-  /@oxfmt/binding-android-arm-eabi@0.36.0:
-    resolution: {integrity: sha512-Z4yVHJWx/swHHjtr0dXrBZb6LxS+qNz1qdza222mWwPTUK4L790+5i3LTgjx3KYGBzcYpjaiZBw4vOx94dH7MQ==}
+  /@oxfmt/binding-android-arm-eabi@0.40.0:
+    resolution: {integrity: sha512-S6zd5r1w/HmqR8t0CTnGjFTBLDq2QKORPwriCHxo4xFNuhmOTABGjPaNvCJJVnrKBLsohOeiDX3YqQfJPF+FXw==}
     engines: {node: ^20.19.0 || >=22.12.0}
     cpu: [arm]
     os: [android]
@@ -4989,8 +4954,8 @@ packages:
     dev: true
     optional: true
 
-  /@oxfmt/binding-android-arm64@0.36.0:
-    resolution: {integrity: sha512-3ElCJRFNPQl7jexf2CAa9XmAm8eC5JPrIDSjc9jSchkVSFTEqyL0NtZinBB2h1a4i4JgP1oGl/5G5n8YR4FN8Q==}
+  /@oxfmt/binding-android-arm64@0.40.0:
+    resolution: {integrity: sha512-/mbS9UUP/5Vbl2D6osIdcYiP0oie63LKMoTyGj5hyMCK/SFkl3EhtyRAfdjPvuvHC0SXdW6ePaTKkBSq1SNcIw==}
     engines: {node: ^20.19.0 || >=22.12.0}
     cpu: [arm64]
     os: [android]
@@ -4998,8 +4963,8 @@ packages:
     dev: true
     optional: true
 
-  /@oxfmt/binding-darwin-arm64@0.36.0:
-    resolution: {integrity: sha512-nak4znWCqIExKhYSY/mz/lWsqWIpdsS7o0+SRzXR1Q0m7GrMcG1UrF1pS7TLGZhhkf7nTfEF7q6oZzJiodRDuw==}
+  /@oxfmt/binding-darwin-arm64@0.40.0:
+    resolution: {integrity: sha512-wRt8fRdfLiEhnRMBonlIbKrJWixoEmn6KCjKE9PElnrSDSXETGZfPb8ee+nQNTobXkCVvVLytp2o0obAsxl78Q==}
     engines: {node: ^20.19.0 || >=22.12.0}
     cpu: [arm64]
     os: [darwin]
@@ -5007,8 +4972,8 @@ packages:
     dev: true
     optional: true
 
-  /@oxfmt/binding-darwin-x64@0.36.0:
-    resolution: {integrity: sha512-V4GP96thDnpKx6ADnMDnhIXNdtV+Ql9D4HUU+a37VTeVbs5qQSF/s6hhUP1b3xUqU7iRcwh72jUU2Y12rtGHAw==}
+  /@oxfmt/binding-darwin-x64@0.40.0:
+    resolution: {integrity: sha512-fzowhqbOE/NRy+AE5ob0+Y4X243WbWzDb00W+pKwD7d9tOqsAFbtWUwIyqqCoCLxj791m2xXIEeLH/3uz7zCCg==}
     engines: {node: ^20.19.0 || >=22.12.0}
     cpu: [x64]
     os: [darwin]
@@ -5016,8 +4981,8 @@ packages:
     dev: true
     optional: true
 
-  /@oxfmt/binding-freebsd-x64@0.36.0:
-    resolution: {integrity: sha512-/xapWCADfI5wrhxpEUjhI9fnw7MV5BUZizVa8e24n3VSK6A3Y1TB/ClOP1tfxNspykFKXp4NBWl6NtDJP3osqQ==}
+  /@oxfmt/binding-freebsd-x64@0.40.0:
+    resolution: {integrity: sha512-agZ9ITaqdBjcerRRFEHB8s0OyVcQW8F9ZxsszjxzeSthQ4fcN2MuOtQFWec1ed8/lDa50jSLHVE2/xPmTgtCfQ==}
     engines: {node: ^20.19.0 || >=22.12.0}
     cpu: [x64]
     os: [freebsd]
@@ -5025,8 +4990,8 @@ packages:
     dev: true
     optional: true
 
-  /@oxfmt/binding-linux-arm-gnueabihf@0.36.0:
-    resolution: {integrity: sha512-1lOmv61XMFIH5uNm27620kRRzWt/RK6tdn250BRDoG9W7OXGOQ5UyI1HVT+SFkoOoKztBiinWgi68+NA1MjBVQ==}
+  /@oxfmt/binding-linux-arm-gnueabihf@0.40.0:
+    resolution: {integrity: sha512-ZM2oQ47p28TP1DVIp7HL1QoMUgqlBFHey0ksHct7tMXoU5BqjNvPWw7888azzMt25lnyPODVuye1wvNbvVUFOA==}
     engines: {node: ^20.19.0 || >=22.12.0}
     cpu: [arm]
     os: [linux]
@@ -5034,8 +4999,8 @@ packages:
     dev: true
     optional: true
 
-  /@oxfmt/binding-linux-arm-musleabihf@0.36.0:
-    resolution: {integrity: sha512-vMH23AskdR1ujUS9sPck2Df9rBVoZUnCVY86jisILzIQ/QQ/yKUTi7tgnIvydPx7TyB/48wsQ5QMr5Knq5p/aw==}
+  /@oxfmt/binding-linux-arm-musleabihf@0.40.0:
+    resolution: {integrity: sha512-RBFPAxRAIsMisKM47Oe6Lwdv6agZYLz02CUhVCD1sOv5ajAcRMrnwCFBPWwGXpazToW2mjnZxFos8TuFjTU15A==}
     engines: {node: ^20.19.0 || >=22.12.0}
     cpu: [arm]
     os: [linux]
@@ -5043,8 +5008,8 @@ packages:
     dev: true
     optional: true
 
-  /@oxfmt/binding-linux-arm64-gnu@0.36.0:
-    resolution: {integrity: sha512-Hy1V+zOBHpBiENRx77qrUTt5aPDHeCASRc8K5KwwAHkX2AKP0nV89eL17hsZrE9GmnXFjsNmd80lyf7aRTXsbw==}
+  /@oxfmt/binding-linux-arm64-gnu@0.40.0:
+    resolution: {integrity: sha512-Nb2XbQ+wV3W2jSIihXdPj7k83eOxeSgYP3N/SRXvQ6ZYPIk6Q86qEh5Gl/7OitX3bQoQrESqm1yMLvZV8/J7dA==}
     engines: {node: ^20.19.0 || >=22.12.0}
     cpu: [arm64]
     os: [linux]
@@ -5052,8 +5017,8 @@ packages:
     dev: true
     optional: true
 
-  /@oxfmt/binding-linux-arm64-musl@0.36.0:
-    resolution: {integrity: sha512-SPGLJkOIHSIC6ABUQ5V8NqJpvYhMJueJv26NYqfCnwi/Mn6A61amkpJJ9Suy0Nmvs+OWESJpcebrBUbXPGZyQQ==}
+  /@oxfmt/binding-linux-arm64-musl@0.40.0:
+    resolution: {integrity: sha512-tGmWhLD/0YMotCdfezlT6tC/MJG/wKpo4vnQ3Cq+4eBk/BwNv7EmkD0VkD5F/dYkT3b8FNU01X2e8vvJuWoM1w==}
     engines: {node: ^20.19.0 || >=22.12.0}
     cpu: [arm64]
     os: [linux]
@@ -5061,8 +5026,8 @@ packages:
     dev: true
     optional: true
 
-  /@oxfmt/binding-linux-ppc64-gnu@0.36.0:
-    resolution: {integrity: sha512-3EuoyB8x9x8ysYJjbEO/M9fkSk72zQKnXCvpZMDHXlnY36/1qMp55Nm0PrCwjGO/1pen5hdOVkz9WmP3nAp2IQ==}
+  /@oxfmt/binding-linux-ppc64-gnu@0.40.0:
+    resolution: {integrity: sha512-rVbFyM3e7YhkVnp0IVYjaSHfrBWcTRWb60LEcdNAJcE2mbhTpbqKufx0FrhWfoxOrW/+7UJonAOShoFFLigDqQ==}
     engines: {node: ^20.19.0 || >=22.12.0}
     cpu: [ppc64]
     os: [linux]
@@ -5070,8 +5035,8 @@ packages:
     dev: true
     optional: true
 
-  /@oxfmt/binding-linux-riscv64-gnu@0.36.0:
-    resolution: {integrity: sha512-MpY3itLwpGh8dnywtrZtaZ604T1m715SydCKy0+qTxetv+IHzuA+aO/AGzrlzUNYZZmtWtmDBrChZGibvZxbRQ==}
+  /@oxfmt/binding-linux-riscv64-gnu@0.40.0:
+    resolution: {integrity: sha512-3ZqBw14JtWeEoLiioJcXSJz8RQyPE+3jLARnYM1HdPzZG4vk+Ua8CUupt2+d+vSAvMyaQBTN2dZK+kbBS/j5mA==}
     engines: {node: ^20.19.0 || >=22.12.0}
     cpu: [riscv64]
     os: [linux]
@@ -5079,8 +5044,8 @@ packages:
     dev: true
     optional: true
 
-  /@oxfmt/binding-linux-riscv64-musl@0.36.0:
-    resolution: {integrity: sha512-mmDhe4Vtx+XwQPRPn/V25+APnkApYgZ23q+6GVsNYY98pf3aU0aI3Me96pbRs/AfJ1jIiGC+/6q71FEu8dHcHw==}
+  /@oxfmt/binding-linux-riscv64-musl@0.40.0:
+    resolution: {integrity: sha512-JJ4PPSdcbGBjPvb+O7xYm2FmAsKCyuEMYhqatBAHMp/6TA6rVlf9Z/sYPa4/3Bommb+8nndm15SPFRHEPU5qFA==}
     engines: {node: ^20.19.0 || >=22.12.0}
     cpu: [riscv64]
     os: [linux]
@@ -5088,8 +5053,8 @@ packages:
     dev: true
     optional: true
 
-  /@oxfmt/binding-linux-s390x-gnu@0.36.0:
-    resolution: {integrity: sha512-AYXhU+DmNWLSnvVwkHM92fuYhogtVHab7UQrPNaDf1sxadugg9gWVmcgJDlIwxJdpk5CVW/TFvwUKwI432zhhA==}
+  /@oxfmt/binding-linux-s390x-gnu@0.40.0:
+    resolution: {integrity: sha512-Kp0zNJoX9Ik77wUya2tpBY3W9f40VUoMQLWVaob5SgCrblH/t2xr/9B2bWHfs0WCefuGmqXcB+t0Lq77sbBmZw==}
     engines: {node: ^20.19.0 || >=22.12.0}
     cpu: [s390x]
     os: [linux]
@@ -5097,8 +5062,8 @@ packages:
     dev: true
     optional: true
 
-  /@oxfmt/binding-linux-x64-gnu@0.36.0:
-    resolution: {integrity: sha512-H16QhhQ3usoakMleiAAQ2mg0NsBDAdyE9agUgfC8IHHh3jZEbr0rIKwjEqwbOHK5M0EmfhJmr+aGO/MgZPsneA==}
+  /@oxfmt/binding-linux-x64-gnu@0.40.0:
+    resolution: {integrity: sha512-7YTCNzleWTaQTqNGUNQ66qVjpoV6DjbCOea+RnpMBly2bpzrI/uu7Rr+2zcgRfNxyjXaFTVQKaRKjqVdeUfeVA==}
     engines: {node: ^20.19.0 || >=22.12.0}
     cpu: [x64]
     os: [linux]
@@ -5106,8 +5071,8 @@ packages:
     dev: true
     optional: true
 
-  /@oxfmt/binding-linux-x64-musl@0.36.0:
-    resolution: {integrity: sha512-EFFGkixA39BcmHiCe2ECdrq02D6FCve5ka6ObbvrheXl4V+R0U/E+/uLyVx1X65LW8TA8QQHdnbdDallRekohw==}
+  /@oxfmt/binding-linux-x64-musl@0.40.0:
+    resolution: {integrity: sha512-hWnSzJ0oegeOwfOEeejYXfBqmnRGHusgtHfCPzmvJvHTwy1s3Neo59UKc1CmpE3zxvrCzJoVHos0rr97GHMNPw==}
     engines: {node: ^20.19.0 || >=22.12.0}
     cpu: [x64]
     os: [linux]
@@ -5115,8 +5080,8 @@ packages:
     dev: true
     optional: true
 
-  /@oxfmt/binding-openharmony-arm64@0.36.0:
-    resolution: {integrity: sha512-zr/t369wZWFOj1qf06Z5gGNjFymfUNDrxKMmr7FKiDRVI1sNsdKRCuRL4XVjtcptKQ+ao3FfxLN1vrynivmCYg==}
+  /@oxfmt/binding-openharmony-arm64@0.40.0:
+    resolution: {integrity: sha512-28sJC1lR4qtBJGzSRRbPnSW3GxU2+4YyQFE6rCmsUYqZ5XYH8jg0/w+CvEzQ8TuAQz5zLkcA25nFQGwoU0PT3Q==}
     engines: {node: ^20.19.0 || >=22.12.0}
     cpu: [arm64]
     os: [openharmony]
@@ -5124,8 +5089,8 @@ packages:
     dev: true
     optional: true
 
-  /@oxfmt/binding-win32-arm64-msvc@0.36.0:
-    resolution: {integrity: sha512-FxO7UksTv8h4olzACgrqAXNF6BP329+H322323iDrMB5V/+a1kcAw07fsOsUmqNrb9iJBsCQgH/zqcqp5903ag==}
+  /@oxfmt/binding-win32-arm64-msvc@0.40.0:
+    resolution: {integrity: sha512-cDkRnyT0dqwF5oIX1Cv59HKCeZQFbWWdUpXa3uvnHFT2iwYSSZspkhgjXjU6iDp5pFPaAEAe9FIbMoTgkTmKPg==}
     engines: {node: ^20.19.0 || >=22.12.0}
     cpu: [arm64]
     os: [win32]
@@ -5133,8 +5098,8 @@ packages:
     dev: true
     optional: true
 
-  /@oxfmt/binding-win32-ia32-msvc@0.36.0:
-    resolution: {integrity: sha512-OjoMQ89H01M0oLMfr/CPNH1zi48ZIwxAKObUl57oh7ssUBNDp/2Vjf7E1TQ8M4oj4VFQ/byxl2SmcPNaI2YNDg==}
+  /@oxfmt/binding-win32-ia32-msvc@0.40.0:
+    resolution: {integrity: sha512-7rPemBJjqm5Gkv6ZRCPvK8lE6AqQ/2z31DRdWazyx2ZvaSgL7QGofHXHNouRpPvNsT9yxRNQJgigsWkc+0qg4w==}
     engines: {node: ^20.19.0 || >=22.12.0}
     cpu: [ia32]
     os: [win32]
@@ -5142,8 +5107,8 @@ packages:
     dev: true
     optional: true
 
-  /@oxfmt/binding-win32-x64-msvc@0.36.0:
-    resolution: {integrity: sha512-MoyeQ9S36ZTz/4bDhOKJgOBIDROd4dQ5AkT9iezhEaUBxAPdNX9Oq0jD8OSnCj3G4wam/XNxVWKMA52kmzmPtQ==}
+  /@oxfmt/binding-win32-x64-msvc@0.40.0:
+    resolution: {integrity: sha512-/Zmj0yTYSvmha6TG1QnoLqVT7ZMRDqXvFXXBQpIjteEwx9qvUYMBH2xbiOFhDeMUJkGwC3D6fdKsFtaqUvkwNA==}
     engines: {node: ^20.19.0 || >=22.12.0}
     cpu: [x64]
     os: [win32]
@@ -8090,7 +8055,7 @@ packages:
     dependencies:
       '@types/http-cache-semantics': 4.2.0
       '@types/keyv': 3.1.4
-      '@types/node': 20.19.30
+      '@types/node': 25.5.0
       '@types/responselike': 1.0.3
 
   /@types/caseless@0.12.5:
@@ -8140,7 +8105,7 @@ packages:
   /@types/express-serve-static-core@4.19.8:
     resolution: {integrity: sha512-02S5fmqeoKzVZCHPZid4b8JH2eM5HzQLZWN2FohQEy/0eXTq8VXZfSN6Pcr3F6N9R/vNrj7cpgbhjie6m/1tCA==}
     dependencies:
-      '@types/node': 20.19.30
+      '@types/node': 25.5.0
       '@types/qs': 6.14.0
       '@types/range-parser': 1.2.7
       '@types/send': 1.2.1
@@ -8206,7 +8171,7 @@ packages:
   /@types/keyv@3.1.4:
     resolution: {integrity: sha512-BQ5aZNSCpj7D6K2ksrRCTmKRLEpnPvWDiLPfoGyhZ++8YtiK9d/3DBKPJgry359X/P1PfruyYwvnvwFjuEiEIg==}
     dependencies:
-      '@types/node': 20.19.30
+      '@types/node': 25.5.0
 
   /@types/linkify-it@5.0.0:
     resolution: {integrity: sha512-sVDA58zAw4eWAffKOaQH5/5j3XeayukzDk+ewSsnv3p4yJEZHCCzMDiZM8e0OUrRvmpGZ85jf4yDHkHsgBNr9Q==}
@@ -8265,6 +8230,12 @@ packages:
     dependencies:
       undici-types: 6.21.0
 
+  /@types/node@20.19.37:
+    resolution: {integrity: sha512-8kzdPJ3FsNsVIurqBs7oodNnCEVbni9yUEkaHbgptDACOPW04jimGagZ51E6+lXUwJjgnBw+hyko/lkFWCldqw==}
+    dependencies:
+      undici-types: 6.21.0
+    dev: false
+
   /@types/node@24.10.12:
     resolution: {integrity: sha512-68e+T28EbdmLSTkPgs3+UacC6rzmqrcWFPQs1C8mwJhI/r5Uxr0yEuQotczNRROd1gq30NGxee+fo0rSIxpyAw==}
     dependencies:
@@ -8280,7 +8251,7 @@ packages:
     resolution: {integrity: sha512-E6OCaRmAe4WDmWNsL/9RMqdkkzDCY1etutkflWk4c+AcjDU07Pcz1fQwTX0TQz+Pxqn9i4L1TU3UFpjnrcDgxA==}
     requiresBuild: true
     dependencies:
-      '@types/node': 20.19.30
+      '@types/node': 25.5.0
       xmlbuilder: 15.1.1
     dev: true
     optional: true
@@ -8323,7 +8294,7 @@ packages:
   /@types/responselike@1.0.3:
     resolution: {integrity: sha512-H/+L+UkTV33uf49PH5pCAUBVPNj2nDBXTN+qS1dOwyyg24l3CcicicCA7ca+HMvJBZcFgl5r8e+RR6elsb4Lyw==}
     dependencies:
-      '@types/node': 20.19.30
+      '@types/node': 25.5.0
 
   /@types/retry@0.12.0:
     resolution: {integrity: sha512-wWKOClTTiizcZhXnPY4wikVAwmdYHp8q6DmC+EJUzAMsycb7HB32Kh9RN4+0gExjmPmZSAQjgURXIGATPegAvA==}
@@ -8341,7 +8312,7 @@ packages:
     resolution: {integrity: sha512-Uqt8rPBE8SY0RK8JB1EzVOIZ32uqy8HwdxCnoCOsYrvnswqmFZ/k+9Ikidlk/ImhsdvBsloHbAlewb2IEBV/Og==}
     dependencies:
       '@types/mime': 1.3.5
-      '@types/node': 20.19.30
+      '@types/node': 25.5.0
     dev: false
 
   /@types/send@1.2.1:
@@ -8353,7 +8324,7 @@ packages:
     resolution: {integrity: sha512-tRs1dB+g8Itk72rlSI2ZrW6vZg0YrLI81iQSTkMmOqnqCaNr/8Ek4VwWcN5vZgCYWbg/JJSGBlUaYGAOP73qBw==}
     dependencies:
       '@types/http-errors': 2.0.5
-      '@types/node': 20.19.30
+      '@types/node': 25.5.0
       '@types/send': 0.17.6
     dev: false
 
@@ -8855,7 +8826,7 @@ packages:
       '@cacheable/node-cache': 1.7.6
       '@hapi/boom': 9.1.4
       async-mutex: 0.5.0
-      libsignal: github.com/whiskeysockets/libsignal-node/1c30d7d7e76a3b0aa120b04dc6a26f5a12dccf67
+      libsignal: git@github.com+whiskeysockets/libsignal-node/1c30d7d7e76a3b0aa120b04dc6a26f5a12dccf67
       lru-cache: 11.2.5
       music-metadata: 11.12.3
       p-queue: 9.1.0
@@ -8999,6 +8970,15 @@ packages:
       fast-json-stable-stringify: 2.1.0
       json-schema-traverse: 0.4.1
       uri-js: 4.4.1
+    dev: true
+
+  /ajv@6.14.0:
+    resolution: {integrity: sha512-IWrosm/yrn43eiKqkfkHis7QioDleaXQHdDVPKg0FSwwd/DuvyX79TZnFOnYpB7dcsFAMmtFztZuXPDvSePkFw==}
+    dependencies:
+      fast-deep-equal: 3.1.3
+      fast-json-stable-stringify: 2.1.0
+      json-schema-traverse: 0.4.1
+      uri-js: 4.4.1
 
   /ajv@8.18.0:
     resolution: {integrity: sha512-PlXPeEWMXMZ7sPYOHqmDyCJzcfNrUr3fGNKtezX14ykXOEIvyK81d+qydx89KY5O71FKMPaQ2vBfBFI5NHR63A==}
@@ -9069,7 +9049,7 @@ packages:
       '@swc/helpers': 0.5.19
       '@types/command-line-args': 5.2.3
       '@types/command-line-usage': 5.0.4
-      '@types/node': 20.19.30
+      '@types/node': 20.19.37
       command-line-args: 5.2.1
       command-line-usage: 7.0.4
       flatbuffers: 24.12.23
@@ -10461,7 +10441,7 @@ packages:
     dependencies:
       '@types/plist': 3.0.5
       '@types/verror': 1.10.11
-      ajv: 6.12.6
+      ajv: 6.14.0
       crc: 3.8.0
       iconv-corefoundation: 1.1.7
       plist: 3.1.0
@@ -11918,7 +11898,7 @@ packages:
     engines: {node: '>=6'}
     deprecated: this library is no longer supported
     dependencies:
-      ajv: 6.12.6
+      ajv: 6.14.0
       har-schema: 2.0.0
     dev: false
 
@@ -12003,12 +11983,6 @@ packages:
     resolution: {integrity: sha512-Xwwo44whKBVCYoliBQwaPvtd/2tYFkRQtXDWj1nackaV2JPXx3L0+Jvd8/qCJ2p+ML0/XVkJ2q+Mr+UVdpJK5w==}
     engines: {node: '>=12.0.0'}
     dev: false
-
-  /hono@4.11.9:
-    resolution: {integrity: sha512-Eaw2YTGM6WOxA6CXbckaEvslr2Ne4NFsKrvc0v97JD5awbmeBLO5w9Ho9L9kmKonrwF9RJlW6BxT1PVv/agBHQ==}
-    engines: {node: '>=16.9.0'}
-    dev: false
-    optional: true
 
   /hono@4.12.7:
     resolution: {integrity: sha512-jq9l1DM0zVIvsm3lv9Nw9nlJnMNPOcAtsbsgiUhWcFzPE99Gvo6yRTlszSLLYacMeQ6quHD6hMfId8crVHvexw==}
@@ -13429,6 +13403,13 @@ packages:
       brace-expansion: 2.0.2
     dev: true
 
+  /minimatch@5.1.9:
+    resolution: {integrity: sha512-7o1wEA2RyMP7Iu7GNba9vc0RWWGACJOCZBJX2GJWip0ikV+wcOsgVuY9uE8CPiyQhkGFSlhuSkZPavN7u1c2Fw==}
+    engines: {node: '>=10'}
+    dependencies:
+      brace-expansion: 2.0.2
+    dev: true
+
   /minimatch@9.0.3:
     resolution: {integrity: sha512-RHiac9mvaRw0x3AYRgDC1CxAP7HTcNrrECeA8YYJeWnpo+2Q5CegtZjaotWTWxDG3UeGA1coE05iH1mPjT/2mg==}
     engines: {node: '>=16 || 14 >=14.17'}
@@ -13961,7 +13942,7 @@ packages:
         optional: true
     dev: false
 
-  /openclaw@2026.3.11(@napi-rs/canvas@0.1.91)(@types/express@5.0.6)(node-llama-cpp@3.16.2):
+  /openclaw@2026.3.11(@napi-rs/canvas@0.1.96)(@types/express@5.0.6)(node-llama-cpp@3.16.2):
     resolution: {integrity: sha512-bxwiBmHPakwfpY5tqC9lrV5TCu5PKf0c1bHNc3nhrb+pqKcPEWV4zOjDVFLQUHr98ihgWA+3pacy4b3LQ8wduQ==}
     engines: {node: '>=22.12.0'}
     hasBin: true
@@ -13985,7 +13966,7 @@ packages:
       '@mariozechner/pi-coding-agent': 0.57.1(ws@8.19.0)(zod@4.3.6)
       '@mariozechner/pi-tui': 0.57.1
       '@mozilla/readability': 0.6.0
-      '@napi-rs/canvas': 0.1.91
+      '@napi-rs/canvas': 0.1.96
       '@sinclair/typebox': 0.34.48
       '@slack/bolt': 4.6.0(@types/express@5.0.6)
       '@slack/web-api': 7.14.1
@@ -14087,32 +14068,32 @@ packages:
       safe-push-apply: 1.0.0
     dev: true
 
-  /oxfmt@0.36.0:
-    resolution: {integrity: sha512-/ejJ+KoSW6J9bcNT9a9UtJSJNWhJ3yOLSBLbkoFHJs/8CZjmaZVZAJe4YgO1KMJlKpNQasrn/G9JQUEZI3p0EQ==}
+  /oxfmt@0.40.0:
+    resolution: {integrity: sha512-g0C3I7xUj4b4DcagevM9kgH6+pUHytikxUcn3/VUkvzTNaaXBeyZqb7IBsHwojeXm4mTBEC/aBjBTMVUkZwWUQ==}
     engines: {node: ^20.19.0 || >=22.12.0}
     hasBin: true
     dependencies:
       tinypool: 2.1.0
     optionalDependencies:
-      '@oxfmt/binding-android-arm-eabi': 0.36.0
-      '@oxfmt/binding-android-arm64': 0.36.0
-      '@oxfmt/binding-darwin-arm64': 0.36.0
-      '@oxfmt/binding-darwin-x64': 0.36.0
-      '@oxfmt/binding-freebsd-x64': 0.36.0
-      '@oxfmt/binding-linux-arm-gnueabihf': 0.36.0
-      '@oxfmt/binding-linux-arm-musleabihf': 0.36.0
-      '@oxfmt/binding-linux-arm64-gnu': 0.36.0
-      '@oxfmt/binding-linux-arm64-musl': 0.36.0
-      '@oxfmt/binding-linux-ppc64-gnu': 0.36.0
-      '@oxfmt/binding-linux-riscv64-gnu': 0.36.0
-      '@oxfmt/binding-linux-riscv64-musl': 0.36.0
-      '@oxfmt/binding-linux-s390x-gnu': 0.36.0
-      '@oxfmt/binding-linux-x64-gnu': 0.36.0
-      '@oxfmt/binding-linux-x64-musl': 0.36.0
-      '@oxfmt/binding-openharmony-arm64': 0.36.0
-      '@oxfmt/binding-win32-arm64-msvc': 0.36.0
-      '@oxfmt/binding-win32-ia32-msvc': 0.36.0
-      '@oxfmt/binding-win32-x64-msvc': 0.36.0
+      '@oxfmt/binding-android-arm-eabi': 0.40.0
+      '@oxfmt/binding-android-arm64': 0.40.0
+      '@oxfmt/binding-darwin-arm64': 0.40.0
+      '@oxfmt/binding-darwin-x64': 0.40.0
+      '@oxfmt/binding-freebsd-x64': 0.40.0
+      '@oxfmt/binding-linux-arm-gnueabihf': 0.40.0
+      '@oxfmt/binding-linux-arm-musleabihf': 0.40.0
+      '@oxfmt/binding-linux-arm64-gnu': 0.40.0
+      '@oxfmt/binding-linux-arm64-musl': 0.40.0
+      '@oxfmt/binding-linux-ppc64-gnu': 0.40.0
+      '@oxfmt/binding-linux-riscv64-gnu': 0.40.0
+      '@oxfmt/binding-linux-riscv64-musl': 0.40.0
+      '@oxfmt/binding-linux-s390x-gnu': 0.40.0
+      '@oxfmt/binding-linux-x64-gnu': 0.40.0
+      '@oxfmt/binding-linux-x64-musl': 0.40.0
+      '@oxfmt/binding-openharmony-arm64': 0.40.0
+      '@oxfmt/binding-win32-arm64-msvc': 0.40.0
+      '@oxfmt/binding-win32-ia32-msvc': 0.40.0
+      '@oxfmt/binding-win32-x64-msvc': 0.40.0
     dev: true
 
   /oxlint-tsgolint@0.16.0:
@@ -15092,7 +15073,7 @@ packages:
   /readdir-glob@1.1.3:
     resolution: {integrity: sha512-v05I2k7xN8zXvPD9N+z/uhXPaj0sUFCe2rcWZIpBsqxfP7xXFQ0tipAd/wjj1YxWyWtUS5IDJpOG82JKt2EAVA==}
     dependencies:
-      minimatch: 5.1.6
+      minimatch: 5.1.9
     dev: true
 
   /readdirp@3.6.0:
@@ -17637,11 +17618,19 @@ packages:
     resolution: {integrity: sha512-bXE4cR/kVZhKZX/RjPEflHaKVhUVl85noU3v6b8apfQEc1x4A+zBxjZ4lN8LqGd6WZ3dl98pY4o717VFmoPp+A==}
     dev: false
 
+  git@github.com+whiskeysockets/libsignal-node/1c30d7d7e76a3b0aa120b04dc6a26f5a12dccf67:
+    resolution: {commit: 1c30d7d7e76a3b0aa120b04dc6a26f5a12dccf67, repo: git@github.com:whiskeysockets/libsignal-node.git, type: git}
+    name: '@whiskeysockets/libsignal-node'
+    version: 2.0.1
+    dependencies:
+      curve25519-js: 0.0.4
+      protobufjs: 6.8.8
+    dev: false
+
   github.com/tloncorp/api-beta/7eede1c1a756977b09f96aa14a92e2b06318ae87:
     resolution: {tarball: https://codeload.github.com/tloncorp/api-beta/tar.gz/7eede1c1a756977b09f96aa14a92e2b06318ae87}
     name: '@tloncorp/api'
     version: 0.0.2
-    prepare: true
     requiresBuild: true
     dependencies:
       '@aws-sdk/client-s3': 3.1000.0
@@ -17661,13 +17650,4 @@ packages:
       validator: 13.15.26
     transitivePeerDependencies:
       - aws-crt
-    dev: false
-
-  github.com/whiskeysockets/libsignal-node/1c30d7d7e76a3b0aa120b04dc6a26f5a12dccf67:
-    resolution: {tarball: https://codeload.github.com/whiskeysockets/libsignal-node/tar.gz/1c30d7d7e76a3b0aa120b04dc6a26f5a12dccf67}
-    name: '@whiskeysockets/libsignal-node'
-    version: 2.0.1
-    dependencies:
-      curve25519-js: 0.0.4
-      protobufjs: 6.8.8
     dev: false
