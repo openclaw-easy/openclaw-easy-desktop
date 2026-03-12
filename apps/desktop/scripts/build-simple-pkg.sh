@@ -34,10 +34,10 @@ pkgbuild \
     "Openclaw-Easy-Simple.pkg"
 
 # Copy to desktop
-cp "Openclaw-Easy-Simple.pkg" "/Users/xinru/Desktop/"
+cp "Openclaw-Easy-Simple.pkg" "$HOME/Desktop/"
 
 # Cleanup
 rm -rf "$BUILD_DIR"
 
-echo "✅ Simple PKG created: /Users/xinru/Desktop/Openclaw-Easy-Simple.pkg"
-echo "Size: $(ls -lh /Users/xinru/Desktop/Openclaw-Easy-Simple.pkg | awk '{print $5}')"
+echo "✅ Simple PKG created: $HOME/Desktop/Openclaw-Easy-Simple.pkg"
+echo "Size: $(ls -lh $HOME/Desktop/Openclaw-Easy-Simple.pkg | awk '{print $5}')"

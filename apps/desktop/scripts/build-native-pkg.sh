@@ -247,10 +247,10 @@ productbuild \
     "Openclaw-Easy-Native-Installer.pkg"
 
 # Copy to desktop
-cp "Openclaw-Easy-Native-Installer.pkg" "/Users/xinru/Desktop/"
+cp "Openclaw-Easy-Native-Installer.pkg" "$HOME/Desktop/"
 
 # Calculate size
-PKG_SIZE=$(ls -lh "/Users/xinru/Desktop/Openclaw-Easy-Native-Installer.pkg" | awk '{print $5}')
+PKG_SIZE=$(ls -lh "$HOME/Desktop/Openclaw-Easy-Native-Installer.pkg" | awk '{print $5}')
 
 # Cleanup
 rm -rf "$BUILD_DIR"
@@ -259,7 +259,7 @@ echo ""
 echo "🎉 NATIVE PKG CREATED!"
 echo "======================"
 echo ""
-echo "📦 Installer: /Users/xinru/Desktop/Openclaw-Easy-Native-Installer.pkg"
+echo "📦 Installer: $HOME/Desktop/Openclaw-Easy-Native-Installer.pkg"
 echo "📏 Size: $PKG_SIZE"
 echo ""
 echo "🤖 NATIVE FEATURES:"

@@ -190,7 +190,7 @@ export function useChatConnection(gatewayPort: number = 18800): ChatConnection {
               if (window.electronAPI?.getGatewayToken) {
                 try {
                   authToken = await window.electronAPI.getGatewayToken();
-                  console.log('[ChatConnection] Retrieved gateway token:', authToken ? `${authToken.slice(0, 10)}...` : 'null');
+                  console.log('[ChatConnection] Retrieved gateway token:', authToken ? '[PRESENT]' : 'null');
                 } catch (error) {
                   console.warn('[ChatConnection] Failed to get gateway token:', error);
                 }

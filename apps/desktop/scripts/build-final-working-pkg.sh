@@ -165,7 +165,7 @@ pkgbuild \
     "Openclaw-Easy-Final-Working.pkg"
 
 # Copy to desktop
-cp "Openclaw-Easy-Final-Working.pkg" "/Users/xinru/Desktop/"
+cp "Openclaw-Easy-Final-Working.pkg" "$HOME/Desktop/"
 
 # Cleanup
 rm -rf "$BUILD_DIR"
@@ -174,8 +174,8 @@ echo ""
 echo "🎉 Final Working PKG Created!"
 echo "=================================="
 echo ""
-echo "📦 Installer: /Users/xinru/Desktop/Openclaw-Easy-Final-Working.pkg"
-echo "📏 Size: $(ls -lh /Users/xinru/Desktop/Openclaw-Easy-Final-Working.pkg | awk '{print $5}')"
+echo "📦 Installer: $HOME/Desktop/Openclaw-Easy-Final-Working.pkg"
+echo "📏 Size: $(ls -lh $HOME/Desktop/Openclaw-Easy-Final-Working.pkg | awk '{print $5}')"
 echo ""
 echo "✨ Key Features:"
 echo "  ✅ Detects your OpenClaw at ~/.openclaw/bin/openclaw"

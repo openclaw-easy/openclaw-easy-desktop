@@ -115,16 +115,16 @@ pkgbuild \
     "Openclaw-Easy-Updated.pkg"
 
 # Copy to desktop
-cp "Openclaw-Easy-Updated.pkg" "/Users/xinru/Desktop/"
+cp "Openclaw-Easy-Updated.pkg" "$HOME/Desktop/"
 
 # Cleanup
 rm -rf "$BUILD_DIR"
 rm -f "/tmp/enhanced-detection.js"
 
-echo "✅ Updated PKG created: /Users/xinru/Desktop/Openclaw-Easy-Updated.pkg"
+echo "✅ Updated PKG created: $HOME/Desktop/Openclaw-Easy-Updated.pkg"
 echo "🔧 Enhanced features:"
 echo "  ✅ Enhanced OpenClaw detection"
 echo "  ✅ Multiple path checking"
 echo "  ✅ Better console logging"
 echo "  ✅ Finds OpenClaw at ~/.openclaw/bin/openclaw"
-echo "Size: $(ls -lh /Users/xinru/Desktop/Openclaw-Easy-Updated.pkg | awk '{print $5}')"
+echo "Size: $(ls -lh $HOME/Desktop/Openclaw-Easy-Updated.pkg | awk '{print $5}')"

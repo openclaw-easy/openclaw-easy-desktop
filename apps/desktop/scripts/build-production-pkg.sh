@@ -90,10 +90,10 @@ pkgbuild \
     "Openclaw-Easy-Production.pkg"
 
 # Copy to desktop
-cp "Openclaw-Easy-Production.pkg" "/Users/xinru/Desktop/"
+cp "Openclaw-Easy-Production.pkg" "$HOME/Desktop/"
 
 # Calculate size
-PKG_SIZE=$(ls -lh "/Users/xinru/Desktop/Openclaw-Easy-Production.pkg" | awk '{print $5}')
+PKG_SIZE=$(ls -lh "$HOME/Desktop/Openclaw-Easy-Production.pkg" | awk '{print $5}')
 
 # Cleanup
 rm -rf "$BUILD_DIR"
@@ -102,7 +102,7 @@ echo ""
 echo "🎉 PRODUCTION PKG CREATED!"
 echo "=========================="
 echo ""
-echo "📦 Installer: /Users/xinru/Desktop/Openclaw-Easy-Production.pkg"
+echo "📦 Installer: $HOME/Desktop/Openclaw-Easy-Production.pkg"
 echo "📏 Size: $PKG_SIZE"
 echo ""
 echo "🚀 PRODUCTION FEATURES:"

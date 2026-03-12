@@ -95,7 +95,7 @@ build_pkg() {
 copy_to_desktop() {
     info "Copying installer to desktop..."
 
-    cp "$BUILD_DIR/${PKG_NAME}.pkg" "/Users/xinru/Desktop/"
+    cp "$BUILD_DIR/${PKG_NAME}.pkg" "$HOME/Desktop/"
 
     log "Installer copied to desktop"
 }
@@ -108,10 +108,10 @@ show_summary() {
     echo "=========================================="
     echo ""
     echo "Installer: ${PKG_NAME}.pkg"
-    echo "Location: /Users/xinru/Desktop/"
+    echo "Location: $HOME/Desktop/"
 
-    if [ -f "/Users/xinru/Desktop/${PKG_NAME}.pkg" ]; then
-        SIZE=$(ls -lh "/Users/xinru/Desktop/${PKG_NAME}.pkg" | awk '{print $5}')
+    if [ -f "$HOME/Desktop/${PKG_NAME}.pkg" ]; then
+        SIZE=$(ls -lh "$HOME/Desktop/${PKG_NAME}.pkg" | awk '{print $5}')
         echo "Size: $SIZE"
     fi
 

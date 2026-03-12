@@ -114,7 +114,7 @@ export class OpenClawEnvironment {
         }
         if (config.apiKey) {
           envVars.OLLAMA_API_KEY = config.apiKey
-          console.log(`[OpenClawEnvironment] Setting OLLAMA_API_KEY: ${config.apiKey}`)
+          console.log(`[OpenClawEnvironment] Setting OLLAMA_API_KEY: [REDACTED]`)
         }
         break
 

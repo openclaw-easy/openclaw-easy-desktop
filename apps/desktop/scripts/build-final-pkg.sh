@@ -128,15 +128,15 @@ pkgbuild \
     "Openclaw-Easy-Final.pkg"
 
 # Copy to desktop
-cp "Openclaw-Easy-Final.pkg" "/Users/xinru/Desktop/"
+cp "Openclaw-Easy-Final.pkg" "$HOME/Desktop/"
 
 # Cleanup
 rm -rf "$BUILD_DIR"
 
-echo "✅ Final PKG created: /Users/xinru/Desktop/Openclaw-Easy-Final.pkg"
+echo "✅ Final PKG created: $HOME/Desktop/Openclaw-Easy-Final.pkg"
 echo "📱 Features:"
 echo "  ✅ Simple app installation (no interference)"
 echo "  ✅ OpenClaw detection with user dialogs"
 echo "  ✅ First-run marker for OpenClaw setup"
 echo "  ✅ Works with existing or new OpenClaw installations"
-echo "Size: $(ls -lh /Users/xinru/Desktop/Openclaw-Easy-Final.pkg | awk '{print $5}')"
+echo "Size: $(ls -lh $HOME/Desktop/Openclaw-Easy-Final.pkg | awk '{print $5}')"

@@ -1035,7 +1035,7 @@ class OpenclawEasyApp {
     })
 
     ipcMain.handle('channels:connect-telegram', async (_, token, name) => {
-      console.log(`Connecting Telegram with token: ${token.slice(0, 10)}...`)
+      console.log(`Connecting Telegram with token: [REDACTED]`)
       return await this.openClawManager.connectTelegram(token, name)
     })
 
@@ -1058,7 +1058,7 @@ class OpenclawEasyApp {
     })
 
     ipcMain.handle('channels:connect-slack', async (_, botToken, appToken, name) => {
-      console.log(`Connecting Slack bot token: ${botToken.slice(0, 10)}...`)
+      console.log(`Connecting Slack bot token: [REDACTED]`)
       return await this.openClawManager.connectSlack(botToken, appToken, name)
     })
 

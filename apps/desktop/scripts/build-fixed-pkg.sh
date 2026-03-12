@@ -174,7 +174,7 @@ pkgbuild \
     "Openclaw-Easy-FIXED.pkg"
 
 # Copy to desktop
-cp "Openclaw-Easy-FIXED.pkg" "/Users/xinru/Desktop/"
+cp "Openclaw-Easy-FIXED.pkg" "$HOME/Desktop/"
 
 # Cleanup
 rm -rf "$BUILD_DIR"
@@ -185,8 +185,8 @@ echo ""
 echo "🎉 FIXED PKG Created!"
 echo "====================="
 echo ""
-echo "📦 Installer: /Users/xinru/Desktop/Openclaw-Easy-FIXED.pkg"
-echo "📏 Size: $(ls -lh /Users/xinru/Desktop/Openclaw-Easy-FIXED.pkg | awk '{print $5}')"
+echo "📦 Installer: $HOME/Desktop/Openclaw-Easy-FIXED.pkg"
+echo "📏 Size: $(ls -lh $HOME/Desktop/Openclaw-Easy-FIXED.pkg | awk '{print $5}')"
 echo ""
 echo "🔧 FIXES INCLUDED:"
 echo "  ✅ Removed HTTP health check dependency"
