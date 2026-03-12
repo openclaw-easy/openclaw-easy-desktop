@@ -38,11 +38,9 @@ mac:
   icon: resources/icons/icon.icns
   category: public.app-category.productivity
   identity: null  # Set your Apple Developer identity for code signing
-  hardenedRuntime: true
+  notarize: false
+  hardenedRuntime: false
   gatekeeperAssess: false
-  entitlements: installer-resources/entitlements.mac.plist
-  entitlementsInherit: installer-resources/entitlements.mac.plist
-  type: distribution
   extendInfo:
     NSMicrophoneUsageDescription: Openclaw Easy uses the microphone for voice input when interacting with AI agents.
     NSCameraUsageDescription: Openclaw Easy uses the camera to scan QR codes for connecting messaging platforms like WhatsApp.
