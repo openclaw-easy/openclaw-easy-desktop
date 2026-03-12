@@ -1,8 +1,6 @@
 name: Build Desktop App
 
 on:
-  push:
-    branches: [main, develop]
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -14,6 +12,41 @@ on:
         default: false
 
 jobs:
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Install dependencies
+        run: pnpm install
+
+      - name: Build app
+        working-directory: ./apps/desktop
+        run: pnpm build
+
+      - name: Package for macOS
+        working-directory: ./apps/desktop
+        run: npx electron-builder --mac dmg --arm64 --x64 --publish never --config electron-builder.yml
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-installer
+          path: apps/desktop/dist-installers/*.dmg
+
   build-windows:
     runs-on: windows-latest
     steps:
@@ -23,30 +56,15 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v3
+        uses: pnpm/action-setup@v4
         with:
           version: 9
-          run_install: false
-
-      - name: Get pnpm store
-        shell: bash
-        run: |
-          echo "STORE_PATH=$(pnpm store path --silent)" >> $GITHUB_ENV
-
-      - name: Setup pnpm cache
-        uses: actions/cache@v3
-        with:
-          path: ${{ env.STORE_PATH }}
-          key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
-          restore-keys: |
-            ${{ runner.os }}-pnpm-store-
 
       - name: Install dependencies
-        working-directory: .
-        run: pnpm install --frozen-lockfile
+        run: pnpm install
 
       - name: Build app
         working-directory: ./apps/desktop
@@ -64,60 +82,6 @@ jobs:
           name: windows-installer
           path: apps/desktop/dist-installers/*.exe
 
-  build-macos:
-    runs-on: macos-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v3
-        with:
-          version: 9
-          run_install: false
-
-      - name: Get pnpm store
-        run: |
-          echo "STORE_PATH=$(pnpm store path --silent)" >> $GITHUB_ENV
-
-      - name: Setup pnpm cache
-        uses: actions/cache@v3
-        with:
-          path: ${{ env.STORE_PATH }}
-          key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
-          restore-keys: |
-            ${{ runner.os }}-pnpm-store-
-
-      - name: Install dependencies
-        working-directory: .
-        run: pnpm install --frozen-lockfile
-
-      - name: Build app
-        working-directory: ./apps/desktop
-        run: pnpm build
-
-      - name: Package for macOS
-        working-directory: ./apps/desktop
-        run: npx electron-builder --mac dmg --arm64 --x64 --publish never --config electron-builder.yml
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Add these if you have Apple Developer credentials
-          # CSC_LINK: ${{ secrets.MAC_CERTS }}
-          # CSC_KEY_PASSWORD: ${{ secrets.MAC_CERTS_PASSWORD }}
-          # APPLE_ID: ${{ secrets.APPLE_ID }}
-          # APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
-
-      - name: Upload macOS artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: macos-installer
-          path: apps/desktop/dist-installers/*.dmg
-
   build-linux:
     runs-on: ubuntu-latest
     steps:
@@ -127,25 +91,12 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v3
+        uses: pnpm/action-setup@v4
         with:
           version: 9
-          run_install: false
-
-      - name: Get pnpm store
-        run: |
-          echo "STORE_PATH=$(pnpm store path --silent)" >> $GITHUB_ENV
-
-      - name: Setup pnpm cache
-        uses: actions/cache@v3
-        with:
-          path: ${{ env.STORE_PATH }}
-          key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
-          restore-keys: |
-            ${{ runner.os }}-pnpm-store-
 
       - name: Install Linux dependencies
         run: |
@@ -153,8 +104,7 @@ jobs:
           sudo apt-get install -y build-essential libx11-dev libxkbfile-dev
 
       - name: Install dependencies
-        working-directory: .
-        run: pnpm install --frozen-lockfile
+        run: pnpm install
 
       - name: Build app
         working-directory: ./apps/desktop
@@ -171,160 +121,3 @@ jobs:
         with:
           name: linux-installer
           path: apps/desktop/dist-installers/*.AppImage
-
-  # Upload all installers to S3 after successful builds (main branch only)
-  upload-s3:
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-    needs: [build-windows, build-macos, build-linux]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: dist
-
-      - name: Get version
-        id: version
-        run: |
-          VERSION=$(node -p "require('./apps/desktop/package.json').version")
-          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
-          echo "Version: $VERSION"
-
-      - name: List downloaded artifacts
-        run: find dist/ -type f | sort
-
-      - name: Upload to S3
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_REGION: us-east-1
-          S3_BUCKET: openclaw-easy.com-website
-          S3_PREFIX: downloads
-          VERSION: ${{ steps.version.outputs.VERSION }}
-        run: |
-          # ── Windows ──
-          WIN_EXE=$(find dist/windows-installer -name '*.exe' | head -1)
-          if [ -n "$WIN_EXE" ]; then
-            echo "Uploading Windows installer: $WIN_EXE"
-            aws s3 cp "$WIN_EXE" \
-              "s3://${S3_BUCKET}/${S3_PREFIX}/OpenclawEasy-Setup.exe" \
-              --content-type "application/x-msdownload" --no-progress
-            aws s3 cp "$WIN_EXE" \
-              "s3://${S3_BUCKET}/${S3_PREFIX}/v${VERSION}/OpenclawEasy-Setup.exe" \
-              --content-type "application/x-msdownload" --no-progress
-          else
-            echo "Warning: No Windows .exe found"
-          fi
-
-          # ── macOS ──
-          for DMG in dist/macos-installer/*.dmg; do
-            [ -f "$DMG" ] || continue
-            FNAME=$(basename "$DMG")
-            echo "Uploading macOS installer: $DMG"
-            aws s3 cp "$DMG" \
-              "s3://${S3_BUCKET}/${S3_PREFIX}/${FNAME}" \
-              --content-type "application/x-apple-diskimage" --no-progress
-            aws s3 cp "$DMG" \
-              "s3://${S3_BUCKET}/${S3_PREFIX}/v${VERSION}/${FNAME}" \
-              --content-type "application/x-apple-diskimage" --no-progress
-          done
-
-          # ── Also upload macOS with stable names (latest) ──
-          ARM64_DMG=$(find dist/macos-installer -name '*arm64*' | head -1)
-          X64_DMG=$(find dist/macos-installer -name '*x64*' | head -1)
-          if [ -n "$ARM64_DMG" ]; then
-            aws s3 cp "$ARM64_DMG" \
-              "s3://${S3_BUCKET}/${S3_PREFIX}/OpenclawEasy-arm64.dmg" \
-              --content-type "application/x-apple-diskimage" --no-progress
-          fi
-          if [ -n "$X64_DMG" ]; then
-            aws s3 cp "$X64_DMG" \
-              "s3://${S3_BUCKET}/${S3_PREFIX}/OpenclawEasy-x64.dmg" \
-              --content-type "application/x-apple-diskimage" --no-progress
-          fi
-
-          # ── Linux ──
-          APPIMAGE=$(find dist/linux-installer -name '*.AppImage' | head -1)
-          if [ -n "$APPIMAGE" ]; then
-            echo "Uploading Linux installer: $APPIMAGE"
-            aws s3 cp "$APPIMAGE" \
-              "s3://${S3_BUCKET}/${S3_PREFIX}/OpenclawEasy.AppImage" \
-              --content-type "application/octet-stream" --no-progress
-            aws s3 cp "$APPIMAGE" \
-              "s3://${S3_BUCKET}/${S3_PREFIX}/v${VERSION}/OpenclawEasy.AppImage" \
-              --content-type "application/octet-stream" --no-progress
-          else
-            echo "Warning: No Linux AppImage found"
-          fi
-
-          # ── Update manifest ──
-          cat > /tmp/latest.json <<-MANIFEST
-          {
-            "version": "${VERSION}",
-            "releaseDate": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-            "files": {
-              "windows": "${S3_PREFIX}/OpenclawEasy-Setup.exe",
-              "arm64": "${S3_PREFIX}/OpenclawEasy-arm64.dmg",
-              "x64": "${S3_PREFIX}/OpenclawEasy-x64.dmg",
-              "linux": "${S3_PREFIX}/OpenclawEasy.AppImage"
-            },
-            "history": {
-              "windows": "${S3_PREFIX}/v${VERSION}/OpenclawEasy-Setup.exe",
-              "arm64": "${S3_PREFIX}/v${VERSION}/Openclaw-Easy-${VERSION}-arm64.dmg",
-              "x64": "${S3_PREFIX}/v${VERSION}/Openclaw-Easy-${VERSION}-x64.dmg",
-              "linux": "${S3_PREFIX}/v${VERSION}/OpenclawEasy.AppImage"
-            }
-          }
-          MANIFEST
-
-          aws s3 cp /tmp/latest.json \
-            "s3://${S3_BUCKET}/${S3_PREFIX}/latest.json" \
-            --content-type "application/json" --no-progress
-
-          echo ""
-          echo "✓ All installers uploaded to S3!"
-          echo "  Windows: https://openclaw-easy.com/${S3_PREFIX}/OpenclawEasy-Setup.exe"
-          echo "  macOS arm64: https://openclaw-easy.com/${S3_PREFIX}/OpenclawEasy-arm64.dmg"
-          echo "  macOS x64: https://openclaw-easy.com/${S3_PREFIX}/OpenclawEasy-x64.dmg"
-          echo "  Linux: https://openclaw-easy.com/${S3_PREFIX}/OpenclawEasy.AppImage"
-          echo "  Manifest: https://openclaw-easy.com/${S3_PREFIX}/latest.json"
-
-  create-release:
-    if: github.event.inputs.release == 'true' && github.ref == 'refs/heads/main'
-    needs: [build-windows, build-macos, build-linux]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: dist
-
-      - name: Get version
-        id: version
-        run: |
-          VERSION=$(node -p "require('./apps/desktop/package.json').version")
-          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
-
-      - name: Create Release
-        uses: ncipollo/release-action@v1
-        with:
-          artifacts: "dist/**/*"
-          tag: "v${{ steps.version.outputs.VERSION }}"
-          name: "Openclaw Easy v${{ steps.version.outputs.VERSION }}"
-          body: |
-            ## Openclaw Easy Desktop App
-
-            ### Downloads
-            - **Windows**: Download the `.exe` installer
-            - **macOS**: Download the `.dmg` for your architecture (x64 or arm64)
-            - **Linux**: Download the `.AppImage`
-          draft: true
-          prerelease: false
