@@ -408,7 +408,7 @@
     "tsdown": "0.21.0",
     "tsx": "^4.21.0",
     "typescript": "^5.9.3",
-    "vitest": "^4.0.18"
+    "vitest": "^4.1.0"
   },
   "peerDependencies": {
     "@napi-rs/canvas": "^0.1.89",
