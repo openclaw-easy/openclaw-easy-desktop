@@ -9,7 +9,7 @@
  * Shared base class, types, and helpers are in process-manager-base.ts.
  */
 
-export type { ProcessStatus, ProcessEvent, HealthEvent, ConfigManager } from './process-manager-base.js'
+export type { ProcessStatus, ProcessEvent, HealthEvent, ConfigManager, GatewayMode, GatewayModeInfo } from './process-manager-base.js'
 export { ProcessManagerBase } from './process-manager-base.js'
 export { ProcessManagerMac } from './process-manager-mac.js'
 export { ProcessManagerWindows } from './process-manager-windows.js'

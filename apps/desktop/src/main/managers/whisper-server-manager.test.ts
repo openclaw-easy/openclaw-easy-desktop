@@ -82,7 +82,9 @@ describe('WhisperServerManager', () => {
       const promise = priv.waitForHealth()
       await promise
 
-      expect(priv.status).toBe('running')
+      // waitForHealth() only resolves when /health returns ok — it does NOT
+      // set status to 'running' (that happens later in start(), after probeModelReady).
+      // Just verify it resolved without error.
     })
 
     it('should reject when process exits before becoming healthy', async () => {
@@ -112,7 +114,6 @@ describe('WhisperServerManager', () => {
 
       const promise = priv.waitForHealth()
       await promise
-      expect(priv.status).toBe('running')
 
       // Process exits after already settled — should not throw
       fakeProcess.emit('close', 0)
@@ -169,7 +170,6 @@ describe('WhisperServerManager', () => {
 
       // Should resolve without error even though there's no process to listen on
       await priv.waitForHealth()
-      expect(priv.status).toBe('running')
     })
   })
 

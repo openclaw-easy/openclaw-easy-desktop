@@ -5,6 +5,7 @@ import { existsSync } from 'fs'
 import { readFile, writeFile, mkdir, copyFile } from 'fs/promises'
 import { Logger } from './logger'
 import { BYOK_PROVIDER_MODELS } from '../../shared/providerModels'
+import { DEFAULT_GATEWAY_PORT } from '../../shared/constants'
 
 export interface AppProviderConfig {
   aiProvider: 'byok' | 'local'
@@ -156,18 +157,14 @@ export class ConfigManager {
       }
     }
 
-    // ── Gateway ──
-    if (!repaired.gateway) {
-      repaired.gateway = {}
-      warnings.push('Created missing gateway structure')
-    }
-    if (!repaired.gateway.mode) {
-      repaired.gateway.mode = 'local'
-      warnings.push('Set gateway.mode to default "local"')
-    }
-    if (!repaired.gateway.port) {
-      repaired.gateway.port = 18800
-      warnings.push('Set gateway.port to default 18800')
+    // ── Gateway — only repair fields within an existing section, never create from scratch.
+    // The gateway config is owned by the system OpenClaw; creating defaults here could
+    // overwrite the actual port/settings used by the LaunchAgent/service.
+    if (repaired.gateway) {
+      if (!repaired.gateway.mode) {
+        repaired.gateway.mode = 'local'
+        warnings.push('Set gateway.mode to default "local"')
+      }
     }
 
     // ── Channels — each entry must be an object; credential fields must be non-empty strings ──
@@ -372,7 +369,7 @@ export class ConfigManager {
         gateway: {
           ...(existingConfig as any).gateway,
           mode: 'local',
-          port: gatewayPort || 18800,  // Use dynamic port (desktop app range: 18800-18809)
+          port: gatewayPort || DEFAULT_GATEWAY_PORT,  // Use official OpenClaw default port
           bind: 'loopback',
           auth: {
             token: 'openclaw-easy-local-dev-token'
@@ -524,11 +521,12 @@ export class ConfigManager {
         hasChanges = true
       }
 
-      // Update port if it doesn't match (ProcessManager may have found a different available port)
-      if (config.gateway.port !== gatewayPort) {
+      // Set port only if missing — don't override an existing port since the system
+      // gateway service (LaunchAgent) may use a different port than the default.
+      if (!config.gateway.port) {
         config.gateway.port = gatewayPort
         hasChanges = true
-        console.log(`[ConfigManager] Updated gateway port to ${gatewayPort}`)
+        console.log(`[ConfigManager] Set gateway port to ${gatewayPort}`)
       }
 
       // Allow WebSocket connections from the Electron desktop app in both dev and production modes.

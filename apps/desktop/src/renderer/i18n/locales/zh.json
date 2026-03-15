@@ -262,7 +262,7 @@
     "gatewayNeeded": "需要运行 OpenClaw 网关才能使用聊天功能。",
     "toStartGateway": "启动网关：",
     "goToSidebar": "前往侧边栏并点击**启动助手**",
-    "separateGateway": "桌面应用使用独立的网关（端口 18800-18809），与官方 OpenClaw 安装（端口 18790）分开。",
+    "separateGateway": "桌面应用连接到你的 OpenClaw 网关（默认端口 18789）。它可以管理现有网关，也可以使用系统安装的 OpenClaw 启动一个新网关。",
     "startConversation": "开始对话",
     "typeBelow": "在下方输入消息与 AI 助手聊天",
     "sendShortcut": "按 Cmd+Enter（Mac）或 Ctrl+Enter（Windows）发送",

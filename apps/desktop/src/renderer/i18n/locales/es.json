@@ -262,7 +262,7 @@
     "gatewayNeeded": "El OpenClaw Gateway necesita estar en ejecución para usar la función de chat.",
     "toStartGateway": "Para iniciar el gateway:",
     "goToSidebar": "Ve a la barra lateral y haz clic en **Iniciar asistente**",
-    "separateGateway": "La app de escritorio usa su propio gateway en el puerto 18800-18809, separado de la instalación oficial de OpenClaw (puerto 18790).",
+    "separateGateway": "La app de escritorio se conecta a tu gateway OpenClaw (puerto predeterminado 18789). Puede gestionar un gateway existente o iniciar uno usando tu instalación de OpenClaw del sistema.",
     "startConversation": "Iniciar una conversación",
     "typeBelow": "Escribe tu mensaje abajo para chatear con el asistente de IA",
     "sendShortcut": "Presiona Cmd+Enter (Mac) o Ctrl+Enter (Windows) para enviar",

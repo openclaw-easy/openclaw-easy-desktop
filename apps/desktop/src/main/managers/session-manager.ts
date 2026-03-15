@@ -1,12 +1,14 @@
-import { OpenClawCommandExecutor } from './openclaw-command-executor'
+type CommandExecutor = {
+  executeCommand(args: string[], timeoutMs?: number): Promise<string | null>
+}
 
 /**
  * SessionManager - Manages OpenClaw conversation sessions
  */
 export class SessionManager {
-  private executor: OpenClawCommandExecutor
+  private executor: CommandExecutor
 
-  constructor(executor: OpenClawCommandExecutor) {
+  constructor(executor: CommandExecutor) {
     this.executor = executor
   }
 

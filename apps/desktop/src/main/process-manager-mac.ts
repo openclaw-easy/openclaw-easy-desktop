@@ -34,8 +34,10 @@ export class ProcessManagerMac extends ProcessManagerBase {
   private isPortListening(port: number): Promise<boolean> {
     return new Promise((resolve) => {
       const socket = new net.Socket()
+      socket.setTimeout(3000)
       socket.once('connect', () => { socket.destroy(); resolve(true) })
       socket.once('error', () => { socket.destroy(); resolve(false) })
+      socket.once('timeout', () => { socket.destroy(); resolve(false) })
       socket.connect(port, '127.0.0.1')
     })
   }
@@ -71,56 +73,6 @@ export class ProcessManagerMac extends ProcessManagerBase {
     }
   }
 
-  private async findAvailablePort(): Promise<number | null> {
-    const ports = [18800, 18801, 18802, 18803, 18804, 18805, 18806, 18807, 18808, 18809]
-
-    console.log('[ProcessManager] Finding available port for desktop gateway...')
-
-    for (const port of ports) {
-      const pid = await this.getPidOnPort(port)
-      if (!pid) {
-        console.log(`[ProcessManager] Port ${port} is available`)
-        return port
-      }
-
-      console.log(`[ProcessManager] Port ${port} is in use (PID ${pid})`)
-
-      // Only try to reclaim the preferred port from a stale desktop gateway
-      if (port === ports[0]) {
-        const isDesktopProcess = await this.isOurDesktopProcess(pid)
-        if (isDesktopProcess) {
-          console.log(`[ProcessManager] Port ${port} is used by a stale desktop gateway, reclaiming...`)
-          const killed = await this.killProcess(pid)
-          if (killed) {
-            await new Promise(resolve => setTimeout(resolve, 1000))
-            const stillInUse = await this.getPidOnPort(port)
-            if (!stillInUse) {
-              console.log(`[ProcessManager] Successfully reclaimed port ${port}`)
-              this.emitLog(`♻️ Reclaimed port ${port} from previous desktop instance`)
-              return port
-            }
-          }
-        }
-      }
-    }
-
-    console.error('[ProcessManager] No available ports found!')
-    this.emitLog('❌ No available ports found for desktop gateway')
-    return null
-  }
-
-  private async isOurDesktopProcess(pid: number): Promise<boolean> {
-    try {
-      const { stdout } = await execFileAsync('ps', ['-p', `${pid}`, '-o', 'command='])
-      const command = stdout.trim()
-      return command.includes('gateway') && command.includes('run') &&
-             command.includes('bun') &&
-             /1880[0-9]/.test(command)
-    } catch {
-      return false
-    }
-  }
-
   async start(): Promise<boolean> {
     if (this.status === 'running') {
       console.log('[ProcessManager] Already running')
@@ -140,138 +92,23 @@ export class ProcessManagerMac extends ProcessManagerBase {
         return true
       }
 
-      const availablePort = await this.findAvailablePort()
-      if (!availablePort) {
-        this.setStatus('error')
-        this.emitLog('❌ Could not find an available port for desktop gateway (18800-18809 all in use)')
-        return false
+      // ── Detect gateway mode ────────────────────────────────────────────
+      const modeInfo = await this.detectGatewayMode()
+      this.gatewayMode = modeInfo.mode
+      this.systemBinaryPath = modeInfo.systemBinaryPath || null
+
+      // ── Mode 1: External — gateway already running ─────────────────────
+      if (modeInfo.mode === 'external') {
+        return this.startExternal(modeInfo.port)
       }
 
-      this.activePort = availablePort
-      console.log(`[ProcessManager] Using port ${availablePort} for desktop gateway`)
-
-      if (this.configManager) {
-        await this.configManager.ensureGatewayConfigured(availablePort)
-        console.log(`[ProcessManager] Updated config with gateway port ${availablePort}`)
-        await this.clearAllCooldowns()
+      // ── Mode 2: System — use system openclaw binary ────────────────────
+      if (modeInfo.mode === 'system') {
+        return this.startSystem(modeInfo.systemBinaryPath!, modeInfo.port)
       }
 
-      const openclawEnv = this.openclawEnv.getEnvironmentVariables()
-      const validation = this.openclawEnv.validateEnvironment()
-      if (!validation.valid) {
-        console.warn(`[ProcessManager] Environment validation issues: missing ${validation.missing.join(', ')}`)
-      }
-
-      const { app } = await import('electron')
-      const home = process.env.HOME || ''
-
-      const expandedPath = [
-        path.join(home, '.bun', 'bin'),
-        path.join(home, '.npm-global', 'bin'),
-        '/opt/homebrew/bin',
-        '/usr/local/bin',
-        '/usr/bin',
-        '/bin',
-        process.env.PATH || ''
-      ].join(':')
-
-      const enhancedEnv = {
-        ...process.env,
-        ...openclawEnv,
-        PATH: expandedPath,
-        OPENCLAW_ALLOW_MULTI_GATEWAY: '1'
-      }
-
-      let spawnCmd: string
-      let spawnArgs: string[]
-      let spawnCwd: string
-
-      if (app.isPackaged) {
-        const bunBinaryName = `bun-${process.arch === 'arm64' ? 'arm64' : 'x64'}`
-        const bundledBun = path.join(process.resourcesPath, 'bun', bunBinaryName)
-        const openclawInstallDir = path.join(home, '.openclaw-easy', 'app')
-        const openclawMjs = path.join(openclawInstallDir, 'openclaw.mjs')
-        const nodeModulesDir = path.join(openclawInstallDir, 'node_modules')
-
-        if (!fs.existsSync(nodeModulesDir)) {
-          this.emitLog('⚙️ First launch: setting up OpenClaw (this takes ~30 seconds)...')
-          console.log('[ProcessManager] First-launch setup: installing OpenClaw dependencies')
-          await this.installOpenClawBundle(bundledBun, openclawInstallDir)
-        } else {
-          this.syncBundledAssets(openclawInstallDir)
-          // Re-install deps if package.json changed (e.g. after app update with new dependencies)
-          if (this.needsDepsUpdate(openclawInstallDir)) {
-            this.emitLog('⚙️ Updating dependencies after app update...')
-            console.log('[ProcessManager] package.json changed — re-running bun install')
-            await this.runBunInstall(bundledBun, openclawInstallDir)
-          }
-        }
-
-        await this.sanitizeConfigForBundled(openclawInstallDir)
-
-        spawnCmd = bundledBun
-        spawnArgs = [openclawMjs, 'gateway', 'run', '--port', String(this.activePort), '--bind', 'loopback']
-        spawnCwd = openclawInstallDir
-        console.log(`[ProcessManager] Production: ${bundledBun} ${openclawMjs}`)
-        this.emitLog('🚀 Starting OpenClaw gateway (bundled runtime)...')
-      } else {
-        const openclawPath = path.join(__dirname, '../../../../openclaw/src/index.ts')
-        spawnCmd = 'bun'
-        spawnArgs = [openclawPath, 'gateway', 'run', '--port', String(this.activePort), '--bind', 'loopback']
-        spawnCwd = path.join(__dirname, '../../../../openclaw/')
-        console.log(`[ProcessManager] Dev: bun ${openclawPath}`)
-      }
-
-      this.process = spawn(spawnCmd, spawnArgs, {
-        stdio: ['pipe', 'pipe', 'pipe'],
-        cwd: spawnCwd,
-        env: enhancedEnv
-      })
-
-      this.setupProcessListeners()
-      this.emitLog(`🖥️ Starting desktop OpenClaw gateway on port ${this.activePort}...`)
-
-      // Wait for the gateway to accept connections.
-      // First launch may need to build UI assets, which can take 30s+.
-      const MAX_WAIT_MS = 60_000
-      const POLL_INTERVAL_MS = 2_000
-      let elapsed = 0
-
-      while (elapsed < MAX_WAIT_MS) {
-        await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL_MS))
-        elapsed += POLL_INTERVAL_MS
-
-        // Bail if the process died or if stop() was called during startup
-        if (!this.process || this.process.killed || this.process.exitCode !== null) {
-          console.error('[ProcessManager] Gateway process exited during startup')
-          this.setStatus('error')
-          this.emitLog('❌ Desktop OpenClaw gateway failed to start')
-          return false
-        }
-        if (this.status !== 'starting') {
-          console.log('[ProcessManager] Startup aborted (status changed externally)')
-          return false
-        }
-
-        if (await this.isPortListening(this.activePort)) {
-          this.setStatus('running')
-          this.emitLog('✅ Desktop OpenClaw gateway started successfully')
-          console.log('[ProcessManager] Desktop OpenClaw gateway started successfully')
-          return true
-        }
-
-        console.log(`[ProcessManager] Waiting for port ${this.activePort}... (${elapsed / 1000}s)`)
-      }
-
-      // Timed out
-      console.error(`[ProcessManager] Gateway did not bind to port ${this.activePort} within ${MAX_WAIT_MS / 1000}s`)
-      this.setStatus('error')
-      this.emitLog(`❌ Gateway did not start within ${MAX_WAIT_MS / 1000}s`)
-      if (this.process) {
-        this.process.kill('SIGTERM')
-        this.process = null
-      }
-      return false
+      // ── Mode 3: Bundled — use embedded openclaw (legacy behavior) ──────
+      return this.startBundled()
 
     } catch (error: any) {
       console.error('[ProcessManager] Start error:', error)
@@ -280,14 +117,328 @@ export class ProcessManagerMac extends ProcessManagerBase {
     }
   }
 
+  /**
+   * Mode 1: Connect to an already-running gateway (started outside the desktop app).
+   * No process is spawned — the desktop app is a pure GUI client.
+   */
+  private async startExternal(port: number): Promise<boolean> {
+    this.activePort = port
+    console.log(`[ProcessManager] Connecting to existing gateway on port ${port} (external mode)`)
+    this.emitLog(`🔗 Detected existing OpenClaw gateway on port ${port}, connecting...`)
+
+    // Verify it's actually reachable
+    if (await this.isPortListening(port)) {
+      this.setStatus('running')
+      this.emitLog(`✅ Connected to existing OpenClaw gateway on port ${port}`)
+      this.startExternalMonitoring()
+      return true
+    }
+
+    // Race condition: gateway went away between detection and connect
+    console.warn('[ProcessManager] External gateway disappeared during connect')
+    this.setStatus('error')
+    this.emitLog('❌ External gateway is no longer reachable')
+    return false
+  }
+
+  /**
+   * Mode 2: Start the gateway using the system-installed openclaw binary.
+   * The desktop app spawns and owns this process.
+   */
+  private async startSystem(binaryPath: string, port: number): Promise<boolean> {
+    this.activePort = port
+    console.log(`[ProcessManager] Starting system OpenClaw at ${binaryPath} on port ${port}`)
+    this.emitLog(`🚀 Starting system OpenClaw gateway (${binaryPath})...`)
+
+    if (this.configManager) {
+      await this.configManager.ensureGatewayConfigured(port)
+      await this.clearAllCooldowns()
+    }
+
+    // Try `openclaw gateway start` first (uses launchd/systemd service management)
+    try {
+      console.log('[ProcessManager] Trying: openclaw gateway start')
+      await execFileAsync(binaryPath, ['gateway', 'start'], { timeout: 15_000 })
+      // Wait for the gateway to come online — the service may use a different port
+      // than the config (e.g. LaunchAgent plist overrides with --port flag)
+      const MAX_WAIT = 15_000
+      const POLL = 1_000
+      let waited = 0
+      while (waited < MAX_WAIT) {
+        await new Promise(resolve => setTimeout(resolve, POLL))
+        waited += POLL
+        // Check the configured port first, then re-read in case it changed
+        const actualPort = this.readConfiguredGatewayPort()
+        if (await this.isPortListening(actualPort)) {
+          this.activePort = actualPort
+          this.gatewayMode = 'external'
+          this.setStatus('running')
+          this.startExternalMonitoring()
+          this.emitLog(`✅ System OpenClaw gateway started on port ${actualPort}`)
+          console.log(`[ProcessManager] System gateway started via "openclaw gateway start" on port ${actualPort}`)
+          return true
+        }
+      }
+      console.warn('[ProcessManager] "openclaw gateway start" ran but port not listening, falling back to spawn')
+    } catch (err: any) {
+      console.warn('[ProcessManager] "openclaw gateway start" failed, falling back to spawn:', err.message)
+    }
+
+    // Fall back to spawning the process directly
+    const home = process.env.HOME || ''
+    const expandedPath = [
+      path.join(home, '.bun', 'bin'),
+      path.join(home, '.npm-global', 'bin'),
+      path.join(home, '.local', 'bin'),
+      '/opt/homebrew/bin',
+      '/usr/local/bin',
+      '/usr/bin',
+      '/bin',
+      process.env.PATH || ''
+    ].join(':')
+
+    const openclawEnv = this.openclawEnv.getEnvironmentVariables()
+
+    this.process = spawn(binaryPath, ['gateway', 'run', '--port', String(port), '--bind', 'loopback'], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      cwd: home,
+      env: {
+        ...process.env,
+        ...openclawEnv,
+        PATH: expandedPath,
+      }
+    })
+
+    this.setupProcessListeners()
+
+    // Wait for the gateway to accept connections (system binary should start faster)
+    const MAX_WAIT_MS = 60_000
+    const POLL_INTERVAL_MS = 2_000
+    let elapsed = 0
+
+    while (elapsed < MAX_WAIT_MS) {
+      await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL_MS))
+      elapsed += POLL_INTERVAL_MS
+
+      if (!this.process || this.process.killed || this.process.exitCode !== null) {
+        console.error('[ProcessManager] System gateway process exited during startup')
+        this.setStatus('error')
+        this.emitLog('❌ System OpenClaw gateway failed to start')
+        return false
+      }
+      if (this.status !== 'starting') {
+        console.log('[ProcessManager] Startup aborted (status changed externally)')
+        return false
+      }
+
+      if (await this.isPortListening(port)) {
+        this.setStatus('running')
+        this.emitLog(`✅ System OpenClaw gateway started on port ${port}`)
+        console.log('[ProcessManager] System OpenClaw gateway started successfully')
+        return true
+      }
+
+      console.log(`[ProcessManager] Waiting for system gateway on port ${port}... (${elapsed / 1000}s)`)
+    }
+
+    console.error(`[ProcessManager] System gateway did not start within ${MAX_WAIT_MS / 1000}s`)
+    this.setStatus('error')
+    this.emitLog(`❌ System gateway did not start within ${MAX_WAIT_MS / 1000}s`)
+    if (this.process) {
+      this.process.kill('SIGTERM')
+      this.process = null
+    }
+    return false
+  }
+
+  /**
+   * Mode 3: Start the gateway using the bundled openclaw copy.
+   * This is the original/legacy behavior, preserved exactly as-is.
+   */
+  private async startBundled(): Promise<boolean> {
+    const port = this.readConfiguredGatewayPort()
+
+    // If something is already on this port, try to reclaim it from a stale desktop process
+    const existingPid = await this.getPidOnPort(port)
+    if (existingPid) {
+      console.log(`[ProcessManager] Port ${port} in use (PID ${existingPid}), attempting to reclaim...`)
+      await this.killProcess(existingPid)
+      await new Promise(resolve => setTimeout(resolve, 1500))
+      if (await this.getPidOnPort(port)) {
+        this.setStatus('error')
+        this.emitLog(`❌ Port ${port} is still in use — cannot start bundled gateway`)
+        return false
+      }
+      this.emitLog(`♻️ Reclaimed port ${port} from previous process`)
+    }
+
+    this.activePort = port
+    console.log(`[ProcessManager] Using port ${port} for bundled gateway`)
+
+    if (this.configManager) {
+      await this.configManager.ensureGatewayConfigured(port)
+      console.log(`[ProcessManager] Updated config with gateway port ${port}`)
+      await this.clearAllCooldowns()
+    }
+
+    const openclawEnv = this.openclawEnv.getEnvironmentVariables()
+    const validation = this.openclawEnv.validateEnvironment()
+    if (!validation.valid) {
+      console.warn(`[ProcessManager] Environment validation issues: missing ${validation.missing.join(', ')}`)
+    }
+
+    const { app } = await import('electron')
+    const home = process.env.HOME || ''
+
+    const expandedPath = [
+      path.join(home, '.bun', 'bin'),
+      path.join(home, '.npm-global', 'bin'),
+      '/opt/homebrew/bin',
+      '/usr/local/bin',
+      '/usr/bin',
+      '/bin',
+      process.env.PATH || ''
+    ].join(':')
+
+    const enhancedEnv = {
+      ...process.env,
+      ...openclawEnv,
+      PATH: expandedPath,
+    }
+
+    let spawnCmd: string
+    let spawnArgs: string[]
+    let spawnCwd: string
+
+    if (app.isPackaged) {
+      const bunBinaryName = `bun-${process.arch === 'arm64' ? 'arm64' : 'x64'}`
+      const bundledBun = path.join(process.resourcesPath, 'bun', bunBinaryName)
+      const openclawInstallDir = path.join(home, '.openclaw-easy', 'app')
+      const openclawMjs = path.join(openclawInstallDir, 'openclaw.mjs')
+      const nodeModulesDir = path.join(openclawInstallDir, 'node_modules')
+
+      if (!fs.existsSync(nodeModulesDir)) {
+        this.emitLog('⚙️ First launch: setting up OpenClaw (this takes ~30 seconds)...')
+        console.log('[ProcessManager] First-launch setup: installing OpenClaw dependencies')
+        await this.installOpenClawBundle(bundledBun, openclawInstallDir)
+      } else {
+        this.syncBundledAssets(openclawInstallDir)
+        // Re-install deps if package.json changed (e.g. after app update with new dependencies)
+        if (this.needsDepsUpdate(openclawInstallDir)) {
+          this.emitLog('⚙️ Updating dependencies after app update...')
+          console.log('[ProcessManager] package.json changed — re-running bun install')
+          await this.runBunInstall(bundledBun, openclawInstallDir)
+        }
+      }
+
+      await this.sanitizeConfigForBundled(openclawInstallDir)
+
+      spawnCmd = bundledBun
+      spawnArgs = [openclawMjs, 'gateway', 'run', '--port', String(this.activePort), '--bind', 'loopback']
+      spawnCwd = openclawInstallDir
+      console.log(`[ProcessManager] Production: ${bundledBun} ${openclawMjs}`)
+      this.emitLog('🚀 Starting OpenClaw gateway (bundled runtime)...')
+    } else {
+      const openclawPath = path.join(__dirname, '../../../../openclaw/src/index.ts')
+      spawnCmd = 'bun'
+      spawnArgs = [openclawPath, 'gateway', 'run', '--port', String(this.activePort), '--bind', 'loopback']
+      spawnCwd = path.join(__dirname, '../../../../openclaw/')
+      console.log(`[ProcessManager] Dev: bun ${openclawPath}`)
+    }
+
+    this.process = spawn(spawnCmd, spawnArgs, {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      cwd: spawnCwd,
+      env: enhancedEnv
+    })
+
+    this.setupProcessListeners()
+    this.emitLog(`🖥️ Starting desktop OpenClaw gateway on port ${this.activePort}...`)
+
+    // Wait for the gateway to accept connections.
+    // First launch may need to build UI assets, which can take 30s+.
+    const MAX_WAIT_MS = 60_000
+    const POLL_INTERVAL_MS = 2_000
+    let elapsed = 0
+
+    while (elapsed < MAX_WAIT_MS) {
+      await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL_MS))
+      elapsed += POLL_INTERVAL_MS
+
+      // Bail if the process died or if stop() was called during startup
+      if (!this.process || this.process.killed || this.process.exitCode !== null) {
+        console.error('[ProcessManager] Gateway process exited during startup')
+        this.setStatus('error')
+        this.emitLog('❌ Desktop OpenClaw gateway failed to start')
+        return false
+      }
+      if (this.status !== 'starting') {
+        console.log('[ProcessManager] Startup aborted (status changed externally)')
+        return false
+      }
+
+      if (await this.isPortListening(this.activePort)) {
+        this.setStatus('running')
+        this.emitLog('✅ Desktop OpenClaw gateway started successfully')
+        console.log('[ProcessManager] Desktop OpenClaw gateway started successfully')
+        return true
+      }
+
+      console.log(`[ProcessManager] Waiting for port ${this.activePort}... (${elapsed / 1000}s)`)
+    }
+
+    // Timed out
+    console.error(`[ProcessManager] Gateway did not bind to port ${this.activePort} within ${MAX_WAIT_MS / 1000}s`)
+    this.setStatus('error')
+    this.emitLog(`❌ Gateway did not start within ${MAX_WAIT_MS / 1000}s`)
+    if (this.process) {
+      this.process.kill('SIGTERM')
+      this.process = null
+    }
+    return false
+  }
+
   async stop(): Promise<boolean> {
     if (this.status === 'stopped') {
       return true
     }
 
+    this.stopExternalMonitoring()
+
+    // In external mode, use `openclaw gateway stop` (handles launchd/systemd properly)
+    if (this.gatewayMode === 'external') {
+      console.log('[ProcessManager] Stopping external gateway...')
+      this.emitLog('🛑 Stopping external gateway...')
+
+      const systemBinary = await this.detectSystemOpenClaw()
+      if (systemBinary) {
+        try {
+          console.log('[ProcessManager] Running: openclaw gateway stop')
+          await execFileAsync(systemBinary, ['gateway', 'stop'], { timeout: 15_000 })
+          console.log('[ProcessManager] openclaw gateway stop succeeded')
+        } catch (err: any) {
+          console.warn('[ProcessManager] openclaw gateway stop failed:', err.message)
+          // Fall back to killing the process directly
+          if (this.activePort > 0) {
+            const pid = await this.getPidOnPort(this.activePort)
+            if (pid) {
+              console.log(`[ProcessManager] Killing gateway (PID ${pid}) on port ${this.activePort}`)
+              await this.killProcess(pid)
+              await new Promise(resolve => setTimeout(resolve, 1500))
+            }
+          }
+        }
+      }
+
+      this.activePort = 0
+      this.setStatus('stopped')
+      this.emitLog('✅ Gateway stopped')
+      return true
+    }
+
     try {
-      console.log('[ProcessManager] Stopping desktop gateway...')
-      this.emitLog('🛑 Stopping desktop gateway...')
+      console.log('[ProcessManager] Stopping gateway...')
+      this.emitLog('🛑 Stopping gateway...')
 
       if (this.process) {
         this.cleanupProcessListeners(this.process)
@@ -299,8 +450,8 @@ export class ProcessManagerMac extends ProcessManagerBase {
         this.process = null
       }
 
-      // Clean up any orphaned process still holding the port
-      if (this.activePort > 0) {
+      // Clean up any orphaned process still holding the port (bundled mode only)
+      if (this.gatewayMode === 'bundled' && this.activePort > 0) {
         const pid = await this.getPidOnPort(this.activePort)
         if (pid) {
           console.log(`[ProcessManager] Killing orphaned gateway on port ${this.activePort} (PID ${pid})`)
@@ -310,7 +461,7 @@ export class ProcessManagerMac extends ProcessManagerBase {
 
       this.activePort = 0
       this.setStatus('stopped')
-      this.emitLog('✅ Desktop gateway stopped')
+      this.emitLog('✅ Gateway stopped')
       return true
     } catch (error: any) {
       console.error('[ProcessManager] Stop error:', error)
@@ -323,7 +474,7 @@ export class ProcessManagerMac extends ProcessManagerBase {
     await this.stop()
 
     // Wait for the port to be fully released
-    const port = this.activePort || 18800
+    const port = this.activePort || this.readConfiguredGatewayPort()
     const deadline = Date.now() + 10_000
     while (Date.now() < deadline) {
       if (!(await this.getPidOnPort(port))) break

@@ -1,7 +1,7 @@
 import * as path from 'path'
 import * as os from 'os'
 import { BrowserWindow } from 'electron'
-import { createProcessManager, ProcessManager, ProcessStatus } from './process-manager.js'
+import { createProcessManager, ProcessManager, ProcessStatus, GatewayMode, GatewayModeInfo } from './process-manager.js'
 import { ProcessManagerWindows } from './process-manager-windows.js'
 import { ChannelManager } from './channel-manager.js'
 import { OpenClawEnvironment } from './openclaw-environment'
@@ -9,6 +9,7 @@ import { Logger } from './managers/logger'
 import { OpenClawCommandExecutor } from './managers/openclaw-command-executor'
 import { OpenClawCommandExecutorWindows } from './managers/openclaw-command-executor-windows'
 import { ConfigManager } from './managers/config-manager'
+import { DEFAULT_GATEWAY_PORT } from '../shared/constants'
 import { AgentBindingManager } from './managers/agent-binding-manager'
 import { SkillsManager } from './managers/skills-manager'
 import { HooksManager } from './managers/hooks-manager'
@@ -18,13 +19,16 @@ import { DoctorManager } from './managers/doctor-manager'
 import { StatisticsManager } from './managers/statistics-manager'
 
 // Unified executor interface — both implementations expose executeCommand()
-type CommandExecutor = { executeCommand(args: string[], timeoutMs?: number): Promise<string | null> }
+type CommandExecutor = {
+  executeCommand(args: string[], timeoutMs?: number): Promise<string | null>
+  setSystemBinary?(binaryPath: string | null): void
+}
 
 export class OpenClawManager {
   private processManager: ProcessManager
   private channelManager: ChannelManager
   private openclawEnv: OpenClawEnvironment
-  private gatewayPort: number = 18800  // Track active gateway port (desktop app range: 18800-18809)
+  private gatewayPort: number = DEFAULT_GATEWAY_PORT  // Track active gateway port (matches official OpenClaw default)
   private lastStatusLogTime: number = 0  // Track last time we logged status
 
   // Specialized managers
@@ -76,47 +80,86 @@ export class OpenClawManager {
 
   // Process Management
   async start(): Promise<boolean> {
-    this.logger.addLog('=== Starting Desktop OpenClaw Gateway ===')
+    this.logger.addLog('=== Starting OpenClaw Gateway ===')
 
     const configPath = this.getConfigPath()
     console.log(`[OpenClawManager] Config path: ${configPath}`)
 
-    // Ensure config exists
-    if (!await this.configManager.configExists()) {
-      this.logger.addLog('⚠️ No OpenClaw configuration found, creating default config...')
-      await this.configManager.createDefaultConfig(this.gatewayPort)
-    } else {
-      this.logger.addLog('✅ Using existing OpenClaw configuration')
-      // Even with existing config, ensure tools are properly configured
-      await this.configManager.ensureToolsConfigured()
-      // Clean up invalid tool names from existing configs
-      await this.configManager.cleanupInvalidToolNames()
-    }
-
-    // Validate and repair config before gateway startup.
-    // Catches corruption from external processes (CLI, gateway doctor, manual edits)
-    // that would otherwise crash the gateway (e.g. channels.discord.token = true).
-    await this.configManager.loadAndValidateConfig()
-
-    this.logger.addLog('ℹ️ Doctor diagnostics available - click "Run Doctor" button if needed')
-    this.logger.addLog('🚀 Starting desktop OpenClaw gateway...')
-
-    // Always try to start our own gateway first
+    // Check if already running
     const existingStatus = this.processManager.getStatus()
     if (existingStatus === 'running') {
-      this.logger.addLog('✅ Desktop OpenClaw gateway is already running')
+      this.logger.addLog('✅ OpenClaw gateway is already running')
       return true
     }
 
-    // Start new gateway (this will handle clearing conflicts and configure the port)
-    this.logger.addLog('🖥️ Starting desktop-managed OpenClaw gateway...')
+    // Detect gateway mode FIRST — before modifying any config files.
+    // The system OpenClaw gateway watches its config and restarts on changes,
+    // so writing config while it's running would cause a restart race condition.
+    this.logger.addLog('🔍 Detecting OpenClaw installation...')
+    const detectedMode = await this.processManager.detectGatewayMode()
+
+    if (detectedMode.mode !== 'external') {
+      // Only modify config when we are going to start the gateway ourselves.
+      // For external mode, the system OpenClaw owns the config — don't touch it.
+      if (!await this.configManager.configExists()) {
+        this.logger.addLog('⚠️ No OpenClaw configuration found, creating default config...')
+        await this.configManager.createDefaultConfig(this.gatewayPort)
+      } else {
+        this.logger.addLog('✅ Using existing OpenClaw configuration')
+        await this.configManager.ensureToolsConfigured()
+        await this.configManager.cleanupInvalidToolNames()
+      }
+      await this.configManager.loadAndValidateConfig()
+    } else {
+      this.logger.addLog('✅ Connecting to existing OpenClaw gateway')
+    }
+
+    this.logger.addLog('ℹ️ Doctor diagnostics available - click "Run Doctor" button if needed')
+
     const result = await this.processManager.start()
 
     if (result) {
-      this.gatewayPort = this.processManager.getActivePort() || 18800
-      this.logger.addLog(`✅ Desktop OpenClaw gateway started successfully on port ${this.gatewayPort}`)
-      this.logger.addLog('🌐 Desktop gateway ready - all channels will run in desktop-controlled process')
-      console.log(`[OpenClawManager] Using desktop gateway on port ${this.gatewayPort}`)
+      this.gatewayPort = this.processManager.getActivePort() || DEFAULT_GATEWAY_PORT
+      const modeInfo = this.processManager.getGatewayModeInfo()
+
+      // Wire up the command executor to use the right binary for this mode
+      if (modeInfo.mode === 'system' || modeInfo.mode === 'external') {
+        // For system/external modes, CLI commands should use the system binary
+        const systemBinary = modeInfo.systemBinaryPath || null
+        if (systemBinary && this.executor.setSystemBinary) {
+          this.executor.setSystemBinary(systemBinary)
+        } else if (modeInfo.mode === 'external') {
+          // External mode without a known system binary: try to detect it
+          // so CLI commands work correctly
+          const detectedBinary = await this.processManager.detectGatewayMode()
+          if (detectedBinary.systemBinaryPath && this.executor.setSystemBinary) {
+            this.executor.setSystemBinary(detectedBinary.systemBinaryPath)
+          }
+        }
+      } else {
+        // Bundled mode: revert to bundled binary
+        if (this.executor.setSystemBinary) {
+          this.executor.setSystemBinary(null)
+        }
+      }
+
+      // Log mode-specific messages
+      switch (modeInfo.mode) {
+        case 'external':
+          this.logger.addLog(`✅ Connected to existing OpenClaw gateway on port ${this.gatewayPort}`)
+          this.logger.addLog('🔗 Running as GUI manager for your existing OpenClaw installation')
+          break
+        case 'system':
+          this.logger.addLog(`✅ Started system OpenClaw gateway on port ${this.gatewayPort}`)
+          this.logger.addLog(`🖥️ Using system binary: ${modeInfo.systemBinaryPath}`)
+          break
+        case 'bundled':
+          this.logger.addLog(`✅ Desktop OpenClaw gateway started on port ${this.gatewayPort}`)
+          this.logger.addLog('📦 Using bundled OpenClaw runtime')
+          break
+      }
+
+      console.log(`[OpenClawManager] Gateway started in ${modeInfo.mode} mode on port ${this.gatewayPort}`)
 
       // On Windows, share the detected WSL2 distro with the command executor
       if (process.platform === 'win32') {
@@ -126,12 +169,15 @@ export class OpenClawManager {
         }
       }
 
-      // Update configuration with the actual port being used
-      await this.configManager.updateGatewayPort(this.gatewayPort)
+      // Update configuration with the actual port being used (skip for external mode
+      // since we don't want to overwrite the user's existing port config)
+      if (modeInfo.mode !== 'external') {
+        await this.configManager.updateGatewayPort(this.gatewayPort)
+      }
       return true
     }
 
-    this.logger.addLog('❌ Failed to start desktop OpenClaw gateway')
+    this.logger.addLog('❌ Failed to start OpenClaw gateway')
     this.logger.addLog('ℹ️ Please ensure OpenClaw is properly installed and try again')
     return false
   }
@@ -183,6 +229,10 @@ export class OpenClawManager {
 
   getActivePort(): number {
     return this.gatewayPort
+  }
+
+  getGatewayModeInfo(): GatewayModeInfo {
+    return this.processManager.getGatewayModeInfo()
   }
 
   getCommandExecutor(): CommandExecutor {
@@ -609,7 +659,7 @@ export class OpenClawManager {
   async getOpenClawInstallations(): Promise<any[]> {
     return [{
       path: 'system-global',
-      version: '2026.2.1',
+      version: '2026.3.15',
       installMethod: 'npm-global',
       isProductionVersion: true
     }]
@@ -627,8 +677,8 @@ export class OpenClawManager {
 
   async checkOpenClawUpdates(): Promise<any> {
     return {
-      currentVersion: '2026.1.30',
-      latestVersion: '2026.1.30',
+      currentVersion: '2026.3.15',
+      latestVersion: '2026.3.15',
       updateAvailable: false,
       updateCommand: 'Updates are included with Openclaw Easy updates'
     }

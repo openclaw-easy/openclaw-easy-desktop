@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useCallback } from 'react'
 import { BarChart3, Loader2, RefreshCw, AlertCircle, Zap, MessageSquare } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
+import { DEFAULT_GATEWAY_PORT } from '../../../../shared/constants'
 
 interface ColorScheme {
   bg: {
@@ -39,7 +40,7 @@ interface UsageStats {
   models: { name: string; inputTokens: number; outputTokens: number }[]
 }
 
-export function UsageSection({ colors, gatewayPort = 18800 }: UsageSectionProps) {
+export function UsageSection({ colors, gatewayPort = DEFAULT_GATEWAY_PORT }: UsageSectionProps) {
   const { t } = useTranslation()
   const [stats, setStats] = useState<UsageStats | null>(null)
   const [loading, setLoading] = useState(true)

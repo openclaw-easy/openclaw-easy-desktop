@@ -64,6 +64,7 @@ import { UpdateBanner } from "./UpdateBanner";
 import { useAppUpdater } from "../../hooks/useAppUpdater";
 import { ThemeProvider } from "../../contexts/ThemeContext";
 import { useToast } from "../../contexts/ToastContext";
+import { DEFAULT_GATEWAY_PORT } from "../../../shared/constants";
 
 export function OpenclawEasyDashboard() {
   const { t } = useTranslation();
@@ -137,7 +138,7 @@ export function OpenclawEasyDashboard() {
   const [lineChannelAccessToken, setLineChannelAccessToken] = useState("");
   const [lineChannelSecret, setLineChannelSecret] = useState("");
   const [ollamaPopupOpen, setOllamaPopupOpen] = useState(false);
-  const [gatewayPort, setGatewayPort] = useState<number>(18800);
+  const [gatewayPort, setGatewayPort] = useState<number>(DEFAULT_GATEWAY_PORT);
   const isMac = navigator.platform.toUpperCase().indexOf("MAC") >= 0;
   const updater = useAppUpdater();
 
@@ -146,7 +147,7 @@ export function OpenclawEasyDashboard() {
     const loadGatewayPort = async () => {
       try {
         const gatewayInfo = await window.electronAPI?.getGatewayInfo?.();
-        const port = gatewayInfo?.port || 18800;
+        const port = gatewayInfo?.port || DEFAULT_GATEWAY_PORT;
         // Only log when port changes to reduce noise
         if (port !== gatewayPort) {
           console.log(`[OpenclawEasyDashboard] Gateway port changed: ${port}`);

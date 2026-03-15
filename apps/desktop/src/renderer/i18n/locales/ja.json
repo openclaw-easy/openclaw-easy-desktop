@@ -262,7 +262,7 @@
     "gatewayNeeded": "チャット機能を使用するにはOpenClaw ゲートウェイが動作している必要があります。",
     "toStartGateway": "ゲートウェイを起動するには:",
     "goToSidebar": "サイドバーで**アシスタントを起動**をクリック",
-    "separateGateway": "デスクトップアプリはポート18800-18809の独自のゲートウェイを使用し、公式OpenClawインストール（ポート18790）とは別です。",
+    "separateGateway": "デスクトップアプリはOpenClawゲートウェイに接続します（デフォルトポート18789）。既存のゲートウェイを管理するか、システムのOpenClawインストールを使用して新しいゲートウェイを起動できます。",
     "startConversation": "会話を始める",
     "typeBelow": "以下にメッセージを入力してAIアシスタントとチャット",
     "sendShortcut": "Cmd+Enter（Mac）またはCtrl+Enter（Windows）で送信",

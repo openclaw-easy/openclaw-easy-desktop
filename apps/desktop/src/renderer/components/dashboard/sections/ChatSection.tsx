@@ -7,6 +7,7 @@ import { StreamingIndicator } from '../../chat/StreamingIndicator';
 import { TalkModeOverlay } from '../../chat/TalkModeOverlay';
 import { ExecApprovalOverlay } from '../../chat/ExecApprovalOverlay';
 import { useTalkMode } from '../../../hooks/useTalkMode';
+import { DEFAULT_GATEWAY_PORT } from '../../../../shared/constants';
 
 interface ColorTheme {
   background: {
@@ -48,7 +49,7 @@ interface Message {
   timestamp: number;
 }
 
-const ChatSectionComponent = ({ colors, sessionKey = 'default', gatewayPort = 18800, isGatewayRunning = false, isActive = false, onUpgrade, onGoToVoiceSettings }: ChatSectionProps) => {
+const ChatSectionComponent = ({ colors, sessionKey = 'default', gatewayPort = DEFAULT_GATEWAY_PORT, isGatewayRunning = false, isActive = false, onUpgrade, onGoToVoiceSettings }: ChatSectionProps) => {
   const { t } = useTranslation();
   const {
     isConnected,

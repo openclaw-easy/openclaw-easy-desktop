@@ -38,12 +38,33 @@ function logSpawnDiagnostics(tag: string, runtime: string, openclawPath: string,
  *
  * Uses spawn() with an args array (no shell) to prevent shell injection from
  * user-controlled values such as cron job names, agent names, and message payloads.
+ *
+ * Supports three execution modes:
+ * - System binary: uses the user's installed `openclaw` binary directly
+ * - Bundled (production): uses the bundled bun + ~/.openclaw-easy/app/openclaw.mjs
+ * - Dev: uses local bun + TypeScript source
  */
 export class OpenClawCommandExecutor {
   private openclawEnv: OpenClawEnvironment
+  /** When set, all commands use this system binary instead of the bundled one. */
+  private systemBinaryPath: string | null = null
 
   constructor(configPath: string) {
     this.openclawEnv = new OpenClawEnvironment(configPath)
+  }
+
+  /**
+   * Switch the executor to use the system-installed openclaw binary.
+   * When set, executeCommand() calls the system binary directly,
+   * bypassing the bundled bun + openclaw.mjs entirely.
+   */
+  setSystemBinary(binaryPath: string | null) {
+    this.systemBinaryPath = binaryPath
+    if (binaryPath) {
+      console.log(`[OpenClawCommandExecutor] Using system binary: ${binaryPath}`)
+    } else {
+      console.log('[OpenClawCommandExecutor] Reverted to bundled binary')
+    }
   }
 
   async executeCommand(args: string[], timeoutMs: number = 10000): Promise<string | null> {
@@ -58,10 +79,33 @@ export class OpenClawCommandExecutor {
     let enhancedEnv: NodeJS.ProcessEnv
     let cwd: string
 
-    if (app.isPackaged) {
-      // Production: use the bun binary bundled in the .app (extraResources/bun/)
+    // ── System binary mode ─────────────────────────────────────────────
+    // When a system openclaw binary is configured, use it directly.
+    // The binary is a self-contained CLI — no separate runtime needed.
+    if (this.systemBinaryPath) {
+      runtime = this.systemBinaryPath
+      openclawPath = '' // Not used — system binary IS the entry point
+      cwd = home
+
+      const expandedPath = isWindows
+        ? (process.env.PATH || '')
+        : [
+            path.join(home, '.bun', 'bin'),
+            path.join(home, '.npm-global', 'bin'),
+            path.join(home, '.local', 'bin'),
+            '/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin',
+            process.env.PATH || ''
+          ].join(pathSep)
+
+      enhancedEnv = {
+        ...process.env,
+        ...openclawEnvVars,
+        PATH: expandedPath
+      }
+    } else if (app.isPackaged) {
+      // ── Bundled mode (production) ──────────────────────────────────────
+      // Use the bun binary bundled in the .app (extraResources/bun/)
       // and the openclaw entry point installed at ~/.openclaw-easy/app/openclaw.mjs.
-      // process-manager.ts ensures openclaw.mjs is present before the gateway starts.
       const bunBinaryName = isWindows
         ? 'bun-windows.exe'
         : `bun-${process.arch === 'arm64' ? 'arm64' : 'x64'}`
@@ -79,7 +123,8 @@ export class OpenClawCommandExecutor {
         PATH: expandedPath
       }
     } else {
-      // Dev: always run TypeScript source directly with bun
+      // ── Dev mode ───────────────────────────────────────────────────────
+      // Always run TypeScript source directly with bun
       openclawPath = path.join(__dirname, '../../../../openclaw/src/index.ts')
       runtime = 'bun'
       cwd = path.join(__dirname, '../../../../openclaw/')
@@ -91,8 +136,11 @@ export class OpenClawCommandExecutor {
       }
     }
 
+    // Build the spawn arguments: system binary doesn't need openclawPath
+    const spawnArgs = openclawPath ? [openclawPath, ...args] : args
+
     // Always log spawn diagnostics so production issues can be root-caused from logs.
-    logSpawnDiagnostics('OpenClawCommandExecutor', runtime, openclawPath, args)
+    logSpawnDiagnostics('OpenClawCommandExecutor', runtime, openclawPath || '(system binary)', args)
 
     // For JSON commands, write stdout directly to a temp file via fd to avoid
     // pipe-buffering race conditions in Electron when output exceeds ~8KB.
@@ -115,7 +163,7 @@ export class OpenClawCommandExecutor {
         const stderrChunks: Buffer[] = []
 
         // Redirect stdout directly to the file descriptor — bypasses Node pipe buffering
-        const child = spawn(runtime, [openclawPath, ...args], {
+        const child = spawn(runtime, spawnArgs, {
           env: enhancedEnv,
           timeout: timeoutMs,
           stdio: ['pipe', fd, 'pipe'],
@@ -170,7 +218,7 @@ export class OpenClawCommandExecutor {
 
     // Regular commands — spawn with array args (no shell, no injection)
     return new Promise((resolve, reject) => {
-      const child = spawn(runtime, [openclawPath, ...args], {
+      const child = spawn(runtime, spawnArgs, {
         env: enhancedEnv,
         timeout: timeoutMs,
         cwd,

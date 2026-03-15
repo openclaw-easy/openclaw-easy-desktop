@@ -162,10 +162,15 @@ describe('ConfigManager', () => {
       expect(config.agents.defaults.model.primary).toBe('google/gemini-2.5-flash')
     })
 
-    it('should ensure gateway structure exists', async () => {
+    it('should NOT create gateway from scratch when missing', async () => {
       await mgr.writeConfig({})
       const config = readConfig()
-      expect(config.gateway).toBeDefined()
+      expect(config.gateway).toBeUndefined()
+    })
+
+    it('should repair gateway.mode when gateway exists but mode missing', async () => {
+      await mgr.writeConfig({ gateway: { port: 18800 } })
+      const config = readConfig()
       expect(config.gateway.mode).toBe('local')
       expect(config.gateway.port).toBe(18800)
     })
@@ -207,11 +212,11 @@ describe('ConfigManager', () => {
       expect(config.gateway.port).toBe(18802)
     })
 
-    it('should update port when different', async () => {
+    it('should NOT override existing port', async () => {
       writeConfig({ gateway: { mode: 'local', port: 18800, bind: 'loopback' } })
       await mgr.ensureGatewayConfigured(18805)
       const config = readConfig()
-      expect(config.gateway.port).toBe(18805)
+      expect(config.gateway.port).toBe(18800)
     })
 
     it('should set controlUi allowedOrigins', async () => {
@@ -274,11 +279,11 @@ describe('ConfigManager', () => {
       expect(config.tools.elevated.enabled).toBe(true)
     })
 
-    it('should set agent timeout to 120s', async () => {
+    it('should set agent timeout to 600s (10 min per OpenClaw docs)', async () => {
       writeConfig({})
       await mgr.ensureToolsConfigured()
       const config = readConfig()
-      expect(config.agents.defaults.timeoutSeconds).toBe(120)
+      expect(config.agents.defaults.timeoutSeconds).toBe(600)
     })
 
     it('should remove plugins.entries to prevent duplicates', async () => {

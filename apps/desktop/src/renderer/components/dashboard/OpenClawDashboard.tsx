@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { DEFAULT_GATEWAY_PORT } from "../../../shared/constants";
 import {
   Activity,
   AlertCircle,
@@ -154,7 +155,7 @@ export function OpenClawDashboard({ colors, onBack }: OpenClawDashboardProps) {
 
       setGatewayStatus({
         status: status || "stopped",
-        port: gatewayInfo?.port || 18800,
+        port: gatewayInfo?.port || DEFAULT_GATEWAY_PORT,
         version: gatewayInfo?.version || "2026.1.30 (Embedded)",
         uptime: status === "running" ? "5m 32s" : "0s",
         requests: 0,

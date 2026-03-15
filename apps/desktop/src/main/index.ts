@@ -1,7 +1,29 @@
 import { app, shell, BrowserWindow, ipcMain, Menu, Tray, nativeImage, session } from 'electron'
 import { join } from 'path'
 import { existsSync, mkdirSync, statSync, renameSync, appendFileSync } from 'fs'
-import { electronApp, optimizer, is } from '@electron-toolkit/utils'
+// Inline replacements for @electron-toolkit/utils to avoid pnpm require('electron') resolution issues
+const is = { dev: !app.isPackaged }
+const electronApp = {
+  setAppUserModelId(id: string) {
+    if (process.platform === 'win32') app.setAppUserModelId(is.dev ? process.execPath : id)
+  }
+}
+const optimizer = {
+  watchWindowShortcuts(window: BrowserWindow) {
+    window.webContents.on('before-input-event', (event, input) => {
+      if (input.type !== 'keyDown') return
+      if (is.dev && input.code === 'F12') {
+        window.webContents.isDevToolsOpened()
+          ? window.webContents.closeDevTools()
+          : window.webContents.openDevTools({ mode: 'undocked' })
+      }
+      if (!is.dev) {
+        if (input.code === 'KeyR' && (input.control || input.meta)) event.preventDefault()
+        if (input.code === 'KeyI' && (input.alt && input.meta || input.control && input.shift)) event.preventDefault()
+      }
+    })
+  }
+}
 import icon from '../../resources/icons/icon.png?asset'
 import lobsterIcon from '../../resources/icons/lobster-emoji.png?asset'
 import lobsterDockIcon from '../../resources/icons/lobster-dock.png?asset'
@@ -16,6 +38,7 @@ import { SettingsManager } from './managers/settings-manager.js'
 import { SessionManager } from './managers/session-manager.js'
 import { WorkspaceManager } from './managers/workspace-manager'
 import { SttManager } from './managers/stt-manager'
+import { DEFAULT_GATEWAY_PORT } from '../shared/constants'
 import { WhisperServerManager } from './managers/whisper-server-manager'
 import { TelemetryManager } from './managers/telemetry-manager'
 
@@ -152,7 +175,9 @@ class OpenclawEasyApp {
     // Start periodic telemetry snapshots
     this.telemetryManager.start()
 
-    // Gateway is started manually by the user via "Launch assistant" button
+    // Auto-detect if a gateway is already running (e.g. official OpenClaw app).
+    // If so, connect to it immediately so the UI shows "online" instead of "Launch Assistant".
+    await this.autoDetectRunningGateway()
 
     // Track when app is quitting to distinguish from minimize-to-tray
     app.on('before-quit', () => {
@@ -170,6 +195,48 @@ class OpenclawEasyApp {
     })
   }
 
+  /**
+   * Probe the configured gateway port on startup.
+   * If a gateway is already listening, call start() which will detect it as
+   * 'external' mode and set status to 'running' — so the UI shows "online"
+   * instead of "Launch Assistant".
+   */
+  private async autoDetectRunningGateway() {
+    try {
+      const net = require('net')
+      const fs = require('fs')
+      const path = require('path')
+      const os = require('os')
+
+      // Read configured port (same logic as readConfiguredGatewayPort)
+      let port = DEFAULT_GATEWAY_PORT
+      try {
+        const configPath = path.join(os.homedir(), '.openclaw', 'openclaw.json')
+        const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'))
+        port = config?.gateway?.port || DEFAULT_GATEWAY_PORT
+      } catch { /* use default */ }
+
+      // Quick TCP probe on the configured port
+      const isListening = await new Promise<boolean>((resolve) => {
+        const socket = new net.Socket()
+        socket.setTimeout(3000)
+        socket.once('connect', () => { socket.destroy(); resolve(true) })
+        socket.once('error', () => { socket.destroy(); resolve(false) })
+        socket.once('timeout', () => { socket.destroy(); resolve(false) })
+        socket.connect(port, '127.0.0.1')
+      })
+
+      if (isListening) {
+        console.log(`[OpenclawEasyApp] Gateway detected on port ${port} at startup — auto-connecting`)
+        await this.openClawManager.start()
+      } else {
+        console.log(`[OpenclawEasyApp] No gateway detected on port ${port} at startup`)
+      }
+    } catch (error) {
+      console.error('[OpenclawEasyApp] Auto-detect gateway failed:', error)
+    }
+  }
+
   private createMainWindow() {
     // Create the browser window
     this.mainWindow = new BrowserWindow({
@@ -185,7 +252,7 @@ class OpenclawEasyApp {
       trafficLightPosition: process.platform === 'darwin' ? { x: 20, y: 20 } : undefined,
       icon: nativeImage.createFromPath(icon),
       webPreferences: {
-        preload: join(__dirname, '../preload/index.mjs'),
+        preload: join(__dirname, '../preload/index.js'),
         sandbox: false,
         contextIsolation: true,
         enableRemoteModule: false,
@@ -396,12 +463,19 @@ class OpenclawEasyApp {
     })
 
     ipcMain.handle('gateway:info', async () => {
+      const modeInfo = this.openClawManager.getGatewayModeInfo()
       return {
         status: this.openClawManager.getStatus(),
         port: this.openClawManager.getActivePort(),
-        version: '2026.1.30 (Embedded)',
-        uptime: 'N/A' // TODO: Track actual uptime
+        version: '2026.3.15',
+        uptime: 'N/A', // TODO: Track actual uptime
+        gatewayMode: modeInfo.mode,
+        systemBinaryPath: modeInfo.systemBinaryPath || null
       }
+    })
+
+    ipcMain.handle('gateway:mode', async () => {
+      return this.openClawManager.getGatewayModeInfo()
     })
 
     ipcMain.handle('gateway:channels', async () => {
@@ -527,10 +601,10 @@ class OpenclawEasyApp {
         const configPath = path.join(os.homedir(), '.openclaw', 'openclaw.json')
         const configData = await fs.readFile(configPath, 'utf8')
         const config = JSON.parse(configData)
-        return config?.gateway?.port || 18800
+        return config?.gateway?.port || DEFAULT_GATEWAY_PORT
       } catch (error) {
         console.error('[Gateway] Failed to read gateway port:', error)
-        return 18800
+        return DEFAULT_GATEWAY_PORT
       }
     })
 
@@ -869,7 +943,7 @@ class OpenclawEasyApp {
         // Update meta timestamp
         if (!config.meta) {config.meta = {}}
         config.meta.lastTouchedAt = new Date().toISOString()
-        config.meta.lastTouchedVersion = "2026.2.1"
+        config.meta.lastTouchedVersion = "2026.3.15"
 
         // Write back using ConfigManager to ensure write lock is respected
         await this.configManager.writeConfig(config)

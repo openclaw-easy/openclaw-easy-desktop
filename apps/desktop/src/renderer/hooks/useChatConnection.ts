@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
+import { DEFAULT_GATEWAY_PORT } from '../../shared/constants';
 import {
   type ExecApprovalRequest,
   type ExecApprovalDecision,
@@ -70,7 +71,7 @@ interface ChatConnection {
 // The gateway may start at any time; giving up permanently is the #1 cause
 // of "gateway not running" when the gateway IS actually running.
 
-export function useChatConnection(gatewayPort: number = 18800): ChatConnection {
+export function useChatConnection(gatewayPort: number = DEFAULT_GATEWAY_PORT): ChatConnection {
   const [isConnected, setIsConnected] = useState(false);
   const [connectionError, setConnectionError] = useState<string | null>(null);
   const [execApprovalQueue, setExecApprovalQueue] = useState<ExecApprovalRequest[]>([]);
@@ -148,7 +149,7 @@ export function useChatConnection(gatewayPort: number = 18800): ChatConnection {
     shouldReconnectRef.current = true;
 
     // Fetch the active gateway port dynamically so we always connect to
-    // whichever port the process manager actually claimed (18800-18809).
+    // whichever port the process manager actually claimed.
     let currentPort = gatewayPort;
     try {
       const fetchedPort = await (window as any).electronAPI?.getGatewayPort?.();

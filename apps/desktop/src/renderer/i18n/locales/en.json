@@ -262,7 +262,7 @@
     "gatewayNeeded": "The OpenClaw Gateway needs to be running to use the chat feature.",
     "toStartGateway": "To start the gateway:",
     "goToSidebar": "Go to the sidebar and click **Launch assistant**",
-    "separateGateway": "The desktop app uses its own gateway on port 18800-18809, separate from the official OpenClaw installation (port 18790).",
+    "separateGateway": "The desktop app connects to your OpenClaw gateway (default port 18789). It can manage an existing gateway or start one using your system OpenClaw installation.",
     "startConversation": "Start a conversation",
     "typeBelow": "Type your message below to chat with the AI assistant",
     "sendShortcut": "Press Cmd+Enter (Mac) or Ctrl+Enter (Windows) to send",

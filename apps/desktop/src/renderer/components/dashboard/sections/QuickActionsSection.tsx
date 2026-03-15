@@ -1,6 +1,7 @@
 import React from "react";
 import { useTranslation } from 'react-i18next';
 import { MessageSquare, Settings, Wrench, Hash, Loader2, Rocket, Clock, Terminal, Bot } from "lucide-react";
+import { DEFAULT_GATEWAY_PORT } from '../../../../shared/constants';
 
 interface ColorScheme {
   bg: {
@@ -151,7 +152,7 @@ export function QuickActionsSection({
                   className="flex items-center gap-4 text-xs"
                   style={{ color: colors.text.muted }}
                 >
-                  <span>✅ {t('quickActions.gatewayPort', { port: status.port || 18800 })}</span>
+                  <span>✅ {t('quickActions.gatewayPort', { port: status.port || DEFAULT_GATEWAY_PORT })}</span>
                   <span>✅ {t('quickActions.processId', { pid: status.pid || "Active" })}</span>
                 </div>
               </div>
@@ -460,7 +461,7 @@ export function QuickActionsSection({
                   window.electronAPI?.getGatewayToken?.(),
                   window.electronAPI?.getGatewayPort?.()
                 ]);
-                const gatewayPort = port || 18800;
+                const gatewayPort = port || DEFAULT_GATEWAY_PORT;
                 const url = token
                   ? `http://localhost:${gatewayPort}?token=${encodeURIComponent(token)}`
                   : `http://localhost:${gatewayPort}`;
@@ -471,7 +472,7 @@ export function QuickActionsSection({
                   "[QuickActions] Failed to get gateway info:",
                   error
                 );
-                window.electronAPI?.openExternal?.("http://localhost:18800");
+                window.electronAPI?.openExternal?.(`http://localhost:${DEFAULT_GATEWAY_PORT}`);
               }
             }}
             disabled={!status.isRunning}
