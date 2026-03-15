@@ -25,15 +25,11 @@ export type NormalizedPluginsConfig = {
 
 export const BUNDLED_ENABLED_BY_DEFAULT = new Set<string>([
   "device-pair",
+  "ollama",
   "phone-control",
+  "sglang",
   "talk-voice",
-  // Channel plugins exposed in the desktop Manage Channels UI
-  "whatsapp",
-  "telegram",
-  "discord",
-  "slack",
-  "feishu",
-  "line",
+  "vllm",
 ]);
 
 const normalizeList = (value: unknown): string[] => {
@@ -208,10 +204,14 @@ export function resolveEnableState(
   if (entry?.enabled === false) {
     return { enabled: false, reason: "disabled in config" };
   }
+  const explicitlyAllowed = config.allow.includes(id);
+  if (origin === "workspace" && !explicitlyAllowed && entry?.enabled !== true) {
+    return { enabled: false, reason: "workspace plugin (disabled by default)" };
+  }
   if (config.slots.memory === id) {
     return { enabled: true };
   }
-  if (config.allow.length > 0 && !config.allow.includes(id)) {
+  if (config.allow.length > 0 && !explicitlyAllowed) {
     return { enabled: false, reason: "not in allowlist" };
   }
   if (entry?.enabled === true) {

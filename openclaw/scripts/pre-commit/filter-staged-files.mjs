@@ -23,17 +23,7 @@ if (mode !== "lint" && mode !== "format") {
 const lintExts = new Set([".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"]);
 const formatExts = new Set([".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".json", ".md", ".mdx"]);
 
-// Paths managed by separate toolchains (own tsconfig/lint config) — skip root-level tools
-const excludedPrefixes = [
-  "moltbot-easy/apps/desktop/",
-  "moltbot-easy/apps/backend/",
-  "moltbot-easy/apps/landing-page/",
-];
-
 const shouldSelect = (filePath) => {
-  if (excludedPrefixes.some((prefix) => filePath.startsWith(prefix))) {
-    return false;
-  }
   const ext = path.extname(filePath).toLowerCase();
   if (mode === "lint") {
     return lintExts.has(ext);
