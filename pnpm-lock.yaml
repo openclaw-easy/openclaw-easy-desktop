@@ -72,8 +72,8 @@ importers:
         specifier: ^11.11.1
         version: 11.11.1
       i18next:
-        specifier: ^25.8.14
-        version: 25.8.14(typescript@5.9.3)
+        specifier: ^25.8.18
+        version: 25.8.18(typescript@5.9.3)
       lucide-react:
         specifier: ^0.321.0
         version: 0.321.0(react@18.3.1)
@@ -85,7 +85,7 @@ importers:
         version: 1.1.0
       react-i18next:
         specifier: ^16.5.6
-        version: 16.5.6(i18next@25.8.14)(react-dom@18.3.1)(react@18.3.1)(typescript@5.9.3)
+        version: 16.5.6(i18next@25.8.18)(react-dom@18.3.1)(react@18.3.1)(typescript@5.9.3)
       tailwind-merge:
         specifier: ^2.2.1
         version: 2.6.1
@@ -12013,8 +12013,8 @@ packages:
     engines: {node: '>=16.17.0'}
     dev: true
 
-  /i18next@25.8.14(typescript@5.9.3):
-    resolution: {integrity: sha512-paMUYkfWJMsWPeE/Hejcw+XLhHrQPehem+4wMo+uELnvIwvCG019L9sAIljwjCmEMtFQQO3YeitJY8Kctei3iA==}
+  /i18next@25.8.18(typescript@5.9.3):
+    resolution: {integrity: sha512-lzY5X83BiL5AP77+9DydbrqkQHFN9hUzWGjqjLpPcp5ZOzuu1aSoKaU3xbBLSjWx9dAzW431y+d+aogxOZaKRA==}
     peerDependencies:
       typescript: ^5
     peerDependenciesMeta:
@@ -14791,7 +14791,7 @@ packages:
       react: 18.3.1
       scheduler: 0.23.2
 
-  /react-i18next@16.5.6(i18next@25.8.14)(react-dom@18.3.1)(react@18.3.1)(typescript@5.9.3):
+  /react-i18next@16.5.6(i18next@25.8.18)(react-dom@18.3.1)(react@18.3.1)(typescript@5.9.3):
     resolution: {integrity: sha512-Ua7V2/efA88ido7KyK51fb8Ki8M/sRfW8LR/rZ/9ZKr2luhuTI7kwYZN5agT1rWG7aYm5G0RYE/6JR8KJoCMDw==}
     peerDependencies:
       i18next: '>= 25.6.2'
@@ -14809,7 +14809,7 @@ packages:
     dependencies:
       '@babel/runtime': 7.28.6
       html-parse-stringify: 3.0.1
-      i18next: 25.8.14(typescript@5.9.3)
+      i18next: 25.8.18(typescript@5.9.3)
       react: 18.3.1
       react-dom: 18.3.1(react@18.3.1)
       typescript: 5.9.3
