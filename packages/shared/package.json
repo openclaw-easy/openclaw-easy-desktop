@@ -1,6 +1,6 @@
 {
   "name": "@moltbot-easy/shared",
-  "version": "1.0.0",
+  "version": "2026.3.15",
   "description": "Shared TypeScript types and utilities for MoltBot Easy",
   "type": "module",
   "main": "./dist/index.js",
