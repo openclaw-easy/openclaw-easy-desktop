@@ -1,14 +1,14 @@
-import { spawn } from 'child_process'
+import { spawn, exec, execFile } from 'child_process'
 import * as crypto from 'crypto'
 import * as path from 'path'
 import * as fs from 'fs'
 import * as net from 'net'
 import { promisify } from 'util'
-import { exec } from 'child_process'
 import { ProcessManagerBase, ConfigManager } from './process-manager-base'
 import { sanitizeConfigForBundled } from './utils/config-sanitizer'
 
 const execAsync = (cmd: string) => promisify(exec)(cmd, { windowsHide: true })
+const execFileAsync = promisify(execFile)
 
 /** Recursively copy a file or directory. */
 function copyRecursive(src: string, dest: string): void {
@@ -147,6 +147,60 @@ export class ProcessManagerWindows extends ProcessManagerBase {
     } catch (error: any) {
       console.error('[ProcessManagerWindows] Failed to sync bundled assets:', error.message)
     }
+  }
+
+  /**
+   * Run `openclaw gateway stop` using the best available binary:
+   * 1. System openclaw binary (if installed)
+   * 2. Bundled bun + openclaw.mjs (production builds)
+   * 3. Dev-mode bun + source
+   */
+  private async runGatewayStop(): Promise<void> {
+    // 1. Try system binary
+    const systemBinary = await this.detectSystemOpenClaw()
+    if (systemBinary) {
+      try {
+        console.log(`[ProcessManagerWindows] Running: ${systemBinary} gateway stop`)
+        await execFileAsync(systemBinary, ['gateway', 'stop'], { timeout: 15_000 })
+        console.log('[ProcessManagerWindows] openclaw gateway stop succeeded (system binary)')
+        return
+      } catch (err: any) {
+        console.warn('[ProcessManagerWindows] System openclaw gateway stop failed:', err.message)
+      }
+    }
+
+    // 2. Try bundled openclaw
+    const { app } = await import('electron')
+    const home = process.env.USERPROFILE || process.env.HOME || ''
+
+    if (app.isPackaged) {
+      const bundledBun = path.join(process.resourcesPath, 'bun', 'bun-windows.exe')
+      const openclawMjs = path.join(home, '.openclaw-easy', 'app', 'openclaw.mjs')
+
+      if (fs.existsSync(bundledBun) && fs.existsSync(openclawMjs)) {
+        try {
+          console.log(`[ProcessManagerWindows] Running: ${bundledBun} ${openclawMjs} gateway stop`)
+          await execFileAsync(bundledBun, [openclawMjs, 'gateway', 'stop'], { timeout: 15_000 })
+          console.log('[ProcessManagerWindows] openclaw gateway stop succeeded (bundled)')
+          return
+        } catch (err: any) {
+          console.warn('[ProcessManagerWindows] Bundled openclaw gateway stop failed:', err.message)
+        }
+      }
+    } else {
+      // Dev mode: use bun + source
+      const openclawPath = path.join(__dirname, '../../../../openclaw/src/index.ts')
+      try {
+        console.log(`[ProcessManagerWindows] Running: bun ${openclawPath} gateway stop`)
+        await execFileAsync('bun', [openclawPath, 'gateway', 'stop'], { timeout: 15_000 })
+        console.log('[ProcessManagerWindows] openclaw gateway stop succeeded (dev)')
+        return
+      } catch (err: any) {
+        console.warn('[ProcessManagerWindows] Dev openclaw gateway stop failed:', err.message)
+      }
+    }
+
+    console.error('[ProcessManagerWindows] All openclaw gateway stop attempts failed')
   }
 
   private async sanitizeConfigForBundled(installDir: string): Promise<void> {
@@ -465,14 +519,13 @@ export class ProcessManagerWindows extends ProcessManagerBase {
 
     this.stopExternalMonitoring()
 
-    // In external mode, we don't own the process — stop it by killing the PID on the port
+    // In external mode, use `openclaw gateway stop`
     if (this.gatewayMode === 'external') {
       console.log('[ProcessManagerWindows] Stopping external gateway...')
       this.emitLog('🛑 Stopping external gateway...')
-      if (this.activePort > 0) {
-        await this.killGatewayOnPort(this.activePort)
-        await new Promise(resolve => setTimeout(resolve, 1500))
-      }
+
+      await this.runGatewayStop()
+
       this.activePort = 0
       this.setStatus('stopped')
       this.emitLog('✅ Gateway stopped')

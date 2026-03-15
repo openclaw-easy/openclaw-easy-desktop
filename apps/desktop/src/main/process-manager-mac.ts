@@ -405,30 +405,12 @@ export class ProcessManagerMac extends ProcessManagerBase {
 
     this.stopExternalMonitoring()
 
-    // In external mode, use `openclaw gateway stop` (handles launchd/systemd properly)
+    // In external mode, use `openclaw gateway stop`
     if (this.gatewayMode === 'external') {
       console.log('[ProcessManager] Stopping external gateway...')
       this.emitLog('🛑 Stopping external gateway...')
 
-      const systemBinary = await this.detectSystemOpenClaw()
-      if (systemBinary) {
-        try {
-          console.log('[ProcessManager] Running: openclaw gateway stop')
-          await execFileAsync(systemBinary, ['gateway', 'stop'], { timeout: 15_000 })
-          console.log('[ProcessManager] openclaw gateway stop succeeded')
-        } catch (err: any) {
-          console.warn('[ProcessManager] openclaw gateway stop failed:', err.message)
-          // Fall back to killing the process directly
-          if (this.activePort > 0) {
-            const pid = await this.getPidOnPort(this.activePort)
-            if (pid) {
-              console.log(`[ProcessManager] Killing gateway (PID ${pid}) on port ${this.activePort}`)
-              await this.killProcess(pid)
-              await new Promise(resolve => setTimeout(resolve, 1500))
-            }
-          }
-        }
-      }
+      await this.runGatewayStop()
 
       this.activePort = 0
       this.setStatus('stopped')
@@ -556,6 +538,61 @@ export class ProcessManagerMac extends ProcessManagerBase {
     } catch (error: any) {
       console.error('[ProcessManager] Failed to sync bundled assets:', error.message)
     }
+  }
+
+  /**
+   * Run `openclaw gateway stop` using the best available binary:
+   * 1. System openclaw binary (if installed)
+   * 2. Bundled bun + openclaw.mjs (production builds)
+   * 3. Dev-mode bun + source
+   */
+  private async runGatewayStop(): Promise<void> {
+    // 1. Try system binary
+    const systemBinary = await this.detectSystemOpenClaw()
+    if (systemBinary) {
+      try {
+        console.log(`[ProcessManager] Running: ${systemBinary} gateway stop`)
+        await execFileAsync(systemBinary, ['gateway', 'stop'], { timeout: 15_000 })
+        console.log('[ProcessManager] openclaw gateway stop succeeded (system binary)')
+        return
+      } catch (err: any) {
+        console.warn('[ProcessManager] System openclaw gateway stop failed:', err.message)
+      }
+    }
+
+    // 2. Try bundled openclaw
+    const { app } = await import('electron')
+    const home = process.env.HOME || ''
+
+    if (app.isPackaged) {
+      const bunBinaryName = `bun-${process.arch === 'arm64' ? 'arm64' : 'x64'}`
+      const bundledBun = path.join(process.resourcesPath, 'bun', bunBinaryName)
+      const openclawMjs = path.join(home, '.openclaw-easy', 'app', 'openclaw.mjs')
+
+      if (fs.existsSync(bundledBun) && fs.existsSync(openclawMjs)) {
+        try {
+          console.log(`[ProcessManager] Running: ${bundledBun} ${openclawMjs} gateway stop`)
+          await execFileAsync(bundledBun, [openclawMjs, 'gateway', 'stop'], { timeout: 15_000 })
+          console.log('[ProcessManager] openclaw gateway stop succeeded (bundled)')
+          return
+        } catch (err: any) {
+          console.warn('[ProcessManager] Bundled openclaw gateway stop failed:', err.message)
+        }
+      }
+    } else {
+      // Dev mode: use bun + source
+      const openclawPath = path.join(__dirname, '../../../../openclaw/src/index.ts')
+      try {
+        console.log(`[ProcessManager] Running: bun ${openclawPath} gateway stop`)
+        await execFileAsync('bun', [openclawPath, 'gateway', 'stop'], { timeout: 15_000 })
+        console.log('[ProcessManager] openclaw gateway stop succeeded (dev)')
+        return
+      } catch (err: any) {
+        console.warn('[ProcessManager] Dev openclaw gateway stop failed:', err.message)
+      }
+    }
+
+    console.error('[ProcessManager] All openclaw gateway stop attempts failed')
   }
 
   private async sanitizeConfigForBundled(installDir: string): Promise<void> {
