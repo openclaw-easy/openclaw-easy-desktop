@@ -78,8 +78,8 @@ importers:
         specifier: ^0.321.0
         version: 0.321.0(react@18.3.1)
       marked:
-        specifier: ^17.0.2
-        version: 17.0.2
+        specifier: ^17.0.4
+        version: 17.0.4
       node-pty:
         specifier: ^1.1.0
         version: 1.1.0
@@ -7998,7 +7998,7 @@ packages:
   /@types/fs-extra@9.0.13:
     resolution: {integrity: sha512-nEnwB++1u5lVDM2UI4c1+5R+FYaKfaAzS4OococimjVm3nQw3TuzH5UNsocrcTBbhnerblyHj4A49qXbIiZdpA==}
     dependencies:
-      '@types/node': 20.19.30
+      '@types/node': 25.5.0
     dev: true
 
   /@types/hast@3.0.4:
@@ -8052,7 +8052,7 @@ packages:
     resolution: {integrity: sha512-jmjpa4BwUsmhxcfsgUit/7A9KbrC48Q0q8KvnY107ogcjGgTFDlIL3RpihNpx2Mu1hM4mdFQjoVc4O6JoGKHsA==}
     deprecated: This is a stub types definition. marked provides its own type definitions, so you do not need this installed.
     dependencies:
-      marked: 17.0.2
+      marked: 17.0.4
     dev: true
 
   /@types/mdast@4.0.4:
@@ -13073,16 +13073,10 @@ packages:
     hasBin: true
     dev: false
 
-  /marked@17.0.2:
-    resolution: {integrity: sha512-s5HZGFQea7Huv5zZcAGhJLT3qLpAfnY7v7GWkICUr0+Wd5TFEtdlRR2XUL5Gg+RH7u2Df595ifrxR03mBaw7gA==}
-    engines: {node: '>= 20'}
-    hasBin: true
-
   /marked@17.0.4:
     resolution: {integrity: sha512-NOmVMM+KAokHMvjWmC5N/ZOvgmSWuqJB8FoYI019j4ogb/PeRMKoKIjReZ2w3376kkA8dSJIP8uD993Kxc0iRQ==}
     engines: {node: '>= 20'}
     hasBin: true
-    dev: false
 
   /matcher@3.0.0:
     resolution: {integrity: sha512-OkeDaAZ/bQCxeFAozM55PKcKU0yJMPGifLwV4Qgjitu+5MoAfSQN4lsLJeXZ1b8w0x+/Emda6MZgXS1jvsapng==}
