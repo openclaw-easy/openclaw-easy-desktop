@@ -167,7 +167,7 @@ openclaw-easy-desktop/
 
 ## Contributing
 
-We welcome contributions! Please see [CONTRIBUTING.md](docs/CONTRIBUTING.md) for guidelines.
+We welcome contributions! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
 1. Fork the repository
 2. Create a feature branch (`git checkout -b feature/my-feature`)
@@ -188,5 +188,7 @@ This project is open source under the [Apache-2.0 License](LICENSE). The core Op
 ---
 
 <p align="center">
-  Built with :heart: by the <a href="https://github.com/openclaw-easy">OpenClaw Easy</a> team
+  <a href="https://star-history.com/#openclaw-easy/openclaw-easy-desktop&Date"><img src="https://api.star-history.com/svg?repos=openclaw-easy/openclaw-easy-desktop&type=Date" alt="Star History Chart" width="600" /></a>
+
+Built with :heart: by the <a href="https://github.com/openclaw-easy">OpenClaw Easy</a> team
 </p>
