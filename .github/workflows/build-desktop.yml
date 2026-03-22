@@ -23,13 +23,28 @@ jobs:
         with:
           node-version: '22'
 
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.2.5'
+
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
 
       - name: Install dependencies
         run: pnpm install --no-frozen-lockfile
 
-      - name: Build app
+      - name: Build OpenClaw core
+        working-directory: ./openclaw
+        run: pnpm build:docker
+        env:
+          OPENCLAW_A2UI_SKIP_MISSING: '1'
+
+      - name: Prepare installer bundle
+        working-directory: ./apps/desktop
+        run: bash scripts/prepare-bundle.sh
+
+      - name: Build desktop app
         working-directory: ./apps/desktop
         run: pnpm build
 
@@ -56,13 +71,29 @@ jobs:
         with:
           node-version: '22'
 
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.2.5'
+
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
 
       - name: Install dependencies
         run: pnpm install --no-frozen-lockfile
 
-      - name: Build app
+      - name: Build OpenClaw core
+        working-directory: ./openclaw
+        run: pnpm build:docker
+        env:
+          OPENCLAW_A2UI_SKIP_MISSING: '1'
+
+      - name: Prepare installer bundle
+        shell: bash
+        working-directory: ./apps/desktop
+        run: bash scripts/prepare-bundle.sh
+
+      - name: Build desktop app
         working-directory: ./apps/desktop
         run: pnpm build
 
@@ -89,6 +120,11 @@ jobs:
         with:
           node-version: '22'
 
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.2.5'
+
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
 
@@ -100,7 +136,17 @@ jobs:
       - name: Install dependencies
         run: pnpm install --no-frozen-lockfile
 
-      - name: Build app
+      - name: Build OpenClaw core
+        working-directory: ./openclaw
+        run: pnpm build:docker
+        env:
+          OPENCLAW_A2UI_SKIP_MISSING: '1'
+
+      - name: Prepare installer bundle
+        working-directory: ./apps/desktop
+        run: bash scripts/prepare-bundle.sh
+
+      - name: Build desktop app
         working-directory: ./apps/desktop
         run: pnpm build
 
