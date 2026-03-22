@@ -1,4 +1,6 @@
-import { spawn, ChildProcess } from 'child_process'
+import { spawn, execFile, ChildProcess } from 'child_process'
+import { existsSync } from 'fs'
+import { promisify } from 'util'
 import { BrowserWindow } from 'electron'
 import * as path from 'path'
 import { OpenClawEnvironment } from './openclaw-environment'
@@ -197,8 +199,8 @@ export class ChannelManager {
     try {
       this.addLog('🔌 Disconnecting WhatsApp...')
 
-      const { runtime, openclawPath, enhancedEnv, cwd } = await this.resolveOpenClawSpawn()
-      const disconnectProc = spawn(runtime, [openclawPath, 'channels', 'logout', '--channel', 'whatsapp'], {
+      const { runtime, enhancedEnv, cwd, buildArgs } = await this.resolveOpenClawSpawn()
+      const disconnectProc = spawn(runtime, buildArgs('channels', 'logout', '--channel', 'whatsapp'), {
         stdio: ['pipe', 'pipe', 'pipe'],
         env: enhancedEnv,
         cwd,
@@ -260,8 +262,8 @@ export class ChannelManager {
     try {
       this.addLog('🔵 Disconnecting Telegram...')
 
-      const { runtime, openclawPath, enhancedEnv, cwd } = await this.resolveOpenClawSpawn()
-      const disconnectProc = spawn(runtime, [openclawPath, 'channels', 'logout', '--channel', 'telegram'], {
+      const { runtime, enhancedEnv, cwd, buildArgs } = await this.resolveOpenClawSpawn()
+      const disconnectProc = spawn(runtime, buildArgs('channels', 'logout', '--channel', 'telegram'), {
         stdio: ['pipe', 'pipe', 'pipe'],
         env: enhancedEnv,
         cwd,
@@ -323,8 +325,8 @@ export class ChannelManager {
     try {
       this.addLog('🟦 Disconnecting Discord...')
 
-      const { runtime, openclawPath, enhancedEnv, cwd } = await this.resolveOpenClawSpawn()
-      const disconnectProc = spawn(runtime, [openclawPath, 'channels', 'logout', '--channel', 'discord'], {
+      const { runtime, enhancedEnv, cwd, buildArgs } = await this.resolveOpenClawSpawn()
+      const disconnectProc = spawn(runtime, buildArgs('channels', 'logout', '--channel', 'discord'), {
         stdio: ['pipe', 'pipe', 'pipe'],
         env: enhancedEnv,
         cwd,
@@ -388,8 +390,8 @@ export class ChannelManager {
     try {
       this.addLog('🔗 Starting WhatsApp login process...')
 
-      const { runtime, openclawPath, enhancedEnv, cwd } = await this.resolveOpenClawSpawn()
-      const loginProc = spawn(runtime, [openclawPath, 'channels', 'login', '--channel', 'whatsapp', '--verbose'], {
+      const { runtime, enhancedEnv, cwd, buildArgs } = await this.resolveOpenClawSpawn()
+      const loginProc = spawn(runtime, buildArgs('channels', 'login', '--channel', 'whatsapp', '--verbose'), {
         stdio: ['pipe', 'pipe', 'pipe'],
         env: enhancedEnv,
         cwd,
@@ -466,10 +468,10 @@ export class ChannelManager {
 
       this.addLog('🔗 Starting WhatsApp QR generation...')
 
-      const { runtime, openclawPath, enhancedEnv, cwd } = await this.resolveOpenClawSpawn()
+      const { runtime, openclawPath, enhancedEnv, cwd, buildArgs } = await this.resolveOpenClawSpawn()
       console.log('[ChannelManager] Starting WhatsApp login:', runtime, openclawPath, 'cwd:', cwd)
 
-      whatsappLoginProcess = spawn(runtime, [openclawPath, 'channels', 'login', '--channel', 'whatsapp', '--account', 'default'], {
+      whatsappLoginProcess = spawn(runtime, buildArgs('channels', 'login', '--channel', 'whatsapp', '--account', 'default'), {
         stdio: ['pipe', 'pipe', 'pipe'],
         env: enhancedEnv,
         cwd,
@@ -630,14 +632,44 @@ export class ChannelManager {
   }
 
   /**
+   * Finds the system-installed openclaw binary by checking common PATH locations.
+   * Returns the absolute path, or null if not found.
+   */
+  private async findSystemOpenClaw(expandedPath: string): Promise<string | null> {
+    const execFileAsync = promisify(execFile)
+
+    // Try `which openclaw` with an expanded PATH
+    try {
+      const { stdout } = await execFileAsync('which', ['openclaw'], {
+        env: { ...process.env, PATH: expandedPath }
+      })
+      const p = stdout.trim()
+      if (p && !p.includes('node_modules')) return p
+    } catch { /* not on PATH */ }
+
+    // Check known install locations
+    const home = process.env.HOME || process.env.USERPROFILE || ''
+    const knownPaths = [
+      path.join(home, '.bun', 'bin', 'openclaw'),
+      path.join(home, '.npm-global', 'bin', 'openclaw'),
+      path.join(home, '.local', 'bin', 'openclaw'),
+      '/opt/homebrew/bin/openclaw',
+      '/usr/local/bin/openclaw',
+    ]
+    for (const p of knownPaths) {
+      if (existsSync(p)) return p
+    }
+    return null
+  }
+
+  /**
    * Resolves the correct runtime binary, openclaw entry point, and environment
    * for spawning openclaw subprocesses. Branches on app.isPackaged to use
    * bundled bun + ~/.openclaw-easy/app/openclaw.mjs in production, or the
    * local bun + TypeScript source in development.
    */
-  private async resolveOpenClawSpawn(): Promise<{ runtime: string; openclawPath: string; enhancedEnv: NodeJS.ProcessEnv; cwd: string }> {
+  private async resolveOpenClawSpawn(): Promise<{ runtime: string; openclawPath: string; enhancedEnv: NodeJS.ProcessEnv; cwd: string; buildArgs: (...args: string[]) => string[] }> {
     const { app } = await import('electron')
-    const { existsSync } = await import('fs')
     const isWindows = process.platform === 'win32'
     const home = process.env.HOME || process.env.USERPROFILE || ''
     const pathSep = isWindows ? ';' : ':'
@@ -652,13 +684,34 @@ export class ChannelManager {
       const bunBinaryName = isWindows
         ? 'bun-windows.exe'
         : `bun-${process.arch === 'arm64' ? 'arm64' : 'x64'}`
-      runtime = path.join(process.resourcesPath, 'bun', bunBinaryName)
-      openclawPath = path.join(home, '.openclaw-easy', 'app', 'openclaw.mjs')
-      cwd = path.join(home, '.openclaw-easy', 'app')
+      const bundledBun = path.join(process.resourcesPath, 'bun', bunBinaryName)
       const expandedPath = isWindows
         ? (process.env.PATH || '')
-        : ['/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin', process.env.PATH || ''].join(pathSep)
-      enhancedEnv = { ...process.env, ...openclawEnv, PATH: expandedPath, OPENCLAW_INCLUDE_OPTIONAL_BUNDLED: '1' }
+        : [
+            path.join(home, '.bun', 'bin'),
+            path.join(home, '.npm-global', 'bin'),
+            path.join(home, '.local', 'bin'),
+            '/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin',
+            process.env.PATH || ''
+          ].join(pathSep)
+
+      if (existsSync(bundledBun)) {
+        // ── Bundled bun present (normal production path) ──────────────────
+        runtime = bundledBun
+        openclawPath = path.join(home, '.openclaw-easy', 'app', 'openclaw.mjs')
+        cwd = path.join(home, '.openclaw-easy', 'app')
+        enhancedEnv = { ...process.env, ...openclawEnv, PATH: expandedPath, OPENCLAW_INCLUDE_OPTIONAL_BUNDLED: '1' }
+      } else {
+        // ── Bundled bun missing — fall back to system openclaw binary ──────
+        // DMGs built without prepare-bundle.sh won't have bun in Resources.
+        // Use the system openclaw binary directly (no separate runtime needed).
+        const systemBinary = await this.findSystemOpenClaw(expandedPath)
+        runtime = systemBinary || 'openclaw'
+        openclawPath = '' // system binary IS the entry point
+        cwd = home
+        enhancedEnv = { ...process.env, ...openclawEnv, PATH: expandedPath, OPENCLAW_INCLUDE_OPTIONAL_BUNDLED: '1' }
+        console.warn(`[ChannelManager] Bundled bun not found at ${bundledBun}; using system binary: ${runtime}`)
+      }
     } else {
       const bunBinDir = path.join(home, '.bun', 'bin')
       const bunAbsolute = path.join(bunBinDir, 'bun')
@@ -671,18 +724,22 @@ export class ChannelManager {
 
     // Diagnostic logging — visible in Electron logs so production failures can be root-caused.
     const runtimeOk = existsSync(runtime)
-    const openclawOk = existsSync(openclawPath)
-    console.log(`[ChannelManager] resolveOpenClawSpawn: runtime=${runtime} (exists=${runtimeOk}), openclaw=${openclawPath} (exists=${openclawOk}), cwd=${cwd}`)
+    // openclawPath is empty in system binary mode — the runtime IS the entry point
+    const openclawOk = !openclawPath || existsSync(openclawPath)
+    console.log(`[ChannelManager] resolveOpenClawSpawn: runtime=${runtime} (exists=${runtimeOk}), openclaw=${openclawPath || '(system binary)'} (exists=${openclawOk}), cwd=${cwd}`)
     if (!runtimeOk) console.error('[ChannelManager] *** MISSING runtime binary — spawn will ENOENT ***')
     if (!openclawOk) console.error('[ChannelManager] *** MISSING openclaw entry point — spawn will fail ***')
 
-    return { runtime, openclawPath, enhancedEnv, cwd }
+    // buildArgs prepends openclawPath when needed; empty means system binary mode
+    const buildArgs = (...args: string[]) => openclawPath ? [openclawPath, ...args] : args
+    return { runtime, openclawPath, enhancedEnv, cwd, buildArgs }
   }
 
   private async executeOpenClawCommand(args: string[]): Promise<string | null> {
-    const { runtime, openclawPath, enhancedEnv, cwd } = await this.resolveOpenClawSpawn()
+    const { runtime, enhancedEnv, cwd, buildArgs } = await this.resolveOpenClawSpawn()
+    const spawnArgs = buildArgs(...args)
     return new Promise((resolve, reject) => {
-      const commandProcess = spawn(runtime, [openclawPath, ...args], {
+      const commandProcess = spawn(runtime, spawnArgs, {
         stdio: ['pipe', 'pipe', 'pipe'],
         env: enhancedEnv,
         cwd,
@@ -1109,8 +1166,8 @@ export class ChannelManager {
     try {
       this.addLog('💬 Disconnecting Slack...')
 
-      const { runtime, openclawPath, enhancedEnv } = await this.resolveOpenClawSpawn()
-      const disconnectProc = spawn(runtime, [openclawPath, 'channels', 'logout', '--channel', 'slack'], {
+      const { runtime, enhancedEnv, buildArgs } = await this.resolveOpenClawSpawn()
+      const disconnectProc = spawn(runtime, buildArgs('channels', 'logout', '--channel', 'slack'), {
         stdio: ['pipe', 'pipe', 'pipe'],
         env: enhancedEnv
       })
