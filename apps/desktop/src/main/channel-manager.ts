@@ -878,7 +878,6 @@ export class ChannelManager {
         'channels', 'add', '--channel', 'discord',
         '--name', name,
         '--token', botToken,
-        '--guild-id', serverId
       ])
       await this.setChannelOpenAccess('discord')
 
