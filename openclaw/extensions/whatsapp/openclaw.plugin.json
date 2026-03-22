@@ -1,5 +1,6 @@
 {
   "id": "whatsapp",
+  "enabledByDefault": true,
   "channels": ["whatsapp"],
   "configSchema": {
     "type": "object",

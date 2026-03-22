@@ -658,13 +658,15 @@ export class ChannelManager {
       const expandedPath = isWindows
         ? (process.env.PATH || '')
         : ['/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin', process.env.PATH || ''].join(pathSep)
-      enhancedEnv = { ...process.env, ...openclawEnv, PATH: expandedPath }
+      enhancedEnv = { ...process.env, ...openclawEnv, PATH: expandedPath, OPENCLAW_INCLUDE_OPTIONAL_BUNDLED: '1' }
     } else {
-      const bunPath = path.join(home, '.bun', 'bin')
-      runtime = 'bun'
+      const bunBinDir = path.join(home, '.bun', 'bin')
+      const bunAbsolute = path.join(bunBinDir, 'bun')
+      // Use absolute path so spawn succeeds even when Electron's PATH is minimal
+      runtime = existsSync(bunAbsolute) ? bunAbsolute : 'bun'
       openclawPath = path.join(__dirname, '../../../../openclaw/src/index.ts')
       cwd = path.join(__dirname, '../../../../openclaw/')
-      enhancedEnv = { ...process.env, ...openclawEnv, PATH: `${bunPath}:${process.env.PATH}` }
+      enhancedEnv = { ...process.env, ...openclawEnv, PATH: `${bunBinDir}:${process.env.PATH}`, OPENCLAW_INCLUDE_OPTIONAL_BUNDLED: '1' }
     }
 
     // Diagnostic logging — visible in Electron logs so production failures can be root-caused.
@@ -1605,7 +1607,7 @@ export class ChannelManager {
     const messages: any[] = []
 
     // Look through recent logs for message content
-    const recentLogs = this.logs.slice(-100) // Last 100 logs
+    const recentLogs: string[] = [] // Logs are streamed to renderer, not stored locally
 
     for (let i = 0; i < recentLogs.length; i++) {
       const log = recentLogs[i]
