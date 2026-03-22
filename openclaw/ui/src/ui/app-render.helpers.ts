@@ -6,6 +6,13 @@ import { refreshChat } from "./app-chat.ts";
 import { syncUrlWithSessionKey } from "./app-settings.ts";
 import type { AppViewState } from "./app-view-state.ts";
 import { OpenClawApp } from "./app.ts";
+import {
+  buildChatModelOption,
+  createChatModelOverride,
+  formatChatModelDisplay,
+  normalizeChatModelOverrideValue,
+  resolveServerChatModelValue,
+} from "./chat-model-ref.ts";
 import { ChatState, loadChatHistory } from "./controllers/chat.ts";
 import { loadSessions } from "./controllers/sessions.ts";
 import { icons } from "./icons.ts";
@@ -480,7 +487,7 @@ export function renderChatMobileToggle(state: AppViewState) {
   `;
 }
 
-function switchChatSession(state: AppViewState, nextSessionKey: string) {
+export function switchChatSession(state: AppViewState, nextSessionKey: string) {
   state.sessionKey = nextSessionKey;
   state.chatMessage = "";
   state.chatStream = null;
@@ -521,24 +528,25 @@ function resolveActiveSessionRow(state: AppViewState) {
 function resolveModelOverrideValue(state: AppViewState): string {
   // Prefer the local cache — it reflects in-flight patches before sessionsResult refreshes.
   const cached = state.chatModelOverrides[state.sessionKey];
-  if (typeof cached === "string") {
-    return cached.trim();
+  if (cached) {
+    return normalizeChatModelOverrideValue(cached, state.chatModelCatalog ?? []);
   }
   // cached === null means explicitly cleared to default.
   if (cached === null) {
     return "";
   }
   // No local override recorded yet — fall back to server data.
+  // Include provider prefix so the value matches option keys (provider/model).
   const activeRow = resolveActiveSessionRow(state);
-  if (activeRow) {
-    return typeof activeRow.model === "string" ? activeRow.model.trim() : "";
+  if (activeRow && typeof activeRow.model === "string" && activeRow.model.trim()) {
+    return resolveServerChatModelValue(activeRow.model, activeRow.modelProvider);
   }
   return "";
 }
 
 function resolveDefaultModelValue(state: AppViewState): string {
-  const model = state.sessionsResult?.defaults?.model;
-  return typeof model === "string" ? model.trim() : "";
+  const defaults = state.sessionsResult?.defaults;
+  return resolveServerChatModelValue(defaults?.model, defaults?.modelProvider);
 }
 
 function buildChatModelOptions(
@@ -562,8 +570,8 @@ function buildChatModelOptions(
   };
 
   for (const entry of catalog) {
-    const provider = entry.provider?.trim();
-    addOption(entry.id, provider ? `${entry.id} · ${provider}` : entry.id);
+    const option = buildChatModelOption(entry);
+    addOption(option.value, option.label);
   }
 
   if (currentOverride) {
@@ -583,7 +591,8 @@ function renderChatModelSelect(state: AppViewState) {
     currentOverride,
     defaultModel,
   );
-  const defaultLabel = defaultModel ? `Default (${defaultModel})` : "Default model";
+  const defaultDisplay = formatChatModelDisplay(defaultModel);
+  const defaultLabel = defaultModel ? `Default (${defaultDisplay})` : "Default model";
   const busy =
     state.chatLoading || state.chatSending || Boolean(state.chatRunId) || state.chatStream !== null;
   const disabled =
@@ -627,7 +636,7 @@ async function switchChatModel(state: AppViewState, nextModel: string) {
   // Write the override cache immediately so the picker stays in sync during the RPC round-trip.
   state.chatModelOverrides = {
     ...state.chatModelOverrides,
-    [targetSessionKey]: nextModel || null,
+    [targetSessionKey]: createChatModelOverride(nextModel),
   };
   try {
     await state.client.request("sessions.patch", {
@@ -848,6 +857,70 @@ export function resolveSessionOptionGroups(
         option.label = `${option.label} · ${option.scopeLabel}`;
       }
     }
+  }
+
+  const allOptions = Array.from(groups.values()).flatMap((group) =>
+    group.options.map((option) => ({ groupLabel: group.label, option })),
+  );
+  const labels = new Map(allOptions.map(({ option }) => [option, option.label]));
+  const countAssignedLabels = () => {
+    const counts = new Map<string, number>();
+    for (const { option } of allOptions) {
+      const label = labels.get(option) ?? option.label;
+      counts.set(label, (counts.get(label) ?? 0) + 1);
+    }
+    return counts;
+  };
+  const labelIncludesScopeLabel = (label: string, scopeLabel: string) => {
+    const trimmedScope = scopeLabel.trim();
+    if (!trimmedScope) {
+      return false;
+    }
+    return (
+      label === trimmedScope ||
+      label.endsWith(` · ${trimmedScope}`) ||
+      label.endsWith(` / ${trimmedScope}`)
+    );
+  };
+
+  const globalCounts = countAssignedLabels();
+  for (const { groupLabel, option } of allOptions) {
+    const currentLabel = labels.get(option) ?? option.label;
+    if ((globalCounts.get(currentLabel) ?? 0) <= 1) {
+      continue;
+    }
+    const scopedPrefix = `${groupLabel} / `;
+    if (currentLabel.startsWith(scopedPrefix)) {
+      continue;
+    }
+    // Keep the agent visible once the native select collapses to a single chosen label.
+    labels.set(option, `${groupLabel} / ${currentLabel}`);
+  }
+
+  const scopedCounts = countAssignedLabels();
+  for (const { option } of allOptions) {
+    const currentLabel = labels.get(option) ?? option.label;
+    if ((scopedCounts.get(currentLabel) ?? 0) <= 1) {
+      continue;
+    }
+    if (labelIncludesScopeLabel(currentLabel, option.scopeLabel)) {
+      continue;
+    }
+    labels.set(option, `${currentLabel} · ${option.scopeLabel}`);
+  }
+
+  const finalCounts = countAssignedLabels();
+  for (const { option } of allOptions) {
+    const currentLabel = labels.get(option) ?? option.label;
+    if ((finalCounts.get(currentLabel) ?? 0) <= 1) {
+      continue;
+    }
+    // Fall back to the full key only when every friendlier disambiguator still collides.
+    labels.set(option, `${currentLabel} · ${option.key}`);
+  }
+
+  for (const { option } of allOptions) {
+    option.label = labels.get(option) ?? option.label;
   }
 
   return Array.from(groups.values());
