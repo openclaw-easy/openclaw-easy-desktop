@@ -695,22 +695,23 @@ export class ChannelManager {
             process.env.PATH || ''
           ].join(pathSep)
 
-      if (existsSync(bundledBun)) {
-        // ── Bundled bun present (normal production path) ──────────────────
+      const openclawMjs = path.join(home, '.openclaw-easy', 'app', 'openclaw.mjs')
+      if (existsSync(bundledBun) && existsSync(openclawMjs)) {
+        // ── Bundled bun + openclaw.mjs both present (normal production path) ──
         runtime = bundledBun
-        openclawPath = path.join(home, '.openclaw-easy', 'app', 'openclaw.mjs')
+        openclawPath = openclawMjs
         cwd = path.join(home, '.openclaw-easy', 'app')
         enhancedEnv = { ...process.env, ...openclawEnv, PATH: expandedPath, OPENCLAW_INCLUDE_OPTIONAL_BUNDLED: '1' }
       } else {
-        // ── Bundled bun missing — fall back to system openclaw binary ──────
-        // DMGs built without prepare-bundle.sh won't have bun in Resources.
-        // Use the system openclaw binary directly (no separate runtime needed).
+        // ── Bundled bun or openclaw.mjs missing — fall back to system binary ──
+        // Happens when: bun not in Resources (old DMG), or openclaw.mjs not yet
+        // installed (gateway running in system binary mode, bundle never unpacked).
         const systemBinary = await this.findSystemOpenClaw(expandedPath)
         runtime = systemBinary || 'openclaw'
         openclawPath = '' // system binary IS the entry point
         cwd = home
         enhancedEnv = { ...process.env, ...openclawEnv, PATH: expandedPath, OPENCLAW_INCLUDE_OPTIONAL_BUNDLED: '1' }
-        console.warn(`[ChannelManager] Bundled bun not found at ${bundledBun}; using system binary: ${runtime}`)
+        console.warn(`[ChannelManager] bundledBun=${existsSync(bundledBun)} openclawMjs=${existsSync(openclawMjs)}; using system binary: ${runtime}`)
       }
     } else {
       const bunBinDir = path.join(home, '.bun', 'bin')
