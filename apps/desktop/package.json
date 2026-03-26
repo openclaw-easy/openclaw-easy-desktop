@@ -40,7 +40,7 @@
     "dompurify": "^3.3.3",
     "electron-updater": "^6.8.3",
     "highlight.js": "^11.11.1",
-    "i18next": "^25.8.18",
+    "i18next": "^25.10.10",
     "lucide-react": "^0.321.0",
     "marked": "^17.0.4",
     "node-pty": "^1.1.0",
