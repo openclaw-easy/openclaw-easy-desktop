@@ -722,7 +722,7 @@
     "@line/bot-sdk": "^10.6.0",
     "@lydell/node-pty": "1.2.0-beta.3",
     "@mariozechner/pi-agent-core": "0.61.1",
-    "@mariozechner/pi-ai": "0.61.1",
+    "@mariozechner/pi-ai": "0.62.0",
     "@mariozechner/pi-coding-agent": "0.61.1",
     "@mariozechner/pi-tui": "0.61.1",
     "@modelcontextprotocol/sdk": "1.27.1",
