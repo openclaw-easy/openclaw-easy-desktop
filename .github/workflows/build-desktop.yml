@@ -29,7 +29,7 @@ jobs:
           bun-version: '1.2.5'
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v6
 
       - name: Install dependencies
         run: pnpm install --no-frozen-lockfile
@@ -77,7 +77,7 @@ jobs:
           bun-version: '1.2.5'
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v6
 
       - name: Install dependencies
         run: pnpm install --no-frozen-lockfile
@@ -126,7 +126,7 @@ jobs:
           bun-version: '1.2.5'
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v6
 
       - name: Install Linux dependencies
         run: |
