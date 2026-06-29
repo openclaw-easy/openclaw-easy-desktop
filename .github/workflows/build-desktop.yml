@@ -1,8 +1,11 @@
 name: Build Desktop App
 
+# Full cross-platform Electron packaging (macOS bills at 10x, Windows 2x) is
+# manual-only. It published no artifact yet ran on every PR — including every
+# Dependabot PR — which was the main GitHub Actions cost. PRs are still
+# validated by ci.yml (cheap ubuntu build); user-facing installers and
+# auto-update are published by the tag-triggered build workflows, not this one.
 on:
-  pull_request:
-    branches: [main]
   workflow_dispatch:
     inputs:
       release:
@@ -10,6 +13,11 @@ on:
         required: false
         type: boolean
         default: false
+
+# A newer dispatch supersedes an in-flight build.
+concurrency:
+  group: build-desktop-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build-macos:
