@@ -1,10 +1,156 @@
-import { spawn, execFile, ChildProcess } from 'child_process'
+import { spawn, ChildProcess } from 'child_process'
 import { existsSync } from 'fs'
-import { promisify } from 'util'
 import { BrowserWindow } from 'electron'
 import * as path from 'path'
 import { OpenClawEnvironment } from './openclaw-environment'
 import { ConfigManager } from './managers/config-manager'
+import { resolveAgentHarness, readExecContextForAgent } from './agent-harness'
+import { detectSystemOpenClaw } from './managers/system-openclaw-resolver'
+import { getDevOpenClawSpawn, isPathResolvedRuntime } from './dev-openclaw-runtime'
+import {
+  setAgentRuntime,
+  getAgentRuntime,
+} from './managers/agent-runtime-config'
+import { listAgents, getAgent, ensureAgent, deleteAgent } from './managers/agent-roster'
+import { repairInstalledWeixinPlugin } from './managers/weixin-plugin-repair'
+
+/**
+ * Strip ANSI escape codes (color, cursor, mode) from a string. The openclaw
+ * CLI wraps each WhatsApp QR row with `\x1b[47m\x1b[30m...\x1b[0m` (white
+ * background, black foreground) so the QR scans cleanly in a real terminal.
+ * In the desktop renderer we render to HTML and the escape codes show up
+ * literally, breaking both the look and the QR's machine-readability.
+ */
+export function stripAnsi(s: string): string {
+  // Covers CSI (ESC [ ...), OSC (ESC ] ... BEL/ST), and standalone ESC sequences
+  // commonly used by chalk/ansi-colors. The CSI form is what whatsapp-web.js
+  // and qrcode-terminal emit; the others are belt-and-suspenders.
+  return s
+    .replace(/\[[0-9;?]*[ -/]*[@-~]/g, '') // CSI sequences
+    .replace(/\][^]*(|\\)/g, '') // OSC sequences
+    .replace(/[@-Z\\-_]/g, '') // Other Fe escape sequences
+}
+
+/**
+ * Extract the QR-art block from a buffer of CLI stdout. Returns the QR as a
+ * clean (ANSI-stripped) joined string, or null if no contiguous block of
+ * QR-glyph lines is found.
+ *
+ * Robust to stdout chunking: callers buffer all stdout and re-run this on
+ * each new chunk. The previous per-chunk check
+ * (`text.includes('█') && text.includes('▄')`) silently failed whenever
+ * pty/pipe buffering split the QR across two `data` events — the most
+ * common reason customers reported "QR doesn't generate" in the UI.
+ */
+/**
+ * Weixin ships as an external official plugin, so its npm spec and ids are
+ * pinned here from scripts/lib/official-external-channel-catalog.json. Keep
+ * them in sync with that catalog on upstream syncs — a stale spec silently
+ * installs an old plugin.
+ */
+export const WEIXIN_CHANNEL_ID = 'openclaw-weixin'
+export const WEIXIN_PLUGIN_ID = 'openclaw-weixin'
+export const WEIXIN_NPM_SPEC = '@tencent-weixin/openclaw-weixin'
+
+let weixinPty: { kill: () => void; write: (data: string) => void } | null = null
+let weixinOperationInProgress = false
+
+/**
+ * Extracts a terminal-rendered QR (half-block glyphs) from buffered CLI
+ * output. Channel-agnostic: WhatsApp and Weixin both render the same way.
+ */
+export function extractTerminalQr(buffer: string): string | null {
+  const stripped = stripAnsi(buffer)
+  const lines = stripped.split('\n')
+  // QR uses half-block glyphs: ▀ ▄ █ plus space-padding on the row edges.
+  const isQrLine = (l: string) => /[▀▄█]/.test(l) && l.length >= 8
+  let bestStart = -1
+  let bestEnd = -1
+  let curStart = -1
+  for (let i = 0; i < lines.length; i++) {
+    if (isQrLine(lines[i])) {
+      if (curStart < 0) curStart = i
+      if (i - curStart > bestEnd - bestStart) {
+        bestStart = curStart
+        bestEnd = i
+      }
+    } else if (curStart >= 0) {
+      curStart = -1
+    }
+  }
+  // Real WhatsApp QR is 33+ rows; require >= 16 to avoid false positives on
+  // stray bullet/box-drawing in surrounding log noise.
+  if (bestStart < 0 || bestEnd - bestStart < 15) return null
+  return lines.slice(bestStart, bestEnd + 1).join('\n')
+}
+
+/** Back-compat name; existing callers and tests import this. */
+export const extractWhatsAppQr = extractTerminalQr
+
+/**
+ * Account ids the Weixin plugin has completed a QR login for.
+ *
+ * The plugin keeps its own state dir — NOT `~/.openclaw/credentials/<channel>/`,
+ * which is the WhatsApp layout:
+ *
+ *   ~/.openclaw/openclaw-weixin/accounts.json          -> ["<accountId>", ...]
+ *   ~/.openclaw/openclaw-weixin/accounts/<id>.json     (+ .sync/.context-tokens sidecars)
+ *
+ * Module-level and homeDir-injected so status can be unit-tested against a
+ * temp dir without building a ChannelManager (which needs Electron).
+ */
+export async function listWeixinAccountIds(homeDir: string): Promise<string[]> {
+  const { promises: fs } = await import('fs')
+  const path = await import('path')
+  const stateDir = path.join(homeDir, '.openclaw', WEIXIN_CHANNEL_ID)
+
+  try {
+    const parsed: unknown = JSON.parse(
+      await fs.readFile(path.join(stateDir, 'accounts.json'), 'utf-8'),
+    )
+    if (Array.isArray(parsed)) {
+      return parsed.filter((id): id is string => typeof id === 'string' && id.length > 0)
+    }
+  } catch {
+    // No registry yet, or malformed — fall through to the per-account files
+    // the plugin writes alongside it.
+  }
+
+  try {
+    const entries = await fs.readdir(path.join(stateDir, 'accounts'))
+    // `<id>.sync.json` and `<id>.context-tokens.json` sit next to `<id>.json`;
+    // only the bare account file means a completed login.
+    return entries
+      .filter(
+        (name) =>
+          name.endsWith('.json') &&
+          !name.endsWith('.sync.json') &&
+          !name.endsWith('.context-tokens.json'),
+      )
+      .map((name) => name.slice(0, -'.json'.length))
+  } catch {
+    return []
+  }
+}
+
+/**
+ * Channels that store their auth credential inline in
+ * `~/.openclaw/openclaw.json` (vs. a per-channel directory under
+ * `~/.openclaw/credentials/<channel>/`). The field name is the
+ * primary auth credential the gateway uses to decide whether the
+ * channel is configured — disconnect/add verify-by-state checks
+ * read this field.
+ *
+ * Note: Slack also needs `appToken` and Discord stores `serverId`,
+ * but those are secondary to the primary `botToken` for connection
+ * status. The disconnect fallback (clearTokenChannelConfig) wipes
+ * ALL plausible fields, so this map only needs the primary.
+ */
+const TOKEN_CHANNEL_FIELDS: Record<'telegram' | 'discord' | 'slack', string> = {
+  telegram: 'botToken',
+  discord: 'botToken',
+  slack: 'botToken',
+}
 
 // WhatsApp session management
 let whatsappLoginProcess: ChildProcess | null = null
@@ -27,12 +173,98 @@ export class ChannelManager {
     }
   }
   private sessionCleanupTimer: ReturnType<typeof setInterval> | null = null
+  private readyPromise: Promise<void>
 
   constructor(configPath: string, configManager?: ConfigManager) {
     this.configPath = configPath
     this.openclawEnv = new OpenClawEnvironment(configPath)
     this.configManager = configManager || new ConfigManager()
     this.setupSessionCleanup()
+    // Backfill `agentRuntime.id` for any agent whose model is set but
+    // harness isn't. Without this, the codex harness's GPT-5 persona-latch
+    // leaks into every non-Codex model. Exposed via `ready()` so the
+    // gateway start path can await it instead of racing the spawn.
+    this.readyPromise = this.repairAgentHarnesses().catch((error) => {
+      console.error('[ChannelManager] repairAgentHarnesses failed:', error)
+    })
+  }
+
+  /**
+   * Resolves once any one-shot startup repairs (harness backfill, etc.)
+   * have committed to disk. Callers that spawn the gateway should await
+   * this before triggering a config-watched restart — otherwise the
+   * gateway can pick up stale `agentRuntime.id` values and boot the
+   * wrong harness for the first chat.
+   */
+  ready(): Promise<void> {
+    return this.readyPromise
+  }
+
+  /**
+   * Walk `agents.list[]` and pin each entry's per-model harness id based on
+   * the entry's resolved primary model. Idempotent. Runs once at startup
+   * (via the constructor's readyPromise) and again after any default-model
+   * change (BYOK provider switch, managed-backend sync) — without that
+   * re-run, agents that inherit from `defaults.model.primary` keep their
+   * old harness and start the wrong runtime.
+   *
+   * Writes go through {@link setAgentRuntime} which places the value at the
+   * canonical `entry.models[primary].agentRuntime.id`. The legacy
+   * top-level `entry.agentRuntime` field is rejected by the gateway zod
+   * schema (>= 2026.6) and is migrated away by the config-repair pass that
+   * `OpenClawManager.start()` runs before every spawn.
+   *
+   * Public so the top-level config-write paths can trigger it.
+   */
+  async repairAgentHarnesses(): Promise<void> {
+    try {
+      const openclawConfig = await this.configManager.loadConfig()
+      const list = listAgents(openclawConfig)
+      if (list.length === 0) return
+
+      let dirty = false
+      for (const entry of list) {
+        const primary: string | undefined =
+          entry?.model?.primary ?? openclawConfig.agents?.defaults?.model?.primary
+        if (!primary) continue
+        // Pass exec context so codex harness isn't pinned for agents
+        // whose tools.exec policy would make the codex app-server
+        // reject startup ("Codex app-server local execution is not
+        // available when tools.exec.mode=allowlist").
+        const execContext = readExecContextForAgent(openclawConfig, entry?.id ?? '')
+        const desired = resolveAgentHarness(primary, execContext)
+        const current = getAgentRuntime(entry, primary)
+        if (current !== desired) {
+          setAgentRuntime(entry, primary, desired)
+          dirty = true
+        }
+
+        // Also re-resolve ALL per-model pins under entry.models — these
+        // were written by past channel-manager runs with the old
+        // exec-blind resolver and now disagree with the current exec
+        // policy. Without this loop, an upgrade install still has the
+        // stale codex pins and chat fails on the first send.
+        const modelsMap = (entry as any)?.models
+        if (modelsMap && typeof modelsMap === 'object' && !Array.isArray(modelsMap)) {
+          for (const [modelRef, slot] of Object.entries(modelsMap)) {
+            if (typeof modelRef !== 'string' || modelRef.length === 0) continue
+            const desiredForSlot = resolveAgentHarness(modelRef, execContext)
+            const currentForSlot = (slot as any)?.agentRuntime?.id
+            if (currentForSlot !== desiredForSlot) {
+              setAgentRuntime(entry, modelRef, desiredForSlot)
+              dirty = true
+            }
+          }
+        }
+      }
+
+      if (dirty) {
+        await this.configManager.writeConfig(openclawConfig)
+        console.log('[ChannelManager] Refreshed per-model agent runtime pins')
+      }
+    } catch (error) {
+      console.error('[ChannelManager] repairAgentHarnesses failed:', error)
+    }
   }
 
   setMainWindow(window: BrowserWindow | null) {
@@ -147,241 +379,300 @@ export class ChannelManager {
     }
   }
 
-  async checkTelegramStatus(): Promise<{ connected: boolean }> {
+  /**
+   * Check whether a channel that stores its credentials INLINE in
+   * `~/.openclaw/openclaw.json` (Telegram, Discord, Slack — bot-token
+   * channels) is currently configured. Unlike WhatsApp, these channels
+   * don't drop a file into `~/.openclaw/credentials/<channel>/`, so the
+   * old credentials-dir check always returned false and the UI offered
+   * to "connect" a channel that was already running at the gateway.
+   *
+   * Returns true iff `config.channels.<channel>` exists, is enabled,
+   * and has a non-empty primary auth field (e.g. `botToken`). Falls
+   * back to the credentials-dir check on read errors so we don't
+   * regress for any future channel that happens to use that shape.
+   */
+  private async isTokenChannelConfigured(
+    channel: 'telegram' | 'discord' | 'slack',
+    tokenField: string,
+  ): Promise<boolean> {
+    try {
+      const config = await this.configManager.loadConfig()
+      const entry = config?.channels?.[channel]
+      if (entry && entry.enabled !== false) {
+        const token = entry[tokenField]
+        if (typeof token === 'string' && token.trim().length > 0) return true
+      }
+    } catch (err) {
+      // Fall through to credentials-dir fallback.
+      console.warn(`[ChannelManager] config-based ${channel} status check failed, falling back:`, err)
+    }
+    // Fallback: legacy credentials-dir check (used by WhatsApp + any
+    // future channel that adopts the dir-based shape).
     try {
       const { app } = await import('electron')
       const { promises: fs } = await import('fs')
       const path = await import('path')
-
       const homeDir = app.getPath('home')
-      const credentialsDir = path.join(homeDir, '.openclaw', 'credentials', 'telegram')
-
-      try {
-        const files = await fs.readdir(credentialsDir)
-        if (files.some(f => !f.startsWith('.'))) {
-          return { connected: true }
-        }
-      } catch {
-        // Directory doesn't exist — not connected
-      }
-
-      return { connected: false }
+      const credentialsDir = path.join(homeDir, '.openclaw', 'credentials', channel)
+      const files = await fs.readdir(credentialsDir)
+      return files.some(f => !f.startsWith('.'))
     } catch {
-      return { connected: false }
+      return false
     }
   }
 
+  /**
+   * Read the per-channel auth token (botToken, channelAccessToken, etc.)
+   * directly from `~/.openclaw/openclaw.json`. Used by the add/remove
+   * verify-by-state checks: after spawning the upstream CLI we trust
+   * the actual on-disk state more than the CLI exit code, because the
+   * CLI's gateway-WS call frequently times out at 10s despite the
+   * gateway having processed the request and written the config.
+   */
+  private async readChannelToken(
+    channel: 'telegram' | 'discord' | 'slack',
+    tokenField: string,
+  ): Promise<string | null> {
+    try {
+      const config = await this.configManager.loadConfig()
+      const token = config?.channels?.[channel]?.[tokenField]
+      return typeof token === 'string' && token.trim().length > 0 ? token : null
+    } catch {
+      return null
+    }
+  }
+
+  async checkTelegramStatus(): Promise<{ connected: boolean }> {
+    return { connected: await this.isTokenChannelConfigured('telegram', 'botToken') }
+  }
+
   async checkDiscordStatus(): Promise<{ connected: boolean }> {
+    return { connected: await this.isTokenChannelConfigured('discord', 'botToken') }
+  }
+
+  /**
+   * Check whether a channel's local credentials/auth files have been cleared.
+   * After `openclaw channels logout` runs, the per-channel credentials
+   * directory under ~/.openclaw/credentials/<channel>/ should be empty
+   * (or non-existent). Same convention used by checkWhatsAppStatus,
+   * checkTelegramStatus, etc. — we re-use it here as a post-disconnect
+   * verification, so a CLI that exited non-zero (e.g. the upstream
+   * `channels.logout` gateway-call timeout bug — gateway responds in
+   * <1s but the CLI's WS client times out at 10s) is still reported
+   * as success when the local fallback actually cleared the auth.
+   */
+  private async isChannelLoggedOut(channel: string): Promise<boolean> {
+    // Token-in-config channels (Telegram/Discord/Slack): logged out iff
+    // the inline auth field has been cleared from `openclaw.json`. The
+    // credentials-dir never exists for these channels, so the original
+    // check below would falsely report "logged out" while the bot kept
+    // running on the gateway from the stored config token.
+    const tokenField = TOKEN_CHANNEL_FIELDS[channel as keyof typeof TOKEN_CHANNEL_FIELDS]
+    if (tokenField) {
+      try {
+        const stored = await this.readChannelToken(
+          channel as 'telegram' | 'discord' | 'slack',
+          tokenField,
+        )
+        return stored === null
+      } catch {
+        // Fall through to legacy check below.
+      }
+    }
     try {
       const { app } = await import('electron')
       const { promises: fs } = await import('fs')
       const path = await import('path')
 
       const homeDir = app.getPath('home')
-      const credentialsDir = path.join(homeDir, '.openclaw', 'credentials', 'discord')
-
+      const credentialsDir = path.join(homeDir, '.openclaw', 'credentials', channel)
       try {
         const files = await fs.readdir(credentialsDir)
-        if (files.some(f => !f.startsWith('.'))) {
-          return { connected: true }
-        }
+        // "Logged out" iff there are no non-dotfile entries
+        return !files.some(f => !f.startsWith('.'))
       } catch {
-        // Directory doesn't exist — not connected
+        // Directory doesn't exist — definitely logged out
+        return true
+      }
+    } catch {
+      // Couldn't determine — assume not logged out (safe default)
+      return false
+    }
+  }
+
+  /**
+   * Manually clear the inline auth token + disable the channel in
+   * `~/.openclaw/openclaw.json`. Used as a last-resort fallback when
+   * the upstream `channels logout` CLI doesn't clear the token (e.g.
+   * the gateway-WS call timed out before the local fallback ran).
+   * Without this, "Disconnect" reported success but the gateway kept
+   * the bot running on the next start, and the user couldn't connect
+   * with a fresh token because the channel was still treated as added.
+   */
+  private async clearTokenChannelConfig(
+    channel: 'telegram' | 'discord' | 'slack',
+  ): Promise<void> {
+    try {
+      const config = await this.configManager.loadConfig()
+      const entry = config?.channels?.[channel]
+      if (!entry) return
+      // Wipe every plausible auth field for the channel. Discord/Slack
+      // hold multiple credentials (botToken + serverId, botToken +
+      // appToken); a partial clear would leave a half-configured entry
+      // the gateway might still try to load.
+      delete entry.botToken
+      delete entry.appToken
+      delete entry.serverId
+      delete entry.channelAccessToken
+      delete entry.channelSecret
+      entry.enabled = false
+      await this.configManager.writeConfig(config)
+      this.addLog(`🔧 Cleared ${channel} credentials from config (fallback)`)
+    } catch (err: any) {
+      console.error(`[ChannelManager] Failed to clear ${channel} config:`, err)
+      this.addLog(`⚠️ Could not clear ${channel} config: ${err.message}`)
+    }
+  }
+
+  /**
+   * Generic per-channel disconnect via `openclaw channels logout`.
+   *
+   * The CLI in turn tries `channels.logout` over the gateway WebSocket; if
+   * that times out (the upstream WS client has a known 10s timeout that
+   * fires even when the gateway has already responded) it falls back to
+   * deleting the local credentials directory. Either path leaves the
+   * channel logged out, so we treat "credentials gone" as the source of
+   * truth instead of trusting the CLI's exit code or stderr.
+   *
+   * Timeouts:
+   *   - 30s spawn timeout (handles dev-mode plugin scanning + the CLI's
+   *     own 10s gateway-WS timeout + local fallback execution time).
+   *   - On timeout we DON'T immediately give up — we kill the proc, then
+   *     re-check the local auth state. The local fallback often
+   *     completes before the kill takes effect.
+   *
+   * Returns success based on the post-spawn auth-state check, not the CLI
+   * exit code.
+   */
+  private async disconnectChannel(opts: {
+    channel: 'whatsapp' | 'telegram' | 'discord' | 'slack'
+    statusEvent: string
+    logEmoji: string
+  }): Promise<{ success: boolean; logs: string[] }> {
+    const { channel, statusEvent, logEmoji } = opts
+    const display = channel.charAt(0).toUpperCase() + channel.slice(1)
+    try {
+      this.addLog(`${logEmoji} Disconnecting ${display}...`)
+
+      const { runtime, enhancedEnv, cwd, buildArgs } = await this.resolveOpenClawSpawn()
+      const disconnectProc = spawn(runtime, buildArgs('channels', 'logout', '--channel', channel), {
+        stdio: ['pipe', 'pipe', 'pipe'],
+        env: enhancedEnv,
+        cwd,
+        windowsHide: true,
+      })
+
+      const logs: string[] = []
+      disconnectProc.stdout?.on('data', (data) => {
+        const text = data.toString()
+        logs.push(text)
+        this.addLog(`${logEmoji} STDOUT: ${text.trim()}`)
+      })
+      disconnectProc.stderr?.on('data', (data) => {
+        const text = data.toString()
+        if (!text.includes('DeprecationWarning')) {
+          logs.push(text)
+          this.addLog(`⚠️ STDERR: ${text.trim()}`)
+        }
+      })
+
+      // Wait for proc exit OR 30s timeout. Either way, we then verify
+      // by checking the local auth state.
+      const procEnded = new Promise<{ code: number | null; reason: 'exit' | 'error' | 'timeout' }>((resolve) => {
+        let settled = false
+        const settle = (v: { code: number | null; reason: 'exit' | 'error' | 'timeout' }) => {
+          if (settled) return
+          settled = true
+          resolve(v)
+        }
+
+        disconnectProc.on('exit', (code) => settle({ code, reason: 'exit' }))
+        disconnectProc.on('error', (error) => {
+          this.addLog(`❌ ${display} disconnect process error: ${error.message}`)
+          logs.push(error.message)
+          settle({ code: null, reason: 'error' })
+        })
+
+        setTimeout(() => {
+          if (!disconnectProc.killed) disconnectProc.kill('SIGTERM')
+          settle({ code: null, reason: 'timeout' })
+        }, 30_000)
+      })
+
+      const result = await procEnded
+      // Verify: was the local auth actually cleared? This is the source
+      // of truth — covers the upstream CLI bug where exit code can be
+      // misleading when the gateway-WS call times out.
+      let loggedOut = await this.isChannelLoggedOut(channel)
+
+      // Token-in-config channels (Telegram/Discord/Slack) often slip
+      // through both the CLI's gateway-WS call AND its local fallback
+      // when the bot is currently mid-startup at the gateway — the
+      // config token never gets cleared. Wipe it manually as a last
+      // resort so the next "Connect" cycle starts from a clean state.
+      if (!loggedOut && (channel === 'telegram' || channel === 'discord' || channel === 'slack')) {
+        this.addLog(`🔧 ${display} CLI logout did not clear token — applying config fallback...`)
+        await this.clearTokenChannelConfig(channel)
+        loggedOut = await this.isChannelLoggedOut(channel)
       }
 
-      return { connected: false }
-    } catch {
-      return { connected: false }
+      if (loggedOut) {
+        this.addLog(`✅ ${display} disconnected successfully (verified locally)`)
+        if (this.mainWindow && !this.mainWindow.isDestroyed()) {
+          this.mainWindow.webContents.send(statusEvent, 'disconnected')
+        }
+        // Token-channel disconnects need a gateway restart so the bot
+        // actually stops (the running provider holds the old token in
+        // memory until the gateway re-reads config on restart).
+        if (channel !== 'whatsapp') {
+          this.suggestGatewayRestart()
+        }
+        return { success: true, logs }
+      }
+
+      this.addLog(
+        `❌ Failed to disconnect ${display} (proc reason=${result.reason}, exit code=${result.code ?? 'n/a'}, auth still present)`,
+      )
+      return { success: false, logs }
+    } catch (error: any) {
+      this.addLog(`❌ Failed to disconnect ${display}: ${error.message}`)
+      return { success: false, logs: [error.message] }
     }
   }
 
   async disconnectWhatsApp(): Promise<{ success: boolean; logs: string[] }> {
-    try {
-      this.addLog('🔌 Disconnecting WhatsApp...')
-
-      const { runtime, enhancedEnv, cwd, buildArgs } = await this.resolveOpenClawSpawn()
-      const disconnectProc = spawn(runtime, buildArgs('channels', 'logout', '--channel', 'whatsapp'), {
-        stdio: ['pipe', 'pipe', 'pipe'],
-        env: enhancedEnv,
-        cwd,
-        windowsHide: true,
-      })
-
-      return new Promise((resolve) => {
-        const logs: string[] = []
-
-        disconnectProc.stdout?.on('data', (data) => {
-          const text = data.toString()
-          logs.push(text)
-          this.addLog(`📱 STDOUT: ${text.trim()}`)
-        })
-
-        disconnectProc.stderr?.on('data', (data) => {
-          const text = data.toString()
-          if (!text.includes('DeprecationWarning')) {
-            logs.push(text)
-            this.addLog(`⚠️ STDERR: ${text.trim()}`)
-          }
-        })
-
-        disconnectProc.on('exit', (code) => {
-          const success = code === 0
-          if (success) {
-            this.addLog('✅ WhatsApp disconnected successfully')
-            // Emit status change to renderer
-            if (this.mainWindow && !this.mainWindow.isDestroyed()) {
-              this.mainWindow.webContents.send('whatsapp:status-change', 'disconnected')
-            }
-          } else {
-            this.addLog(`❌ Failed to disconnect WhatsApp (exit code: ${code})`)
-          }
-
-          resolve({ success, logs })
-        })
-
-        disconnectProc.on('error', (error) => {
-          this.addLog(`❌ Disconnect process error: ${error.message}`)
-          resolve({ success: false, logs: [error.message] })
-        })
-
-        // Timeout after 10 seconds
-        setTimeout(() => {
-          if (!disconnectProc.killed) {
-            disconnectProc.kill('SIGTERM')
-            resolve({ success: false, logs: ['Disconnect timeout'] })
-          }
-        }, 10000)
-      })
-    } catch (error: any) {
-      this.addLog(`❌ Failed to disconnect WhatsApp: ${error.message}`)
-      return { success: false, logs: [error.message] }
-    }
+    return await this.disconnectChannel({
+      channel: 'whatsapp',
+      statusEvent: 'whatsapp:status-change',
+      logEmoji: '📱',
+    })
   }
 
   async disconnectTelegram(): Promise<{ success: boolean; logs: string[] }> {
-    try {
-      this.addLog('🔵 Disconnecting Telegram...')
-
-      const { runtime, enhancedEnv, cwd, buildArgs } = await this.resolveOpenClawSpawn()
-      const disconnectProc = spawn(runtime, buildArgs('channels', 'logout', '--channel', 'telegram'), {
-        stdio: ['pipe', 'pipe', 'pipe'],
-        env: enhancedEnv,
-        cwd,
-        windowsHide: true,
-      })
-
-      return new Promise((resolve) => {
-        const logs: string[] = []
-
-        disconnectProc.stdout?.on('data', (data) => {
-          const text = data.toString()
-          logs.push(text)
-          this.addLog(`🔵 STDOUT: ${text.trim()}`)
-        })
-
-        disconnectProc.stderr?.on('data', (data) => {
-          const text = data.toString()
-          if (!text.includes('DeprecationWarning')) {
-            logs.push(text)
-            this.addLog(`⚠️ STDERR: ${text.trim()}`)
-          }
-        })
-
-        disconnectProc.on('exit', (code) => {
-          const success = code === 0
-          if (success) {
-            this.addLog('✅ Telegram disconnected successfully')
-            // Emit status change to renderer
-            if (this.mainWindow && !this.mainWindow.isDestroyed()) {
-              this.mainWindow.webContents.send('telegram:status-change', 'disconnected')
-            }
-          } else {
-            this.addLog(`❌ Failed to disconnect Telegram (exit code: ${code})`)
-          }
-
-          resolve({ success, logs })
-        })
-
-        disconnectProc.on('error', (error) => {
-          this.addLog(`❌ Telegram disconnect process error: ${error.message}`)
-          resolve({ success: false, logs: [error.message] })
-        })
-
-        // Timeout after 10 seconds
-        setTimeout(() => {
-          if (!disconnectProc.killed) {
-            disconnectProc.kill('SIGTERM')
-            resolve({ success: false, logs: ['Disconnect timeout'] })
-          }
-        }, 10000)
-      })
-    } catch (error: any) {
-      this.addLog(`❌ Failed to disconnect Telegram: ${error.message}`)
-      return { success: false, logs: [error.message] }
-    }
+    return await this.disconnectChannel({
+      channel: 'telegram',
+      statusEvent: 'telegram:status-change',
+      logEmoji: '🔵',
+    })
   }
 
   async disconnectDiscord(): Promise<{ success: boolean; logs: string[] }> {
-    try {
-      this.addLog('🟦 Disconnecting Discord...')
-
-      const { runtime, enhancedEnv, cwd, buildArgs } = await this.resolveOpenClawSpawn()
-      const disconnectProc = spawn(runtime, buildArgs('channels', 'logout', '--channel', 'discord'), {
-        stdio: ['pipe', 'pipe', 'pipe'],
-        env: enhancedEnv,
-        cwd,
-        windowsHide: true,
-      })
-
-      return new Promise((resolve) => {
-        const logs: string[] = []
-
-        disconnectProc.stdout?.on('data', (data) => {
-          const text = data.toString()
-          logs.push(text)
-          this.addLog(`🟦 STDOUT: ${text.trim()}`)
-        })
-
-        disconnectProc.stderr?.on('data', (data) => {
-          const text = data.toString()
-          if (!text.includes('DeprecationWarning')) {
-            logs.push(text)
-            this.addLog(`⚠️ STDERR: ${text.trim()}`)
-          }
-        })
-
-        disconnectProc.on('exit', (code) => {
-          const success = code === 0
-          if (success) {
-            this.addLog('✅ Discord disconnected successfully')
-            // Emit status change to renderer
-            if (this.mainWindow && !this.mainWindow.isDestroyed()) {
-              this.mainWindow.webContents.send('discord:status-change', 'disconnected')
-            }
-          } else {
-            this.addLog(`❌ Failed to disconnect Discord (exit code: ${code})`)
-          }
-
-          resolve({ success, logs })
-        })
-
-        disconnectProc.on('error', (error) => {
-          this.addLog(`❌ Discord disconnect process error: ${error.message}`)
-          resolve({ success: false, logs: [error.message] })
-        })
-
-        // Timeout after 10 seconds
-        setTimeout(() => {
-          if (!disconnectProc.killed) {
-            disconnectProc.kill('SIGTERM')
-            resolve({ success: false, logs: ['Disconnect timeout'] })
-          }
-        }, 10000)
-      })
-    } catch (error: any) {
-      this.addLog(`❌ Failed to disconnect Discord: ${error.message}`)
-      return { success: false, logs: [error.message] }
-    }
+    return await this.disconnectChannel({
+      channel: 'discord',
+      statusEvent: 'discord:status-change',
+      logEmoji: '🟦',
+    })
   }
 
   async loginWhatsApp(): Promise<{success: boolean, logs: string[]}> {
@@ -481,19 +772,28 @@ export class ChannelManager {
       return new Promise((resolve) => {
         let qrData = ''
         let foundQR = false
+        // Buffer all stdout so the QR detector can scan across chunk
+        // boundaries. WhatsApp's QR is ~17 rows; pty/pipe buffering
+        // routinely splits it across multiple `data` events, and a
+        // per-chunk includes('█') check would miss every split QR —
+        // the bug customers were hitting as "QR doesn't generate".
+        let stdoutBuffer = ''
 
         whatsappLoginProcess!.stdout?.on('data', (data) => {
           const text = data.toString()
           logs.push(text)
+          stdoutBuffer += text
 
-          // Check if already connected or just completed login
-          if (text.includes('already linked') ||
-              text.includes('Linked!') ||
-              text.includes('web session ready') ||
-              text.includes('Credentials saved')) {
+          // Strip ANSI for the success-marker checks too — the CLI sometimes
+          // colorizes "Linked!" / status lines, and the bare includes() would
+          // miss them when the chunk also carried color codes.
+          const cleanText = stripAnsi(text)
+
+          if (cleanText.includes('already linked') ||
+              cleanText.includes('Linked!') ||
+              cleanText.includes('web session ready') ||
+              cleanText.includes('Credentials saved')) {
             if (foundQR) {
-              // QR was shown and user scanned it — this is a successful login completion.
-              // Send status-change event BEFORE cleanup so the renderer can react.
               this.addLog('✅ WhatsApp login successful — credentials saved')
               if (activeWhatsAppSession) {
                 activeWhatsAppSession.status = 'connected'
@@ -503,11 +803,9 @@ export class ChannelManager {
               }
               this.cleanupWhatsAppSession()
               this.suggestGatewayRestart()
-              // Promise already resolved with QR data — no need to resolve again
               return
             }
 
-            // No QR was shown — device was already linked before we started
             this.addLog('✅ WhatsApp is already connected')
             if (activeWhatsAppSession) {
               activeWhatsAppSession.status = 'connected'
@@ -518,15 +816,10 @@ export class ChannelManager {
             return
           }
 
-          // Look for QR code data
-          if (text.includes('█') && text.includes('▄') && !foundQR) {
-            const lines = text.split('\n')
-            const qrLines = lines.filter((line: string) =>
-              line.includes('█') || line.includes('▄') || line.includes('▀')
-            )
-
-            if (qrLines.length > 10) {
-              qrData = qrLines.join('\n')
+          if (!foundQR) {
+            const qr = extractWhatsAppQr(stdoutBuffer)
+            if (qr) {
+              qrData = qr
               foundQR = true
 
               if (activeWhatsAppSession) {
@@ -540,7 +833,7 @@ export class ChannelManager {
             }
           }
 
-          this.addLog(`📱 ${text.trim()}`)
+          this.addLog(`📱 ${cleanText.trim()}`)
         })
 
         whatsappLoginProcess!.stderr?.on('data', (data) => {
@@ -551,15 +844,25 @@ export class ChannelManager {
           }
         })
 
+        // 90s timeout — chosen because in dev mode (`bun src/index.ts ...`)
+        // bun has to load+transpile the entire openclaw TS source on each
+        // spawn, which takes ~30s before any stdout flushes (proven via a
+        // direct spawn diagnostic on 2026-05-10: first chunk @30,274ms,
+        // QR @30,704ms). In production (packaged DMG) the runtime runs
+        // pre-built openclaw.mjs and the QR appears in 3-5s, so the same
+        // 90s ceiling stays well above slow networks/disks. The previous
+        // 30s value was racing the dev cold-start by ~270ms — appearing
+        // as "QR Generation Failed" with empty logs in the UI.
+        const QR_TIMEOUT_MS = 90000
         const qrTimeout = setTimeout(() => {
           if (!foundQR) {
-            console.log('[ChannelManager] QR generation timed out after 30 seconds. Logs collected:')
+            console.log(`[ChannelManager] QR generation timed out after ${QR_TIMEOUT_MS / 1000} seconds. Logs collected:`)
             console.log(logs.join('\n'))
-            this.addLog('⏱️ QR generation timed out after 30 seconds')
+            this.addLog(`⏱️ QR generation timed out after ${QR_TIMEOUT_MS / 1000} seconds`)
             this.cleanupWhatsAppSession()
             resolve({ success: false, logs })
           }
-        }, 30000)
+        }, QR_TIMEOUT_MS)
 
         whatsappLoginProcess!.on('exit', (code) => {
           clearTimeout(qrTimeout)
@@ -631,42 +934,20 @@ export class ChannelManager {
     }, 60000) // Every minute
   }
 
-  /**
-   * Finds the system-installed openclaw binary by checking common PATH locations.
-   * Returns the absolute path, or null if not found.
-   */
-  private async findSystemOpenClaw(expandedPath: string): Promise<string | null> {
-    const execFileAsync = promisify(execFile)
-
-    // Try `which openclaw` with an expanded PATH
-    try {
-      const { stdout } = await execFileAsync('which', ['openclaw'], {
-        env: { ...process.env, PATH: expandedPath }
-      })
-      const p = stdout.trim()
-      if (p && !p.includes('node_modules')) return p
-    } catch { /* not on PATH */ }
-
-    // Check known install locations
-    const home = process.env.HOME || process.env.USERPROFILE || ''
-    const knownPaths = [
-      path.join(home, '.bun', 'bin', 'openclaw'),
-      path.join(home, '.npm-global', 'bin', 'openclaw'),
-      path.join(home, '.local', 'bin', 'openclaw'),
-      '/opt/homebrew/bin/openclaw',
-      '/usr/local/bin/openclaw',
-    ]
-    for (const p of knownPaths) {
-      if (existsSync(p)) return p
-    }
-    return null
-  }
+  // System openclaw detection lives in
+  // src/main/managers/system-openclaw-resolver.ts (`detectSystemOpenClaw`).
+  // ChannelManager used to ship its own findSystemOpenClaw with a
+  // marginally different ordering; the resolver is now a strict superset
+  // (`.bun/bin/openclaw`, node_modules filter, augmented PATH) so the
+  // local impl was removed during the consolidation that landed alongside
+  // the Doctor SQLite cascade fix.
 
   /**
    * Resolves the correct runtime binary, openclaw entry point, and environment
-   * for spawning openclaw subprocesses. Branches on app.isPackaged to use
-   * bundled bun + ~/.openclaw-easy/app/openclaw.mjs in production, or the
-   * local bun + TypeScript source in development.
+   * for spawning openclaw subprocesses. Production uses bundled Node +
+   * ~/.openclaw-easy/app/openclaw.mjs; development prefers the system
+   * openclaw binary, falling back to Node + built dist
+   * (dev-openclaw-runtime.ts).
    */
   private async resolveOpenClawSpawn(): Promise<{ runtime: string; openclawPath: string; enhancedEnv: NodeJS.ProcessEnv; cwd: string; buildArgs: (...args: string[]) => string[] }> {
     const { app } = await import('electron')
@@ -680,51 +961,72 @@ export class ChannelManager {
     let enhancedEnv: NodeJS.ProcessEnv
     let cwd: string
 
+    // Rich PATH so the spawned openclaw + its deps resolve even when Electron
+    // inherited a sparse PATH. Shared by every spawn mode below.
+    const expandedPath = isWindows
+      ? (process.env.PATH || '')
+      : [
+          path.join(home, '.bun', 'bin'),
+          path.join(home, '.npm-global', 'bin'),
+          path.join(home, '.local', 'bin'),
+          '/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin',
+          process.env.PATH || ''
+        ].join(pathSep)
+
     if (app.isPackaged) {
-      const bunBinaryName = isWindows
-        ? 'bun-windows.exe'
-        : `bun-${process.arch === 'arm64' ? 'arm64' : 'x64'}`
-      const bundledBun = path.join(process.resourcesPath, 'bun', bunBinaryName)
-      const expandedPath = isWindows
-        ? (process.env.PATH || '')
-        : [
-            path.join(home, '.bun', 'bin'),
-            path.join(home, '.npm-global', 'bin'),
-            path.join(home, '.local', 'bin'),
-            '/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin',
-            process.env.PATH || ''
-          ].join(pathSep)
+      // Run openclaw under bundled Node (has node:sqlite); bun is install-only.
+      const nodeBinaryName = isWindows
+        ? 'node-windows.exe'
+        : `node-${process.arch === 'arm64' ? 'arm64' : 'x64'}`
+      const bundledNode = path.join(process.resourcesPath, 'node', nodeBinaryName)
 
       const openclawMjs = path.join(home, '.openclaw-easy', 'app', 'openclaw.mjs')
-      if (existsSync(bundledBun) && existsSync(openclawMjs)) {
-        // ── Bundled bun + openclaw.mjs both present (normal production path) ──
-        runtime = bundledBun
+      if (existsSync(bundledNode) && existsSync(openclawMjs)) {
+        // ── Bundled node + openclaw.mjs both present (normal production path) ──
+        runtime = bundledNode
         openclawPath = openclawMjs
         cwd = path.join(home, '.openclaw-easy', 'app')
         enhancedEnv = { ...process.env, ...openclawEnv, PATH: expandedPath, OPENCLAW_INCLUDE_OPTIONAL_BUNDLED: '1' }
       } else {
-        // ── Bundled bun or openclaw.mjs missing — fall back to system binary ──
-        // Happens when: bun not in Resources (old DMG), or openclaw.mjs not yet
+        // ── Bundled node or openclaw.mjs missing — fall back to system binary ──
+        // Happens when: node not in Resources (old DMG), or openclaw.mjs not yet
         // installed (gateway running in system binary mode, bundle never unpacked).
-        const systemBinary = await this.findSystemOpenClaw(expandedPath)
+        // The system binary also runs under Node, so node:sqlite stays available.
+        const systemBinary = await detectSystemOpenClaw()
         runtime = systemBinary || 'openclaw'
         openclawPath = '' // system binary IS the entry point
         cwd = home
         enhancedEnv = { ...process.env, ...openclawEnv, PATH: expandedPath, OPENCLAW_INCLUDE_OPTIONAL_BUNDLED: '1' }
-        console.warn(`[ChannelManager] bundledBun=${existsSync(bundledBun)} openclawMjs=${existsSync(openclawMjs)}; using system binary: ${runtime}`)
+        console.warn(`[ChannelManager] bundledNode=${existsSync(bundledNode)} openclawMjs=${existsSync(openclawMjs)}; using system binary: ${runtime}`)
       }
     } else {
-      const bunBinDir = path.join(home, '.bun', 'bin')
-      const bunAbsolute = path.join(bunBinDir, 'bun')
-      // Use absolute path so spawn succeeds even when Electron's PATH is minimal
-      runtime = existsSync(bunAbsolute) ? bunAbsolute : 'bun'
-      openclawPath = path.join(__dirname, '../../../../openclaw/src/index.ts')
-      cwd = path.join(__dirname, '../../../../openclaw/')
-      enhancedEnv = { ...process.env, ...openclawEnv, PATH: `${bunBinDir}:${process.env.PATH}`, OPENCLAW_INCLUDE_OPTIONAL_BUNDLED: '1' }
+      // Dev (unpackaged). Prefer the system openclaw binary, which runs under
+      // Node — Node 22.5+/24+ ships `node:sqlite`, which the CLI requires for
+      // health-state and agent writes (bun has no node:sqlite, which is why
+      // no dev path spawns bun anymore — see dev-openclaw-runtime.ts). The
+      // gateway (ProcessManager) and OpenClawCommandExecutor already use the
+      // system binary in dev; this aligns channel/agent commands with them.
+      const systemBinary = await detectSystemOpenClaw()
+      if (systemBinary) {
+        runtime = systemBinary
+        openclawPath = '' // system binary IS the entry point (Node runtime)
+        cwd = home
+        enhancedEnv = { ...process.env, ...openclawEnv, PATH: expandedPath, OPENCLAW_INCLUDE_OPTIONAL_BUNDLED: '1' }
+      } else {
+        // Last resort with no global install: built CLI under Node (see
+        // dev-openclaw-runtime.ts) — the gateway/CLI needs node:sqlite.
+        const dev = getDevOpenClawSpawn()
+        runtime = dev.runtime
+        openclawPath = dev.entry
+        cwd = dev.cwd
+        enhancedEnv = { ...process.env, ...openclawEnv, PATH: expandedPath, OPENCLAW_INCLUDE_OPTIONAL_BUNDLED: '1' }
+      }
     }
 
-    // Diagnostic logging — visible in Electron logs so production failures can be root-caused.
-    const runtimeOk = existsSync(runtime)
+    // Diagnostic logging — visible in Electron logs so production failures can
+    // be root-caused. Bare names ('node') resolve via PATH at spawn time, so
+    // only path-shaped runtimes get an existence check.
+    const runtimeOk = isPathResolvedRuntime(runtime) || existsSync(runtime)
     // openclawPath is empty in system binary mode — the runtime IS the entry point
     const openclawOk = !openclawPath || existsSync(openclawPath)
     console.log(`[ChannelManager] resolveOpenClawSpawn: runtime=${runtime} (exists=${runtimeOk}), openclaw=${openclawPath || '(system binary)'} (exists=${openclawOk}), cwd=${cwd}`)
@@ -802,16 +1104,20 @@ export class ChannelManager {
    * so the bot responds to all DMs immediately. The CLI defaults to "pairing" which
    * silently drops messages until the user pairs — bad UX for a desktop app where
    * the user owns the bot.
+   *
+   * Goes through ConfigManager so the write is serialised with every
+   * other config write in the desktop. The raw `fs.readFile`+`writeFile`
+   * pattern used previously could race with concurrent edits (e.g. an
+   * agent-config write triggered while this method was mid-flight) and
+   * lose data when both sides re-read + wrote at the same time.
    */
   private async setChannelOpenAccess(channelId: string): Promise<void> {
     try {
-      const fs = await import('fs/promises')
-      const configData = await fs.readFile(this.configPath, 'utf8')
-      const config = JSON.parse(configData)
+      const config = await this.configManager.loadConfig()
       if (config.channels?.[channelId]) {
         config.channels[channelId].dmPolicy = 'open'
         config.channels[channelId].allowFrom = ['*']
-        await fs.writeFile(this.configPath, JSON.stringify(config, null, 2))
+        await this.configManager.writeConfig(config)
         console.log(`[ChannelManager] Set ${channelId} dmPolicy=open, allowFrom=["*"]`)
       }
     } catch (error: any) {
@@ -832,27 +1138,104 @@ export class ChannelManager {
 
   // Telegram Methods
   async addTelegramChannel(botToken: string, name: string = 'Telegram'): Promise<{ success: boolean; error?: string }> {
-    try {
-      this.addLog(`🔵 Adding Telegram channel: ${name}`)
+    return this.addTokenChannel({
+      channel: 'telegram',
+      tokenField: 'botToken',
+      token: botToken,
+      name,
+      logEmoji: '🔵',
+      validateFormat: (t) => t.includes(':') && t.length >= 40,
+      formatHint: 'Expected format: 123456:ABC-DEF...',
+    })
+  }
 
-      // Validate token format
-      if (!botToken || !botToken.includes(':')) {
-        return { success: false, error: 'Invalid bot token format. Expected format: 123456:ABC-DEF...' }
+  /**
+   * Generic add-token-channel helper for Telegram/Discord/Slack.
+   *
+   * Why we bypass the upstream `channels add` CLI:
+   *
+   * The CLI's `channels.add` WS call to the running gateway frequently
+   * hangs — the well-documented upstream `callGateway` bug in
+   * `src/gateway/call.ts` (10s timeout that fires even when the
+   * gateway already processed the request). For DISCONNECT, the CLI
+   * has a local fallback that clears credentials regardless of WS
+   * timeout; for ADD it does NOT — when the WS call hangs the CLI
+   * never writes the config. Empirically: a 30s desktop spawn timeout
+   * fires, the config is unchanged, the user sees the generic
+   * "Please check your credentials" toast.
+   *
+   * Same shape as Feishu/Line already use (`connectFeishu`,
+   * `connectLine`): write `config.channels.<channel>` directly via
+   * ConfigManager (which holds the write lock), then nudge the
+   * gateway to reload. No CLI in the hot path.
+   *
+   * Short-circuit: if the config ALREADY has the same token, the
+   * channel is already added with this exact credential — common
+   * when the user opens the connect modal on a channel that's still
+   * running. Skip even the write and just refresh open-access.
+   */
+  private async addTokenChannel(opts: {
+    channel: 'telegram' | 'discord' | 'slack'
+    tokenField: string
+    token: string
+    name: string
+    logEmoji: string
+    validateFormat?: (token: string) => boolean
+    formatHint?: string
+    extraFields?: Record<string, unknown>
+  }): Promise<{ success: boolean; error?: string }> {
+    const { channel, tokenField, token, name, logEmoji, validateFormat, formatHint, extraFields } = opts
+    const display = channel.charAt(0).toUpperCase() + channel.slice(1)
+    try {
+      this.addLog(`${logEmoji} Adding ${display} channel: ${name}`)
+
+      if (!token || (validateFormat && !validateFormat(token))) {
+        return {
+          success: false,
+          error: `Invalid ${display} token format.${formatHint ? ' ' + formatHint : ''}`,
+        }
       }
 
-      // Add the Telegram channel using OpenClaw
-      await this.executeOpenClawCommand([
-        'channels', 'add', '--channel', 'telegram',
-        '--name', name,
-        '--token', botToken
-      ])
-      await this.setChannelOpenAccess('telegram')
+      // Short-circuit: same token already in config → nothing to write.
+      const existing = await this.readChannelToken(channel, tokenField)
+      if (existing === token) {
+        this.addLog(`✅ ${display} channel already configured with this token; refreshing open-access only.`)
+        await this.setChannelOpenAccess(channel)
+        return { success: true }
+      }
 
-      this.addLog('✅ Telegram channel added successfully')
+      // Direct config write — match the schema `channels add --token` would
+      // produce. Goes through ConfigManager.writeConfig which holds the
+      // write lock, so we don't race with a concurrent edit elsewhere.
+      // Set dmPolicy:open + allowFrom:* in the SAME write so the bot
+      // accepts DMs without manual pairing. Single atomic write here
+      // instead of CLI-spawn + setChannelOpenAccess back-to-back: no
+      // race window, no second readFile/writeFile pair.
+      const config = await this.configManager.loadConfig()
+      if (!config.channels) config.channels = {}
+      const entry: Record<string, any> = config.channels[channel] ?? {}
+      entry.name = name
+      entry.enabled = true
+      entry[tokenField] = token
+      entry.dmPolicy = 'open'
+      entry.allowFrom = ['*']
+      if (extraFields) {
+        for (const [k, v] of Object.entries(extraFields)) entry[k] = v
+      }
+      config.channels[channel] = entry
+      await this.configManager.writeConfig(config)
+      this.addLog(`💾 Wrote ${display} credentials to openclaw.json (dmPolicy=open)`)
+
+      // The gateway needs to reload its config to pick up the new
+      // channel. Desktop emits the suggestion event so the user can
+      // hit "Restart Gateway" — auto-restart would interrupt any
+      // in-flight chat.
+      this.suggestGatewayRestart()
+      this.addLog(`✅ ${display} channel added successfully (restart gateway to activate)`)
       return { success: true }
     } catch (error: any) {
-      console.error('[ChannelManager] Failed to add Telegram channel:', error)
-      this.addLog(`❌ Failed to add Telegram channel: ${error.message}`)
+      console.error(`[ChannelManager] Failed to add ${display} channel:`, error)
+      this.addLog(`❌ Failed to add ${display} channel: ${error.message}`)
       return { success: false, error: error.message }
     }
   }
@@ -920,32 +1303,38 @@ export class ChannelManager {
 
   // Discord Methods
   async addDiscordChannel(botToken: string, serverId: string, name: string = 'Discord'): Promise<{ success: boolean; error?: string }> {
-    try {
-      this.addLog(`🟦 Adding Discord channel: ${name}`)
-
-      // Validate inputs
-      if (!botToken || botToken.length < 50) {
-        return { success: false, error: 'Invalid Discord bot token' }
-      }
-      if (!serverId || !/^\d{17,19}$/.test(serverId)) {
-        return { success: false, error: 'Invalid Discord server ID' }
-      }
-
-      // Add the Discord channel using OpenClaw
-      await this.executeOpenClawCommand([
-        'channels', 'add', '--channel', 'discord',
-        '--name', name,
-        '--token', botToken,
-      ])
-      await this.setChannelOpenAccess('discord')
-
-      this.addLog('✅ Discord channel added successfully')
-      return { success: true }
-    } catch (error: any) {
-      console.error('[ChannelManager] Failed to add Discord channel:', error)
-      this.addLog(`❌ Failed to add Discord channel: ${error.message}`)
-      return { success: false, error: error.message }
+    if (!serverId || !/^\d{17,19}$/.test(serverId)) {
+      return { success: false, error: 'Invalid Discord server ID' }
     }
+    // Reuse the same direct-config-write path Telegram uses (bypasses the
+    // buggy `channels add` CLI). After the main add succeeds, register
+    // the user-supplied guild under `channels.discord.guilds[serverId]`
+    // — preserving any other guilds already present (don't pass `guilds`
+    // through `extraFields`, that would wipe them).
+    const result = await this.addTokenChannel({
+      channel: 'discord',
+      tokenField: 'botToken',
+      token: botToken,
+      name,
+      logEmoji: '🟦',
+      validateFormat: (t) => t.length >= 50,
+      formatHint: 'Discord bot tokens are at least 50 characters.',
+    })
+    if (!result.success) return result
+
+    try {
+      const config = await this.configManager.loadConfig()
+      if (!config.channels.discord.guilds) config.channels.discord.guilds = {}
+      if (!config.channels.discord.guilds[serverId]) {
+        config.channels.discord.guilds[serverId] = {}
+        await this.configManager.writeConfig(config)
+        this.addLog(`📌 Registered Discord guild ${serverId}`)
+      }
+    } catch (writeErr: any) {
+      this.addLog(`⚠️ Discord channel added but couldn't register guild ${serverId}: ${writeErr.message}`)
+      // Non-fatal — the bot still works on any guild it's invited to.
+    }
+    return { success: true }
   }
 
   async testDiscordBot(botToken: string): Promise<{ success: boolean; botInfo?: any; error?: string }> {
@@ -1017,27 +1406,7 @@ export class ChannelManager {
 
   // Slack Methods
   async checkSlackStatus(): Promise<{ connected: boolean }> {
-    try {
-      const { app } = await import('electron')
-      const { promises: fs } = await import('fs')
-      const path = await import('path')
-
-      const homeDir = app.getPath('home')
-      const credentialsDir = path.join(homeDir, '.openclaw', 'credentials', 'slack')
-
-      try {
-        const files = await fs.readdir(credentialsDir)
-        if (files.some(f => !f.startsWith('.'))) {
-          return { connected: true }
-        }
-      } catch {
-        // Directory doesn't exist — not connected
-      }
-
-      return { connected: false }
-    } catch {
-      return { connected: false }
-    }
+    return { connected: await this.isTokenChannelConfigured('slack', 'botToken') }
   }
 
   async testSlackBotToken(botToken: string): Promise<{ success: boolean; teamName?: string; botName?: string; error?: string }> {
@@ -1071,66 +1440,45 @@ export class ChannelManager {
   }
 
   async addSlackChannel(botToken: string, appToken: string, name: string = 'Slack'): Promise<{ success: boolean; error?: string }> {
-    try {
-      this.addLog(`💬 Adding Slack channel: ${name}`)
-
-      if (!botToken || !botToken.startsWith('xoxb-')) {
-        return { success: false, error: 'Invalid bot token format. Must start with xoxb-' }
-      }
-      if (!appToken || !appToken.startsWith('xapp-')) {
-        return { success: false, error: 'Invalid app token format. Must start with xapp-' }
-      }
-
-      await this.executeOpenClawCommand([
-        'channels', 'add', '--channel', 'slack',
-        '--name', name,
-        '--bot-token', botToken,
-        '--app-token', appToken,
-      ])
-      await this.setChannelOpenAccess('slack')
-
-      this.addLog('✅ Slack channel added successfully')
-      return { success: true }
-    } catch (error: any) {
-      // If CLI doesn't support --bot-token/--app-token flags, write config directly
-      this.addLog('⚠️ CLI add failed, writing config directly...')
-      try {
-        const { app } = await import('electron')
-        const fs = await import('fs/promises')
-        const path = await import('path')
-
-        const configPath = path.join(app.getPath('home'), '.openclaw', 'openclaw.json')
-        let config: any = {}
-        try {
-          const data = await fs.readFile(configPath, 'utf8')
-          config = JSON.parse(data)
-        } catch {
-          // Start fresh if config doesn't exist
-        }
-
-        if (!config.channels) config.channels = {}
-        config.channels.slack = {
-          enabled: true,
-          mode: 'socket',
-          botToken,
-          appToken,
-          dmPolicy: 'open',
-          allowFrom: ['*'],
-        }
-
-        // Ensure slack plugin is enabled
-        if (!config.plugins) config.plugins = {}
-        if (!config.plugins.entries) config.plugins.entries = {}
-        config.plugins.entries.slack = { enabled: true }
-
-        await fs.writeFile(configPath, JSON.stringify(config, null, 2))
-        this.addLog('✅ Slack config written successfully')
-        return { success: true }
-      } catch (configError: any) {
-        this.addLog(`❌ Failed to add Slack channel: ${configError.message}`)
-        return { success: false, error: configError.message }
-      }
+    if (!appToken || !appToken.startsWith('xapp-')) {
+      return { success: false, error: 'Invalid Slack app token format. Must start with xapp-' }
     }
+    // Single direct-config-write path. The previous code did CLI →
+    // catch → raw fs.writeFile as a fallback, with both branches
+    // bypassing the write lock and the fallback duplicating dmPolicy/
+    // allowFrom logic. Now we use the same addTokenChannel helper that
+    // works for Telegram, with extraFields carrying the second token
+    // (appToken) and the socket-mode flag.
+    const result = await this.addTokenChannel({
+      channel: 'slack',
+      tokenField: 'botToken',
+      token: botToken,
+      name,
+      logEmoji: '💬',
+      validateFormat: (t) => t.startsWith('xoxb-'),
+      formatHint: 'Slack bot tokens start with xoxb-.',
+      extraFields: { mode: 'socket', appToken },
+    })
+    if (!result.success) return result
+
+    // Ensure the slack plugin is enabled. (The CLI used to do this for
+    // us. With the direct-write path we have to do it ourselves —
+    // otherwise the gateway has the credentials but the plugin stays
+    // off and no events flow.)
+    try {
+      const config = await this.configManager.loadConfig()
+      if (!config.plugins) config.plugins = {}
+      if (!config.plugins.entries) config.plugins.entries = {}
+      if (!config.plugins.entries.slack?.enabled) {
+        config.plugins.entries.slack = { ...(config.plugins.entries.slack ?? {}), enabled: true }
+        await this.configManager.writeConfig(config)
+        this.addLog('🔧 Enabled Slack plugin')
+      }
+    } catch (pluginErr: any) {
+      this.addLog(`⚠️ Slack channel added but plugin-enable failed: ${pluginErr.message}`)
+      // Non-fatal — user can enable manually if needed.
+    }
+    return { success: true }
   }
 
   async connectSlackBot(botToken: string, appToken: string, name: string = 'Slack'): Promise<{ success: boolean; error?: string }> {
@@ -1165,55 +1513,16 @@ export class ChannelManager {
 
   async disconnectSlack(): Promise<{ success: boolean; logs: string[] }> {
     try {
-      this.addLog('💬 Disconnecting Slack...')
-
-      const { runtime, enhancedEnv, buildArgs } = await this.resolveOpenClawSpawn()
-      const disconnectProc = spawn(runtime, buildArgs('channels', 'logout', '--channel', 'slack'), {
-        stdio: ['pipe', 'pipe', 'pipe'],
-        env: enhancedEnv
-      })
-
-      return new Promise((resolve) => {
-        const logs: string[] = []
-
-        disconnectProc.stdout?.on('data', (data) => {
-          const text = data.toString()
-          logs.push(text)
-          this.addLog(`💬 STDOUT: ${text.trim()}`)
-        })
-
-        disconnectProc.stderr?.on('data', (data) => {
-          const text = data.toString()
-          if (!text.includes('DeprecationWarning')) {
-            logs.push(text)
-            this.addLog(`⚠️ STDERR: ${text.trim()}`)
-          }
-        })
-
-        disconnectProc.on('exit', (code) => {
-          const success = code === 0
-          if (success) {
-            this.addLog('✅ Slack disconnected successfully')
-            if (this.mainWindow && !this.mainWindow.isDestroyed()) {
-              this.mainWindow.webContents.send('slack:status-change', 'disconnected')
-            }
-          } else {
-            this.addLog(`❌ Failed to disconnect Slack (exit code: ${code})`)
-          }
-          resolve({ success, logs })
-        })
-
-        disconnectProc.on('error', (error) => {
-          this.addLog(`❌ Slack disconnect process error: ${error.message}`)
-          resolve({ success: false, logs: [error.message] })
-        })
-
-        setTimeout(() => {
-          if (!disconnectProc.killed) {
-            disconnectProc.kill('SIGTERM')
-            resolve({ success: false, logs: ['Disconnect timeout'] })
-          }
-        }, 10000)
+      // Route through the shared disconnect helper so Slack gets the
+      // same verify-by-state + config-fallback behavior as Telegram and
+      // Discord. The previous Slack-only implementation didn't verify
+      // the actual auth state (relied on CLI exit code) and didn't
+      // suggest a gateway restart on success — both regressions vs
+      // the disconnect refactor that landed for the other channels.
+      return await this.disconnectChannel({
+        channel: 'slack',
+        statusEvent: 'slack:status-change',
+        logEmoji: '💬',
       })
     } catch (error: any) {
       this.addLog(`❌ Failed to disconnect Slack: ${error.message}`)
@@ -1224,22 +1533,9 @@ export class ChannelManager {
   // Feishu Methods
   async checkFeishuStatus(): Promise<{ connected: boolean }> {
     try {
-      const { app } = await import('electron')
-      const fs = await import('fs/promises')
-      const pathMod = await import('path')
-
-      const configPath = pathMod.join(app.getPath('home'), '.openclaw', 'openclaw.json')
-      try {
-        const data = await fs.readFile(configPath, 'utf8')
-        const config = JSON.parse(data)
-        const appId = config?.channels?.feishu?.accounts?.main?.appId
-        if (appId && appId.trim()) {
-          return { connected: true }
-        }
-      } catch {
-        // Config doesn't exist or can't be parsed
-      }
-      return { connected: false }
+      const config = await this.configManager.loadConfig()
+      const appId = config?.channels?.feishu?.accounts?.main?.appId
+      return { connected: typeof appId === 'string' && appId.trim().length > 0 }
     } catch {
       return { connected: false }
     }
@@ -1249,19 +1545,15 @@ export class ChannelManager {
     try {
       this.addLog('🔵 Connecting Feishu...')
 
-      const { app } = await import('electron')
-      const fs = await import('fs/promises')
-      const pathMod = await import('path')
-
-      const configPath = pathMod.join(app.getPath('home'), '.openclaw', 'openclaw.json')
-      let config: any = {}
-      try {
-        const data = await fs.readFile(configPath, 'utf8')
-        config = JSON.parse(data)
-      } catch {
-        // Start fresh if config doesn't exist
+      if (!appId || !appId.trim() || !appSecret || !appSecret.trim()) {
+        return { success: false, error: 'Feishu requires both appId and appSecret' }
       }
 
+      // Use ConfigManager so writes serialise with everything else. The
+      // previous raw `fs.readFile`+`writeFile` pair could lose data when
+      // a concurrent agent-config write hit at the same time. Same fix
+      // pattern as Telegram now uses.
+      const config = await this.configManager.loadConfig()
       if (!config.channels) config.channels = {}
       if (!config.channels.feishu) config.channels.feishu = {}
       if (!config.channels.feishu.accounts) config.channels.feishu.accounts = {}
@@ -1271,8 +1563,12 @@ export class ChannelManager {
         ...(botName.trim() ? { botName: botName.trim() } : {}),
         enabled: true,
       }
-
-      await fs.writeFile(configPath, JSON.stringify(config, null, 2))
+      // Match the open-access default the bot-token channels use, so
+      // Feishu DMs work without manual pairing.
+      config.channels.feishu.enabled = true
+      config.channels.feishu.dmPolicy = 'open'
+      config.channels.feishu.allowFrom = ['*']
+      await this.configManager.writeConfig(config)
       this.addLog('✅ Feishu configured successfully')
 
       this.suggestGatewayRestart()
@@ -1287,21 +1583,17 @@ export class ChannelManager {
     try {
       this.addLog('🔵 Disconnecting Feishu...')
 
-      const { app } = await import('electron')
-      const fs = await import('fs/promises')
-      const pathMod = await import('path')
-
-      const configPath = pathMod.join(app.getPath('home'), '.openclaw', 'openclaw.json')
-      try {
-        const data = await fs.readFile(configPath, 'utf8')
-        const config = JSON.parse(data)
-        if (config?.channels?.feishu) {
-          delete config.channels.feishu
-          await fs.writeFile(configPath, JSON.stringify(config, null, 2))
-        }
-      } catch { /* ignore */ }
+      const config = await this.configManager.loadConfig()
+      if (config?.channels?.feishu) {
+        delete config.channels.feishu
+        await this.configManager.writeConfig(config)
+      }
 
       this.addLog('✅ Feishu disconnected successfully')
+      // Suggest gateway restart so the running provider actually stops.
+      // The previous implementation skipped this, so the bot kept
+      // responding until the user manually restarted the gateway.
+      this.suggestGatewayRestart()
       return { success: true, logs: [] }
     } catch (error: any) {
       this.addLog(`❌ Failed to disconnect Feishu: ${error.message}`)
@@ -1312,22 +1604,9 @@ export class ChannelManager {
   // Line Methods
   async checkLineStatus(): Promise<{ connected: boolean }> {
     try {
-      const { app } = await import('electron')
-      const fs = await import('fs/promises')
-      const pathMod = await import('path')
-
-      const configPath = pathMod.join(app.getPath('home'), '.openclaw', 'openclaw.json')
-      try {
-        const data = await fs.readFile(configPath, 'utf8')
-        const config = JSON.parse(data)
-        const token = config?.channels?.line?.channelAccessToken
-        if (token && token.trim()) {
-          return { connected: true }
-        }
-      } catch {
-        // Config doesn't exist or can't be parsed
-      }
-      return { connected: false }
+      const config = await this.configManager.loadConfig()
+      const token = config?.channels?.line?.channelAccessToken
+      return { connected: typeof token === 'string' && token.trim().length > 0 }
     } catch {
       return { connected: false }
     }
@@ -1337,27 +1616,24 @@ export class ChannelManager {
     try {
       this.addLog('🟢 Connecting LINE...')
 
-      const { app } = await import('electron')
-      const fs = await import('fs/promises')
-      const pathMod = await import('path')
-
-      const configPath = pathMod.join(app.getPath('home'), '.openclaw', 'openclaw.json')
-      let config: any = {}
-      try {
-        const data = await fs.readFile(configPath, 'utf8')
-        config = JSON.parse(data)
-      } catch {
-        // Start fresh if config doesn't exist
+      if (!channelAccessToken || !channelAccessToken.trim() || !channelSecret || !channelSecret.trim()) {
+        return { success: false, error: 'LINE requires both channelAccessToken and channelSecret' }
       }
 
+      // ConfigManager.writeConfig for the same write-lock reason
+      // documented in connectFeishu / addTokenChannel above.
+      const config = await this.configManager.loadConfig()
       if (!config.channels) config.channels = {}
       config.channels.line = {
+        ...(config.channels.line ?? {}),
         enabled: true,
         channelAccessToken: channelAccessToken.trim(),
         channelSecret: channelSecret.trim(),
+        // Mirror the open-access default the bot-token channels use.
+        dmPolicy: 'open',
+        allowFrom: ['*'],
       }
-
-      await fs.writeFile(configPath, JSON.stringify(config, null, 2))
+      await this.configManager.writeConfig(config)
       this.addLog('✅ LINE configured successfully')
 
       this.suggestGatewayRestart()
@@ -1373,21 +1649,15 @@ export class ChannelManager {
     try {
       this.addLog('🟢 Disconnecting LINE...')
 
-      const { app } = await import('electron')
-      const fs = await import('fs/promises')
-      const pathMod = await import('path')
-
-      const configPath = pathMod.join(app.getPath('home'), '.openclaw', 'openclaw.json')
-      try {
-        const data = await fs.readFile(configPath, 'utf8')
-        const config = JSON.parse(data)
-        if (config?.channels?.line) {
-          delete config.channels.line
-          await fs.writeFile(configPath, JSON.stringify(config, null, 2))
-        }
-      } catch { /* ignore */ }
+      const config = await this.configManager.loadConfig()
+      if (config?.channels?.line) {
+        delete config.channels.line
+        await this.configManager.writeConfig(config)
+      }
 
       this.addLog('✅ LINE disconnected successfully')
+      // Suggest gateway restart so the running provider actually stops.
+      this.suggestGatewayRestart()
       return { success: true, logs: [] }
     } catch (error: any) {
       this.addLog(`❌ Failed to disconnect LINE: ${error.message}`)
@@ -1464,15 +1734,30 @@ export class ChannelManager {
       this.addLog(`🤖 Creating agent: ${agentName}`)
 
       // Sanitize agent name - replace spaces/special chars with hyphens
-      const sanitizedAgentName = agentName
+      const sanitizedAgentName = (agentName ?? '')
         .toLowerCase()
         .replace(/[^a-z0-9-]/g, '-')
         .replace(/-+/g, '-')
         .replace(/^-|-$/g, '')
 
+      // Reject names that sanitize to an empty string (e.g. user typed
+      // "!!!" or "🦞"). The CLI would otherwise receive `--workspace
+      // ~/.openclaw/workspace/` and create an oddly-named agent dir
+      // with no readable id. Audit finding #7.
+      if (!sanitizedAgentName) {
+        const msg = `Agent name "${agentName}" is empty after sanitization. Use letters, digits, or hyphens.`
+        this.addLog(`❌ ${msg}`)
+        return { success: false, error: msg }
+      }
+
       const { app } = require('electron')
       const homeDir = app.getPath('home')
-      const workspaceDir = config.workspace || path.join(homeDir, '.openclaw', 'workspace', sanitizedAgentName)
+      // Sibling dir (`workspace-<id>`), NOT nested under the main agent's
+      // `~/.openclaw/workspace` — matches the gateway's resolveAgentWorkspaceDir
+      // default and keeps the main agent's workspace from listing sub-agent
+      // folders. The path is also persisted to agents.list[].workspace so the
+      // desktop's WorkspaceManager and the gateway resolve the same dir.
+      const workspaceDir = config.workspace || path.join(homeDir, '.openclaw', `workspace-${sanitizedAgentName}`)
 
       // Use non-interactive mode with workspace directory to avoid prompts
       this.addLog('⏳ Creating agent...')
@@ -1507,28 +1792,62 @@ export class ChannelManager {
     if (!openclawConfig.agents) openclawConfig.agents = {}
     if (!openclawConfig.agents.defaults) openclawConfig.agents.defaults = {}
     if (!openclawConfig.agents.defaults.model) openclawConfig.agents.defaults.model = {}
-    if (!openclawConfig.agents.list) openclawConfig.agents.list = []
+    // Canonical roster is the keyed map `agents.entries` — the agent id is the
+    // key, not an `id` field. ensureAgent migrates a legacy `agents.list` in
+    // place and returns the live entry to mutate.
+    const agentEntry = ensureAgent(openclawConfig, agentId)
 
-    // Find or create the agent entry
-    let agentEntry = openclawConfig.agents.list.find((a: any) => a.id === agentId)
-    if (!agentEntry) {
-      agentEntry = { id: agentId }
-      openclawConfig.agents.list.push(agentEntry)
-    }
-
-    // Per-agent model
+    // Per-agent model. Bug B2/B3 fix: this used to ALSO write
+    // openclaw.agents.defaults.model.primary "for backward compat",
+    // making `defaults` effectively "the model of the last edited agent"
+    // — every agent edit clobbered the default. New agents added later
+    // would inherit whatever was edited most recently, not a stable
+    // default. Now we only update defaults when:
+    //   - the config has no defaults primary set yet (first-time bootstrap), OR
+    //   - the agent being edited IS the active "main" agent (the one
+    //     unspecified-routing chats hit) AND no other agent has a
+    //     different primary that would be unrelated to "default".
+    // This preserves per-agent overrides without making defaults a
+    // moving target.
     if (config.model) {
       if (!agentEntry.model) agentEntry.model = {}
       agentEntry.model.primary = config.model
-      // Also set global default for backward compat
-      openclawConfig.agents.defaults.model.primary = config.model
+
+      const defaultsPrimary = openclawConfig.agents.defaults.model.primary
+      const isFirstBootstrap = !defaultsPrimary || typeof defaultsPrimary !== 'string'
+      const isMainAgent = agentId === 'main'
+      if (isFirstBootstrap || isMainAgent) {
+        openclawConfig.agents.defaults.model.primary = config.model
+      }
+
+      // Pin the harness explicitly to match the model. Without this,
+      // openclaw's auto-selection routes anything under provider "openai"
+      // (including the openclaw-easy.com openai-responses backend that
+      // tunnels Claude/DeepSeek variants) to the codex harness, which
+      // injects a "I am Codex / GPT-5" persona-latch system prompt — the
+      // model still receives the right weights but reports a wrong
+      // identity. {@link setAgentRuntime} writes the canonical per-model
+      // location; see agent-harness.ts for the harness resolution rules.
+      //
+      // Exec policy matters: codex app-server rejects when tools.exec.mode
+      // resolves to deny/allowlist; we pass the merged exec context so
+      // resolveAgentHarness can fall back to pi when codex would refuse.
+      const execContext = readExecContextForAgent(openclawConfig, agentId)
+      const harness = resolveAgentHarness(config.model, execContext)
+      setAgentRuntime(agentEntry, config.model, harness)
     }
 
-    // Per-agent fallbacks
+    // Per-agent fallbacks — same rule.
     if (config.fallbacks !== undefined) {
       if (!agentEntry.model) agentEntry.model = {}
       agentEntry.model.fallbacks = config.fallbacks
-      openclawConfig.agents.defaults.model.fallbacks = config.fallbacks
+
+      const defaultsFallbacks = openclawConfig.agents.defaults.model.fallbacks
+      const isFirstBootstrap = !Array.isArray(defaultsFallbacks)
+      const isMainAgent = agentId === 'main'
+      if (isFirstBootstrap || isMainAgent) {
+        openclawConfig.agents.defaults.model.fallbacks = config.fallbacks
+      }
     }
 
     // Clean up keys that OpenClaw's config schema doesn't recognize
@@ -1543,13 +1862,45 @@ export class ChannelManager {
     try {
       this.addLog(`🗑️ Deleting agent: ${agentId}`)
 
-      // Use OpenClaw CLI to delete the agent with --force flag to skip confirmation
-      await this.executeOpenClawCommand([
-        'agents', 'delete',
-        '--force',
-        agentId
-      ])
+      // The CLI removes the agent's workspace + sessions dir but leaves
+      // a stale entry in `~/.openclaw/openclaw.json::agents.list[]`.
+      // We try the CLI first (handles the on-disk cleanup) then ALWAYS
+      // remove the config entry — even if the CLI fails we want the
+      // deleted agent to disappear from listAgents (otherwise it
+      // resurrects on the next reload).
+      let cliError: Error | null = null
+      try {
+        await this.executeOpenClawCommand([
+          'agents', 'delete',
+          '--force',
+          agentId,
+        ])
+      } catch (err: any) {
+        cliError = err instanceof Error ? err : new Error(String(err))
+        this.addLog(`⚠️ Agent CLI delete reported error: ${cliError.message} — falling through to config cleanup`)
+      }
 
+      // Remove the agent's config entry. Goes through ConfigManager
+      // so the write is serialised with every other config write.
+      try {
+        const config = await this.configManager.loadConfig()
+        if (deleteAgent(config, agentId)) {
+          await this.configManager.writeConfig(config)
+          this.addLog(`🧹 Removed '${agentId}' from agents.entries`)
+        }
+      } catch (cleanupErr: any) {
+        // If we can't write the config we have to report failure even
+        // if the CLI succeeded — otherwise the ghost entry stays.
+        this.addLog(`❌ Failed to clean up agent config: ${cleanupErr.message}`)
+        return { success: false, error: cleanupErr.message }
+      }
+
+      if (cliError) {
+        // CLI failed but config cleanup succeeded — surface to user.
+        // The agent is gone from the desktop's view but may have
+        // leftover workspace files on disk.
+        return { success: false, error: cliError.message }
+      }
       this.addLog(`✅ Agent '${agentId}' deleted successfully`)
       return { success: true }
     } catch (error: any) {
@@ -1565,7 +1916,7 @@ export class ChannelManager {
 
       // Read previous model for return value
       const openclawConfig = await this.configManager.loadConfig()
-      const agentEntry = openclawConfig.agents?.list?.find((a: any) => a.id === agentId)
+      const agentEntry = getAgent(openclawConfig, agentId)
       const prevModel = agentEntry?.model?.primary || openclawConfig.agents?.defaults?.model?.primary
 
       // Write per-agent config using the shared helper
@@ -1833,11 +2184,316 @@ export class ChannelManager {
     }
   }
 
+  // ---------------------------------------------------------------------
+  // Weixin (personal WeChat)
+  // ---------------------------------------------------------------------
+  // Unlike our other six channels, Weixin is an EXTERNAL official plugin: it
+  // is excluded from the core dist, so `channels login` only works after the
+  // npm package is installed and enabled and the gateway has restarted.
+  // Pinned spec + id come from scripts/lib/official-external-channel-catalog.json.
+
+  /**
+   * Installs + enables the Weixin plugin if it is not already usable.
+   * Idempotent: a second call short-circuits once the plugin is enabled, so
+   * the connect button can be pressed repeatedly without reinstalling.
+   */
+  async ensureWeixinPlugin(): Promise<{ success: boolean; alreadyInstalled: boolean; logs: string[] }> {
+    const logs: string[] = []
+    try {
+      const listed = await this.executeOpenClawCommand(['plugins', 'list'])
+      if (listed?.includes(WEIXIN_PLUGIN_ID)) {
+        // A reinstall/update done outside the desktop (CLI, doctor) restores
+        // the broken 2.4.6 import — re-apply the compat repair every time.
+        this.repairWeixinPluginCompat({ suggestRestartOnRepair: true })
+        this.addLog('✅ Weixin plugin already installed')
+        return { success: true, alreadyInstalled: true, logs }
+      }
+
+      this.addLog('📦 Installing Weixin plugin…')
+      const installed = await this.executeOpenClawCommand(['plugins', 'install', WEIXIN_NPM_SPEC])
+      if (installed === null) {
+        this.addLog('❌ Weixin plugin install failed')
+        return { success: false, alreadyInstalled: false, logs }
+      }
+
+      // 2.4.6 (newest on npm) imports a deleted SDK subpath and crash-loops
+      // on 2026.7.x without this rewrite — see weixin-plugin-repair.ts.
+      this.repairWeixinPluginCompat({ suggestRestartOnRepair: false })
+
+      // Enable explicitly: install alone does not flip
+      // plugins.entries.<id>.enabled. Goes through ConfigManager so the write
+      // uses the shared validation pipeline and write lock rather than a raw
+      // `config set`.
+      await this.ensurePluginEnabled(WEIXIN_PLUGIN_ID)
+      this.addLog('✅ Weixin plugin installed and enabled')
+      // The gateway only picks up a newly installed plugin after a restart —
+      // plugin metadata is process-stable by design.
+      this.suggestGatewayRestart()
+      return { success: true, alreadyInstalled: false, logs }
+    } catch (error: any) {
+      this.addLog(`❌ Weixin plugin setup failed: ${error.message}`)
+      return { success: false, alreadyInstalled: false, logs }
+    }
+  }
+
+  /**
+   * Apply the createTypingCallbacks import rewrite to the installed plugin.
+   * When a repair actually changed files while the plugin was already
+   * running, the channel process has likely exhausted its crash-loop
+   * retries — only then is a gateway restart suggested.
+   */
+  private repairWeixinPluginCompat(opts: { suggestRestartOnRepair: boolean }): void {
+    try {
+      const { changedFiles } = repairInstalledWeixinPlugin(path.dirname(this.configPath))
+      if (changedFiles.length > 0) {
+        this.addLog(`🔧 Repaired Weixin plugin SDK imports (${changedFiles.length} file(s)) for OpenClaw 2026.7.x`)
+        if (opts.suggestRestartOnRepair) {
+          this.suggestGatewayRestart()
+        }
+      }
+    } catch (error: any) {
+      // Best-effort: a failed repair leaves the plugin exactly as installed.
+      this.addLog(`⚠️ Weixin plugin compat repair failed: ${error.message}`)
+    }
+  }
+
+  /**
+   * Runs `channels login --channel openclaw-weixin` and returns the scannable
+   * QR. Mirrors the WhatsApp flow (same terminal-QR rendering), but success is
+   * detected from process exit rather than log-marker strings so we do not
+   * depend on this plugin's wording.
+   */
+  async getWeixinQRFromLogin(): Promise<{ success: boolean; qrData?: string; logs: string[] }> {
+    const logs: string[] = []
+
+    if (weixinOperationInProgress) {
+      return { success: false, logs: ['Weixin operation already in progress, please wait'] }
+    }
+    weixinOperationInProgress = true
+
+    try {
+      const prepared = await this.ensureWeixinPlugin()
+      if (!prepared.success) {
+        return { success: false, logs: ['Weixin plugin is not installed — see Activity log'] }
+      }
+
+      this.cleanupWeixinSession()
+      this.addLog('🔗 Starting Weixin QR generation…')
+
+      const { runtime, enhancedEnv, cwd, buildArgs } = await this.resolveOpenClawSpawn()
+      // Run under a pty, not a plain pipe. `channels login` drives the
+      // onboarding wizard, whose prompt library only reads from a real TTY:
+      // with piped stdio the "Install Weixin plugin?" prompt renders but can
+      // never be answered, so the process hangs and no QR is ever produced.
+      // A pty also gives us the terminal-rendered QR verbatim.
+      const { spawn: ptySpawn } = await import('node-pty')
+      const ptyProcess = ptySpawn(
+        runtime,
+        buildArgs('channels', 'login', '--channel', WEIXIN_CHANNEL_ID),
+        {
+          name: 'xterm-256color',
+          // Wide enough that the QR is not wrapped; wrapping would break the
+          // contiguous glyph-run detection in extractTerminalQr.
+          cols: 120,
+          rows: 40,
+          cwd,
+          env: enhancedEnv as Record<string, string>,
+        },
+      )
+
+      weixinPty = ptyProcess
+
+      return await new Promise((resolve) => {
+        let settled = false
+        // Buffer across chunks: a terminal QR is routinely split across
+        // multiple `data` events, so per-chunk scanning misses it entirely.
+        let stdoutBuffer = ''
+        // `channels login` runs the onboarding wizard, which asks
+        // "Install Weixin plugin?" with "Download from npm" preselected — and
+        // it asks even when the plugin is already installed and enabled.
+        // We spawn with piped stdio and no TTY, so nothing answers it and the
+        // process hangs forever without ever emitting a QR. Confirm the
+        // highlighted default once, which is what a user would do.
+        let answeredInstallPrompt = false
+
+        const finish = (result: { success: boolean; qrData?: string; logs: string[] }) => {
+          if (settled) return
+          settled = true
+          resolve(result)
+        }
+
+        const onData = (chunk: string) => {
+          const text = chunk
+          logs.push(text)
+          stdoutBuffer += text
+
+          const clean = stripAnsi(text)
+
+          if (!answeredInstallPrompt && /Install .*plugin\?|Download from npm/i.test(clean)) {
+            answeredInstallPrompt = true
+            this.addLog('📦 Confirming Weixin plugin install prompt…')
+            try {
+              // CR is what the prompt library treats as Enter; the
+              // highlighted default is "Download from npm".
+              ptyProcess.write('\r')
+            } catch {
+              // pty already gone — exit handler settles the promise.
+            }
+            return
+          }
+
+          if (/already linked|already logged in|已登录/i.test(clean)) {
+            this.addLog('✅ Weixin is already connected')
+            this.cleanupWeixinSession()
+            finish({ success: true, qrData: 'ALREADY_CONNECTED', logs })
+            return
+          }
+
+          const qr = extractTerminalQr(stdoutBuffer)
+          if (qr) {
+            this.addLog('📱 Weixin QR code ready — scan it in WeChat')
+            finish({ success: true, qrData: qr, logs })
+          }
+        }
+
+        ptyProcess.onData(onData)
+
+        ptyProcess.onExit(({ exitCode }) => {
+          const ok = exitCode === 0
+          this.addLog(ok ? '✅ Weixin login completed' : `❌ Weixin login exited (${exitCode})`)
+          // The IPC promise already resolved when the QR was extracted, so the
+          // scan result can only reach the renderer as an event. Emit BOTH
+          // outcomes: without the failure case an expired QR leaves the modal
+          // showing a dead code forever, with no way to tell it apart from one
+          // still waiting to be scanned.
+          if (this.mainWindow && !this.mainWindow.isDestroyed()) {
+            this.mainWindow.webContents.send(
+              'weixin:status-change',
+              ok ? 'connected' : 'failed',
+            )
+          }
+          weixinPty = null
+          finish({ success: ok, logs })
+        })
+      })
+    } catch (error: any) {
+      this.addLog(`❌ Failed to start Weixin login: ${error.message}`)
+      return { success: false, logs }
+    } finally {
+      weixinOperationInProgress = false
+    }
+  }
+
+  /**
+   * Weixin keeps no credential in openclaw.json. A completed QR login writes a
+   * logged-in account into the plugin's own state dir:
+   *
+   *   ~/.openclaw/openclaw-weixin/accounts.json   -> ["<accountId>", ...]
+   *   ~/.openclaw/openclaw-weixin/accounts/<accountId>.json
+   *
+   * NOT `~/.openclaw/credentials/<channel>/`, which is the WhatsApp layout this
+   * check was originally modelled on. Probing there meant a successful scan
+   * still reported "not connected" forever — the app looked like nothing had
+   * happened even though the channel was live and replying.
+   *
+   * `channels['openclaw-weixin'].enabled` is deliberately NOT the signal:
+   * `channels add` sets it before any login, so it is true for a channel that
+   * has never been paired. The account registry is the only real login proof.
+   */
+  async checkWeixinStatus(): Promise<{ connected: boolean }> {
+    try {
+      const config = await this.configManager.loadConfig()
+      if (!config?.plugins?.entries?.[WEIXIN_PLUGIN_ID]?.enabled) {
+        return { connected: false }
+      }
+      const homeDir = process.env.HOME || process.env.USERPROFILE || ''
+      return { connected: (await listWeixinAccountIds(homeDir)).length > 0 }
+    } catch {
+      return { connected: false }
+    }
+  }
+
+  /**
+   * Disconnects Weixin and reports the resulting STATE, not a command's exit
+   * code.
+   *
+   * This used to run `channels logout --channel openclaw-weixin`. The plugin
+   * declares only a login action (`loginWithQrStart`/`loginWithQrWait`), so the
+   * CLI exits 1 with "does not support logout" and disconnect always failed.
+   *
+   * `channels remove` retires the account in openclaw.json, but the plugin also
+   * keeps its own account registry under `~/.openclaw/openclaw-weixin/` (see
+   * listWeixinAccountIds). Leaving that behind makes checkWeixinStatus report
+   * "connected" against a channel that is gone, so both have to go — and the
+   * verdict is whether the account registry actually came back empty.
+   */
+  async disconnectWeixin(): Promise<boolean> {
+    const homeDir = process.env.HOME || process.env.USERPROFILE || ''
+    try {
+      this.cleanupWeixinSession()
+
+      // Best-effort: retires the config entry. A non-zero exit here is not
+      // fatal — the state check below decides.
+      await this.executeOpenClawCommand([
+        'channels',
+        'remove',
+        '--channel',
+        WEIXIN_CHANNEL_ID,
+        '--delete',
+      ]).catch(() => null)
+
+      await this.clearWeixinAccountState(homeDir)
+
+      const success = (await listWeixinAccountIds(homeDir)).length === 0
+      this.addLog(success ? '✅ Weixin disconnected' : '❌ Weixin disconnect failed')
+      if (success) this.suggestGatewayRestart()
+      return success
+    } catch (error: any) {
+      this.addLog(`❌ Weixin disconnect failed: ${error.message}`)
+      return false
+    }
+  }
+
+  /**
+   * Removes the plugin's logged-in account files. Scoped to the account
+   * registry and its per-account files so unrelated plugin state is left
+   * alone; the dir itself stays so a later login writes into place.
+   */
+  private async clearWeixinAccountState(homeDir: string): Promise<void> {
+    const { promises: fs } = await import('fs')
+    const path = await import('path')
+    const stateDir = path.join(homeDir, '.openclaw', WEIXIN_CHANNEL_ID)
+
+    await fs.rm(path.join(stateDir, 'accounts.json'), { force: true })
+    try {
+      const accountsDir = path.join(stateDir, 'accounts')
+      for (const name of await fs.readdir(accountsDir)) {
+        if (name.endsWith('.json')) {
+          await fs.rm(path.join(accountsDir, name), { force: true })
+        }
+      }
+    } catch {
+      // Accounts dir absent — nothing logged in, already the desired state.
+    }
+  }
+
+  private cleanupWeixinSession() {
+    if (weixinPty) {
+      try {
+        weixinPty.kill()
+      } catch {
+        // Already exited — nothing to clean up.
+      }
+    }
+    weixinPty = null
+  }
+
   destroy() {
     if (this.sessionCleanupTimer) {
       clearInterval(this.sessionCleanupTimer)
       this.sessionCleanupTimer = null
     }
     this.cleanupWhatsAppSession()
+    this.cleanupWeixinSession()
   }
 }

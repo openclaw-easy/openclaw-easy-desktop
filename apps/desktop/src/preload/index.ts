@@ -19,6 +19,7 @@ const api = {
   buildDeviceIdentity: (opts: {
     clientId: string; clientMode: string; role: string;
     scopes: string[]; token: string; nonce: string;
+    platform?: string; deviceFamily?: string;
   }) => ipcRenderer.invoke('device:build-identity', opts),
   getDeviceId: () => ipcRenderer.invoke('device:get-id') as Promise<string | null>,
   getGatewayPort: () => ipcRenderer.invoke('gateway:get-port'),
@@ -74,8 +75,9 @@ const api = {
   setApiKey: (provider: string, apiKey: string) => ipcRenderer.invoke('config:set-api-key', provider, apiKey),
   getApiKey: (provider: string) => ipcRenderer.invoke('config:get-api-key', provider),
   configExists: () => ipcRenderer.invoke('config:exists'),
-  updateOpenClawConfig: (config: any) => ipcRenderer.invoke('config:update-openclaw', config),
   getOpenClawConfig: () => ipcRenderer.invoke('config:get-openclaw'),
+
+  // Auth - sync remote backend config
 
   // App config management (for config store)
   getConfig: () => ipcRenderer.invoke('config:get'),
@@ -113,6 +115,10 @@ const api = {
 
   // Channel setup
   getWhatsAppQR: () => ipcRenderer.invoke('channels:whatsapp-qr'),
+  getWeixinQR: () => ipcRenderer.invoke('channels:weixin-qr'),
+  ensureWeixinPlugin: () => ipcRenderer.invoke('channels:weixin-ensure-plugin'),
+  checkWeixinStatus: () => ipcRenderer.invoke('channels:check-weixin-status'),
+  disconnectWeixin: () => ipcRenderer.invoke('channels:disconnect-weixin'),
   startWhatsAppSetup: () => ipcRenderer.invoke('channels:whatsapp-start'),
   checkWhatsAppStatus: () => ipcRenderer.invoke('channels:check-whatsapp-status'),
   checkTelegramStatus: () => ipcRenderer.invoke('channels:check-telegram-status'),
@@ -135,11 +141,33 @@ const api = {
     return () => ipcRenderer.removeListener('slack:status-change', handler)
   },
 
+  // Weixin QR scan outcome. getWeixinQR resolves as soon as the QR is on
+  // screen, so whether the user actually scanned it can only arrive later, as
+  // an event — without this bridge the modal sits on the QR forever even
+  // though the channel is already connected.
+  onWeixinStatusChange: (callback: (status: 'connected' | 'failed') => void) => {
+    const handler = (_event: unknown, status: 'connected' | 'failed') => callback(status)
+    ipcRenderer.on('weixin:status-change', handler)
+    return () => ipcRenderer.removeListener('weixin:status-change', handler)
+  },
+
   // Gateway restart suggestion (after channel connect/disconnect)
   onGatewayRestartSuggested: (callback: () => void) => {
     const handler = () => callback()
     ipcRenderer.on('gateway:restart-suggested', handler)
     return () => ipcRenderer.removeListener('gateway:restart-suggested', handler)
+  },
+
+  // Background gateway-restart progress (queued → restarting → ready/failed).
+  // Emitted by openclaw-manager.ts requestRestartIfChanged() after a
+  // provider switch or agent model change. Lets the dashboard show a
+  // small "Applying changes…" pill instead of blocking the modal.
+  onGatewayRestartStatus: (
+    callback: (event: { status: 'queued' | 'restarting' | 'ready' | 'failed'; reason: string }) => void,
+  ) => {
+    const handler = (_e: any, payload: { status: 'queued' | 'restarting' | 'ready' | 'failed'; reason: string }) => callback(payload)
+    ipcRenderer.on('gateway:restart-status', handler)
+    return () => ipcRenderer.removeListener('gateway:restart-status', handler)
   },
 
   // Feishu channel setup
@@ -159,15 +187,17 @@ const api = {
   updateAgent: (agentId: string, config: any) => ipcRenderer.invoke('agents:update', agentId, config),
   deleteAgent: (agentId: string) => ipcRenderer.invoke('agents:delete', agentId),
 
+  // Subscription management
+
   // System integration
   openExternal: (url: string) => ipcRenderer.invoke('system:open-external', url),
-  showInFolder: (path: string) => ipcRenderer.invoke('system:show-in-folder', path),
   getSystemInfo: () => ipcRenderer.invoke('system:get-info'),
 
   // Skills management
   listSkills: () => ipcRenderer.invoke('skills:list'),
-  checkSkills: () => ipcRenderer.invoke('skills:check'),
-  getSkillInfo: (skillName: string) => ipcRenderer.invoke('skills:info', skillName),
+  // ClawHub-audit additions (2026-06-15):
+  checkSkills: (agentId?: string) => ipcRenderer.invoke('skills:check', agentId),
+  updateAllSkills: () => ipcRenderer.invoke('skills:update-all'),
   installSkillRequirements: (skillName: string) => ipcRenderer.invoke('skills:install', skillName),
   setSkillEnabled: (skillName: string, enabled: boolean) => ipcRenderer.invoke('skills:set-enabled', skillName, enabled),
   searchSkillRegistry: (query: string) => ipcRenderer.invoke('skills:search-registry', query),
@@ -205,8 +235,34 @@ const api = {
   runCronJob: (id: string) => ipcRenderer.invoke('cron:run', id),
   getCronRuns: (id: string, limit?: number) => ipcRenderer.invoke('cron:runs', id, limit),
 
+  // Channel access control (dmPolicy / allowlists / pairing)
+  getChannelAccess: () => ipcRenderer.invoke('access:get'),
+  setChannelAccess: (channelId: string, patch: any) => ipcRenderer.invoke('access:set', channelId, patch),
+  listPairingRequests: () => ipcRenderer.invoke('access:pairing-list'),
+  approvePairing: (channel: string, code: string) => ipcRenderer.invoke('access:pairing-approve', channel, code),
+
+  // Browser tool surface
+  getBrowserStatus: () => ipcRenderer.invoke('browser:status'),
+  setBrowserEnabled: (enabled: boolean) => ipcRenderer.invoke('browser:set-enabled', enabled),
+  startBrowser: () => ipcRenderer.invoke('browser:start'),
+  stopBrowser: () => ipcRenderer.invoke('browser:stop'),
+  captureBrowserScreenshot: () => ipcRenderer.invoke('browser:screenshot'),
+
+  // Memory surface
+  getMemoryStatus: () => ipcRenderer.invoke('memory:status'),
+  searchMemory: (query: string) => ipcRenderer.invoke('memory:search', query),
+  reindexMemory: () => ipcRenderer.invoke('memory:reindex'),
+  listMemoryFiles: (workspaceDir?: string) => ipcRenderer.invoke('memory:list-files', workspaceDir),
+  readMemoryFile: (workspaceDir: string, relPath: string) => ipcRenderer.invoke('memory:read-file', workspaceDir, relPath),
+  deleteMemoryFile: (workspaceDir: string, relPath: string) => ipcRenderer.invoke('memory:delete-file', workspaceDir, relPath),
+
   // Doctor management
   runDoctor: () => ipcRenderer.invoke('doctor:run'),
+
+  // Commands discovery — list top-level openclaw CLI commands so the
+  // Commands page can surface upstream additions our static catalog doesn't
+  // know about yet (acp, commitments, crestodian, message, onboard, …).
+  listDiscoveredCommands: () => ipcRenderer.invoke('commands:list-discovered'),
 
   // Dashboard Statistics
   getDashboardStatistics: () => ipcRenderer.invoke('dashboard:get-statistics'),
@@ -236,8 +292,6 @@ const api = {
   // Spawns embedded OpenClaw directly — renderer passes only the CLI args
   createOpenclawTerminal: (args: string[]) =>
     ipcRenderer.invoke('terminal:create-openclaw', args),
-  createTerminal: (command: string, args: string[], options?: { cwd?: string }) =>
-    ipcRenderer.invoke('terminal:create', command, args, options),
 
   writeToTerminal: (terminalId: string, data: string) =>
     ipcRenderer.invoke('terminal:write', terminalId, data),
@@ -291,14 +345,14 @@ const api = {
   requestPermission: (type: 'microphone' | 'camera') => ipcRenderer.invoke('permissions:request', type),
   openPermissionSettings: (type: string) => ipcRenderer.invoke('permissions:open-system-settings', type),
 
-  // Workspace file management
-  listWorkspaceFiles: () => ipcRenderer.invoke('workspace:list'),
-  readWorkspaceFile: (name: string) => ipcRenderer.invoke('workspace:read', name),
-  writeWorkspaceFile: (name: string, content: string) => ipcRenderer.invoke('workspace:write', name, content),
-  createWorkspaceFile: (name: string) => ipcRenderer.invoke('workspace:create', name),
-  deleteWorkspaceFile: (name: string) => ipcRenderer.invoke('workspace:delete', name),
-  listMemoryFiles: () => ipcRenderer.invoke('workspace:list-memory'),
-  readMemoryFile: (name: string) => ipcRenderer.invoke('workspace:read-memory', name),
+  // Workspace file management. Optional agentId scopes ops to that agent's
+  // workspace dir; omitted → the main agent's ~/.openclaw/workspace.
+  listWorkspaceFiles: (agentId?: string) => ipcRenderer.invoke('workspace:list', agentId),
+  readWorkspaceFile: (name: string, agentId?: string) => ipcRenderer.invoke('workspace:read', name, agentId),
+  writeWorkspaceFile: (name: string, content: string, agentId?: string) => ipcRenderer.invoke('workspace:write', name, content, agentId),
+  createWorkspaceFile: (name: string, agentId?: string) => ipcRenderer.invoke('workspace:create', name, agentId),
+  deleteWorkspaceFile: (name: string, agentId?: string) => ipcRenderer.invoke('workspace:delete', name, agentId),
+  openWorkspaceDir: (agentId?: string) => ipcRenderer.invoke('workspace:open-dir', agentId),
 
   // Window controls (frameless window on Windows)
   windowMinimize: () => ipcRenderer.invoke('window:minimize'),

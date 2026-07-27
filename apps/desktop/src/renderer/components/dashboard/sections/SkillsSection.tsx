@@ -22,6 +22,15 @@ import {
 } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import { ColorTheme } from '../types'
+import { EmptyState } from '../../ui/empty-state'
+import { MascotIllustration } from '../../ui/mascot-illustration'
+import { AnimatedNumber } from '../../ui/animated-number'
+import { Skeleton, SkeletonCard } from '../../ui/skeleton'
+import { CLAWHUB_BASE_URL } from '../../../../shared/constants'
+
+// Per-skill documentation URL is built from the skill name and routes to
+// the public docs site. Kept as a constant so the literal isn't duplicated.
+const SKILL_DOCS_URL = (name: string) => `https://docs.openclaw.ai/skills/${name}`
 
 interface Skill {
   name: string
@@ -84,15 +93,40 @@ const filterAutoResolvableConfig = (configKeys: string[] | undefined): string[] 
   })
 }
 
+/**
+ * Track which keys are mid-flight for an async operation (e.g. "this skill
+ * is being installed"). Collapses three near-identical `Set<string>` state
+ * slots (`installLoading`, `toggleLoading`, `removeLoading`) plus their
+ * copy-pasted add/delete callbacks into a single hook with stable semantics.
+ *
+ * Inline rather than in a shared `hooks/` file because SkillsSection is
+ * currently the only consumer; promote when a second one shows up.
+ */
+function useBusySet() {
+  const [busy, setBusy] = useState<Set<string>>(new Set())
+  return {
+    has: (key: string) => busy.has(key),
+    start: (key: string) =>
+      setBusy(prev => (prev.has(key) ? prev : new Set(prev).add(key))),
+    finish: (key: string) =>
+      setBusy(prev => {
+        if (!prev.has(key)) return prev
+        const s = new Set(prev)
+        s.delete(key)
+        return s
+      }),
+  }
+}
+
 export const SkillsSection: React.FC<SkillsSectionProps> = ({ colors }) => {
   const { t } = useTranslation()
   const [activeTab, setActiveTab] = useState<'manage' | 'discover'>('manage')
   const [skills, setSkills] = useState<Skill[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
-  const [installLoading, setInstallLoading] = useState<Set<string>>(new Set())
-  const [toggleLoading, setToggleLoading] = useState<Set<string>>(new Set())
-  const [removeLoading, setRemoveLoading] = useState<Set<string>>(new Set())
+  const installBusy = useBusySet()
+  const toggleBusy = useBusySet()
+  const removeBusy = useBusySet()
   const [searchFilter, setSearchFilter] = useState('')
   const [skillsStats, setSkillsStats] = useState({
     total: 0,
@@ -160,7 +194,10 @@ export const SkillsSection: React.FC<SkillsSectionProps> = ({ colors }) => {
         window.electronAPI.listWorkspaceSkills()
       ])
 
-      const rawWsSkills: WorkspaceSkill[] = wsResult.success ? (wsResult.skills || []) : []
+      // The preload binding only declares `{dir, name}` for entries even
+      // though the IPC actually returns the full WorkspaceSkill shape.
+      // Cast here rather than over-promise in the preload type.
+      const rawWsSkills: WorkspaceSkill[] = wsResult.success ? ((wsResult.skills || []) as WorkspaceSkill[]) : []
       setWorkspaceSkills(rawWsSkills)
 
       console.log('[SkillsSection] Skills data:', skillsResult.skills)
@@ -192,7 +229,7 @@ export const SkillsSection: React.FC<SkillsSectionProps> = ({ colors }) => {
           return {
             name: skill.name,
             emoji: skill.emoji || '📦',
-            description: skill.description || 'No description available',
+            description: skill.description || t('skills.noDescription', 'No description available'),
             enabled: !skill.disabled,
             status,
             source: skill.source || 'unknown',
@@ -224,36 +261,35 @@ export const SkillsSection: React.FC<SkillsSectionProps> = ({ colors }) => {
 
     } catch (err: any) {
       console.error('[SkillsSection] Error loading skills:', err)
-      setError(err.message || 'Failed to load skills')
+      setError(err.message || t('skills.errorLoad'))
     } finally {
       setLoading(false)
     }
   }
 
   const toggleSkillEnabled = async (skillName: string, currentEnabled: boolean) => {
-    setToggleLoading(prev => new Set(prev).add(skillName))
+    toggleBusy.start(skillName)
     try {
       const result = await window.electronAPI.setSkillEnabled(skillName, !currentEnabled)
       if (result.success) {
         await loadSkills(true)
       } else {
-        setInstallBanner(result.error || 'Failed to update skill')
+        setInstallBanner(result.error || t('skills.errorUpdate'))
       }
     } catch (err: any) {
       console.error(`[SkillsSection] Error toggling skill ${skillName}:`, err)
-      setInstallBanner(err.message || 'Failed to update skill')
+      setInstallBanner(err.message || t('skills.errorUpdate'))
     } finally {
-      setToggleLoading(prev => {
-        const newSet = new Set(prev)
-        newSet.delete(skillName)
-        return newSet
-      })
+      toggleBusy.finish(skillName)
     }
   }
 
   const removeSkill = async (skillName: string) => {
-    if (!window.confirm(`Remove skill "${skillName}"? This deletes ~/.openclaw/skills/${skillName}.`)) return
-    setRemoveLoading(prev => new Set(prev).add(skillName))
+    // Native window.confirm is intentional here — the app doesn't yet
+    // have a themed confirm modal component. The user-facing message
+    // is i18n'd; only the chrome is locale-default.
+    if (!window.confirm(t('skills.confirmRemove', { name: skillName }))) return
+    removeBusy.start(skillName)
     try {
       const result = await window.electronAPI.removeSkill(skillName)
       if (result.success) {
@@ -262,18 +298,17 @@ export const SkillsSection: React.FC<SkillsSectionProps> = ({ colors }) => {
         setSkillsStats(prev => ({ ...prev, total: prev.total - 1 }))
         setWorkspaceSkills(prev => prev.filter(ws => ws.dir !== skillName && ws.name !== skillName))
       } else {
-        setInstallBanner(result.error || 'Failed to remove skill')
+        setInstallBanner(result.error || t('skills.errorRemove'))
       }
     } catch (err: any) {
-      setInstallBanner(err.message || 'Failed to remove skill')
+      setInstallBanner(err.message || t('skills.errorRemove'))
     } finally {
-      setRemoveLoading(prev => { const s = new Set(prev); s.delete(skillName); return s })
+      removeBusy.finish(skillName)
     }
   }
 
   const installSkillRequirements = async (skillName: string) => {
-    setInstallLoading(prev => new Set(prev).add(skillName))
-
+    installBusy.start(skillName)
     try {
       console.log(`[SkillsSection] Installing requirements for: ${skillName}`)
       const result = await window.electronAPI.installSkillRequirements(skillName)
@@ -284,17 +319,13 @@ export const SkillsSection: React.FC<SkillsSectionProps> = ({ colors }) => {
         setInstallBanner(result.message || t('skills.installedRestartNeeded', 'Skill installed — restart the assistant to activate it'))
         await loadSkills(true)
       } else {
-        setInstallBanner(result.error || 'Failed to install requirements')
+        setInstallBanner(result.error || t('skills.errorInstallRequirements'))
       }
     } catch (err: any) {
       console.error(`[SkillsSection] Error installing requirements for ${skillName}:`, err)
-      setInstallBanner(err.message || 'Failed to install requirements')
+      setInstallBanner(err.message || t('skills.errorInstallRequirements'))
     } finally {
-      setInstallLoading(prev => {
-        const newSet = new Set(prev)
-        newSet.delete(skillName)
-        return newSet
-      })
+      installBusy.finish(skillName)
     }
   }
 
@@ -315,10 +346,10 @@ export const SkillsSection: React.FC<SkillsSectionProps> = ({ colors }) => {
       if (result.success) {
         setDiscoverSkills(result.skills || [])
       } else {
-        setDiscoverError(result.error || 'Failed to load skills')
+        setDiscoverError(result.error || t('skills.errorLoad'))
       }
     } catch (err: any) {
-      setDiscoverError(err.message || 'Failed to load skills')
+      setDiscoverError(err.message || t('skills.errorLoad'))
     } finally {
       setDiscoverLoading(false)
     }
@@ -341,12 +372,12 @@ export const SkillsSection: React.FC<SkillsSectionProps> = ({ colors }) => {
         setInstallingSkills(prev => ({ ...prev, [slug]: 'error' }))
         setInstallOutputs(prev => ({
           ...prev,
-          [slug]: result.output || result.error || 'Installation failed'
+          [slug]: result.output || result.error || t('skills.errorInstallation')
         }))
       }
     } catch (err: any) {
       setInstallingSkills(prev => ({ ...prev, [slug]: 'error' }))
-      setInstallOutputs(prev => ({ ...prev, [slug]: err.message || 'Installation failed' }))
+      setInstallOutputs(prev => ({ ...prev, [slug]: err.message || t('skills.errorInstallation') }))
     }
   }
 
@@ -411,11 +442,21 @@ export const SkillsSection: React.FC<SkillsSectionProps> = ({ colors }) => {
   }, [activeTab, discoverQuery])
 
   if (loading) {
+    // Skeleton scaffold matches the manage-tab layout: stats pills,
+    // search bar, list of skill cards. Lets the user see the shape of
+    // the section immediately while the workspace skill scan completes.
     return (
-      <div className="p-8 h-full flex items-center justify-center">
-        <div className="flex items-center space-x-3">
-          <Loader2 className="h-6 w-6 animate-spin" style={{ color: colors.accent.brand }} />
-          <span style={{ color: colors.text.normal }}>{t('skills.loadingSkills')}</span>
+      <div className="p-6 h-full flex flex-col space-y-4" aria-busy="true" aria-label={t('skills.loadingSkills')}>
+        <div className="flex items-center gap-5">
+          {Array.from({ length: 4 }).map((_, i) => (
+            <Skeleton key={i} className="h-5 w-20 rounded-md" />
+          ))}
+        </div>
+        <Skeleton className="h-9 w-full max-w-md rounded-md" />
+        <div className="space-y-3 flex-1 overflow-hidden">
+          {Array.from({ length: 6 }).map((_, i) => (
+            <SkeletonCard key={i} />
+          ))}
         </div>
       </div>
     )
@@ -433,8 +474,8 @@ export const SkillsSection: React.FC<SkillsSectionProps> = ({ colors }) => {
             {error}
           </p>
           <Button
-            onClick={loadSkills}
-            style={{ backgroundColor: colors.accent.brand, color: '#ffffff', border: 'none' }}
+            onClick={() => loadSkills()}
+            style={{ backgroundColor: colors.accent.brand, color: colors.button.primaryFg, border: 'none' }}
           >
             {t('common.tryAgain')}
           </Button>
@@ -465,9 +506,9 @@ export const SkillsSection: React.FC<SkillsSectionProps> = ({ colors }) => {
               </h3>
             </div>
             <Button
-              onClick={loadSkills}
+              onClick={() => loadSkills()}
               size="sm"
-              style={{ backgroundColor: colors.accent.brand, color: '#ffffff', border: 'none' }}
+              style={{ backgroundColor: colors.accent.brand, color: colors.button.primaryFg, border: 'none' }}
             >
               <RefreshCw className="h-4 w-4 mr-2" />
               {t('skills.refresh')}
@@ -479,8 +520,17 @@ export const SkillsSection: React.FC<SkillsSectionProps> = ({ colors }) => {
           </p>
 
           {/* Tab Bar */}
-          <div className="flex space-x-1 mb-0" style={{ borderBottom: `1px solid ${colors.bg.tertiary}` }}>
+          <div
+            role="tablist"
+            aria-label={t('skills.title')}
+            className="flex space-x-1 mb-0"
+            style={{ borderBottom: `1px solid ${colors.bg.tertiary}` }}
+          >
             <button
+              role="tab"
+              aria-selected={activeTab === 'manage'}
+              aria-controls="skills-tabpanel-manage"
+              aria-label={t('skills.ariaTabManage')}
               onClick={() => setActiveTab('manage')}
               className="flex items-center space-x-2 px-4 py-2 text-sm font-medium transition-colors"
               style={{
@@ -493,6 +543,10 @@ export const SkillsSection: React.FC<SkillsSectionProps> = ({ colors }) => {
               <span>{t('skills.manage')}</span>
             </button>
             <button
+              role="tab"
+              aria-selected={activeTab === 'discover'}
+              aria-controls="skills-tabpanel-discover"
+              aria-label={t('skills.ariaTabDiscover')}
               onClick={() => setActiveTab('discover')}
               className="flex items-center space-x-2 px-4 py-2 text-sm font-medium transition-colors"
               style={{
@@ -509,24 +563,24 @@ export const SkillsSection: React.FC<SkillsSectionProps> = ({ colors }) => {
 
         {/* ── MANAGE TAB ── */}
         {activeTab === 'manage' && (
-          <>
+          <div role="tabpanel" id="skills-tabpanel-manage" className="contents">
             <div className="px-6 pt-3 pb-2 flex-shrink-0">
-              {/* Skills Stats */}
+              {/* Skills Stats — numbers tween via AnimatedNumber. */}
               <div className="flex items-center gap-5 mb-2">
                 <div className="flex items-center gap-1.5">
-                  <span className="text-base font-bold" style={{ color: colors.text.header }}>{skillsStats.total}</span>
+                  <span className="text-base font-bold" style={{ color: colors.text.header }}><AnimatedNumber value={skillsStats.total} /></span>
                   <span className="text-xs" style={{ color: colors.text.muted }}>{t('skills.total')}</span>
                 </div>
                 <div className="flex items-center gap-1.5">
-                  <span className="text-base font-bold" style={{ color: colors.accent.green }}>{skillsStats.ready}</span>
+                  <span className="text-base font-bold" style={{ color: colors.accent.green }}><AnimatedNumber value={skillsStats.ready} /></span>
                   <span className="text-xs" style={{ color: colors.text.muted }}>{t('skills.ready')}</span>
                 </div>
                 <div className="flex items-center gap-1.5">
-                  <span className="text-base font-bold" style={{ color: colors.accent.yellow }}>{skillsStats.missing}</span>
+                  <span className="text-base font-bold" style={{ color: colors.accent.yellow }}><AnimatedNumber value={skillsStats.missing} /></span>
                   <span className="text-xs" style={{ color: colors.text.muted }}>{t('skills.missing')}</span>
                 </div>
                 <div className="flex items-center gap-1.5">
-                  <span className="text-base font-bold" style={{ color: colors.text.muted }}>{skillsStats.disabled + skillsStats.blocked}</span>
+                  <span className="text-base font-bold" style={{ color: colors.text.muted }}><AnimatedNumber value={skillsStats.disabled + skillsStats.blocked} /></span>
                   <span className="text-xs" style={{ color: colors.text.muted }}>{t('skills.other')}</span>
                 </div>
               </div>
@@ -544,7 +598,7 @@ export const SkillsSection: React.FC<SkillsSectionProps> = ({ colors }) => {
                       onChange={(e) => setSearchFilter(e.target.value)}
                       className="pl-10 pr-4 py-2 border rounded-md text-sm w-80"
                       style={{
-                        backgroundColor: colors.bg.primary,
+                        backgroundColor: colors.bg.tertiary,
                         borderColor: colors.bg.tertiary,
                         color: colors.text.normal
                       }}
@@ -566,42 +620,38 @@ export const SkillsSection: React.FC<SkillsSectionProps> = ({ colors }) => {
                 <div className="space-y-3 pr-4">
                   {/* Empty state: no skills at all */}
                   {skills.length === 0 && !searchFilter && (
-                    <div className="text-center py-12">
-                      <div className="text-5xl mb-4">📦</div>
-                      <h3 className="text-lg font-medium mb-2" style={{ color: colors.text.header }}>
-                        {t('skills.noSkillsFound')}
-                      </h3>
-                      <p className="text-sm mb-4" style={{ color: colors.text.muted }}>
-                        {t('skills.browseDiscoverTab')}
-                      </p>
-                      <Button
-                        size="sm"
-                        onClick={() => setActiveTab('discover')}
-                        style={{ backgroundColor: colors.accent.brand, color: '#ffffff', border: 'none' }}
-                      >
-                        <Globe className="h-4 w-4 mr-2" />
-                        {t('skills.discoverSkills')}
-                      </Button>
-                    </div>
+                    <EmptyState
+                      colors={colors}
+                      illustration={<MascotIllustration mood="napping" />}
+                      title={t('skills.noSkillsFound')}
+                      description={t('skills.browseDiscoverTab')}
+                      action={
+                        <Button
+                          size="sm"
+                          onClick={() => setActiveTab('discover')}
+                          style={{ backgroundColor: colors.accent.brand, color: colors.button.primaryFg, border: 'none' }}
+                        >
+                          <Globe className="h-4 w-4 mr-2" />
+                          {t('skills.discoverSkills')}
+                        </Button>
+                      }
+                    />
                   )}
 
                   {filteredSkills.length === 0 && searchFilter ? (
-                    <div className="text-center py-8">
-                      <div className="text-6xl mb-4">🔍</div>
-                      <h3 className="text-lg font-medium mb-2" style={{ color: colors.text.header }}>
-                        {t('skills.noSkillsFound')}
-                      </h3>
-                      <p className="text-sm" style={{ color: colors.text.muted }}>
-                        {t('skills.noSkillsMatch', { search: searchFilter })}
-                      </p>
-                    </div>
+                    <EmptyState
+                      colors={colors}
+                      illustration={<MascotIllustration mood="thinking" size={64} />}
+                      title={t('skills.noSkillsFound')}
+                      description={t('skills.noSkillsMatch', { search: searchFilter })}
+                    />
                   ) : (
                     filteredSkills.map((skill) => (
                     <div
                       key={skill.name}
                       className="rounded-lg p-4 transition-all duration-200"
                       style={{
-                        backgroundColor: colors.bg.primary,
+                        backgroundColor: colors.bg.tertiary,
                       }}
                     >
                       <div className="flex items-start justify-between">
@@ -642,10 +692,10 @@ export const SkillsSection: React.FC<SkillsSectionProps> = ({ colors }) => {
                             <Button
                               size="sm"
                               onClick={() => installSkillRequirements(skill.name)}
-                              disabled={installLoading.has(skill.name)}
-                              style={{ backgroundColor: colors.accent.brand, color: '#ffffff', border: 'none' }}
+                              disabled={installBusy.has(skill.name)}
+                              style={{ backgroundColor: colors.accent.brand, color: colors.button.primaryFg, border: 'none' }}
                             >
-                              {installLoading.has(skill.name) ? (
+                              {installBusy.has(skill.name) ? (
                                 <Loader2 className="h-4 w-4 animate-spin" />
                               ) : (
                                 <>
@@ -660,15 +710,21 @@ export const SkillsSection: React.FC<SkillsSectionProps> = ({ colors }) => {
                               size="sm"
                               variant="outline"
                               onClick={() => toggleSkillEnabled(skill.name, skill.enabled)}
-                              disabled={toggleLoading.has(skill.name)}
+                              disabled={toggleBusy.has(skill.name)}
                               title={skill.enabled ? t('skills.disableSkill') : t('skills.enableSkill')}
                               style={{
                                 backgroundColor: colors.bg.tertiary,
-                                color: skill.enabled ? colors.accent.red : colors.accent.green,
-                                borderColor: skill.enabled ? colors.accent.red + '88' : colors.accent.green + '88'
+                                // Toggle button color = what the click WILL DO.
+                                // Currently enabled → click disables → destructive
+                                // (red). Currently disabled → click enables →
+                                // primary action (coral).
+                                color: skill.enabled ? colors.button.destructive : colors.button.primary,
+                                borderColor: skill.enabled
+                                  ? colors.button.destructive + '88'
+                                  : colors.button.primary + '88'
                               }}
                             >
-                              {toggleLoading.has(skill.name)
+                              {toggleBusy.has(skill.name)
                                 ? <Loader2 className="h-4 w-4 animate-spin" />
                                 : <Power className="h-4 w-4" />
                               }
@@ -677,7 +733,9 @@ export const SkillsSection: React.FC<SkillsSectionProps> = ({ colors }) => {
                           <Button
                             size="sm"
                             variant="outline"
-                            onClick={() => window.electronAPI?.openExternal?.(`https://docs.openclaw.ai/skills/${skill.name}`)}
+                            onClick={() => window.electronAPI?.openExternal?.(SKILL_DOCS_URL(skill.name))}
+                            title={t('skills.ariaSkillInfo', { name: skill.name })}
+                            aria-label={t('skills.ariaSkillInfo', { name: skill.name })}
                             style={{ backgroundColor: colors.bg.tertiary, color: colors.text.muted, borderColor: colors.bg.hover }}
                           >
                             <Info className="h-4 w-4" />
@@ -687,6 +745,7 @@ export const SkillsSection: React.FC<SkillsSectionProps> = ({ colors }) => {
                             variant="outline"
                             onClick={() => window.electronAPI.openSkillFolder(skill.name)}
                             title={t('skills.openSkillFolder')}
+                            aria-label={t('skills.openSkillFolder')}
                             style={{ backgroundColor: colors.bg.tertiary, color: colors.text.muted, borderColor: colors.bg.hover }}
                           >
                             <FolderOpen className="h-4 w-4" />
@@ -695,11 +754,12 @@ export const SkillsSection: React.FC<SkillsSectionProps> = ({ colors }) => {
                             size="sm"
                             variant="outline"
                             onClick={() => removeSkill(skill.name)}
-                            disabled={removeLoading.has(skill.name)}
+                            disabled={removeBusy.has(skill.name)}
                             title={t('skills.removeSkill')}
+                            aria-label={t('skills.removeSkill')}
                             style={{ backgroundColor: colors.bg.tertiary, color: colors.accent.red, borderColor: colors.accent.red + '66' }}
                           >
-                            {removeLoading.has(skill.name)
+                            {removeBusy.has(skill.name)
                               ? <Loader2 className="h-4 w-4 animate-spin" />
                               : <Trash2 className="h-4 w-4" />
                             }
@@ -740,17 +800,18 @@ export const SkillsSection: React.FC<SkillsSectionProps> = ({ colors }) => {
                             )}
                           </div>
                           {skill.homepage && (
-                            <a
-                              href="#"
-                              onClick={(e) => {
-                                e.preventDefault()
-                                window.electronAPI?.openExternal?.(skill.homepage!)
-                              }}
-                              className="flex items-center flex-shrink-0 ml-4"
+                            // Not a real <a href> since this opens via Electron's
+                            // shell rather than the renderer's nav — using a
+                            // <button> avoids the fake href="#" and gets correct
+                            // keyboard focus + screen-reader semantics for free.
+                            <button
+                              type="button"
+                              onClick={() => window.electronAPI?.openExternal?.(skill.homepage!)}
+                              className="flex items-center flex-shrink-0 ml-4 bg-transparent"
                               style={{ color: colors.accent.brand }}
                             >
                               {t('skills.homepage')} <ExternalLink className="h-3 w-3 ml-1" />
-                            </a>
+                            </button>
                           )}
                         </div>
                       </div>
@@ -760,12 +821,12 @@ export const SkillsSection: React.FC<SkillsSectionProps> = ({ colors }) => {
                 </div>
               </div>
             </div>
-          </>
+          </div>
         )}
 
         {/* ── DISCOVER TAB ── */}
         {activeTab === 'discover' && (
-          <>
+          <div role="tabpanel" id="skills-tabpanel-discover" className="contents">
             {/* Source badge + search row */}
             <div className="p-6 pb-4 flex-shrink-0">
               {/* Source badge */}
@@ -781,7 +842,7 @@ export const SkillsSection: React.FC<SkillsSectionProps> = ({ colors }) => {
                   <button
                     className="text-xs"
                     style={{ color: colors.text.muted }}
-                    onClick={() => window.electronAPI?.openExternal?.('https://clawhub.ai')}
+                    onClick={() => window.electronAPI?.openExternal?.(CLAWHUB_BASE_URL)}
                   >
                     <ExternalLink className="h-3 w-3 inline mr-0.5" />
                     {t('skills.browseClawhub')}
@@ -792,6 +853,8 @@ export const SkillsSection: React.FC<SkillsSectionProps> = ({ colors }) => {
                   variant="outline"
                   onClick={() => loadDiscoverData(discoverQuery)}
                   disabled={discoverLoading}
+                  title={t('skills.ariaRefreshRegistry')}
+                  aria-label={t('skills.ariaRefreshRegistry')}
                   style={{ backgroundColor: colors.bg.tertiary, color: colors.text.muted, borderColor: colors.bg.hover }}
                 >
                   <RefreshCw className={`h-3 w-3 ${discoverLoading ? 'animate-spin' : ''}`} />
@@ -807,7 +870,11 @@ export const SkillsSection: React.FC<SkillsSectionProps> = ({ colors }) => {
                   <span className="text-sm" style={{ color: colors.accent.green }}>
                     ✓ {installBanner}
                   </span>
-                  <button onClick={() => setInstallBanner(null)}>
+                  <button
+                    onClick={() => setInstallBanner(null)}
+                    aria-label={t('skills.ariaCloseBanner')}
+                    title={t('skills.ariaCloseBanner')}
+                  >
                     <X className="h-4 w-4" style={{ color: colors.accent.green }} />
                   </button>
                 </div>
@@ -823,7 +890,7 @@ export const SkillsSection: React.FC<SkillsSectionProps> = ({ colors }) => {
                   onChange={e => { setDiscoverQuery(e.target.value); setDiscoverPage(1) }}
                   className="w-full pl-10 pr-4 py-2 border rounded-md text-sm"
                   style={{
-                    backgroundColor: colors.bg.primary,
+                    backgroundColor: colors.bg.tertiary,
                     borderColor: colors.bg.tertiary,
                     color: colors.text.normal
                   }}
@@ -847,7 +914,7 @@ export const SkillsSection: React.FC<SkillsSectionProps> = ({ colors }) => {
                     <Button
                       size="sm"
                       onClick={() => loadDiscoverData(discoverQuery)}
-                      style={{ backgroundColor: colors.accent.brand, color: '#ffffff', border: 'none' }}
+                      style={{ backgroundColor: colors.accent.brand, color: colors.button.primaryFg, border: 'none' }}
                     >
                       {t('common.tryAgain')}
                     </Button>
@@ -878,7 +945,7 @@ export const SkillsSection: React.FC<SkillsSectionProps> = ({ colors }) => {
                           <div
                             key={skill.slug}
                             className="rounded-lg p-4 flex flex-col"
-                            style={{ backgroundColor: colors.bg.primary }}
+                            style={{ backgroundColor: colors.bg.tertiary }}
                           >
                             {/* Card header */}
                             <div className="flex items-start space-x-3 mb-2">
@@ -931,7 +998,7 @@ export const SkillsSection: React.FC<SkillsSectionProps> = ({ colors }) => {
                                 <Button
                                   size="sm"
                                   disabled
-                                  style={{ backgroundColor: colors.accent.brand, color: '#ffffff', border: 'none', fontSize: '11px', padding: '2px 10px', opacity: 0.7 }}
+                                  style={{ backgroundColor: colors.accent.brand, color: colors.button.primaryFg, border: 'none', fontSize: '11px', padding: '2px 10px', opacity: 0.7 }}
                                 >
                                   <Loader2 className="h-3 w-3 animate-spin mr-1" />
                                   {t('common.installing')}
@@ -957,7 +1024,7 @@ export const SkillsSection: React.FC<SkillsSectionProps> = ({ colors }) => {
                                 <Button
                                   size="sm"
                                   onClick={() => installFromRegistry(skill.slug)}
-                                  style={{ backgroundColor: colors.accent.brand, color: '#ffffff', border: 'none', fontSize: '11px', padding: '2px 10px' }}
+                                  style={{ backgroundColor: colors.accent.brand, color: colors.button.primaryFg, border: 'none', fontSize: '11px', padding: '2px 10px' }}
                                 >
                                   <Download className="h-3 w-3 mr-1" />
                                   {t('skills.install')}
@@ -994,7 +1061,7 @@ export const SkillsSection: React.FC<SkillsSectionProps> = ({ colors }) => {
                 )}
               </div>
             </div>
-          </>
+          </div>
         )}
       </div>
     </div>

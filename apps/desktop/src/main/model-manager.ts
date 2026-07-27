@@ -1005,13 +1005,6 @@ export class ModelManager {
             }
           ]
         };
-      } else if (provider === 'anthropic') {
-        // Ensure Anthropic provider is configured
-        if (!openclawConfig.models.providers.anthropic) {
-          openclawConfig.models.providers.anthropic = {
-            apiKey: process.env.ANTHROPIC_API_KEY || ""
-          };
-        }
       } else if (provider === 'openai') {
         // Ensure OpenAI provider is configured
         if (!openclawConfig.models.providers.openai) {
@@ -1065,14 +1058,9 @@ export class ModelManager {
         }
       }
 
-      // Validate that required credentials are available
-      if (provider === 'anthropic' && !openclawConfig.models.providers.anthropic?.apiKey) {
-        console.warn('[ModelManager] Warning: Anthropic API key not configured');
-        return {
-          success: true,
-          message: `Model configured but Anthropic API key is missing. Please add it in Configuration.`
-        };
-      }
+      // Validate that required credentials are available.
+      // Anthropic BYOK was removed 2026-06-15 — no validation branch
+      // needed; setOpenClaw refuses the provider above.
       if (provider === 'openai' && !openclawConfig.models.providers.openai?.apiKey) {
         console.warn('[ModelManager] Warning: OpenAI API key not configured');
         return {

@@ -18,6 +18,11 @@ export type CommandCategory =
   | 'memory'
   | 'hooks'
   | 'browser'
+  | 'terminal'
+  | 'mcp'
+  | 'devices'
+  | 'tasks'
+  | 'directory'
 
 export interface CommandParam {
   /** Unique key for this param's form state */
@@ -46,17 +51,22 @@ export interface CommandDef {
 }
 
 export const CATEGORY_LABELS: Record<CommandCategory, string> = {
-  system:   '🔧 System',
-  gateway:  '🌐 Gateway',
-  channels: '📡 Channels',
-  skills:   '🎯 Skills',
-  agents:   '🤖 Agents',
-  schedule: '⏰ Schedule',
-  models:   '🧠 Models',
-  sessions: '💬 Sessions',
-  memory:   '💾 Memory',
-  hooks:    '🪝 Hooks',
-  browser:  '🌍 Browser',
+  system:    '🔧 System',
+  gateway:   '🌐 Gateway',
+  channels:  '📡 Channels',
+  skills:    '🎯 Skills',
+  agents:    '🤖 Agents',
+  schedule:  '⏰ Schedule',
+  models:    '🧠 Models',
+  sessions:  '💬 Sessions',
+  memory:    '💾 Memory',
+  hooks:     '🪝 Hooks',
+  browser:   '🌍 Browser',
+  terminal:  '🖥️ Terminal & UI',
+  mcp:       '🔌 MCP',
+  devices:   '📱 Devices',
+  tasks:     '⚙️ Tasks',
+  directory: '📇 Directory',
 }
 
 /** Shared channel list for dropdown params — core + common extensions */
@@ -143,6 +153,86 @@ export const COMMANDS: CommandDef[] = [
     args: ['reset'],
     danger: true,
     dangerMessage: 'This will clear local configuration and state. Your gateway data is not affected.',
+  },
+  {
+    id: 'docs-search',
+    category: 'system',
+    icon: '📚',
+    title: 'Search Docs',
+    description: 'Search the live OpenClaw documentation from the terminal',
+    args: ['docs'],
+    params: [
+      { paramId: 'query', flag: '', label: 'Search Query', type: 'text', placeholder: 'e.g. webhook', required: true },
+    ],
+  },
+  {
+    id: 'logs',
+    category: 'system',
+    icon: '📜',
+    title: 'Tail Gateway Logs',
+    description: 'Tail Gateway logs locally or via RPC — useful when debugging behavior',
+    args: ['logs'],
+  },
+  {
+    id: 'backup-create',
+    category: 'system',
+    icon: '💼',
+    title: 'Create Backup',
+    description: 'Write a backup archive containing config, credentials, sessions, and workspaces',
+    args: ['backup', 'create'],
+  },
+  {
+    id: 'backup-verify',
+    category: 'system',
+    icon: '🔐',
+    title: 'Verify Backup',
+    description: 'Validate a backup archive and its embedded manifest',
+    args: ['backup', 'verify'],
+    params: [
+      { paramId: 'path', flag: '', label: 'Archive Path', type: 'text', placeholder: '/path/to/backup.tar.zst', required: true },
+    ],
+  },
+  {
+    id: 'secrets-audit',
+    category: 'system',
+    icon: '🔍',
+    title: 'Audit Secrets',
+    description: 'Find plaintext secrets, unresolved refs, and precedence drift in config',
+    args: ['secrets', 'audit'],
+  },
+  {
+    id: 'secrets-reload',
+    category: 'system',
+    icon: '🔄',
+    title: 'Reload Secrets',
+    description: 'Re-resolve secret references and atomically swap the runtime snapshot',
+    args: ['secrets', 'reload'],
+  },
+  {
+    id: 'completion',
+    category: 'system',
+    icon: '⌨️',
+    title: 'Shell Completion',
+    description: 'Generate a tab-completion script for bash/zsh/fish',
+    args: ['completion'],
+    params: [
+      {
+        paramId: 'shell', flag: '', label: 'Shell', type: 'select',
+        options: ['bash', 'zsh', 'fish'],
+        required: true,
+        default: 'zsh',
+      },
+    ],
+  },
+  {
+    id: 'uninstall',
+    category: 'system',
+    icon: '⚠️',
+    title: 'Uninstall Gateway',
+    description: 'Uninstall the gateway service + local data (the CLI itself stays)',
+    args: ['uninstall'],
+    danger: true,
+    dangerMessage: 'This will remove the installed gateway service and clear local data. Your config and credentials will be wiped.',
   },
 
   // ── Gateway ──────────────────────────────────────────────────────────────
@@ -490,6 +580,36 @@ export const COMMANDS: CommandDef[] = [
     description: 'Set tool execution approval requirements and allowlist rules',
     args: ['approvals', 'set'],
   },
+  {
+    id: 'agent-turn',
+    category: 'agents',
+    icon: '💭',
+    title: 'Run Agent Turn',
+    description: 'Run a single agent turn through the Gateway with a one-off prompt',
+    args: ['agent'],
+    params: [
+      { paramId: 'prompt', flag: '--prompt', label: 'Prompt', type: 'text', placeholder: 'What should the agent do?', required: true },
+    ],
+  },
+  {
+    id: 'commitments-list',
+    category: 'agents',
+    icon: '📌',
+    title: 'List Commitments',
+    description: 'List inferred follow-up commitments the agent has noted from past chats',
+    args: ['commitments', 'list'],
+  },
+  {
+    id: 'commitments-dismiss',
+    category: 'agents',
+    icon: '✖️',
+    title: 'Dismiss Commitment',
+    description: 'Dismiss an inferred follow-up commitment by ID',
+    args: ['commitments', 'dismiss'],
+    params: [
+      { paramId: 'id', flag: '', label: 'Commitment ID', type: 'text', placeholder: 'Commitment ID', required: true },
+    ],
+  },
 
   // ── Schedule ──────────────────────────────────────────────────────────────
   {
@@ -824,5 +944,221 @@ export const COMMANDS: CommandDef[] = [
     args: ['browser', 'reset-profile'],
     danger: true,
     dangerMessage: 'This will clear all browser cookies and saved login sessions.',
+  },
+
+  // ── Terminal & UI ─────────────────────────────────────────────────────────
+  {
+    id: 'tui',
+    category: 'terminal',
+    icon: '🖥️',
+    title: 'Terminal Chat (TUI)',
+    description: 'Open a terminal-based UI connected to the Gateway',
+    args: ['tui'],
+  },
+  {
+    id: 'chat-local',
+    category: 'terminal',
+    icon: '💬',
+    title: 'Local Chat',
+    description: 'Open a local terminal UI without going through the Gateway',
+    args: ['chat'],
+  },
+  {
+    id: 'dashboard',
+    category: 'terminal',
+    icon: '🎛️',
+    title: 'Open Web Dashboard',
+    description: 'Open the Control UI in your browser with a fresh auth token',
+    args: ['dashboard'],
+  },
+  {
+    id: 'qr',
+    category: 'terminal',
+    icon: '📱',
+    title: 'Mobile Pairing QR',
+    description: 'Generate a QR code or setup link for pairing the mobile app',
+    args: ['qr'],
+  },
+
+  // ── MCP (Model Context Protocol) ──────────────────────────────────────────
+  {
+    id: 'mcp-list',
+    category: 'mcp',
+    icon: '🔌',
+    title: 'List MCP Servers',
+    description: 'Show all configured MCP (Model Context Protocol) servers',
+    args: ['mcp', 'list'],
+  },
+  {
+    id: 'mcp-show',
+    category: 'mcp',
+    icon: 'ℹ️',
+    title: 'Show MCP Server',
+    description: 'Show one configured MCP server (or the full MCP config if name omitted)',
+    args: ['mcp', 'show'],
+    params: [
+      { paramId: 'name', flag: '', label: 'Server Name', type: 'text', placeholder: 'Optional — leave blank for full config', required: false },
+    ],
+  },
+  {
+    id: 'mcp-unset',
+    category: 'mcp',
+    icon: '🗑️',
+    title: 'Remove MCP Server',
+    description: 'Remove one configured MCP server by name',
+    args: ['mcp', 'unset'],
+    params: [
+      { paramId: 'name', flag: '', label: 'Server Name', type: 'text', placeholder: 'MCP server name', required: true },
+    ],
+    danger: true,
+    dangerMessage: 'This will unregister the MCP server. You can re-add it later with `mcp set`.',
+  },
+  {
+    id: 'mcp-serve',
+    category: 'mcp',
+    icon: '📡',
+    title: 'Serve via MCP',
+    description: 'Expose OpenClaw channels over MCP stdio (use from Claude Desktop / IDE clients)',
+    args: ['mcp', 'serve'],
+  },
+
+  // ── Devices ───────────────────────────────────────────────────────────────
+  // The 'pairing list/approve' commands above are still valid for legacy
+  // sender-pairing. The 'devices' subcommand tree below handles the newer
+  // device-token model used by mobile/Tailscale pairings.
+  {
+    id: 'devices-list',
+    category: 'devices',
+    icon: '📱',
+    title: 'List Devices',
+    description: 'List pending and paired devices for this Gateway',
+    args: ['devices', 'list'],
+  },
+  {
+    id: 'devices-approve',
+    category: 'devices',
+    icon: '✔️',
+    title: 'Approve Device',
+    description: 'Approve a pending device pairing request',
+    args: ['devices', 'approve'],
+    params: [
+      { paramId: 'id', flag: '', label: 'Device ID', type: 'text', placeholder: 'Pending device ID', required: true },
+    ],
+  },
+  {
+    id: 'devices-reject',
+    category: 'devices',
+    icon: '✖️',
+    title: 'Reject Device',
+    description: 'Reject a pending device pairing request',
+    args: ['devices', 'reject'],
+    params: [
+      { paramId: 'id', flag: '', label: 'Device ID', type: 'text', placeholder: 'Pending device ID', required: true },
+    ],
+  },
+  {
+    id: 'devices-remove',
+    category: 'devices',
+    icon: '🗑️',
+    title: 'Remove Device',
+    description: 'Remove a paired device entry from the Gateway table',
+    args: ['devices', 'remove'],
+    params: [
+      { paramId: 'id', flag: '', label: 'Device ID', type: 'text', placeholder: 'Paired device ID', required: true },
+    ],
+    danger: true,
+    dangerMessage: 'The device will need to re-pair before it can talk to the Gateway again.',
+  },
+  {
+    id: 'devices-rotate',
+    category: 'devices',
+    icon: '🔄',
+    title: 'Rotate Device Token',
+    description: 'Rotate the device token for a role (best-practice on key compromise)',
+    args: ['devices', 'rotate'],
+    params: [
+      { paramId: 'role', flag: '', label: 'Role', type: 'text', placeholder: 'e.g. mobile', required: true },
+    ],
+  },
+  {
+    id: 'devices-revoke',
+    category: 'devices',
+    icon: '🚫',
+    title: 'Revoke Device Token',
+    description: 'Revoke a device token for a role — disconnects all devices using it',
+    args: ['devices', 'revoke'],
+    params: [
+      { paramId: 'role', flag: '', label: 'Role', type: 'text', placeholder: 'e.g. mobile', required: true },
+    ],
+    danger: true,
+    dangerMessage: 'All devices using this role token will lose Gateway access immediately.',
+  },
+
+  // ── Tasks (durable background jobs) ───────────────────────────────────────
+  {
+    id: 'tasks-list',
+    category: 'tasks',
+    icon: '📋',
+    title: 'List Tasks',
+    description: 'List tracked durable background tasks across the Gateway',
+    args: ['tasks', 'list'],
+  },
+  {
+    id: 'tasks-show',
+    category: 'tasks',
+    icon: 'ℹ️',
+    title: 'Show Task',
+    description: 'Show one background task by task id, run id, or session key',
+    args: ['tasks', 'show'],
+    params: [
+      { paramId: 'id', flag: '', label: 'Task / Run / Session ID', type: 'text', placeholder: 'task ID', required: true },
+    ],
+  },
+  {
+    id: 'tasks-audit',
+    category: 'tasks',
+    icon: '🔍',
+    title: 'Audit Tasks',
+    description: 'Show stale or broken background tasks and TaskFlows that need attention',
+    args: ['tasks', 'audit'],
+  },
+  {
+    id: 'tasks-cancel',
+    category: 'tasks',
+    icon: '⏹️',
+    title: 'Cancel Task',
+    description: 'Cancel a running background task by ID',
+    args: ['tasks', 'cancel'],
+    params: [
+      { paramId: 'id', flag: '', label: 'Task ID', type: 'text', placeholder: 'task ID', required: true },
+    ],
+    danger: true,
+    dangerMessage: 'Cancellation may leave the task in a half-completed state — verify with `tasks show` afterwards.',
+  },
+
+  // ── Directory (find IDs of channels, groups, contacts) ────────────────────
+  {
+    id: 'directory-self',
+    category: 'directory',
+    icon: '👤',
+    title: 'Show My ID',
+    description: 'Show the current account user ID for the linked channel',
+    args: ['directory', 'self'],
+  },
+  {
+    id: 'directory-peers',
+    category: 'directory',
+    icon: '👥',
+    title: 'List Contacts',
+    description: 'List peer (contact / user) IDs across linked channels — useful for allowFrom',
+    args: ['directory', 'peers'],
+  },
+  {
+    id: 'directory-groups',
+    category: 'directory',
+    icon: '🏷️',
+    title: 'List Groups',
+    description: 'List group IDs across linked channels — useful for allowGroups',
+    args: ['directory', 'groups'],
   },
 ]

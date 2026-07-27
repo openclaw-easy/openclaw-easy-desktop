@@ -1,3 +1,5 @@
+import { validateAgentId, isPathInsideRoot } from './session-manager.helpers'
+
 type CommandExecutor = {
   executeCommand(args: string[], timeoutMs?: number): Promise<string | null>
 }
@@ -199,12 +201,27 @@ export class SessionManager {
     try {
       console.log('[SessionManager] Deleting session:', sessionKey)
 
+      // Strict agentId validation BEFORE building any path. An IPC
+      // caller controls this value, so an unvalidated `../../etc/passwd`
+      // (or even `../other-agent`) would traverse out of the sessions
+      // root and let the renderer delete arbitrary `sessions.json`
+      // files. See session-manager.helpers.ts for the rule set.
+      const safeAgentId = validateAgentId(agentId)
+      if (!safeAgentId) {
+        console.warn('[SessionManager] Refusing delete — invalid agentId:', agentId)
+        return {
+          success: false,
+          error: 'Invalid agentId',
+        }
+      }
+
       const fs = require('fs').promises
       const path = require('path')
       const os = require('os')
 
-      // Path to sessions store
-      const sessionsDir = path.join(os.homedir(), '.openclaw', 'agents', agentId, 'sessions')
+      // Path to sessions store (now safely scoped under the validated id).
+      const agentsRoot = path.join(os.homedir(), '.openclaw', 'agents')
+      const sessionsDir = path.join(agentsRoot, safeAgentId, 'sessions')
       const sessionsStorePath = path.join(sessionsDir, 'sessions.json')
 
       // Check if sessions store exists
@@ -231,16 +248,26 @@ export class SessionManager {
 
       // Get session file path
       const sessionFile = store[sessionKey].sessionFile
-      const sessionId = store[sessionKey].sessionId
 
-      // Delete transcript file if it exists
+      // Delete transcript file if it exists — but ONLY when the recorded
+      // path resolves inside this agent's sessions dir. A tampered
+      // sessions.json (or a future bug elsewhere) could point this at
+      // any absolute path; refuse outright rather than fall through to
+      // `fs.unlink` with an attacker-controlled target.
       if (sessionFile) {
-        try {
-          await fs.unlink(sessionFile)
-          console.log('[SessionManager] Deleted transcript file:', sessionFile)
-        } catch (error) {
-          console.warn('[SessionManager] Failed to delete transcript file:', error)
-          // Continue even if file deletion fails
+        if (isPathInsideRoot(sessionFile, sessionsDir)) {
+          try {
+            await fs.unlink(sessionFile)
+            console.log('[SessionManager] Deleted transcript file:', sessionFile)
+          } catch (error) {
+            console.warn('[SessionManager] Failed to delete transcript file:', error)
+            // Continue even if file deletion fails
+          }
+        } else {
+          console.warn(
+            '[SessionManager] Refused to delete sessionFile outside the agent sessions dir:',
+            sessionFile,
+          )
         }
       }
 

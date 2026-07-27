@@ -2,7 +2,17 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 
 export interface AppStatus {
   isRunning: boolean;
+  /**
+   * Explicit lifecycle status from the main process. The legacy
+   * isRunning boolean collapsed 'stopped' / 'starting' / 'error' into
+   * "not running", so consumers couldn't tell a gateway that *failed*
+   * from one that's *off*. The main process always sends this field;
+   * older snapshots that pre-date the field surface as undefined.
+   */
+  status?: 'stopped' | 'starting' | 'running' | 'error';
   port?: number;
+  pid?: number | null;
+  gatewayMode?: 'external' | 'system' | 'bundled';
   uptime?: number;
   version?: string;
 }
@@ -68,9 +78,19 @@ export function useAppBridge() {
           autoRestartDisabledRef.current = false;
         }
 
+        // The main process now owns its own auto-restart (with backoff
+        // + 3-attempt cap). When it reports 'error' it has GIVEN UP —
+        // racing it from the renderer would just thrash the gateway.
+        // Treat 'error' as a hard stop: disable client-side restart
+        // until the user explicitly clicks Launch again.
+        if (newStatus.status === 'error') {
+          autoRestartDisabledRef.current = true;
+        }
         if (
           lastKnownRunningRef.current &&
           !newStatus.isRunning &&
+          newStatus.status !== 'error' &&
+          newStatus.status !== 'starting' &&
           !isAutoRestartingRef.current &&
           !wasManualStop &&
           !autoRestartDisabledRef.current &&
@@ -138,9 +158,12 @@ export function useAppBridge() {
     // Subscribe to real-time status updates from the process manager.
     // The IPC event carries a ProcessEvent ({ status, timestamp, previousStatus }),
     // not an AppStatus — convert so the rest of the hook sees a consistent shape.
+    // Also surface the raw status string so the UI watchdog can distinguish
+    // 'error' (gave up) from 'stopped' (clean stop) and clear the launch button.
     const unsubscribeStatus = window.electronAPI.onStatusUpdate((event: any) => {
       const isRunning = event?.status === 'running' || event?.isRunning === true;
-      setStatus((prev) => ({ ...prev, isRunning }));
+      const rawStatus = typeof event?.status === 'string' ? event.status : undefined;
+      setStatus((prev) => ({ ...prev, isRunning, status: rawStatus ?? prev.status }));
       // Also update the running ref immediately so auto-restart logic stays fresh
       lastKnownRunningRef.current = isRunning;
     });

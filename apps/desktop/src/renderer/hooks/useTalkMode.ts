@@ -1,4 +1,5 @@
 import { useState, useRef, useCallback, useEffect } from 'react'
+import { useTranslation } from 'react-i18next'
 
 interface TalkModeState {
   isSupported: boolean
@@ -28,6 +29,7 @@ const MIN_RECORDING_MS = 1000
 const MAX_RECORDING_MS = 120_000
 
 export function useTalkMode(): TalkModeState {
+  const { t } = useTranslation()
   const [isActive, setIsActive] = useState(false)
   const [isListening, setIsListening] = useState(false)
   const [isSpeaking, setIsSpeaking] = useState(false)
@@ -103,7 +105,7 @@ export function useTalkMode(): TalkModeState {
       if (window.electronAPI?.requestPermission) {
         const granted = await window.electronAPI.requestPermission('microphone')
         if (!granted) {
-          setError('Microphone access denied. Go to System Settings > Privacy & Security > Microphone to allow access.')
+          setError(t('chat.microphoneDeniedMac', 'Microphone access denied. Go to System Settings > Privacy & Security > Microphone to allow access.'))
           setIsListening(false)
           return
         }
@@ -148,6 +150,14 @@ export function useTalkMode(): TalkModeState {
         if (audioCtxRef.current) {
           audioCtxRef.current.close().catch(() => {})
           audioCtxRef.current = null
+        }
+        // Release the mic after each turn. The continuous-conversation loop
+        // re-acquires a fresh stream via getUserMedia next turn, so not
+        // stopping here orphans a live track and leaves the OS mic indicator
+        // on for the whole session.
+        if (audioStreamRef.current) {
+          audioStreamRef.current.getTracks().forEach(t => t.stop())
+          audioStreamRef.current = null
         }
 
         if (chunks.length === 0) {
@@ -254,7 +264,7 @@ export function useTalkMode(): TalkModeState {
         audioCtx.close().catch(() => {})
         audioCtxRef.current = null
       }
-      setError('Microphone access denied. Check System Preferences > Privacy > Microphone.')
+      setError(t('chat.microphoneDenied', 'Microphone access denied. Check System Preferences > Privacy > Microphone.'))
       setIsListening(false)
     }
   }, [])
@@ -273,6 +283,13 @@ export function useTalkMode(): TalkModeState {
       }
       setIsSpeaking(false)
       setError(null)
+    }
+    // Guarantee mic/recorder release if the component unmounts while talk mode
+    // is still active (route change, hot reload) — the else-branch above only
+    // runs on an isActive toggle, not unmount. cleanup() is idempotent.
+    return () => {
+      cleanup()
+      if (synthRef.current?.speaking) synthRef.current.cancel()
     }
   }, [isActive, doStartListening, cleanup])
 

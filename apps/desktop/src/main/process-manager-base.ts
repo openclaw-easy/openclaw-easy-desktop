@@ -1,12 +1,11 @@
-import { spawn, ChildProcess, execFile } from 'child_process'
+import { spawn, ChildProcess } from 'child_process'
 import { BrowserWindow } from 'electron'
 import * as path from 'path'
 import * as net from 'net'
-import { promisify } from 'util'
+import * as http from 'http'
 import { OpenClawEnvironment } from './openclaw-environment'
 import { DEFAULT_GATEWAY_PORT } from '../shared/constants'
-
-const execFileAsync = promisify(execFile)
+import { detectSystemOpenClaw as resolveSystemOpenClaw } from './managers/system-openclaw-resolver'
 
 // Forward declaration to avoid circular dependency
 export type ConfigManager = {
@@ -90,6 +89,14 @@ export abstract class ProcessManagerBase {
   protected systemBinaryPath: string | null = null
   /** Polling interval for monitoring external/system gateway liveness */
   protected externalMonitorInterval: NodeJS.Timeout | null = null
+  /** Epoch ms when the current child process was spawned (or 0 if none). */
+  protected spawnedAt: number = 0
+  /** True while a stop() is in flight — used to distinguish operator stops from crashes. */
+  protected intentionalStop: boolean = false
+  /** Auto-restart attempts since the last clean run. Reset on a successful run. */
+  protected restartAttempts: number = 0
+  /** Pending auto-restart timer; cancelled on stop(). */
+  protected restartTimer: NodeJS.Timeout | null = null
 
   constructor(configPath: string, configManager?: ConfigManager) {
     this.configPath = configPath
@@ -102,7 +109,14 @@ export abstract class ProcessManagerBase {
     this.mainWindow = window
   }
 
-  abstract start(): Promise<boolean>
+  /**
+   * Start the gateway. `presetMode`, if supplied, lets the caller skip
+   * an internal re-detection — the openclaw-manager already detects
+   * the mode at its layer to decide config-write strategy, so passing
+   * the same `GatewayModeInfo` down avoids running TCP probe +
+   * `which openclaw` + 5 `fs.existsSync` calls a second time.
+   */
+  abstract start(presetMode?: GatewayModeInfo): Promise<boolean>
   abstract stop(): Promise<boolean>
   abstract restart(): Promise<boolean>
 
@@ -135,8 +149,39 @@ export abstract class ProcessManagerBase {
     return this.activePort
   }
 
+  /**
+   * The PID of the gateway process when we own it (bundled/system modes).
+   * Returns null in external mode since we don't have a handle on the
+   * launchd-managed or already-running process. The renderer should hide
+   * the PID line when this is null instead of falling back to a misleading
+   * placeholder string.
+   */
+  getActivePid(): number | null {
+    return this.process && !this.process.killed && typeof this.process.pid === 'number'
+      ? this.process.pid
+      : null
+  }
+
   isRunning(): boolean {
     return this.status === 'running'
+  }
+
+  /**
+   * Is a gateway actually serving on the configured port, whoever started it?
+   *
+   * `isRunning()` reports the status this manager tracks, which lags or misses
+   * a gateway the desktop does not own — the launchd service (external mode),
+   * or one started before the app. Restart-to-apply decisions must not use it:
+   * a model change that skips the restart leaves the running gateway on the
+   * OLD model, and the user gets an auth error naming the previous provider
+   * while the UI shows the new model as active.
+   *
+   * Probes the port instead, so external and owned gateways answer the same.
+   */
+  async isGatewayReachable(): Promise<boolean> {
+    const port = this.activePort || this.readConfiguredGatewayPort()
+    if (!port) return false
+    return this.isPortListeningBase(port)
   }
 
   protected setStatus(newStatus: ProcessStatus) {
@@ -151,7 +196,17 @@ export abstract class ProcessManagerBase {
           previousStatus: oldStatus
         } as ProcessEvent)
       }
+      for (const fn of this.statusListeners) {
+        try { fn(newStatus, oldStatus) } catch (err) { console.error('[ProcessManager] Status listener threw:', err) }
+      }
     }
+  }
+
+  private statusListeners: Array<(status: ProcessStatus, previous: ProcessStatus) => void> = []
+  /** Subscribe to status changes outside the renderer (e.g. tray menu). Returns an unsubscribe fn. */
+  public onStatusChange(fn: (status: ProcessStatus, previous: ProcessStatus) => void): () => void {
+    this.statusListeners.push(fn)
+    return () => { this.statusListeners = this.statusListeners.filter(f => f !== fn) }
   }
 
   protected emitLog(message: string) {
@@ -216,15 +271,71 @@ export abstract class ProcessManagerBase {
         console.log(`[ProcessManager] Ignoring exit from stale process (current pid=${this.process?.pid})`)
         return
       }
-      if (this.status === 'running') {
+      const wasRunning = this.status === 'running'
+      const wasStarting = this.status === 'starting'
+      if (wasRunning) {
         this.setStatus('stopped')
         this.emitLog('❌ Gateway process stopped unexpectedly')
-      } else if (this.status === 'starting') {
+      } else if (wasStarting) {
         this.setStatus('stopped')
         this.emitLog(`❌ Gateway process died during startup (signal=${signal})`)
       }
       this.process = null
+      this.spawnedAt = 0
+
+      // Auto-restart on unexpected exit. openclaw's own architecture
+      // doc says "Supervision: launchd/systemd for auto-restart" — when
+      // we own the process (bundled/system spawn) we have to supervise
+      // ourselves. Operator-driven stop()s set intentionalStop so we
+      // don't fight them. Backoff caps at 3 attempts; on the 3rd
+      // failure we surface 'error' and stop trying.
+      if (!this.intentionalStop && wasRunning && this.gatewayMode !== 'external') {
+        this.scheduleAutoRestart()
+      }
     })
+  }
+
+  /**
+   * Schedule a backed-off restart of the gateway after an unexpected
+   * exit. Backoff: 1s → 3s → 9s, then give up and stay 'error'.
+   */
+  protected scheduleAutoRestart(): void {
+    if (this.restartTimer) return // already scheduled
+    if (this.restartAttempts >= 3) {
+      console.error('[ProcessManager] Gave up auto-restart after 3 attempts')
+      this.emitLog('❌ Gateway failed to recover after 3 restart attempts — please restart manually')
+      this.setStatus('error')
+      return
+    }
+    const delayMs = 1000 * Math.pow(3, this.restartAttempts) // 1s, 3s, 9s
+    this.restartAttempts++
+    console.log(`[ProcessManager] Scheduling auto-restart #${this.restartAttempts} in ${delayMs}ms`)
+    this.emitLog(`🔄 Gateway crashed — auto-restarting in ${delayMs / 1000}s (attempt ${this.restartAttempts}/3)`)
+    this.restartTimer = setTimeout(() => {
+      this.restartTimer = null
+      this.start().then((ok) => {
+        if (ok) {
+          // Successful relaunch — reset attempts so a future independent
+          // crash doesn't inherit the count.
+          this.restartAttempts = 0
+        }
+      }).catch((err) => {
+        console.error('[ProcessManager] Auto-restart attempt failed:', err)
+      })
+    }, delayMs)
+  }
+
+  /**
+   * Cancel any pending auto-restart timer. Does NOT reset the attempt
+   * counter — the auto-restart sequence itself needs the counter to
+   * persist across its scheduled retries. Operator-driven stop()
+   * resets the counter separately.
+   */
+  protected cancelAutoRestart(): void {
+    if (this.restartTimer) {
+      clearTimeout(this.restartTimer)
+      this.restartTimer = null
+    }
   }
 
   protected async clearAllCooldowns(): Promise<void> {
@@ -282,6 +393,31 @@ export abstract class ProcessManagerBase {
   }
 
   /**
+   * Verify the gateway is actually serving requests, not just bound to
+   * a port. TCP-listening fires the moment the socket binds — before
+   * the gateway has finished plugin load and started accepting WS
+   * handshakes (the doc explicitly flags a `UNAVAILABLE / "startup-
+   * sidecars"` window after bind). A hung event loop will still pass
+   * a TCP probe and fail every WS connect.
+   *
+   * We probe by sending a one-shot HTTP GET. The gateway exposes
+   * `/__openclaw__/canvas/` on the same port, so any HTTP response —
+   * 200, 404, 426 Upgrade Required, anything — proves the server is
+   * processing requests. We don't care about the status code, only
+   * that the server responded within the budget.
+   */
+  protected isGatewayServing(port: number, timeoutMs: number = 2000): Promise<boolean> {
+    return new Promise((resolve) => {
+      const req = http.get(
+        { host: '127.0.0.1', port, path: '/', timeout: timeoutMs },
+        (res) => { res.resume(); resolve(true) },
+      )
+      req.once('error', () => resolve(false))
+      req.once('timeout', () => { req.destroy(); resolve(false) })
+    })
+  }
+
+  /**
    * Read the gateway port from the shared config file.
    * Returns the configured port, or DEFAULT_GATEWAY_PORT if not set.
    */
@@ -298,59 +434,22 @@ export abstract class ProcessManagerBase {
   /**
    * Detect whether a system-wide `openclaw` binary is installed.
    * Returns the absolute path to the binary, or null if not found.
+   *
+   * Delegates to the pure helper at managers/system-openclaw-resolver.ts
+   * which owns the canonical detection logic — `which openclaw` with
+   * augmented PATH, node_modules filter, and hard-coded fallback paths
+   * for stripped-PATH environments. The same helper is used by
+   * OpenClawCommandExecutor and the terminal:create-openclaw IPC handler
+   * so all three spawn paths see the same binary.
    */
   protected async detectSystemOpenClaw(): Promise<string | null> {
-    const candidates = [
-      // Check PATH first via `which`
-      async (): Promise<string | null> => {
-        try {
-          const home = process.env.HOME || ''
-          const expandedPath = [
-            path.join(home, '.bun', 'bin'),
-            path.join(home, '.npm-global', 'bin'),
-            path.join(home, '.local', 'bin'),
-            '/opt/homebrew/bin',
-            '/usr/local/bin',
-            '/usr/bin',
-            '/bin',
-            process.env.PATH || ''
-          ].join(':')
-          const { stdout } = await execFileAsync('which', ['openclaw'], {
-            env: { ...process.env, PATH: expandedPath }
-          })
-          const p = stdout.trim()
-          return p || null
-        } catch {
-          return null
-        }
-      },
-      // Check known paths
-      async (): Promise<string | null> => {
-        const fs = require('fs')
-        const home = process.env.HOME || ''
-        const knownPaths = [
-          '/usr/local/bin/openclaw',
-          '/opt/homebrew/bin/openclaw',
-          path.join(home, '.local', 'bin', 'openclaw'),
-          path.join(home, '.npm-global', 'bin', 'openclaw'),
-          path.join(home, '.bun', 'bin', 'openclaw'),
-        ]
-        for (const p of knownPaths) {
-          if (fs.existsSync(p)) return p
-        }
-        return null
-      }
-    ]
-
-    for (const detect of candidates) {
-      const result = await detect()
-      if (result) {
-        console.log(`[ProcessManager] Found system OpenClaw at: ${result}`)
-        return result
-      }
+    const result = await resolveSystemOpenClaw()
+    if (result) {
+      console.log(`[ProcessManager] Found system OpenClaw at: ${result}`)
+    } else {
+      console.log('[ProcessManager] No system OpenClaw installation found')
     }
-    console.log('[ProcessManager] No system OpenClaw installation found')
-    return null
+    return result
   }
 
   /**
@@ -423,7 +522,11 @@ export abstract class ProcessManagerBase {
           this.mainWindow.webContents.send('openclaw:health-update', {
             status: this.status,
             logCount: 0,
-            uptime: this.process?.pid ? Date.now() : 0,
+            // Previously `Date.now()` (1.7e12 — a wall-clock epoch, not
+            // an uptime). spawnedAt is the epoch ms the current child
+            // was spawned; subtract for real uptime. 0 in external mode
+            // where we don't own the process.
+            uptime: this.spawnedAt > 0 ? Date.now() - this.spawnedAt : 0,
             timestamp: new Date().toISOString()
           } as HealthEvent)
         }
@@ -431,11 +534,33 @@ export abstract class ProcessManagerBase {
     }, 30000)
   }
 
+  /** Get the uptime in milliseconds since the current child was spawned. */
+  getUptime(): number {
+    return this.spawnedAt > 0 ? Date.now() - this.spawnedAt : 0
+  }
+
   destroy() {
+    // Cancel any scheduled auto-restart so we don't relaunch after teardown.
+    this.cancelAutoRestart()
     this.stopExternalMonitoring()
     if (this.healthCheckInterval) {
       clearInterval(this.healthCheckInterval)
       this.healthCheckInterval = null
     }
+    // Kill the owned child so it doesn't orphan and hold the gateway port.
+    // Mark as intentional so the exit handler doesn't trigger auto-restart
+    // mid-teardown. SIGTERM only — the OS will reap if the process is
+    // already dead, and we don't want to escalate to SIGKILL during a
+    // graceful app quit.
+    if (this.process) {
+      this.intentionalStop = true
+      try {
+        this.process.kill('SIGTERM')
+      } catch (err) {
+        console.error('[ProcessManager] destroy() kill failed:', err)
+      }
+      this.process = null
+    }
+    this.spawnedAt = 0
   }
 }

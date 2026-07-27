@@ -1,32 +1,13 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Settings, Loader2, Package, Globe } from 'lucide-react';
+import { Settings, Loader2, Package, Globe, Sun, Moon, Monitor } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { SUPPORTED_LANGUAGES } from '../../i18n';
+import { useThemeStore, type ThemeMode } from '../../stores/themeStore';
+import type { ColorTheme } from './types';
 
-interface ColorScheme {
-  bg: {
-    primary: string;
-    secondary: string;
-    tertiary: string;
-    hover: string;
-    active: string;
-  };
-  text: {
-    normal: string;
-    muted: string;
-    header: string;
-    link: string;
-    danger: string;
-  };
-  accent: {
-    brand: string;
-    green: string;
-    yellow: string;
-    red: string;
-    purple: string;
-    indigo: string;
-  };
-}
+// Local alias for back-compat with the prop name. Was a duplicated
+// interface declaration until the 2026-06-15 ColorTheme dedup pass.
+type ColorScheme = ColorTheme;
 
 interface SettingsContentProps {
   colors: ColorScheme;
@@ -40,6 +21,8 @@ export function SettingsContent({
   setActiveChannel,
 }: SettingsContentProps) {
   const { t, i18n } = useTranslation();
+  const themeMode = useThemeStore((s) => s.mode);
+  const setThemeMode = useThemeStore((s) => s.setMode);
   const [settings, setSettings] = useState({
     startOnBoot: false,
     minimizeToTray: true,
@@ -154,6 +137,7 @@ export function SettingsContent({
       {/* Scrollable Settings Content */}
       <div className="flex-1 overflow-y-auto px-8 pb-8">
         <div className="space-y-6">
+
           {/* Application Settings */}
           <div
             className="rounded-lg p-6"
@@ -272,8 +256,55 @@ export function SettingsContent({
                     )}
                 </div>
               </div>
+
+              {/* Appearance — theme picker (system / light / dark). Mirrors
+                  the sidebar footer toggle so it's discoverable in Settings
+                  too. */}
+              <div className="flex items-center space-x-3">
+                <Sun className="h-5 w-5" style={{ color: colors.text.muted }} />
+                <div className="flex-1">
+                  <div className="font-medium" style={{ color: colors.text.header }}>
+                    {t('settings.appearance', 'Appearance')}
+                  </div>
+                  <p className="text-sm" style={{ color: colors.text.muted }}>
+                    {t('settings.appearanceDesc', 'Choose how Openclaw Easy looks.')}
+                  </p>
+                </div>
+                <div
+                  role="group"
+                  aria-label="Theme"
+                  className="flex items-center rounded-md overflow-hidden flex-shrink-0"
+                  style={{ border: `1px solid ${colors.bg.hover}` }}
+                >
+                  {(
+                    [
+                      { id: 'system' as ThemeMode, label: t('settings.themeSystem', 'System'), Icon: Monitor },
+                      { id: 'light'  as ThemeMode, label: t('settings.themeLight', 'Light'),   Icon: Sun },
+                      { id: 'dark'   as ThemeMode, label: t('settings.themeDark', 'Dark'),     Icon: Moon },
+                    ]
+                  ).map(({ id, label, Icon }) => {
+                    const active = themeMode === id;
+                    return (
+                      <button
+                        key={id}
+                        onClick={() => void setThemeMode(id)}
+                        className="flex items-center gap-1.5 px-3 py-2 text-xs font-medium transition-colors"
+                        style={{
+                          backgroundColor: active ? colors.accent.brand : 'transparent',
+                          color: active ? '#ffffff' : colors.text.normal,
+                        }}
+                        aria-pressed={active}
+                      >
+                        <Icon className="h-3.5 w-3.5" />
+                        <span>{label}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
             </div>
           </div>
+
 
           {/* App Version */}
           <div
@@ -333,7 +364,7 @@ export function SettingsContent({
                     className="px-4 py-2 rounded text-sm font-medium transition-colors"
                     style={{
                       backgroundColor: colors.accent.brand,
-                      color: 'white',
+                      color: colors.button.primaryFg,
                     }}
                   >
                     {t('settings.download')}
@@ -346,7 +377,7 @@ export function SettingsContent({
                   style={{
                     backgroundColor: colors.bg.secondary,
                     color: colors.text.normal,
-                    border: `1px solid ${colors.bg.primary}`,
+                    border: `1px solid ${colors.bg.tertiary}`,
                   }}
                 >
                   {checkingUpdate ? (

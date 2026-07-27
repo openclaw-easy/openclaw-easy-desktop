@@ -17,11 +17,6 @@ export interface AppProviderConfig {
   }
 }
 
-export interface RemoteModel {
-  id: string
-  name: string
-}
-
 export function useProviderConfig() {
   const [config, setConfig] = useState<AppProviderConfig | null>(null)
   const [isLoading, setIsLoading] = useState(true)

@@ -15,6 +15,11 @@ export interface ColorTheme {
     link: string
     danger: string
   }
+  // `accent.*` is the semantic *signal* palette — what a color MEANS in
+  // context (green=success, red=error, yellow=warn, blue=info). Use these
+  // for icons, status dots, badges, transient feedback. NEVER use
+  // `accent.green` as a button background — buttons take their color from
+  // `button.*` below so the brand stays coral across the entire app.
   accent: {
     brand: string
     green: string
@@ -22,6 +27,23 @@ export interface ColorTheme {
     red: string
     purple: string
     indigo?: string
+    blue?: string
+  }
+  // `button.*` is the semantic *action* palette — what a click DOES.
+  // Every clickable surface in the app pulls its color from here so a
+  // change to OpenClaw's brand only has to be made in one spot. The
+  // hierarchy mirrors openclaw.ai:
+  //   primary     — coral, used for all positive CTAs (Launch, Save,
+  //                 Get Started, Configure, Enable, Open Chat, …).
+  //   destructive — red, used only when the click destroys / aborts
+  //                 work (Stop, Cancel running task, Delete, Disable).
+  //   primaryFg / destructiveFg — text + icon color *on top of* the
+  //                 above. Always white-ish so contrast is preserved.
+  button: {
+    primary: string
+    primaryFg: string
+    destructive: string
+    destructiveFg: string
   }
 }
 

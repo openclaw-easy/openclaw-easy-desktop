@@ -58,11 +58,16 @@ export function MarkdownRenderer({ content, className = '' }: MarkdownRendererPr
       }}
       dangerouslySetInnerHTML={{ __html: renderedHtml }}
       onClick={(e) => {
-        // Open links in external browser
-        const target = e.target as HTMLElement;
-        if (target.tagName === 'A') {
+        // Open links in the external browser. Use closest('a') — clicking the
+        // child of a formatted link (e.g. the bold/code text inside
+        // [**docs**](url)) makes e.target the child, not the <a>; matching only
+        // tagName==='A' would miss it, the default same-window navigation would
+        // proceed, and the BrowserWindow would navigate away — destroying all
+        // React/WebSocket state and bricking the app until restart.
+        const anchor = (e.target as HTMLElement).closest('a');
+        if (anchor) {
           e.preventDefault();
-          const href = target.getAttribute('href');
+          const href = anchor.getAttribute('href');
           if (href) {
             window.electronAPI?.openExternal?.(href);
           }

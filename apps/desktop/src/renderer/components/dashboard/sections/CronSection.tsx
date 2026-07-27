@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react'
 import { useTranslation } from 'react-i18next'
+import cronstrue from 'cronstrue'
 import { Button } from '../../ui/button'
 import {
   Clock,
@@ -16,6 +17,36 @@ import {
   XCircle
 } from 'lucide-react'
 import { ColorTheme } from '../types'
+import { EmptyState } from '../../ui/empty-state'
+import { ErrorAlert } from '../../ui/error-alert'
+import { MascotIllustration } from '../../ui/mascot-illustration'
+import { AnimatedNumber } from '../../ui/animated-number'
+
+type SchedulePreset = {
+  label: string
+  scheduleKind: 'every' | 'cron'
+  scheduleValue: string
+}
+
+// Curated quick-pick presets — these cover ~90% of "remind me to X every Y"
+// requests without making the user write cron syntax.
+const SCHEDULE_PRESETS: SchedulePreset[] = [
+  { label: 'Every 15 min',     scheduleKind: 'every', scheduleValue: '15m' },
+  { label: 'Hourly',           scheduleKind: 'every', scheduleValue: '1h' },
+  { label: 'Daily 9 AM',       scheduleKind: 'cron',  scheduleValue: '0 9 * * *' },
+  { label: 'Daily 6 PM',       scheduleKind: 'cron',  scheduleValue: '0 18 * * *' },
+  { label: 'Weekdays 9 AM',    scheduleKind: 'cron',  scheduleValue: '0 9 * * 1-5' },
+  { label: 'Weekly Mon 9 AM',  scheduleKind: 'cron',  scheduleValue: '0 9 * * 1' },
+  { label: 'Monthly 1st 9 AM', scheduleKind: 'cron',  scheduleValue: '0 9 1 * *' },
+]
+
+function humanizeCron(expr: string): string | null {
+  try {
+    return cronstrue.toString(expr, { use24HourTimeFormat: false })
+  } catch {
+    return null
+  }
+}
 
 interface CronJobSchedule {
   kind: 'every' | 'cron' | 'at'
@@ -62,7 +93,10 @@ function formatSchedule(schedule: CronJobSchedule): string {
     if (ms >= 60000) {return `Every ${Math.round(ms / 60000)}m`}
     return `Every ${Math.round(ms / 1000)}s`
   }
-  if (schedule.kind === 'cron') {return schedule.expr || 'cron'}
+  if (schedule.kind === 'cron') {
+    const expr = schedule.expr || ''
+    return humanizeCron(expr) || expr || 'cron'
+  }
   if (schedule.kind === 'at') {return `At ${schedule.at || ''}`}
   return 'Unknown'
 }
@@ -103,8 +137,15 @@ export const CronSection: React.FC<CronSectionProps> = ({ colors }) => {
   const [formAtDate, setFormAtDate] = useState('')
   const [formAtTime, setFormAtTime] = useState('')
   const [formAgentId, setFormAgentId] = useState('')
+  const [formChannel, setFormChannel] = useState('')
+  const [formRecipient, setFormRecipient] = useState('')
   const [formSubmitting, setFormSubmitting] = useState(false)
   const [formError, setFormError] = useState<string | null>(null)
+
+  // Installed channel ids (telegram, whatsapp, discord, ...) populated from
+  // the gateway so the channel dropdown only shows channels the user has
+  // actually connected. Empty string means "use the agent's default channel".
+  const [installedChannels, setInstalledChannels] = useState<string[]>([])
 
   const loadJobs = async (silent = false) => {
     if (!silent) {setLoading(true)}
@@ -123,6 +164,26 @@ export const CronSection: React.FC<CronSectionProps> = ({ colors }) => {
 
   useEffect(() => {
     loadJobs()
+  }, [])
+
+  // Discover installed channels for the per-job delivery dropdown. The CLI
+  // returns `{ chat: { telegram: {...}, whatsapp: {...} } }`; we only need
+  // the channel ids. Failure here is non-fatal — user can still create jobs
+  // without targeting a specific channel.
+  useEffect(() => {
+    let cancelled = false
+    ;(async () => {
+      try {
+        const channels = await window.electronAPI.listChannels()
+        if (cancelled) return
+        const chat = (channels && channels.chat) || {}
+        const ids = Object.keys(chat).filter((id) => chat[id]?.installed)
+        setInstalledChannels(ids)
+      } catch (err) {
+        console.warn('[CronSection] Failed to load channels for delivery dropdown:', err)
+      }
+    })()
+    return () => { cancelled = true }
   }, [])
 
   const withActionLoading = async (id: string, fn: () => Promise<void>) => {
@@ -181,6 +242,16 @@ export const CronSection: React.FC<CronSectionProps> = ({ colors }) => {
       if (!scheduleValue) { setFormError('Schedule value is required'); return }
     }
 
+    // Recipient only meaningful when delivering to a channel — best-effort
+    // deliver so a missing recipient doesn't fail the whole run; the user
+    // can still see the job's last_status to debug.
+    const channel = formChannel.trim() || undefined
+    const to = formRecipient.trim() || undefined
+    if (channel && !to) {
+      setFormError('Recipient is required when a delivery channel is selected')
+      return
+    }
+
     setFormSubmitting(true)
     try {
       const result = await window.electronAPI.addCronJob({
@@ -189,7 +260,11 @@ export const CronSection: React.FC<CronSectionProps> = ({ colors }) => {
         scheduleValue,
         payloadKind: formPayloadKind,
         payloadValue: formPayloadValue.trim(),
-        agentId: formAgentId.trim() || undefined
+        agentId: formAgentId.trim() || undefined,
+        channel,
+        to,
+        announce: Boolean(channel),
+        bestEffortDeliver: Boolean(channel),
       })
       if (!result.success) {throw new Error(result.error)}
       // Reset form
@@ -201,6 +276,8 @@ export const CronSection: React.FC<CronSectionProps> = ({ colors }) => {
       setFormPayloadKind('message')
       setFormPayloadValue('')
       setFormAgentId('')
+      setFormChannel('')
+      setFormRecipient('')
       setShowAddForm(false)
       await loadJobs(true)
     } catch (err: any) {
@@ -208,6 +285,12 @@ export const CronSection: React.FC<CronSectionProps> = ({ colors }) => {
     } finally {
       setFormSubmitting(false)
     }
+  }
+
+  const applyPreset = (preset: SchedulePreset) => {
+    setFormScheduleKind(preset.scheduleKind)
+    setFormScheduleValue(preset.scheduleValue)
+    setFormError(null)
   }
 
   const enabledCount = jobs.filter(j => j.enabled).length
@@ -274,7 +357,7 @@ export const CronSection: React.FC<CronSectionProps> = ({ colors }) => {
               <Button
                 onClick={() => setShowAddForm(v => !v)}
                 size="sm"
-                style={{ backgroundColor: colors.accent.brand, color: '#ffffff', border: 'none' }}
+                style={{ backgroundColor: colors.accent.brand, color: colors.button.primaryFg, border: 'none' }}
               >
                 <Plus className="h-4 w-4 mr-2" />
                 {t('cron.addJob')}
@@ -282,34 +365,30 @@ export const CronSection: React.FC<CronSectionProps> = ({ colors }) => {
             </div>
           </div>
 
-          {/* Stats */}
+          {/* Stats — numbers tween via AnimatedNumber. */}
           <div className="grid grid-cols-3 gap-4 mb-4">
             <div className="flex items-baseline justify-center gap-2 p-3 rounded" style={{ backgroundColor: colors.bg.tertiary }}>
-              <span className="text-2xl font-bold" style={{ color: colors.text.header }}>{jobs.length}</span>
+              <span className="font-display text-2xl font-bold tracking-tight" style={{ color: colors.text.header }}><AnimatedNumber value={jobs.length} /></span>
               <span className="text-xs" style={{ color: colors.text.muted }}>{t('cron.total')}</span>
             </div>
             <div className="flex items-baseline justify-center gap-2 p-3 rounded" style={{ backgroundColor: colors.bg.tertiary }}>
-              <span className="text-2xl font-bold" style={{ color: colors.accent.green }}>{enabledCount}</span>
+              <span className="font-display text-2xl font-bold tracking-tight" style={{ color: colors.accent.green }}><AnimatedNumber value={enabledCount} /></span>
               <span className="text-xs" style={{ color: colors.text.muted }}>{t('common.enabled')}</span>
             </div>
             <div className="flex items-baseline justify-center gap-2 p-3 rounded" style={{ backgroundColor: colors.bg.tertiary }}>
-              <span className="text-2xl font-bold" style={{ color: colors.text.muted }}>{disabledCount}</span>
+              <span className="font-display text-2xl font-bold tracking-tight" style={{ color: colors.text.muted }}><AnimatedNumber value={disabledCount} /></span>
               <span className="text-xs" style={{ color: colors.text.muted }}>{t('common.disabled')}</span>
             </div>
           </div>
 
           {/* Error banner */}
           {error && (
-            <div
-              className="flex items-start space-x-3 p-3 rounded mb-4"
-              style={{ backgroundColor: `${colors.accent.red}15`, border: `1px solid ${colors.accent.red}40` }}
-            >
-              <AlertCircle className="h-5 w-5 flex-shrink-0" style={{ color: colors.accent.red }} />
-              <div>
-                <p className="text-sm font-medium" style={{ color: colors.text.header }}>{t('cron.mustBeRunning')}</p>
-                <p className="text-xs mt-1" style={{ color: colors.text.muted }}>{error}</p>
-              </div>
-            </div>
+            <ErrorAlert
+              colors={colors}
+              title={t('cron.mustBeRunning')}
+              message={error}
+              className="mb-4"
+            />
           )}
 
           {/* Add Job Form */}
@@ -330,6 +409,34 @@ export const CronSection: React.FC<CronSectionProps> = ({ colors }) => {
                     onChange={e => setFormName(e.target.value)}
                     style={inputStyle}
                   />
+                </div>
+
+                {/* Quick-pick schedule presets — one click writes the
+                    schedule kind + expression into the form below. */}
+                <div>
+                  <label className="block text-xs mb-1 font-medium" style={{ color: colors.text.muted }}>Quick presets</label>
+                  <div className="flex flex-wrap gap-1.5">
+                    {SCHEDULE_PRESETS.map(preset => {
+                      const active =
+                        preset.scheduleKind === formScheduleKind &&
+                        preset.scheduleValue === formScheduleValue
+                      return (
+                        <button
+                          key={preset.label}
+                          type="button"
+                          onClick={() => applyPreset(preset)}
+                          className="text-xs px-2.5 py-1 rounded-full border transition-colors"
+                          style={{
+                            backgroundColor: active ? colors.accent.brand : colors.bg.tertiary,
+                            color: active ? '#ffffff' : colors.text.normal,
+                            borderColor: active ? colors.accent.brand : colors.bg.hover,
+                          }}
+                        >
+                          {preset.label}
+                        </button>
+                      )
+                    })}
+                  </div>
                 </div>
 
                 {/* Schedule type + value */}
@@ -410,6 +517,50 @@ export const CronSection: React.FC<CronSectionProps> = ({ colors }) => {
                   </div>
                 </div>
 
+                {/* Channel + recipient (optional) — when both set, the
+                    cron's payload is delivered to that exact chat instead
+                    of routing through the agent's default channel. */}
+                {formPayloadKind === 'message' && (
+                  <div className="grid grid-cols-2 gap-3">
+                    <div>
+                      <label className="block text-xs mb-1 font-medium" style={{ color: colors.text.muted }}>Deliver to channel</label>
+                      <select
+                        value={formChannel}
+                        onChange={e => {
+                          const next = e.target.value
+                          setFormChannel(next)
+                          if (!next) setFormRecipient('')
+                        }}
+                        style={selectStyle}
+                      >
+                        <option value="">Agent default</option>
+                        {installedChannels.map(id => (
+                          <option key={id} value={id}>{id.charAt(0).toUpperCase() + id.slice(1)}</option>
+                        ))}
+                      </select>
+                    </div>
+                    <div>
+                      <label className="block text-xs mb-1 font-medium" style={{ color: colors.text.muted }}>
+                        Recipient {formChannel ? '' : '(disabled)'}
+                      </label>
+                      <input
+                        type="text"
+                        placeholder={
+                          formChannel === 'telegram' ? '@username or chat_id' :
+                          formChannel === 'whatsapp' ? '+15551234567' :
+                          formChannel === 'discord' ? 'channel_id or user_id' :
+                          formChannel === 'slack' ? '#channel or @user' :
+                          'Pick a channel first'
+                        }
+                        value={formRecipient}
+                        onChange={e => setFormRecipient(e.target.value)}
+                        disabled={!formChannel}
+                        style={{ ...inputStyle, opacity: formChannel ? 1 : 0.5 }}
+                      />
+                    </div>
+                  </div>
+                )}
+
                 {/* Agent ID (optional) */}
                 <div>
                   <label className="block text-xs mb-1 font-medium" style={{ color: colors.text.muted }}>{t('cron.agentIdOptional')}</label>
@@ -431,7 +582,7 @@ export const CronSection: React.FC<CronSectionProps> = ({ colors }) => {
                     onClick={handleAddJob}
                     disabled={formSubmitting}
                     size="sm"
-                    style={{ backgroundColor: colors.accent.brand, color: '#ffffff', border: 'none' }}
+                    style={{ backgroundColor: colors.accent.brand, color: colors.button.primaryFg, border: 'none' }}
                   >
                     {formSubmitting ? <Loader2 className="h-4 w-4 animate-spin mr-1" /> : <Plus className="h-4 w-4 mr-1" />}
                     {t('cron.createJob')}
@@ -454,20 +605,21 @@ export const CronSection: React.FC<CronSectionProps> = ({ colors }) => {
         <div className="flex-1 px-6 pb-6 min-h-0 overflow-hidden">
           <div className="h-full overflow-y-auto overflow-x-hidden">
             {jobs.length === 0 ? (
-              <div className="text-center py-16">
-                <Clock className="h-12 w-12 mx-auto mb-4" style={{ color: colors.text.muted, opacity: 0.4 }} />
-                <h3 className="text-lg font-medium mb-2" style={{ color: colors.text.header }}>{t('cron.noJobsYet')}</h3>
-                <p className="text-sm mb-4" style={{ color: colors.text.muted }}>
-                  {t('cron.noJobsDesc')}
-                </p>
-                <Button
-                  onClick={() => setShowAddForm(true)}
-                  style={{ backgroundColor: colors.accent.brand, color: '#ffffff', border: 'none' }}
-                >
-                  <Plus className="h-4 w-4 mr-2" />
-                  {t('cron.addFirstJob')}
-                </Button>
-              </div>
+              <EmptyState
+                colors={colors}
+                illustration={<MascotIllustration mood="napping" />}
+                title={t('cron.noJobsYet')}
+                description={t('cron.noJobsDesc')}
+                action={
+                  <Button
+                    onClick={() => setShowAddForm(true)}
+                    style={{ backgroundColor: colors.accent.brand, color: colors.button.primaryFg, border: 'none' }}
+                  >
+                    <Plus className="h-4 w-4 mr-2" />
+                    {t('cron.addFirstJob')}
+                  </Button>
+                }
+              />
             ) : (
               <div className="space-y-3 pr-4">
                 {jobs.map(job => {
@@ -540,6 +692,7 @@ export const CronSection: React.FC<CronSectionProps> = ({ colors }) => {
                               onClick={() => handleRunNow(job)}
                               disabled={isRunning}
                               title="Run now"
+                              aria-label={t('cron.runNow', 'Run now')}
                               className="p-1.5 rounded hover:opacity-80 transition-opacity"
                               style={{ backgroundColor: `${colors.accent.green}20`, color: colors.accent.green }}
                             >
@@ -554,10 +707,14 @@ export const CronSection: React.FC<CronSectionProps> = ({ colors }) => {
                               onClick={() => handleToggleEnabled(job)}
                               disabled={isActioning}
                               title={job.enabled ? 'Disable' : 'Enable'}
+                              aria-label={job.enabled ? t('common.disable', 'Disable') : t('common.enable', 'Enable')}
                               className="p-1.5 rounded hover:opacity-80 transition-opacity"
                               style={{
-                                backgroundColor: job.enabled ? `${colors.accent.red}20` : `${colors.accent.green}20`,
-                                color: job.enabled ? colors.accent.red : colors.accent.green
+                                // Toggle color = the action the click performs.
+                                backgroundColor: job.enabled
+                                  ? `${colors.button.destructive}20`
+                                  : `${colors.button.primary}20`,
+                                color: job.enabled ? colors.button.destructive : colors.button.primary
                               }}
                             >
                               {isActioning
@@ -571,6 +728,7 @@ export const CronSection: React.FC<CronSectionProps> = ({ colors }) => {
                               onClick={() => handleDelete(job)}
                               disabled={isActioning}
                               title="Delete"
+                              aria-label={t('common.delete', 'Delete')}
                               className="p-1.5 rounded hover:opacity-80 transition-opacity"
                               style={{ backgroundColor: `${colors.accent.red}15`, color: colors.accent.red }}
                             >

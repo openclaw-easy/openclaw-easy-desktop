@@ -19,7 +19,15 @@ interface DoctorLogEntry {
   timestamp: string;
   level: 'info' | 'warning' | 'error' | 'success';
   message: string;
-  type?: 'problem' | 'fix' | 'status';
+  /**
+   * Badge category — what's shown in the colored pill next to the
+   * timestamp. Should mirror the line's level so a warning-class line
+   * gets a yellow "WARNING" pill, not a red "PROBLEM" pill. The earlier
+   * fork conflated these into a single 'problem' type which produced
+   * misleading red badges for advisories like "skill missing optional
+   * config" or "skill needs `obsidian` binary".
+   */
+  type?: 'error' | 'warning' | 'fix' | 'preview' | 'status';
 }
 
 interface DoctorSectionProps {
@@ -41,11 +49,19 @@ export function DoctorSection({ colors }: DoctorSectionProps) {
     }).catch(() => {});
   }, []);
   const [summary, setSummary] = useState<{
+    /** True blockers (red ❌). */
     problemsFound: number;
+    /** Yellow advisories — formerly conflated with problemsFound. */
+    warningsFound: number;
+    /** "Doctor changes" preview entries — fixes that --fix would apply. */
+    fixesPreviewed: number;
+    /** Repairs applied (only populated by `doctor --fix`). */
     problemsFixed: number;
     status: 'idle' | 'running' | 'success' | 'warning' | 'error';
   }>({
     problemsFound: 0,
+    warningsFound: 0,
+    fixesPreviewed: 0,
     problemsFixed: 0,
     status: 'idle',
   });
@@ -77,12 +93,24 @@ export function DoctorSection({ colors }: DoctorSectionProps) {
       const doctorOutput = await window.electronAPI?.runDoctor?.();
 
       if (doctorOutput?.success) {
-        // Parse doctor output into structured logs
-        parseDoctorOutput(doctorOutput.output, doctorOutput.errors);
-        setSummary(prev => ({
-          ...prev,
-          status: doctorOutput.problemsFixed > 0 ? 'success' : 'warning'
-        }));
+        // Render the raw doctor output as structured log entries. The
+        // main-process parser is the source of truth for the counter
+        // badges — we no longer re-count in the renderer (that was the
+        // path that lit up "8 problems found" on a clean machine because
+        // every clack-panel bullet counted, regardless of warning vs
+        // error context). See managers/doctor-manager.ts:parseDoctorOutput.
+        renderDoctorLogs(doctorOutput.output, doctorOutput.errors);
+        const errors = doctorOutput.problemsFound ?? 0;
+        const warnings = doctorOutput.warningsFound ?? 0;
+        const previews = doctorOutput.fixesPreviewed ?? 0;
+        const fixed = doctorOutput.problemsFixed ?? 0;
+        setSummary({
+          problemsFound: errors,
+          warningsFound: warnings,
+          fixesPreviewed: previews,
+          problemsFixed: fixed,
+          status: errors > 0 ? 'error' : warnings > 0 ? 'warning' : 'success',
+        });
       } else {
         throw new Error(doctorOutput?.error || 'Doctor command failed');
       }
@@ -108,60 +136,90 @@ export function DoctorSection({ colors }: DoctorSectionProps) {
     }
   };
 
-  const parseDoctorOutput = (output: string, errors: string) => {
-    const lines = (output + '\n' + errors).split('\n').filter(line => line.trim());
-    let problemsFound = 0;
-    let problemsFixed = 0;
+  // Pattern matchers for panel headers. Mirrors managers/doctor-manager.ts
+  // so per-line log coloring matches the badge counts the main process
+  // returns. Order matters — most specific first.
+  const PANEL_ERROR_RE = /^[\s│┌└├─◇◆◐◯╭╮╯╰┤┬┴┼]*Doctor errors\b/i;
+  const PANEL_WARNING_RE = /^[\s│┌└├─◇◆◐◯╭╮╯╰┤┬┴┼]*Doctor warnings\b/i;
+  const PANEL_CHANGES_RE = /^[\s│┌└├─◇◆◐◯╭╮╯╰┤┬┴┼]*Doctor changes\b/i;
+  const PANEL_GENERIC_RE = /^[\s│┌└├─◇◆◐◯╭╮╯╰┤┬┴┼]*[A-Z][\w\s/]*?\s+[─╮╭]/;
+  const BULLET_RE = /^[\s│┌└├─◇◆◐◯╭╮╯╰┤┬┴┼]*-\s/;
+
+  // Strip the leading box-drawing prefix to see what a line ACTUALLY says.
+  const BOX_PREFIX_STRIP_RE = /^[\s│┌└├─◇◆◐◯╭╮╯╰┤┬┴┼]+/;
+  // Lines that are purely box-drawing separators carry no signal.
+  const PURE_SEPARATOR_RE = /^[─╮╭╯┤├]+$/;
+  // Trailing box-drawing on the right side of a panel row.
+  const TRAILING_BOX_RE = /[\s│]+$/;
+
+  const renderDoctorLogs = (output: string, errors: string) => {
+    const lines = (output + '\n' + errors).split('\n');
     const parsedLogs: DoctorLogEntry[] = [];
 
-    lines.forEach(line => {
-      const trimmedLine = line.trim();
-      if (!trimmedLine) {return;}
+    // Track the enclosing panel's severity so each bullet inherits the
+    // right color. Default to error for bare top-level bullets.
+    let currentSeverity: 'error' | 'warning' | 'info' | 'success' = 'error';
+
+    lines.forEach((rawLine) => {
+      const trimmedLine = rawLine.trim();
+      if (!trimmedLine) return;
+
+      // Panel transitions — update current severity, don't emit a log entry.
+      if (PANEL_ERROR_RE.test(trimmedLine)) { currentSeverity = 'error'; return; }
+      if (PANEL_WARNING_RE.test(trimmedLine)) { currentSeverity = 'warning'; return; }
+      if (PANEL_CHANGES_RE.test(trimmedLine)) { currentSeverity = 'info'; return; }
+      if (PANEL_GENERIC_RE.test(trimmedLine)) { currentSeverity = 'warning'; return; }
+
+      // Strip the box-drawing prefix + trailing chars to see the actual content.
+      // A clack box-drawing row looks like:
+      //   │  - real content here  │
+      // After stripping leading box chars and trailing │, we get the meat.
+      const inside = trimmedLine.replace(BOX_PREFIX_STRIP_RE, '').replace(TRAILING_BOX_RE, '');
+      // Skip lines that are 100% decorative — empty box rows, separator runs,
+      // closing corners. These are the bulk of "yellow noise" in the log pane.
+      if (!inside) return;
+      if (PURE_SEPARATOR_RE.test(inside)) return;
 
       let level: DoctorLogEntry['level'] = 'info';
       let type: DoctorLogEntry['type'] = 'status';
-      let message = trimmedLine;
+      let message = inside;
 
-      // Detect message types by emoji prefix first (most reliable),
-      // then fall back to keyword heuristics — but skip "no ... detected"
-      // phrases that indicate the absence of a problem.
-      const isNegated = /\b(no|not|none|zero)\b/i.test(trimmedLine);
-
-      if (trimmedLine.includes('✅') || trimmedLine.includes('fixed') || trimmedLine.includes('resolved')) {
+      // Forward-compat: doctor --fix emits explicit success markers.
+      if (/^✅|^Applied:|^Fixed:|^Repaired:/i.test(inside)) {
         level = 'success';
         type = 'fix';
-        problemsFixed++;
-        message = `✅ ${trimmedLine.replace(/^✅\s*/, '')}`;
-      } else if (trimmedLine.includes('⚠️') || (!isNegated && /\bwarning\b/i.test(trimmedLine)) || (!isNegated && /\bissue\b/i.test(trimmedLine))) {
-        level = 'warning';
-        type = 'problem';
-        problemsFound++;
-        message = `⚠️ ${trimmedLine.replace(/^⚠️\s*/, '')}`;
-      } else if (trimmedLine.includes('❌') || (!isNegated && /\berror\b/i.test(trimmedLine)) || (!isNegated && /\bfailed\b/i.test(trimmedLine))) {
-        level = 'error';
-        type = 'problem';
-        problemsFound++;
-        message = `❌ ${trimmedLine.replace(/^❌\s*/, '')}`;
-      } else if (trimmedLine.includes('🔍') || trimmedLine.includes('checking') || trimmedLine.includes('scanning')) {
-        level = 'info';
-        message = `🔍 ${trimmedLine.replace(/^🔍\s*/, '')}`;
+        message = `✅ ${inside.replace(/^✅\s*/, '')}`;
+      } else if (/^-\s/.test(inside)) {
+        // Bullet inherits the panel's severity. "No issues/warnings"
+        // is informational ("- No issues detected.").
+        if (/^-\s+No\s/i.test(inside)) {
+          type = 'status';
+          level = 'info';
+        } else if (currentSeverity === 'error') {
+          type = 'error';
+          level = 'error';
+        } else if (currentSeverity === 'warning') {
+          type = 'warning';
+          level = 'warning';
+        } else if (currentSeverity === 'info') {
+          // "Doctor changes" panel — auto-fix previews, NOT problems.
+          type = 'preview';
+          level = 'info';
+        }
       }
+      // Prose lines (not bullets, not success markers) fall through to
+      // level='info' / type='status'. They render with a transparent
+      // background — visible for context but not screaming for attention.
 
       parsedLogs.push({
         timestamp: new Date().toISOString(),
         level,
         message,
-        type
+        type,
       });
     });
 
-    setLogs(prev => [...prev, ...parsedLogs]);
-    setSummary(prev => ({
-      ...prev,
-      problemsFound,
-      problemsFixed,
-      status: problemsFound === 0 ? 'success' : problemsFixed > 0 ? 'warning' : 'error'
-    }));
+    setLogs((prev) => [...prev, ...parsedLogs]);
   };
 
   const getStatusIcon = () => {
@@ -198,7 +256,7 @@ export function DoctorSection({ colors }: DoctorSectionProps) {
         <div className="flex items-center gap-3">
           {getStatusIcon()}
           <div className="flex items-baseline gap-2">
-            <h2 className="text-lg font-bold" style={{ color: colors.text.header }}>
+            <h2 className="font-display text-lg font-bold tracking-tight" style={{ color: colors.text.header }}>
               {t('doctor.title')}
             </h2>
             <p className="text-sm" style={{ color: colors.text.muted }}>
@@ -211,8 +269,8 @@ export function DoctorSection({ colors }: DoctorSectionProps) {
           disabled={isRunning}
           className="flex items-center gap-2 px-6 py-2"
           style={{
-            backgroundColor: colors.accent.blue,
-            color: colors.bg.primary,
+            backgroundColor: colors.accent.brand,
+            color: colors.button.primaryFg,
           }}
         >
           {isRunning ? (
@@ -229,32 +287,51 @@ export function DoctorSection({ colors }: DoctorSectionProps) {
         </Button>
       </div>
 
-      {/* Status Summary */}
-      <div className="grid grid-cols-3 gap-4 flex-shrink-0">
+      {/* Status Summary — 4 cards. The Warnings card was previously
+          conflated into Problems Found, producing scary "N issues
+          detected" badges for what were really yellow advisories. */}
+      <div className="grid grid-cols-4 gap-4 flex-shrink-0">
+        {/* Errors (red) — true blockers from "Doctor errors" panels. */}
         <Card className="border-0 shadow-none" style={{ backgroundColor: colors.bg.secondary }}>
           <CardContent className="p-4">
             <div className="flex items-center justify-between">
               <div className="flex items-baseline gap-2">
-                <span className="text-2xl font-bold" style={{ color: colors.text.header }}>{summary.problemsFound}</span>
+                <span className="font-display text-2xl font-bold tracking-tight" style={{ color: colors.text.header }}>{summary.problemsFound}</span>
                 <span className="text-sm" style={{ color: colors.text.muted }}>{t('doctor.problemsFound')}</span>
+              </div>
+              <XCircle className="h-6 w-6 flex-shrink-0" style={{ color: colors.accent.red }} />
+            </div>
+          </CardContent>
+        </Card>
+
+        {/* Warnings (yellow) — advisories from "Doctor warnings" + generic panels. */}
+        <Card className="border-0 shadow-none" style={{ backgroundColor: colors.bg.secondary }}>
+          <CardContent className="p-4">
+            <div className="flex items-center justify-between">
+              <div className="flex items-baseline gap-2">
+                <span className="font-display text-2xl font-bold tracking-tight" style={{ color: colors.text.header }}>{summary.warningsFound}</span>
+                <span className="text-sm" style={{ color: colors.text.muted }}>{t('doctor.warningsFound', 'Warnings')}</span>
               </div>
               <AlertCircle className="h-6 w-6 flex-shrink-0" style={{ color: colors.accent.yellow }} />
             </div>
           </CardContent>
         </Card>
 
+        {/* Fixes Previewed (info) — "Doctor changes" panel entries the
+            gateway would auto-apply on `doctor --fix`. Not problems. */}
         <Card className="border-0 shadow-none" style={{ backgroundColor: colors.bg.secondary }}>
           <CardContent className="p-4">
             <div className="flex items-center justify-between">
               <div className="flex items-baseline gap-2">
-                <span className="text-2xl font-bold" style={{ color: colors.text.header }}>{summary.problemsFixed}</span>
-                <span className="text-sm" style={{ color: colors.text.muted }}>{t('doctor.problemsFixed')}</span>
+                <span className="font-display text-2xl font-bold tracking-tight" style={{ color: colors.text.header }}>{summary.fixesPreviewed}</span>
+                <span className="text-sm" style={{ color: colors.text.muted }}>{t('doctor.fixesPreviewed', 'Fixes Previewed')}</span>
               </div>
               <CheckCircle className="h-6 w-6 flex-shrink-0" style={{ color: colors.accent.green }} />
             </div>
           </CardContent>
         </Card>
 
+        {/* Last run timestamp. */}
         <Card className="border-0 shadow-none" style={{ backgroundColor: colors.bg.secondary }}>
           <CardContent className="p-4">
             <div className="flex items-center justify-between">
@@ -277,7 +354,7 @@ export function DoctorSection({ colors }: DoctorSectionProps) {
             ref={logContainerRef}
             className="flex-1 overflow-y-auto space-y-1"
             style={{
-              backgroundColor: colors.bg.primary,
+              backgroundColor: colors.bg.tertiary,
             }}
           >
             {logs.length === 0 ? (
@@ -295,9 +372,15 @@ export function DoctorSection({ colors }: DoctorSectionProps) {
                   key={index}
                   className="flex items-start gap-2 px-3 py-1.5 rounded-md hover:bg-opacity-50 transition-colors"
                   style={{
-                    backgroundColor: entry.level === 'error' ? `${colors.accent.red}15` :
-                                   entry.level === 'warning' ? `${colors.accent.yellow}15` :
-                                   entry.level === 'success' ? `${colors.accent.green}15` :
+                    // Only TINT the background when the line has its own
+                    // pill (real actionable item). Prose / status lines
+                    // are level='info' but type='status' — we render them
+                    // transparently so the log pane isn't a wall of yellow
+                    // when a warning panel has lots of contextual prose.
+                    backgroundColor: entry.type === 'error' ? `${colors.accent.red}15` :
+                                   entry.type === 'warning' ? `${colors.accent.yellow}15` :
+                                   entry.type === 'fix' ? `${colors.accent.green}15` :
+                                   entry.type === 'preview' ? `${colors.accent.blue}15` :
                                    'transparent'
                   }}
                 >
@@ -310,28 +393,40 @@ export function DoctorSection({ colors }: DoctorSectionProps) {
                       >
                         {new Date(entry.timestamp).toLocaleTimeString()}
                       </span>
-                      {entry.type && (
+                      {entry.type && entry.type !== 'status' && (
                         <span
                           className="text-xs px-2 py-1 rounded-full font-medium uppercase tracking-wide"
                           style={{
-                            backgroundColor: entry.type === 'fix' ? colors.accent.green :
-                                           entry.type === 'problem' ? colors.accent.red :
-                                           colors.accent.blue,
-                            color: colors.bg.primary,
-                            opacity: 0.9
+                            backgroundColor:
+                              entry.type === 'error' ? colors.accent.red :
+                              entry.type === 'warning' ? colors.accent.yellow :
+                              entry.type === 'fix' ? colors.accent.green :
+                              entry.type === 'preview' ? colors.accent.blue :
+                              colors.accent.blue,
+                            color: colors.button.primaryFg,
+                            opacity: 0.95
                           }}
                         >
-                          {entry.type === 'problem' ? t('doctor.problem') : entry.type === 'fix' ? t('doctor.fix') : t('doctor.status')}
+                          {entry.type === 'error' ? t('doctor.error', 'Error') :
+                           entry.type === 'warning' ? t('doctor.warning', 'Warning') :
+                           entry.type === 'fix' ? t('doctor.fix') :
+                           entry.type === 'preview' ? t('doctor.preview', 'Preview') :
+                           t('doctor.status')}
                         </span>
                       )}
                     </div>
                     <p
                       className="text-sm leading-relaxed font-medium break-words"
                       style={{
-                        color: entry.level === 'success' ? colors.accent.green :
-                               entry.level === 'warning' ? colors.accent.yellow :
-                               entry.level === 'error' ? colors.accent.red :
-                               colors.text.header,
+                        // Same idea as background: only color the text
+                        // when this row has a pill. Prose/status lines
+                        // use the muted header color so they read like
+                        // context, not severity.
+                        color: entry.type === 'fix' ? colors.accent.green :
+                               entry.type === 'warning' ? colors.accent.yellow :
+                               entry.type === 'error' ? colors.accent.red :
+                               entry.type === 'preview' ? colors.accent.blue :
+                               colors.text.normal,
                         fontFamily: 'inherit'
                       }}
                     >

@@ -1,5 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { DEFAULT_GATEWAY_PORT } from '../../shared/constants';
+import { nextMessageKey } from './messageKey';
+
 import {
   type ExecApprovalRequest,
   type ExecApprovalDecision,
@@ -8,6 +10,16 @@ import {
   addExecApproval,
   removeExecApproval,
 } from './useExecApproval';
+
+/**
+ * True when a rejection was caused by the socket closing rather than by a
+ * genuine request failure. In-flight requests are rejected with "Disconnected"
+ * on teardown/restart, which is normal lifecycle noise.
+ */
+function isDisconnectError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error ?? '');
+  return /disconnect/i.test(message);
+}
 
 
 interface ChatAttachment {
@@ -79,15 +91,50 @@ export function useChatConnection(gatewayPort: number = DEFAULT_GATEWAY_PORT): C
   const [execApprovalError, setExecApprovalError] = useState<string | null>(null);
   const execApprovalTimersRef = useRef<Map<string, NodeJS.Timeout>>(new Map());
   const wsRef = useRef<WebSocket | null>(null);
+  /**
+   * Promise-based single-flight for `connect()`. The first call sets this
+   * to the in-flight connect Promise; concurrent callers (React
+   * StrictMode double-mount, auto-reconnect racing with manual
+   * reconnect(), useEffect re-runs) get the SAME Promise back and await
+   * the same connect attempt.
+   *
+   * Without this, two concurrent connect() calls would both pass the
+   * `wsRef.current` null-check, both await `getGatewayPort()`, and both
+   * construct a WebSocket. The orphaned socket never gets a
+   * `connect.challenge` reply (the renderer's onmessage guard ignores it
+   * via `wsRef.current !== ws`), so the gateway logs a 15s
+   * handshake-timeout and the user sees flaky chat.
+   *
+   * Cleared when the WS is constructed (wsRef takes over de-dup duty) or
+   * when the attempt errors out.
+   */
+  const connectPromiseRef = useRef<Promise<void> | null>(null);
   const reconnectTimeoutRef = useRef<NodeJS.Timeout>();
   const retryCountRef = useRef(0);
   const shouldReconnectRef = useRef(true);
+  /**
+   * Epoch ms when the current reconnect sequence started (i.e. when the
+   * connection first dropped without a successful re-handshake). Used to
+   * give up auto-reconnect after a cumulative budget so a permanently
+   * offline gateway doesn't burn battery indefinitely. Cleared on every
+   * successful handshake.
+   */
+  const reconnectSequenceStartRef = useRef<number | null>(null);
+  /** Cumulative reconnect budget — give up after this elapses. 10 min
+   *  feels right: enough to ride out a gateway restart or short network
+   *  hiccup, short enough that a permanently-stopped gateway doesn't
+   *  pin the renderer's event loop overnight. Manual reconnect() resets
+   *  this so the user can always force a fresh attempt. */
+  const RECONNECT_BUDGET_MS = 10 * 60 * 1000;
   const pendingRequestsRef = useRef<Map<string, { resolve: any; reject: any }>>(new Map());
   const chatEventHandlersRef = useRef<Set<(event: ChatEvent) => void | Promise<void>>>(new Set());
   const requestIdCounter = useRef(0);
   const isHandshakeCompleteRef = useRef(false);
-  const pendingHandshakeRequestsRef = useRef<Array<() => void>>([]);
-  const cleanupTimerRef = useRef<NodeJS.Timeout | null>(null);
+  // Queued send requests that arrived before the handshake completed.
+  // Each entry carries its own reject so we can fail the awaiting Promise
+  // when the connection is torn down, rather than silently dropping it
+  // (H3 — caller would otherwise hang forever on its `await sendMessage`).
+  const pendingHandshakeRequestsRef = useRef<Array<{ execute: () => void; reject: (err: Error) => void }>>([]);
   const heartbeatRef = useRef<NodeJS.Timeout | null>(null);
 
   const generateRequestId = useCallback(() => {
@@ -129,14 +176,14 @@ export function useChatConnection(gatewayPort: number = DEFAULT_GATEWAY_PORT): C
       // Queue request if handshake not complete (unless it's the connect request itself)
       if (!isHandshakeCompleteRef.current && method !== 'connect') {
         console.log('[ChatConnection] Queueing request until handshake completes:', method);
-        pendingHandshakeRequestsRef.current.push(executeRequest);
+        pendingHandshakeRequestsRef.current.push({ execute: executeRequest, reject });
       } else {
         executeRequest();
       }
     });
   }, [generateRequestId]);
 
-  const connect = useCallback(async () => {
+  const connect = useCallback(async (): Promise<void> => {
     // Don't create new connection if already connecting or connected
     if (wsRef.current &&
         (wsRef.current.readyState === WebSocket.OPEN ||
@@ -145,26 +192,46 @@ export function useChatConnection(gatewayPort: number = DEFAULT_GATEWAY_PORT): C
       return;
     }
 
-    // Enable reconnection when manually connecting
-    shouldReconnectRef.current = true;
-
-    // Fetch the active gateway port dynamically so we always connect to
-    // whichever port the process manager actually claimed.
-    let currentPort = gatewayPort;
-    try {
-      const fetchedPort = await (window as any).electronAPI?.getGatewayPort?.();
-      if (fetchedPort && fetchedPort > 0) {
-        currentPort = fetchedPort;
-      }
-    } catch {
-      // fall back to prop value
+    // Promise-based single-flight. If a connect attempt is already in
+    // flight, every concurrent caller awaits THE SAME Promise — they all
+    // observe the same final outcome (success or failure) without
+    // racing to construct duplicate WebSockets.
+    if (connectPromiseRef.current) {
+      console.log('[ChatConnection] connect() already in progress, awaiting in-flight attempt...');
+      return connectPromiseRef.current;
     }
 
-    try {
+    const attempt = (async () => {
+      // Enable reconnection when manually connecting
+      shouldReconnectRef.current = true;
+
+      // Fetch the active gateway port dynamically so we always connect
+      // to whichever port the process manager actually claimed.
+      let currentPort = gatewayPort;
+      try {
+        const fetchedPort = await (window as any).electronAPI?.getGatewayPort?.();
+        if (fetchedPort && fetchedPort > 0) {
+          currentPort = fetchedPort;
+        }
+      } catch {
+        // fall back to prop value
+      }
+
+      // The single-flight gate guarantees no parallel connect was
+      // running, but a reconnect() called during our await window
+      // could have already established a fresh socket. Honor it.
+      if (wsRef.current &&
+          (wsRef.current.readyState === WebSocket.OPEN ||
+           wsRef.current.readyState === WebSocket.CONNECTING)) {
+        console.log('[ChatConnection] WS materialized during await — skipping duplicate construct');
+        return;
+      }
+
       console.log(`[ChatConnection] Connecting to ws://localhost:${currentPort}/`);
       const ws = new WebSocket(`ws://localhost:${currentPort}/`);
 
-      // Set wsRef immediately so sendRequest can use it
+      // Set wsRef immediately so sendRequest can use it AND the next
+      // concurrent connect() sees us via the wsRef early-return guard.
       wsRef.current = ws;
 
       ws.onopen = async () => {
@@ -186,12 +253,32 @@ export function useChatConnection(gatewayPort: number = DEFAULT_GATEWAY_PORT): C
             try {
               const nonce = frame.payload?.nonce;
 
+              // Bound IPC waits — without these, a hung getGatewayToken() or
+              // buildDeviceIdentity() blocks the handshake until the gateway
+              // closes the WS for nonce-staleness, then reconnect spins
+              // forever in "Gateway Not Running". 5s is generous: both calls
+              // are local main-process work (keychain read + Ed25519 sign).
+              const withTimeout = <T,>(p: Promise<T>, ms: number, label: string): Promise<T | undefined> =>
+                Promise.race([
+                  p,
+                  new Promise<undefined>((resolve) =>
+                    setTimeout(() => {
+                      console.warn(`[ChatConnection] ${label} timed out after ${ms}ms — proceeding without it`);
+                      resolve(undefined);
+                    }, ms),
+                  ),
+                ]);
+
               // Get gateway auth token from Electron main process
               let authToken: string | undefined;
               if (window.electronAPI?.getGatewayToken) {
                 try {
-                  authToken = await window.electronAPI.getGatewayToken();
-                  console.log('[ChatConnection] Retrieved gateway token:', authToken ? '[PRESENT]' : 'null');
+                  authToken = await withTimeout(
+                    Promise.resolve(window.electronAPI.getGatewayToken()),
+                    5000,
+                    'getGatewayToken',
+                  );
+                  console.log('[ChatConnection] Retrieved gateway token:', authToken ? `${authToken.slice(0, 10)}...` : 'null');
                 } catch (error) {
                   console.warn('[ChatConnection] Failed to get gateway token:', error);
                 }
@@ -201,20 +288,32 @@ export function useChatConnection(gatewayPort: number = DEFAULT_GATEWAY_PORT): C
 
               const clientId = 'webchat';
               const clientMode = 'webchat';
+              const platform = typeof navigator !== 'undefined' ? navigator.platform : 'electron';
+              const deviceFamily = '';
               const scopes = ['operator.read', 'operator.write', 'operator.admin', 'operator.approvals', 'operator.pairing'];
 
-              // Build Ed25519 device identity via main process (Node.js crypto, required for scope grants)
+              // Build Ed25519 device identity via main process (Node.js crypto, required for scope grants).
+              // Pass platform + deviceFamily so the V3 signed payload matches the
+              // platform string we send in connectParams.client.platform — the gateway's
+              // verifier reconstructs the payload from BOTH the device fields and the
+              // client.platform field; if they disagree, signature verification fails.
               let device_identity: object | undefined;
               try {
                 if (window.electronAPI?.buildDeviceIdentity) {
-                  device_identity = await window.electronAPI.buildDeviceIdentity({
-                    clientId,
-                    clientMode,
-                    role: 'operator',
-                    scopes,
-                    token: authToken || '',
-                    nonce: nonce || ''
-                  });
+                  device_identity = await withTimeout(
+                    Promise.resolve(window.electronAPI.buildDeviceIdentity({
+                      clientId,
+                      clientMode,
+                      role: 'operator',
+                      scopes,
+                      token: authToken || '',
+                      nonce: nonce || '',
+                      platform,
+                      deviceFamily,
+                    })),
+                    5000,
+                    'buildDeviceIdentity',
+                  );
                   if (device_identity) {
                     console.log('[ChatConnection] Device identity ready, deviceId:', (device_identity as any).id?.slice(0, 16) + '...');
                   } else {
@@ -238,12 +337,14 @@ export function useChatConnection(gatewayPort: number = DEFAULT_GATEWAY_PORT): C
               }
 
               const connectParams = {
+                // Protocol version bumped from 3 → 4 in upstream openclaw post-2026.5.
+                // Sending maxProtocol < 4 returns INVALID_REQUEST "protocol mismatch".
                 minProtocol: 3,
-                maxProtocol: 3,
+                maxProtocol: 4,
                 client: {
                   id: clientId,
                   version: '1.0.0',
-                  platform: typeof navigator !== 'undefined' ? navigator.platform : 'electron',
+                  platform,
                   mode: clientMode,
                   instanceId: `desktop-${Date.now()}`
                 },
@@ -262,29 +363,37 @@ export function useChatConnection(gatewayPort: number = DEFAULT_GATEWAY_PORT): C
               setIsConnected(true);
               setConnectionError(null);
               retryCountRef.current = 0;
+              // Reset the cumulative reconnect budget — a successful
+              // handshake means the next disconnect starts a fresh
+              // 10-minute clock, not a continuation of the previous one.
+              reconnectSequenceStartRef.current = null;
 
-              // Start heartbeat ping every 30s
+              // Start heartbeat every 30s. Uses gateway.identity.get (a real
+              // read-only method in the BASE_METHODS list) instead of "ping",
+              // which the v4 gateway doesn't expose. The old "ping" call
+              // returned INVALID_REQUEST every 30s — harmless to chat but
+              // spammed the gateway log and burned a request slot per beat.
               if (heartbeatRef.current) clearInterval(heartbeatRef.current);
               heartbeatRef.current = setInterval(() => {
                 if (wsRef.current?.readyState === WebSocket.OPEN) {
-                  const pingId = `ping_${Date.now()}`;
+                  const beatId = `hb_${Date.now()}`;
                   const pongTimeout = setTimeout(() => {
                     // No response within 5s — close and let reconnect handle it
-                    console.warn('[ChatConnection] Heartbeat pong timeout — closing socket');
+                    console.warn('[ChatConnection] Heartbeat timeout — closing socket');
                     if (heartbeatRef.current) { clearInterval(heartbeatRef.current); heartbeatRef.current = null; }
                     wsRef.current?.close();
                   }, 5000);
 
-                  pendingRequestsRef.current.set(pingId, {
+                  pendingRequestsRef.current.set(beatId, {
                     resolve: () => clearTimeout(pongTimeout),
                     reject: () => clearTimeout(pongTimeout),
                   });
 
                   try {
-                    wsRef.current.send(JSON.stringify({ type: 'req', id: pingId, method: 'ping', params: {} }));
+                    wsRef.current.send(JSON.stringify({ type: 'req', id: beatId, method: 'gateway.identity.get', params: {} }));
                   } catch {
                     clearTimeout(pongTimeout);
-                    pendingRequestsRef.current.delete(pingId);
+                    pendingRequestsRef.current.delete(beatId);
                   }
                 }
               }, 30000);
@@ -293,7 +402,7 @@ export function useChatConnection(gatewayPort: number = DEFAULT_GATEWAY_PORT): C
               const queued = [...pendingHandshakeRequestsRef.current];
               pendingHandshakeRequestsRef.current = [];
               console.log(`[ChatConnection] Executing ${queued.length} queued requests`);
-              queued.forEach(fn => fn());
+              queued.forEach(entry => entry.execute());
             } catch (error) {
               console.error('[ChatConnection] Handshake failed:', error);
               setConnectionError('Handshake failed');
@@ -410,25 +519,63 @@ export function useChatConnection(gatewayPort: number = DEFAULT_GATEWAY_PORT): C
         setIsConnected(false);
         wsRef.current = null;
         isHandshakeCompleteRef.current = false;
+        // Reject any requests queued behind a handshake that will now never
+        // complete — silent drop would hang the caller's `await sendMessage`.
+        const droppedOnClose = pendingHandshakeRequestsRef.current;
         pendingHandshakeRequestsRef.current = [];
+        droppedOnClose.forEach(entry => entry.reject(new Error('WebSocket disconnected before handshake completed')));
 
-        // Auto-reconnect with exponential backoff — never give up.
-        // The gateway can start/restart at any time; permanently giving up
-        // leaves the user stuck on "Gateway Not Running" even after starting it.
+        // Also reject already-SENT RPCs (chat.send/chat.history) that are still
+        // awaiting a response — otherwise they only settle via their 30s
+        // timeout, keeping the send path blocked ("isSending") for 30s after a
+        // drop and stranding the caller's await.
+        const inFlight = Array.from(pendingRequestsRef.current.values());
+        pendingRequestsRef.current.clear();
+        inFlight.forEach(entry => { try { entry.reject(new Error('WebSocket disconnected')); } catch { /* heartbeat reject clears its timer */ } });
+
+        // Auto-reconnect with exponential backoff. Originally "never give
+        // up" — but a permanently offline gateway then pinged forever at
+        // 30s intervals, burning battery without ever succeeding. We now
+        // cap at a cumulative 10-minute budget per reconnect sequence:
+        // long enough to ride out a gateway restart or transient
+        // network blip, short enough that a stopped gateway doesn't keep
+        // the desktop's event loop busy overnight. The manual reconnect()
+        // button clears the budget so the user can always retry.
         if (shouldReconnectRef.current) {
+          if (reconnectSequenceStartRef.current === null) {
+            reconnectSequenceStartRef.current = Date.now();
+          }
+          const elapsed = Date.now() - reconnectSequenceStartRef.current;
+          if (elapsed >= RECONNECT_BUDGET_MS) {
+            console.log(`[ChatConnection] Auto-reconnect budget exhausted (${(elapsed / 1000).toFixed(0)}s) — stopping. User can manually retry.`);
+            shouldReconnectRef.current = false;
+            setConnectionError('Could not reach gateway — click reconnect to try again.');
+            return;
+          }
           const delay = Math.min(1000 * Math.pow(2, retryCountRef.current), 30000);
           retryCountRef.current = Math.min(retryCountRef.current + 1, 15); // cap counter, not attempts
-          console.log(`[ChatConnection] Reconnecting in ${delay}ms...`);
+          console.log(`[ChatConnection] Reconnecting in ${delay}ms (elapsed ${(elapsed / 1000).toFixed(0)}s / ${RECONNECT_BUDGET_MS / 1000}s budget)...`);
 
           reconnectTimeoutRef.current = setTimeout(() => {
             connect();
           }, delay);
         }
       };
-    } catch (error) {
-      console.error('[ChatConnection] Connection failed:', error);
-      setConnectionError(error instanceof Error ? error.message : 'Connection failed');
-    }
+    })();
+
+    // Publish + track the in-flight Promise. Concurrent connect() callers
+    // hit the `connectPromiseRef.current` early-return and await this
+    // same Promise. Cleared in the finally block so the next attempt is
+    // unblocked regardless of success or failure.
+    connectPromiseRef.current = attempt
+      .catch((error) => {
+        console.error('[ChatConnection] Connection failed:', error);
+        setConnectionError(error instanceof Error ? error.message : 'Connection failed');
+      })
+      .finally(() => {
+        connectPromiseRef.current = null;
+      });
+    return connectPromiseRef.current;
   }, [gatewayPort]);
 
   const disconnect = useCallback(() => {
@@ -447,9 +594,19 @@ export function useChatConnection(gatewayPort: number = DEFAULT_GATEWAY_PORT): C
       wsRef.current.close();
       wsRef.current = null;
     }
+    // Clear the in-flight connect Promise so a subsequent reconnect()
+    // can start fresh instead of awaiting a now-meaningless attempt.
+    connectPromiseRef.current = null;
     setIsConnected(false);
     isHandshakeCompleteRef.current = false;
+    // Reject queued sends so awaiters fail fast instead of hanging forever.
+    const droppedOnDisconnect = pendingHandshakeRequestsRef.current;
     pendingHandshakeRequestsRef.current = [];
+    droppedOnDisconnect.forEach(entry => entry.reject(new Error('Disconnected before handshake completed')));
+    // Reject already-sent RPCs too so they don't hang on their 30s timeout.
+    const inFlightOnDisconnect = Array.from(pendingRequestsRef.current.values());
+    pendingRequestsRef.current.clear();
+    inFlightOnDisconnect.forEach(entry => { try { entry.reject(new Error('Disconnected')); } catch { /* heartbeat reject clears its timer */ } });
 
     // Clear exec approval state
     setExecApprovalQueue([]);
@@ -481,11 +638,20 @@ export function useChatConnection(gatewayPort: number = DEFAULT_GATEWAY_PORT): C
       wsRef.current.close();
       wsRef.current = null;
     }
+    // Drop any in-flight connect Promise — we want a fresh attempt, not
+    // to await one that's already racing with the close we just did.
+    connectPromiseRef.current = null;
 
-    // Reset retry state
+    // Reset retry state — including the cumulative reconnect budget, so
+    // a user-driven retry always gets a fresh 10-minute clock even if
+    // auto-reconnect had previously given up.
     retryCountRef.current = 0;
+    reconnectSequenceStartRef.current = null;
     isHandshakeCompleteRef.current = false;
+    // Reject queued sends so awaiters fail fast — they can be retried after reconnect.
+    const droppedOnReconnect = pendingHandshakeRequestsRef.current;
     pendingHandshakeRequestsRef.current = [];
+    droppedOnReconnect.forEach(entry => entry.reject(new Error('Reconnect requested before handshake completed')));
     setConnectionError(null);
 
     // Re-enable auto-reconnect, then connect
@@ -528,7 +694,13 @@ export function useChatConnection(gatewayPort: number = DEFAULT_GATEWAY_PORT): C
           let content = extractDisplayText(msg);
           if (role === 'user') content = stripUserMessageMetadata(content);
           return {
-            id: msg.id || `${msg.timestamp || Date.now()}`,
+            // `nextMessageKey` makes this a globally-unique React key
+            // even when upstream history sends two messages with the
+            // same `msg.id` (the gateway occasionally uses bare
+            // Date.now() ids that collide within a millisecond — that
+            // produced the "two children with the same key 1778…" warning
+            // and caused bubbles to silently merge).
+            id: nextMessageKey('hist', msg.id ?? msg.timestamp),
             role,
             content,
             timestamp: msg.timestamp || Date.now(),
@@ -539,6 +711,14 @@ export function useChatConnection(gatewayPort: number = DEFAULT_GATEWAY_PORT): C
 
       return messages;
     } catch (error) {
+      // A history request still in flight when the socket closes is rejected
+      // with "Disconnected". That is an expected lifecycle event — gateway
+      // restart, app teardown, a network blip — not a fault, so it must not
+      // surface as console.error. Real failures still do.
+      if (isDisconnectError(error)) {
+        console.debug('[ChatConnection] History load aborted: connection closed');
+        return [];
+      }
       console.error('[ChatConnection] Failed to load history:', error);
       return [];
     }
@@ -579,25 +759,22 @@ export function useChatConnection(gatewayPort: number = DEFAULT_GATEWAY_PORT): C
     };
   }, []);
 
-  // Auto-connect on mount
+  // Auto-connect on mount.
+  //
+  // The Promise-based single-flight in `connect()` makes this safe under
+  // React StrictMode's double-mount: the second mount's `connect()` call
+  // finds either a non-null `wsRef.current` (early return) OR an in-flight
+  // `connectPromiseRef.current` (awaits the same Promise). Either way,
+  // exactly ONE WebSocket is constructed.
+  //
+  // We deliberately disconnect on every cleanup — including StrictMode
+  // unmount/remount. Briefly closing + reopening shows up in the gateway
+  // log as a clean connect/disconnect pair (no stuck-handshake noise),
+  // which is the right trade for not carrying timer hacks.
   useEffect(() => {
-    // Clear any pending cleanup timer from previous effect runs (StrictMode re-mounts)
-    if (cleanupTimerRef.current) {
-      clearTimeout(cleanupTimerRef.current);
-      cleanupTimerRef.current = null;
-    }
-
-    connect();
-
+    void connect();
     return () => {
-      // Only disconnect if the component is truly unmounting, not just re-mounting
-      // Add a delay to avoid disconnecting during StrictMode re-mounts
-      // If the component re-mounts within 150ms, the cleanup timer will be cleared above
-      cleanupTimerRef.current = setTimeout(() => {
-        console.log('[ChatConnection] Cleanup timer fired - disconnecting');
-        disconnect();
-        cleanupTimerRef.current = null;
-      }, 200);
+      disconnect();
     };
   }, []); // Empty deps - only run once on mount (twice in StrictMode)
 

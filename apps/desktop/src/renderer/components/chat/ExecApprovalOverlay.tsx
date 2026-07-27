@@ -87,7 +87,7 @@ export function ExecApprovalOverlay({ queue, busy, error, colors, onDecision }: 
           {queueCount > 1 && (
             <span
               className="text-xs px-2 py-1 rounded-full font-medium"
-              style={{ backgroundColor: colors.accent.brand, color: '#ffffff' }}
+              style={{ backgroundColor: colors.accent.brand, color: colors.button.primaryFg }}
             >
               {queueCount} {t('chat.pending')}
             </span>
@@ -131,15 +131,15 @@ export function ExecApprovalOverlay({ queue, busy, error, colors, onDecision }: 
           <button
             disabled={busy}
             onClick={() => onDecision(active.id, 'allow-once')}
-            className="flex-1 py-2.5 rounded-lg font-semibold text-sm transition-colors disabled:opacity-50"
-            style={{ backgroundColor: colors.accent.brand, color: '#ffffff' }}
+            className="press-pulse ripple-glow flex-1 py-2.5 rounded-lg font-semibold text-sm transition-all hover:-translate-y-px hover:shadow-glow active:translate-y-0 disabled:opacity-50"
+            style={{ backgroundColor: colors.accent.brand, color: colors.button.primaryFg }}
           >
             {t('chat.allowOnce')}
           </button>
           <button
             disabled={busy}
             onClick={() => onDecision(active.id, 'allow-always')}
-            className="flex-1 py-2.5 rounded-lg font-medium text-sm transition-colors disabled:opacity-50"
+            className="press-pulse ripple-glow flex-1 py-2.5 rounded-lg font-medium text-sm transition-all hover:-translate-y-px active:translate-y-0 disabled:opacity-50"
             style={{ backgroundColor: colors.background.tertiary, color: colors.text.normal }}
           >
             {t('chat.alwaysAllow')}
@@ -147,8 +147,8 @@ export function ExecApprovalOverlay({ queue, busy, error, colors, onDecision }: 
           <button
             disabled={busy}
             onClick={() => onDecision(active.id, 'deny')}
-            className="flex-1 py-2.5 rounded-lg font-medium text-sm transition-colors disabled:opacity-50"
-            style={{ backgroundColor: '#7f1d1d', color: '#fca5a5' }}
+            className="press-pulse ripple-glow flex-1 py-2.5 rounded-lg font-medium text-sm transition-all hover:-translate-y-px active:translate-y-0 disabled:opacity-50"
+            style={{ backgroundColor: 'rgba(220, 38, 38, 0.18)', color: '#fca5a5' }}
           >
             {t('chat.deny')}
           </button>

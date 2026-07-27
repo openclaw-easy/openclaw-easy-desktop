@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { Copy, Check, X } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { MarkdownRenderer } from './MarkdownRenderer';
+import { useEscapeKey } from '../../hooks/useEscapeKey';
 
 interface ColorTheme {
   background: {
@@ -85,6 +86,8 @@ function renderUserContentWithImages(content: string) {
 
 function InlineImage({ src }: { src: string }) {
   const [expanded, setExpanded] = useState(false);
+  // Dismiss the lightbox preview on Escape.
+  useEscapeKey(() => setExpanded(false), expanded);
 
   return (
     <>
@@ -98,11 +101,11 @@ function InlineImage({ src }: { src: string }) {
       />
       {expanded && (
         <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 cursor-pointer"
+          className="modal-backdrop animate-backdrop cursor-pointer"
           onClick={() => setExpanded(false)}
         >
           <button
-            className="absolute top-4 right-4 p-2 rounded-full bg-black/50 text-white hover:bg-black/70"
+            className="press-pulse absolute top-4 right-4 p-2 rounded-full bg-black/50 text-white hover:bg-black/70 transition-colors"
             onClick={() => setExpanded(false)}
           >
             <X className="h-5 w-5" />
@@ -110,7 +113,7 @@ function InlineImage({ src }: { src: string }) {
           <img
             src={src}
             alt="Full size"
-            className="max-w-[90vw] max-h-[90vh] object-contain rounded-lg"
+            className="max-w-[90vw] max-h-[90vh] object-contain rounded-lg animate-modal-glass"
           />
         </div>
       )}
@@ -141,10 +144,16 @@ export function MessageBubble({
   const isUser = role === 'user';
 
   return (
-    <div className={`flex ${isUser ? 'justify-end' : 'justify-start'} group`}>
+    // `animate-fade-up` slides each newly-mounted bubble in from below
+    // (220ms, Apple curve, opacity 0→1, translateY 6→0). React keys on
+    // message.id, so already-rendered bubbles never re-animate on scroll
+    // or on display:none↔flex tab toggles — only fresh appends play.
+    <div className={`flex ${isUser ? 'justify-end' : 'justify-start'} group animate-fade-up`}>
       <div
-        className={`max-w-[75%] rounded-lg px-4 py-3 relative ${
-          isUser ? 'rounded-br-none' : 'rounded-bl-none'
+        className={`max-w-[75%] rounded-2xl px-4 py-3 relative shadow-sm ${
+          isUser
+            ? 'rounded-br-md'
+            : 'rounded-bl-md ring-1 ring-black/[0.04] dark:ring-white/[0.06]'
         }`}
         style={{
           backgroundColor: isUser
@@ -162,6 +171,7 @@ export function MessageBubble({
             color: colors.text.muted
           }}
           title={t('chat.copyMessage')}
+          aria-label={t('chat.copyMessage')}
         >
           {copied ? (
             <Check className="h-3.5 w-3.5" style={{ color: colors.accent.green }} />

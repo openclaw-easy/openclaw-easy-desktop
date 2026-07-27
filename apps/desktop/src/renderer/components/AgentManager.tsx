@@ -2,8 +2,10 @@ import React, { useEffect, useState } from "react";
 import { Bot } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { useElectronAPI } from "../hooks/useElectronAPI";
+import { useToast } from "../contexts/ToastContext";
 import { AgentFormModal } from "./AgentFormModal";
 import { ColorTheme } from "./dashboard/types";
+import { Modal } from "./ui/modal";
 
 interface Agent {
   id: string;
@@ -45,6 +47,7 @@ const PlusIcon = () => (
 
 export const AgentManager: React.FC<AgentManagerProps> = ({ onClose, colors, onNavigateToLocalModels }) => {
   const { t } = useTranslation();
+  const { addToast } = useToast();
   const electronAPI = useElectronAPI();
   const [agents, setAgents] = useState<Agent[]>([]);
   const [loading, setLoading] = useState(true);
@@ -81,7 +84,9 @@ export const AgentManager: React.FC<AgentManagerProps> = ({ onClose, colors, onN
       setLoading(true);
       setLoadError(null);
       const agentList = await electronAPI.listAgents();
-      setAgents(agentList);
+      // Guard against a null/non-array result (e.g. gateway not ready yet) —
+      // otherwise the next render does agents.length on undefined and throws.
+      setAgents(Array.isArray(agentList) ? agentList : []);
     } catch (error: any) {
       console.error("Failed to load agents:", error);
       setLoadError(error.message || "Failed to load agents");
@@ -109,6 +114,16 @@ export const AgentManager: React.FC<AgentManagerProps> = ({ onClose, colors, onN
 
   const handleModalSuccess = async () => {
     await loadAgents();
+    // The IPC has already awaited the gateway restart by the time we
+    // get here (commit reverting 2afae1df20 fire-and-forget). So this
+    // toast firing == the new model is actually live in the gateway,
+    // not just written to disk. Phrase the toast so users know they
+    // can chat now without worrying about stale-model responses.
+    addToast(
+      t('agentForm.modelLiveToast', 'Model switched — chat is using the new model.'),
+      'success',
+      4000,
+    );
   };
 
   const handleDeleteAgent = async (agent: Agent) => {
@@ -120,11 +135,11 @@ export const AgentManager: React.FC<AgentManagerProps> = ({ onClose, colors, onN
         await loadAgents();
         setAgentToDelete(null);
       } else {
-        alert(`Failed to delete agent: ${result.error}`);
+        addToast(t('nav.deleteAgentFailed', { error: result.error, defaultValue: 'Failed to delete agent: {{error}}' }), 'error');
       }
     } catch (error: any) {
       console.error("Failed to delete agent:", error);
-      alert(`Failed to delete agent: ${error.message}`);
+      addToast(t('nav.deleteAgentFailed', { error: error.message, defaultValue: 'Failed to delete agent: {{error}}' }), 'error');
     } finally {
       setIsDeleting(false);
     }
@@ -134,15 +149,15 @@ export const AgentManager: React.FC<AgentManagerProps> = ({ onClose, colors, onN
     switch ((status || "").toLowerCase()) {
       case "active":
       case "running":
-        return { label: "Active", color: colors.accent.green };
+        return { label: t('nav.agentStatusActive', 'Active'), color: colors.accent.green };
       case "idle":
-        return { label: "Idle", color: colors.accent.yellow };
+        return { label: t('nav.agentStatusIdle', 'Idle'), color: colors.accent.yellow };
       case "stopped":
-        return { label: "Stopped", color: colors.text.muted };
+        return { label: t('nav.agentStatusStopped', 'Stopped'), color: colors.text.muted };
       case "error":
-        return { label: "Error", color: colors.accent.red };
+        return { label: t('nav.agentStatusError', 'Error'), color: colors.accent.red };
       default:
-        return { label: status || "Unknown", color: colors.text.muted };
+        return { label: status || t('nav.agentStatusUnknown', 'Unknown'), color: colors.text.muted };
     }
   };
 
@@ -163,7 +178,7 @@ export const AgentManager: React.FC<AgentManagerProps> = ({ onClose, colors, onN
           onClick={handleOpenCreateModal}
           disabled={loading}
           className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-sm font-medium transition-opacity disabled:opacity-50"
-          style={{ backgroundColor: colors.accent.brand, color: "#ffffff" }}
+          style={{ backgroundColor: colors.accent.brand, color: colors.button.primaryFg }}
         >
           <PlusIcon />
           {t('nav.newAgent')}
@@ -183,7 +198,7 @@ export const AgentManager: React.FC<AgentManagerProps> = ({ onClose, colors, onN
           <span>⚠</span>
           <span className="flex-1">{loadError}</span>
           <button onClick={loadAgents} className="text-xs underline hover:no-underline opacity-80">
-            Retry
+            {t('common.retry')}
           </button>
         </div>
       )}
@@ -271,8 +286,8 @@ export const AgentManager: React.FC<AgentManagerProps> = ({ onClose, colors, onN
                     onClick={() => handleOpenConfigureModal(agent)}
                     className="px-4 py-2 rounded-lg text-sm font-semibold transition-colors"
                     style={{
-                      backgroundColor: '#e67e22',
-                      color: '#ffffff',
+                      backgroundColor: colors.button.primary,
+                      color: colors.button.primaryFg,
                     }}
                     onMouseEnter={(e) =>
                       (e.currentTarget.style.opacity = '0.85')
@@ -286,7 +301,7 @@ export const AgentManager: React.FC<AgentManagerProps> = ({ onClose, colors, onN
                   <button
                     onClick={() => setAgentToDelete(agent)}
                     className="p-1.5 rounded transition-colors"
-                    title="Delete agent"
+                    title={t('nav.deleteAgent')}
                     style={{ color: colors.text.muted, backgroundColor: "transparent" }}
                     onMouseEnter={(e) => {
                       e.currentTarget.style.backgroundColor = colors.accent.red + "20";
@@ -321,7 +336,7 @@ export const AgentManager: React.FC<AgentManagerProps> = ({ onClose, colors, onN
           <button
             onClick={handleOpenCreateModal}
             className="px-5 py-2 rounded-md text-sm font-medium"
-            style={{ backgroundColor: colors.accent.brand, color: "#ffffff" }}
+            style={{ backgroundColor: colors.accent.brand, color: colors.button.primaryFg }}
           >
             {t('nav.createFirstAgent')}
           </button>
@@ -340,24 +355,21 @@ export const AgentManager: React.FC<AgentManagerProps> = ({ onClose, colors, onN
         onNavigateToLocalModels={onNavigateToLocalModels}
       />
 
-      {/* Delete Confirmation Modal */}
-      {agentToDelete && (
-        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50">
-          <div
-            className="p-6 rounded-xl max-w-md w-full mx-4"
-            style={{
-              backgroundColor: colors.bg.secondary,
-            }}
-          >
+      {/* Delete Confirmation Modal — dismiss is suppressed mid-delete so
+          an accidental Escape/backdrop click doesn't drop the user before
+          the IPC settles. */}
+      <Modal
+        open={!!agentToDelete}
+        onClose={() => setAgentToDelete(null)}
+        dismissable={!isDeleting}
+      >
+        {agentToDelete && (
+          <>
             <h3 className="text-lg font-bold mb-1" style={{ color: colors.text.header }}>
               {t('nav.deleteAgent')}
             </h3>
             <p className="text-sm mb-1" style={{ color: colors.text.normal }}>
-              Are you sure you want to delete{" "}
-              <span className="font-semibold" style={{ color: colors.text.header }}>
-                "{agentToDelete.name}"
-              </span>
-              ?
+              {t('nav.deleteAgentPrompt', { name: agentToDelete.name, defaultValue: `Are you sure you want to delete "${agentToDelete.name}"?` })}
             </p>
             <p className="text-xs mb-6" style={{ color: colors.accent.red }}>
               {t('nav.deleteAgentConfirm')}
@@ -376,7 +388,7 @@ export const AgentManager: React.FC<AgentManagerProps> = ({ onClose, colors, onN
                 onClick={() => handleDeleteAgent(agentToDelete)}
                 disabled={isDeleting}
                 className="px-4 py-2 rounded-md text-sm font-medium flex items-center gap-2"
-                style={{ backgroundColor: colors.accent.red, color: "#ffffff" }}
+                style={{ backgroundColor: colors.accent.red, color: colors.button.primaryFg }}
               >
                 {isDeleting ? (
                   <>
@@ -388,9 +400,9 @@ export const AgentManager: React.FC<AgentManagerProps> = ({ onClose, colors, onN
                 )}
               </button>
             </div>
-          </div>
-        </div>
-      )}
+          </>
+        )}
+      </Modal>
     </div>
   );
 };

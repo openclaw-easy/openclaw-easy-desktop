@@ -1,25 +1,13 @@
 import { spawn, execFile } from 'child_process'
-import * as crypto from 'crypto'
 import * as path from 'path'
 import * as fs from 'fs'
-import * as net from 'net'
 import { promisify } from 'util'
 import { ProcessManagerBase, ConfigManager } from './process-manager-base'
 import { sanitizeConfigForBundled } from './utils/config-sanitizer'
+import { getOpenClawBundle } from './openclaw-bundle'
+import { getDevOpenClawSpawn } from './dev-openclaw-runtime'
 
 const execFileAsync = promisify(execFile)
-
-/** Recursively copy a file or directory. */
-function copyRecursive(src: string, dest: string): void {
-  if (fs.statSync(src).isDirectory()) {
-    fs.mkdirSync(dest, { recursive: true })
-    for (const entry of fs.readdirSync(src)) {
-      copyRecursive(path.join(src, entry), path.join(dest, entry))
-    }
-  } else {
-    fs.copyFileSync(src, dest)
-  }
-}
 
 export class ProcessManagerMac extends ProcessManagerBase {
 
@@ -28,18 +16,16 @@ export class ProcessManagerMac extends ProcessManagerBase {
   }
 
   /**
-   * Check if a port is actually accepting TCP connections.
-   * More reliable than parsing lsof output.
+   * Verify the gateway is actually serving on `port`. Two-step probe:
+   * TCP socket bind (cheap, weeds out "not listening") then an HTTP
+   * round-trip (proves the event loop is processing requests, not just
+   * accepted the syscall). See `isGatewayServing` in the base class for
+   * the rationale — fixes the "TCP open but not serving" window where
+   * the UI prematurely flips to running and the first chat hangs.
    */
-  private isPortListening(port: number): Promise<boolean> {
-    return new Promise((resolve) => {
-      const socket = new net.Socket()
-      socket.setTimeout(3000)
-      socket.once('connect', () => { socket.destroy(); resolve(true) })
-      socket.once('error', () => { socket.destroy(); resolve(false) })
-      socket.once('timeout', () => { socket.destroy(); resolve(false) })
-      socket.connect(port, '127.0.0.1')
-    })
+  private async isPortListening(port: number): Promise<boolean> {
+    if (!(await this.isPortListeningBase(port))) return false
+    return this.isGatewayServing(port)
   }
 
   /** Find the PID occupying a port via lsof. Returns null if the port is free. */
@@ -73,7 +59,7 @@ export class ProcessManagerMac extends ProcessManagerBase {
     }
   }
 
-  async start(): Promise<boolean> {
+  async start(presetMode?: import('./process-manager-base').GatewayModeInfo): Promise<boolean> {
     if (this.status === 'running') {
       console.log('[ProcessManager] Already running')
       return true
@@ -84,6 +70,12 @@ export class ProcessManagerMac extends ProcessManagerBase {
       return false
     }
 
+    // Fresh launch: clear any in-flight auto-restart timer and reset
+    // the operator-stop flag so the exit handler treats subsequent
+    // unexpected exits as crashes.
+    this.cancelAutoRestart()
+    this.intentionalStop = false
+
     try {
       this.setStatus('starting')
 
@@ -93,7 +85,10 @@ export class ProcessManagerMac extends ProcessManagerBase {
       }
 
       // ── Detect gateway mode ────────────────────────────────────────────
-      const modeInfo = await this.detectGatewayMode()
+      // Reuse the caller's detection if supplied (openclaw-manager runs
+      // it earlier to decide config-write strategy). Saves a TCP probe +
+      // `which openclaw` + several fs.existsSync calls.
+      const modeInfo = presetMode ?? await this.detectGatewayMode()
       this.gatewayMode = modeInfo.mode
       this.systemBinaryPath = modeInfo.systemBinaryPath || null
 
@@ -112,6 +107,10 @@ export class ProcessManagerMac extends ProcessManagerBase {
 
     } catch (error: any) {
       console.error('[ProcessManager] Start error:', error)
+      // Surface pre-spawn failures (e.g. missing dev dist build) in the UI
+      // log — spawn-time failures are reported by the process listeners, but
+      // a synchronous throw here would otherwise only reach the console.
+      this.emitLog(`❌ Gateway start failed: ${error?.message ?? error}`)
       this.setStatus('error')
       return false
     }
@@ -208,6 +207,7 @@ export class ProcessManagerMac extends ProcessManagerBase {
         PATH: expandedPath,
       }
     })
+    this.spawnedAt = Date.now()
 
     this.setupProcessListeners()
 
@@ -311,39 +311,30 @@ export class ProcessManagerMac extends ProcessManagerBase {
     let spawnCwd: string
 
     if (app.isPackaged) {
-      const bunBinaryName = `bun-${process.arch === 'arm64' ? 'arm64' : 'x64'}`
-      const bundledBun = path.join(process.resourcesPath, 'bun', bunBinaryName)
-      const openclawInstallDir = path.join(home, '.openclaw-easy', 'app')
-      const openclawMjs = path.join(openclawInstallDir, 'openclaw.mjs')
-      const nodeModulesDir = path.join(openclawInstallDir, 'node_modules')
+      const bundle = getOpenClawBundle()
+      await bundle.ensureInstalled((msg) => {
+        console.log(`[ProcessManager] ${msg}`)
+        this.emitLog(msg)
+      })
 
-      if (!fs.existsSync(nodeModulesDir)) {
-        this.emitLog('⚙️ First launch: setting up OpenClaw (this takes ~30 seconds)...')
-        console.log('[ProcessManager] First-launch setup: installing OpenClaw dependencies')
-        await this.installOpenClawBundle(bundledBun, openclawInstallDir)
-      } else {
-        this.syncBundledAssets(openclawInstallDir)
-        // Re-install deps if package.json changed (e.g. after app update with new dependencies)
-        if (this.needsDepsUpdate(openclawInstallDir)) {
-          this.emitLog('⚙️ Updating dependencies after app update...')
-          console.log('[ProcessManager] package.json changed — re-running bun install')
-          await this.runBunInstall(bundledBun, openclawInstallDir)
-        }
-      }
+      // Run openclaw under bundled Node (has node:sqlite); bun is install-only.
+      const bundledNode = bundle.getNodeBinary()
+      const openclawInstallDir = bundle.getInstallDir()
+      const openclawMjs = bundle.getOpenClawMjs()
 
       await this.sanitizeConfigForBundled(openclawInstallDir)
 
-      spawnCmd = bundledBun
+      spawnCmd = bundledNode
       spawnArgs = [openclawMjs, 'gateway', 'run', '--port', String(this.activePort), '--bind', 'loopback']
       spawnCwd = openclawInstallDir
-      console.log(`[ProcessManager] Production: ${bundledBun} ${openclawMjs}`)
+      console.log(`[ProcessManager] Production: ${bundledNode} ${openclawMjs}`)
       this.emitLog('🚀 Starting OpenClaw gateway (bundled runtime)...')
     } else {
-      const openclawPath = path.join(__dirname, '../../../../openclaw/src/index.ts')
-      spawnCmd = 'bun'
-      spawnArgs = [openclawPath, 'gateway', 'run', '--port', String(this.activePort), '--bind', 'loopback']
-      spawnCwd = path.join(__dirname, '../../../../openclaw/')
-      console.log(`[ProcessManager] Dev: bun ${openclawPath}`)
+      const dev = getDevOpenClawSpawn()
+      spawnCmd = dev.runtime
+      spawnArgs = [dev.entry, 'gateway', 'run', '--port', String(this.activePort), '--bind', 'loopback']
+      spawnCwd = dev.cwd
+      console.log(`[ProcessManager] Dev: ${dev.runtime} ${dev.entry}`)
     }
 
     this.process = spawn(spawnCmd, spawnArgs, {
@@ -351,6 +342,7 @@ export class ProcessManagerMac extends ProcessManagerBase {
       cwd: spawnCwd,
       env: enhancedEnv
     })
+    this.spawnedAt = Date.now()
 
     this.setupProcessListeners()
     this.emitLog(`🖥️ Starting desktop OpenClaw gateway on port ${this.activePort}...`)
@@ -403,9 +395,16 @@ export class ProcessManagerMac extends ProcessManagerBase {
       return true
     }
 
+    // Operator-driven stop: tell the exit handler not to auto-restart
+    // and cancel any pending restart timer. Reset the attempt counter
+    // so the next user-initiated start gets a fresh budget.
+    this.intentionalStop = true
+    this.cancelAutoRestart()
+    this.restartAttempts = 0
+
     this.stopExternalMonitoring()
 
-    // In external mode, use `openclaw gateway stop`
+    // In external mode, use `openclaw gateway stop` (handles launchd/systemd properly)
     if (this.gatewayMode === 'external') {
       console.log('[ProcessManager] Stopping external gateway...')
       this.emitLog('🛑 Stopping external gateway...')
@@ -455,96 +454,26 @@ export class ProcessManagerMac extends ProcessManagerBase {
   async restart(): Promise<boolean> {
     await this.stop()
 
-    // Wait for the port to be fully released
+    // Wait for the port to be fully released. Poll every 100ms (was
+    // 1000ms — measured cost: 1-2s wasted per restart on a fast kernel
+    // that releases the port in <100ms). 5s deadline is generous; if the
+    // OS hasn't released the port by then, something else is wrong and
+    // start() will surface a clearer error.
     const port = this.activePort || this.readConfiguredGatewayPort()
-    const deadline = Date.now() + 10_000
+    const deadline = Date.now() + 5_000
     while (Date.now() < deadline) {
       if (!(await this.getPidOnPort(port))) break
-      await new Promise(resolve => setTimeout(resolve, 1000))
+      await new Promise(resolve => setTimeout(resolve, 100))
     }
 
     return this.start()
   }
 
-  /** Returns true when the installed package.json differs from the bundled one. */
-  private needsDepsUpdate(installDir: string): boolean {
-    try {
-      const hashFile = path.join(installDir, '.package-hash')
-      const pkgPath = path.join(installDir, 'package.json')
-      if (!fs.existsSync(pkgPath)) return false
-      const currentHash = crypto.createHash('sha256').update(fs.readFileSync(pkgPath)).digest('hex')
-      if (!fs.existsSync(hashFile)) return true
-      return fs.readFileSync(hashFile, 'utf-8').trim() !== currentHash
-    } catch {
-      return true
-    }
-  }
-
-  /** Run bun install and save the package.json hash on success. */
-  private async runBunInstall(bundledBun: string, installDir: string): Promise<void> {
-    await new Promise<void>((resolve, reject) => {
-      const proc = spawn(bundledBun, ['install', '--production', '--ignore-scripts'], {
-        cwd: installDir,
-        stdio: ['pipe', 'pipe', 'pipe'],
-        env: { ...process.env, HOME: path.join(process.env.HOME || '', '.openclaw-easy') }
-      })
-      const timeout = setTimeout(() => { proc.kill(); reject(new Error('bun install timed out')) }, 3 * 60 * 1000)
-      proc.stdout?.on('data', (d) => { const t = d.toString().trim(); if (t) this.emitLog(`  ${t}`) })
-      proc.stderr?.on('data', (d) => { const t = d.toString().trim(); if (t && !t.includes('warn')) this.emitLog(`  ${t}`) })
-      proc.on('exit', (code) => {
-        clearTimeout(timeout)
-        if (code === 0) {
-          this.emitLog('✅ Dependencies updated successfully')
-          this.savePackageHash(installDir)
-          resolve()
-        } else {
-          reject(new Error(`bun install exited with code ${code}`))
-        }
-      })
-      proc.on('error', (err) => { clearTimeout(timeout); reject(err) })
-    })
-  }
-
-  private savePackageHash(installDir: string): void {
-    try {
-      const pkgPath = path.join(installDir, 'package.json')
-      const hash = crypto.createHash('sha256').update(fs.readFileSync(pkgPath)).digest('hex')
-      fs.writeFileSync(path.join(installDir, '.package-hash'), hash)
-    } catch { /* best effort */ }
-  }
-
-  private syncBundledAssets(installDir: string): void {
-    try {
-      const resourcesOpenClaw = path.join(process.resourcesPath, 'openclaw')
-      for (const dir of ['dist', 'docs', 'extensions', 'skills']) {
-        const src = path.join(resourcesOpenClaw, dir)
-        const dest = path.join(installDir, dir)
-        if (fs.existsSync(src)) {
-          copyRecursive(src, dest)
-        }
-      }
-      for (const file of ['openclaw.mjs', 'package.json']) {
-        const src = path.join(resourcesOpenClaw, file)
-        if (fs.existsSync(src)) {
-          fs.copyFileSync(src, path.join(installDir, file))
-        }
-      }
-      // Remove lockfiles that confuse bun install (e.g. leftover package-lock.json)
-      for (const lockfile of ['package-lock.json', 'pnpm-lock.yaml', 'yarn.lock']) {
-        const lf = path.join(installDir, lockfile)
-        if (fs.existsSync(lf)) fs.unlinkSync(lf)
-      }
-      console.log('[ProcessManager] Synced bundled assets to install dir')
-    } catch (error: any) {
-      console.error('[ProcessManager] Failed to sync bundled assets:', error.message)
-    }
-  }
-
   /**
    * Run `openclaw gateway stop` using the best available binary:
    * 1. System openclaw binary (if installed)
-   * 2. Bundled bun + openclaw.mjs (production builds)
-   * 3. Dev-mode bun + source
+   * 2. Bundled Node + openclaw.mjs (production builds)
+   * 3. Dev-mode Node + built dist (dev-openclaw-runtime.ts)
    */
   private async runGatewayStop(): Promise<void> {
     // 1. Try system binary
@@ -565,14 +494,14 @@ export class ProcessManagerMac extends ProcessManagerBase {
     const home = process.env.HOME || ''
 
     if (app.isPackaged) {
-      const bunBinaryName = `bun-${process.arch === 'arm64' ? 'arm64' : 'x64'}`
-      const bundledBun = path.join(process.resourcesPath, 'bun', bunBinaryName)
+      const nodeBinaryName = `node-${process.arch === 'arm64' ? 'arm64' : 'x64'}`
+      const bundledNode = path.join(process.resourcesPath, 'node', nodeBinaryName)
       const openclawMjs = path.join(home, '.openclaw-easy', 'app', 'openclaw.mjs')
 
-      if (fs.existsSync(bundledBun) && fs.existsSync(openclawMjs)) {
+      if (fs.existsSync(bundledNode) && fs.existsSync(openclawMjs)) {
         try {
-          console.log(`[ProcessManager] Running: ${bundledBun} ${openclawMjs} gateway stop`)
-          await execFileAsync(bundledBun, [openclawMjs, 'gateway', 'stop'], { timeout: 15_000 })
+          console.log(`[ProcessManager] Running: ${bundledNode} ${openclawMjs} gateway stop`)
+          await execFileAsync(bundledNode, [openclawMjs, 'gateway', 'stop'], { timeout: 15_000 })
           console.log('[ProcessManager] openclaw gateway stop succeeded (bundled)')
           return
         } catch (err: any) {
@@ -580,11 +509,11 @@ export class ProcessManagerMac extends ProcessManagerBase {
         }
       }
     } else {
-      // Dev mode: use bun + source
-      const openclawPath = path.join(__dirname, '../../../../openclaw/src/index.ts')
+      // Dev mode: built CLI under Node (see dev-openclaw-runtime.ts)
       try {
-        console.log(`[ProcessManager] Running: bun ${openclawPath} gateway stop`)
-        await execFileAsync('bun', [openclawPath, 'gateway', 'stop'], { timeout: 15_000 })
+        const dev = getDevOpenClawSpawn()
+        console.log(`[ProcessManager] Running: ${dev.runtime} ${dev.entry} gateway stop`)
+        await execFileAsync(dev.runtime, [dev.entry, 'gateway', 'stop'], { timeout: 15_000 })
         console.log('[ProcessManager] openclaw gateway stop succeeded (dev)')
         return
       } catch (err: any) {
@@ -604,53 +533,4 @@ export class ProcessManagerMac extends ProcessManagerBase {
     })
   }
 
-  private async installOpenClawBundle(bundledBun: string, installDir: string): Promise<void> {
-    const resourcesOpenClaw = path.join(process.resourcesPath, 'openclaw')
-
-    this.emitLog('📦 Copying OpenClaw files...')
-    fs.mkdirSync(installDir, { recursive: true })
-    copyRecursive(resourcesOpenClaw, installDir)
-
-    // Remove lockfiles that confuse bun install
-    for (const lockfile of ['package-lock.json', 'pnpm-lock.yaml', 'yarn.lock']) {
-      const lf = path.join(installDir, lockfile)
-      if (fs.existsSync(lf)) fs.unlinkSync(lf)
-    }
-
-    this.emitLog('📥 Installing dependencies (first launch only, ~30 seconds)...')
-    console.log('[ProcessManager] Running bun install --production in', installDir)
-
-    await new Promise<void>((resolve, reject) => {
-      const proc = spawn(bundledBun, ['install', '--production', '--ignore-scripts'], {
-        cwd: installDir,
-        stdio: ['pipe', 'pipe', 'pipe'],
-        env: { ...process.env, HOME: path.join(process.env.HOME || '', '.openclaw-easy') }
-      })
-
-      const timeout = setTimeout(() => {
-        proc.kill()
-        reject(new Error('bun install timed out after 3 minutes'))
-      }, 3 * 60 * 1000)
-
-      proc.stdout?.on('data', (d) => {
-        const text = d.toString().trim()
-        if (text) this.emitLog(`  ${text}`)
-      })
-      proc.stderr?.on('data', (d) => {
-        const text = d.toString().trim()
-        if (text && !text.includes('warn')) this.emitLog(`  ${text}`)
-      })
-      proc.on('exit', (code) => {
-        clearTimeout(timeout)
-        if (code === 0) {
-          this.emitLog('✅ OpenClaw dependencies installed successfully')
-          this.savePackageHash(installDir)
-          resolve()
-        } else {
-          reject(new Error(`bun install exited with code ${code}`))
-        }
-      })
-      proc.on('error', (err) => { clearTimeout(timeout); reject(err) })
-    })
-  }
 }

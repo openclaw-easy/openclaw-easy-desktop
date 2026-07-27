@@ -54,7 +54,7 @@ export function TalkModeOverlay({
       className="flex-shrink-0 px-6 py-3 border-t flex items-center gap-3"
       style={{
         borderColor: colors.background.modifier.hover,
-        backgroundColor: error ? '#7f1d1d20' : colors.accent.brand + '15',
+        backgroundColor: error ? 'rgba(220, 38, 38, 0.12)' : colors.accent.brand + '15',
       }}
     >
       {/* Mic button */}
@@ -88,7 +88,7 @@ export function TalkModeOverlay({
               <button
                 onClick={() => { onGoToVoiceSettings(); onClose(); }}
                 className="text-xs font-medium px-2 py-0.5 rounded whitespace-nowrap transition-opacity hover:opacity-80"
-                style={{ backgroundColor: colors.accent.brand, color: '#ffffff' }}
+                style={{ backgroundColor: colors.accent.brand, color: colors.button.primaryFg }}
               >
                 {t('chat.openVoiceSettings')}
               </button>
@@ -140,6 +140,7 @@ export function TalkModeOverlay({
         className="p-1.5 rounded transition-colors flex-shrink-0"
         style={{ color: colors.text.muted }}
         title={t('chat.closeTalkMode')}
+        aria-label={t('chat.closeTalkMode')}
       >
         <X className="h-4 w-4" />
       </button>

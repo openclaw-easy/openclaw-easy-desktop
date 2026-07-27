@@ -124,7 +124,7 @@ export const WindowsPermissionsSection: React.FC<WindowsPermissionsSectionProps>
                     onClick={() => handleOpenSettings(perm.id)}
                     disabled={isOpening}
                     className="text-xs px-3 py-1 rounded font-medium transition-colors disabled:opacity-50"
-                    style={{ backgroundColor: colors.bg.primary, color: colors.text.link }}
+                    style={{ backgroundColor: colors.bg.tertiary, color: colors.text.link }}
                   >
                     {isOpening ? t('tools.opening') : t('tools.openSettings')}
                   </button>

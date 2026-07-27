@@ -11,6 +11,8 @@ export interface AppSettings {
   language: string
   version?: string
   lastUpdated?: string
+  /** Last app version whose "What's new" dialog the user has seen. */
+  lastSeenWhatsNewVersion?: string
 }
 
 const DEFAULT_SETTINGS: AppSettings = {

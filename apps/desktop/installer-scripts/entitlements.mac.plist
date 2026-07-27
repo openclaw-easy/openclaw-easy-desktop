@@ -35,10 +35,14 @@
     <key>com.apple.security.automation.apple-events</key>
     <true/>
 
-    <!-- Keychain access group: prevents repeated password prompts across app updates -->
+    <!-- Keychain access group: prevents repeated password prompts across app updates.
+         Renamed 2026-06-17 to match the appId in electron-builder.yml
+         (com.openclaw-easy.app). Existing installs migrate via
+         keychain-migration.ts on first launch under the new entitlement
+         (audit W1.9). -->
     <key>com.apple.security.keychain-access-groups</key>
     <array>
-        <string>$(TEAM_ID).com.openclaw-easy.app</string>
+        <string>SNW9DN2FD5.com.openclaw-easy.app</string>
     </array>
 </dict>
 </plist>

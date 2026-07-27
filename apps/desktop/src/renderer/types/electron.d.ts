@@ -69,7 +69,8 @@ export interface ElectronAPI {
   getGatewayToken: () => Promise<string | null>;
   getGatewayPort: () => Promise<number>;
 
-  // API Validation
+  // API Validation. The renderer still passes 'anthropic' (useElectronAPI.ts);
+  // the main handler tolerates it (returns false), so the union must include it.
   validateApiKey: (provider: 'anthropic' | 'openai' | 'google', apiKey: string) => Promise<boolean>;
 
   // Event Listeners
@@ -78,16 +79,142 @@ export interface ElectronAPI {
 
   // Channel Management
   getWhatsAppQR: () => Promise<string>;
+  getWeixinQR: () => Promise<{ success: boolean; qrData?: string; logs: string[] }>;
+  ensureWeixinPlugin: () => Promise<{ success: boolean; alreadyInstalled: boolean; logs: string[] }>;
+  checkWeixinStatus: () => Promise<{ connected: boolean }>;
+  disconnectWeixin: () => Promise<boolean>;
   getWhatsAppMessages: () => Promise<{ success: boolean; messages?: any[]; error?: string }>;
-  connectTelegram: (token: string) => Promise<boolean>;
+  connectTelegram: (token: string, name?: string) => Promise<{ success: boolean; error?: string }>;
+  connectDiscord: (token: string, serverId: string, name?: string) => Promise<{ success: boolean; error?: string }>;
   disconnectTelegram: () => Promise<{ success: boolean; logs: string[] }>;
   disconnectDiscord: () => Promise<{ success: boolean; logs: string[] }>;
   checkSlackStatus: () => Promise<{ connected: boolean }>;
   testSlackBot: (botToken: string) => Promise<{ success: boolean; teamName?: string; botName?: string; error?: string }>;
   connectSlack: (botToken: string, appToken: string, name?: string) => Promise<{ success: boolean; error?: string }>;
+
+  // Channel status / setup (reconciled with preload — these were missing from
+  // the type, hiding real bugs like a failed connect reading as success).
+  checkWhatsAppStatus: () => Promise<{ connected: boolean; logs: string[] }>;
+  checkTelegramStatus: () => Promise<{ connected: boolean }>;
+  checkDiscordStatus: () => Promise<{ connected: boolean }>;
+  disconnectWhatsApp: () => Promise<{ success: boolean; logs: string[] }>;
+  startWhatsAppSetup: () => Promise<string>;
+  // JSON.parse of `openclaw channels list --json` — shape not guaranteed
+  // (callers see both array and {chat:{…}} object forms), so keep it `any`.
+  listChannels: () => Promise<any>;
+  onWhatsAppStatusChange: (callback: (status: 'connected' | 'disconnected' | 'error') => void) => () => void;
+
+  // Device / logs
+  getDeviceId: () => Promise<string | null>;
+  getOpenClawLogs: () => Promise<string[]>;
+
+  // Settings
+  getSettings: () => Promise<{
+    startOnBoot: boolean;
+    minimizeToTray: boolean;
+    autoUpdate: boolean;
+    telemetry: boolean;
+    language: string;
+    version?: string;
+    lastUpdated?: string;
+  }>;
+  setStartOnBoot: (enabled: boolean) => Promise<{ success: boolean; error?: string }>;
+  setMinimizeToTray: (enabled: boolean) => Promise<void>;
+
+  // Channel access control (dmPolicy / allowlists / pairing)
+  getChannelAccess: () => Promise<{
+    success: boolean;
+    channels?: Array<{
+      channelId: string;
+      enabled: boolean;
+      dmPolicy?: 'open' | 'pairing' | 'allowlist' | 'disabled';
+      allowFrom: string[];
+      groupPolicy?: 'open' | 'allowlist' | 'disabled';
+      groupAllowFrom: string[];
+    }>;
+    error?: string;
+  }>;
+  setChannelAccess: (
+    channelId: string,
+    patch: {
+      dmPolicy?: 'open' | 'pairing' | 'allowlist' | 'disabled';
+      allowFrom?: string[];
+      groupPolicy?: 'open' | 'allowlist' | 'disabled';
+      groupAllowFrom?: string[];
+    },
+  ) => Promise<{ success: boolean; error?: string }>;
+  listPairingRequests: () => Promise<{
+    success: boolean;
+    requests?: Array<{ channel: string; code: string; from?: string; createdAt?: string }>;
+    error?: string;
+  }>;
+  approvePairing: (channel: string, code: string) => Promise<{ success: boolean; error?: string }>;
+
+  // Browser tool surface
+  getBrowserStatus: () => Promise<{
+    success: boolean;
+    status?: {
+      enabled: boolean;
+      running: boolean;
+      profile?: string;
+      detectedBrowser?: string | null;
+      detectedExecutablePath?: string | null;
+      chosenBrowser?: string | null;
+      headless?: boolean;
+      cdpPort?: number;
+      pid?: number | null;
+    };
+    error?: string;
+  }>;
+  setBrowserEnabled: (enabled: boolean) => Promise<{ success: boolean; error?: string }>;
+  startBrowser: () => Promise<{ success: boolean; error?: string }>;
+  stopBrowser: () => Promise<{ success: boolean; error?: string }>;
+  captureBrowserScreenshot: () => Promise<{ success: boolean; path?: string; dataUrl?: string; error?: string }>;
+
+  // Memory surface
+  getMemoryStatus: () => Promise<{
+    success: boolean;
+    status?: { agentId: string; files: number; chunks: number; dirty: boolean; workspaceDir: string; provider?: string };
+    error?: string;
+  }>;
+  searchMemory: (query: string) => Promise<{
+    success: boolean;
+    results?: Array<{ path?: string; snippet?: string; score?: number }>;
+    error?: string;
+  }>;
+  reindexMemory: () => Promise<{ success: boolean; error?: string }>;
+  listMemoryFiles: (workspaceDir?: string) => Promise<{
+    success: boolean;
+    workspaceDir: string;
+    files: Array<{ relPath: string; sizeBytes: number; modifiedAtMs: number }>;
+    error?: string;
+  }>;
+  readMemoryFile: (workspaceDir: string, relPath: string) => Promise<{ success: boolean; content?: string; error?: string }>;
+  deleteMemoryFile: (workspaceDir: string, relPath: string) => Promise<{ success: boolean; error?: string }>;
+
+  // Doctor / commands discovery
+  runDoctor: () => Promise<{
+    success: boolean;
+    output: string;
+    errors: string;
+    problemsFound: number;
+    problemsFixed: number;
+    error?: string;
+  }>;
+  listDiscoveredCommands: () => Promise<{
+    success: boolean;
+    commands?: Array<{ name: string; description: string; hasSubcommands: boolean }>;
+    error?: string;
+  }>;
   disconnectSlack: () => Promise<{ success: boolean; logs: string[] }>;
   onSlackStatusChange: (callback: (status: 'connected' | 'disconnected' | 'error') => void) => () => void;
+  onWeixinStatusChange: (
+    callback: (status: 'connected' | 'failed') => void,
+  ) => () => void;
   onGatewayRestartSuggested: (callback: () => void) => () => void;
+  onGatewayRestartStatus: (
+    callback: (event: { status: 'queued' | 'restarting' | 'ready' | 'failed'; reason: string }) => void,
+  ) => () => void;
   getChannelStatus: () => Promise<Record<string, boolean>>;
   checkFeishuStatus: () => Promise<{ connected: boolean }>;
   connectFeishu: (appId: string, appSecret: string, botName?: string) => Promise<{ success: boolean; error?: string }>;
@@ -98,7 +225,6 @@ export interface ElectronAPI {
 
   // System Integration
   openExternal: (url: string) => Promise<void>;
-  showInFolder: (path: string) => Promise<void>;
 
   // Agent Management
   listAgents: () => Promise<any[]>;
@@ -126,10 +252,36 @@ export interface ElectronAPI {
   // System Info
   getSystemInfo: () => Promise<any>;
 
+  // Authentication
+  createAccount: (email: string, password: string) => Promise<{ success: boolean; user?: any; error?: string; requiresVerification?: boolean }>;
+  signIn: (email: string, password: string) => Promise<{ success: boolean; user?: any; token?: string; error?: string }>;
+  signOut: () => Promise<{ success: boolean; error?: string }>;
+  getAuthToken: () => Promise<string | null>;
+
   // Skills Management
   listSkills: () => Promise<{ success: boolean; skills?: any[]; error?: string }>;
-  checkSkills: () => Promise<{ success: boolean; status?: any; error?: string }>;
-  getSkillInfo: (skillName: string) => Promise<{ success: boolean; info?: any; error?: string }>;
+  // ClawHub-audit additions (2026-06-15):
+  // - checkSkills: `openclaw skills check --json` — categorized eligibility report
+  // - updateAllSkills: `openclaw skills update --all` — refresh installed skills
+  checkSkills: (agentId?: string) => Promise<{
+    success: boolean
+    report?: {
+      agentId?: string
+      workspaceDir?: string
+      managedSkillsDir?: string
+      summary?: Record<string, number>
+      eligible?: any[]
+      modelVisible?: any[]
+      commandVisible?: any[]
+      disabled?: any[]
+      blocked?: any[]
+      agentFiltered?: any[]
+      notInjected?: any[]
+      missingRequirements?: any[]
+    }
+    error?: string
+  }>;
+  updateAllSkills: () => Promise<{ success: boolean; output?: string; error?: string }>;
   installSkillRequirements: (skillName: string) => Promise<{ success: boolean; message?: string; error?: string }>;
   setSkillEnabled: (skillName: string, enabled: boolean) => Promise<{ success: boolean; error?: string }>;
   searchSkillRegistry: (query: string) => Promise<{ success: boolean; skills?: any[]; total?: number; error?: string }>;
@@ -163,6 +315,14 @@ export interface ElectronAPI {
     payloadKind: 'message' | 'system-event';
     payloadValue: string;
     agentId?: string;
+    description?: string;
+    tz?: string;
+    channel?: string;
+    to?: string;
+    account?: string;
+    threadId?: string;
+    announce?: boolean;
+    bestEffortDeliver?: boolean;
   }) => Promise<{ success: boolean; job?: any; error?: string }>;
   enableCronJob: (id: string) => Promise<{ success: boolean; error?: string }>;
   disableCronJob: (id: string) => Promise<{ success: boolean; error?: string }>;
@@ -255,12 +415,6 @@ export interface ElectronAPI {
     args: string[]
   ) => Promise<{ terminalId: string; pid: number }>;
 
-  createTerminal: (
-    command: string,
-    args: string[],
-    options?: { cwd?: string }
-  ) => Promise<{ terminalId: string; pid: number }>;
-
   writeToTerminal: (
     terminalId: string,
     data: string
@@ -312,19 +466,21 @@ export interface ElectronAPI {
   requestPermission: (type: 'microphone' | 'camera') => Promise<boolean>;
   openPermissionSettings: (type: string) => Promise<boolean>;
 
-  // Workspace file management
-  listWorkspaceFiles: () => Promise<{ success: boolean; files?: Array<{ name: string; size: number; modified: number }>; error?: string }>
-  readWorkspaceFile: (name: string) => Promise<{ success: boolean; content?: string; error?: string }>
-  writeWorkspaceFile: (name: string, content: string) => Promise<{ success: boolean; error?: string }>
-  createWorkspaceFile: (name: string) => Promise<{ success: boolean; error?: string }>
-  deleteWorkspaceFile: (name: string) => Promise<{ success: boolean; error?: string }>
-  listMemoryFiles: () => Promise<{ success: boolean; files?: Array<{ name: string; path: string; date: string; size: number; modified: number }>; error?: string }>
-  readMemoryFile: (path: string) => Promise<{ success: boolean; content?: string; error?: string }>
+  // Workspace file management. Optional agentId scopes to that agent's dir.
+  listWorkspaceFiles: (agentId?: string) => Promise<{ success: boolean; files?: Array<{ name: string; size: number; modified: number }>; error?: string }>
+  readWorkspaceFile: (name: string, agentId?: string) => Promise<{ success: boolean; content?: string; error?: string }>
+  writeWorkspaceFile: (name: string, content: string, agentId?: string) => Promise<{ success: boolean; error?: string }>
+  createWorkspaceFile: (name: string, agentId?: string) => Promise<{ success: boolean; error?: string }>
+  deleteWorkspaceFile: (name: string, agentId?: string) => Promise<{ success: boolean; error?: string }>
+  openWorkspaceDir: (agentId?: string) => Promise<{ success: boolean; error?: string }>
 
-  // Device identity for WebSocket auth
+  // Device identity for WebSocket auth (V3 payload — platform + deviceFamily
+  // are part of the signed payload post-2026.5; gateway rejects V2 with
+  // metadata-upgrade re-pairing on first reconnect).
   buildDeviceIdentity: (opts: {
     clientId: string; clientMode: string; role: string;
     scopes: string[]; token: string; nonce: string;
+    platform?: string; deviceFamily?: string;
   }) => Promise<any>
 
   // Gateway info

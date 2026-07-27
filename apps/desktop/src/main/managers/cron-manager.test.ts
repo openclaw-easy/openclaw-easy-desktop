@@ -152,6 +152,50 @@ describe('CronManager', () => {
       const result = await cron.addCronJob(params)
       expect(result.success).toBe(false)
     })
+
+    it('should forward channel + recipient targeting flags to the CLI', async () => {
+      // Regression: the CronSection lets users target a specific Telegram
+      // chat / WhatsApp number per job. If these flags stop reaching the
+      // CLI, every scheduled job would silently fall back to the agent's
+      // default channel — that's a money-burning UX regression.
+      executor.executeCommand.mockResolvedValue(JSON.stringify({ job: { id: 'j6' } }))
+      const params: AddCronJobParams = {
+        name: 'bedtime',
+        scheduleKind: 'cron',
+        scheduleValue: '0 22 * * *',
+        payloadKind: 'message',
+        payloadValue: 'time for bed',
+        channel: 'telegram',
+        to: '@xinru',
+        announce: true,
+        bestEffortDeliver: true,
+      }
+      await cron.addCronJob(params)
+      const args = executor.executeCommand.mock.calls[0][0]
+      expect(args).toContain('--channel')
+      expect(args[args.indexOf('--channel') + 1]).toBe('telegram')
+      expect(args).toContain('--to')
+      expect(args[args.indexOf('--to') + 1]).toBe('@xinru')
+      expect(args).toContain('--announce')
+      expect(args).toContain('--best-effort-deliver')
+    })
+
+    it('should omit channel/to flags when not provided (default routing)', async () => {
+      executor.executeCommand.mockResolvedValue(JSON.stringify({ job: { id: 'j7' } }))
+      const params: AddCronJobParams = {
+        name: 'no-targeting',
+        scheduleKind: 'every',
+        scheduleValue: '60000',
+        payloadKind: 'message',
+        payloadValue: 'test',
+      }
+      await cron.addCronJob(params)
+      const args = executor.executeCommand.mock.calls[0][0]
+      expect(args).not.toContain('--channel')
+      expect(args).not.toContain('--to')
+      expect(args).not.toContain('--announce')
+      expect(args).not.toContain('--best-effort-deliver')
+    })
   })
 
   // ── enableCronJob ──────────────────────────────────────────────────

@@ -40,7 +40,9 @@ export class HooksManager {
   async listHooks(): Promise<{ success: boolean; hooks?: any[]; error?: string }> {
     try {
       console.log('[HooksManager] Getting hooks list...')
-      const result = await this.executor.executeCommand(['hooks', 'list', '--json'], 30000)
+      // 12s ceiling — early-resolve in the executor returns ~6s when the JSON
+      // is on disk; bundled-plugin scanning in dev can otherwise idle the runtime past 30s.
+      const result = await this.executor.executeCommand(['hooks', 'list', '--json'], 12000)
 
       if (result) {
         console.log(`[HooksManager] Raw output length: ${result.length} chars`)
@@ -60,7 +62,7 @@ export class HooksManager {
   async checkHooks(): Promise<{ success: boolean; status?: any; error?: string }> {
     try {
       console.log('[HooksManager] Checking hooks status...')
-      const result = await this.executor.executeCommand(['hooks', 'check', '--json'], 30000)
+      const result = await this.executor.executeCommand(['hooks', 'check', '--json'], 12000)
 
       if (result) {
         const status = JSON.parse(this.extractJson(result))

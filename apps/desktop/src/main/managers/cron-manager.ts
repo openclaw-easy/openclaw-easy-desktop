@@ -40,6 +40,14 @@ export interface AddCronJobParams {
   payloadKind: 'message' | 'system-event'
   payloadValue: string
   agentId?: string
+  description?: string
+  tz?: string
+  channel?: string
+  to?: string
+  account?: string
+  threadId?: string
+  announce?: boolean
+  bestEffortDeliver?: boolean
 }
 
 /**
@@ -95,6 +103,33 @@ export class CronManager {
       // Optional agent ID
       if (params.agentId) {
         args.push('--agent', params.agentId)
+      }
+
+      // Optional delivery targeting — lets the user say "send this Telegram
+      // chat 123 every weekday at 9 AM" without writing routing config by hand.
+      if (params.channel) {
+        args.push('--channel', params.channel)
+      }
+      if (params.to) {
+        args.push('--to', params.to)
+      }
+      if (params.account) {
+        args.push('--account', params.account)
+      }
+      if (params.threadId) {
+        args.push('--thread-id', params.threadId)
+      }
+      if (params.tz) {
+        args.push('--tz', params.tz)
+      }
+      if (params.description) {
+        args.push('--description', params.description)
+      }
+      if (params.announce) {
+        args.push('--announce')
+      }
+      if (params.bestEffortDeliver) {
+        args.push('--best-effort-deliver')
       }
 
       args.push('--json')

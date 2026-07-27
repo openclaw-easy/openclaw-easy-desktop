@@ -3,6 +3,9 @@ import { existsSync, readFileSync, unlinkSync, openSync, closeSync, mkdirSync } 
 import { spawn } from 'child_process'
 import { tmpdir } from 'os'
 import { OpenClawEnvironment } from '../openclaw-environment'
+import { getOpenClawBundle } from '../openclaw-bundle'
+import { getDevOpenClawSpawn } from '../dev-openclaw-runtime'
+import { detectSystemOpenClaw } from './system-openclaw-resolver'
 
 /** Filter known-noisy stderr lines produced by the OpenClaw CLI on every invocation. */
 function filterStderrNoise(raw: string): string {
@@ -27,7 +30,10 @@ function logSpawnDiagnostics(tag: string, runtime: string, openclawPath: string,
   // Only check existence for absolute paths — bare names like 'bun' are resolved via PATH
   const isAbsPath = path.isAbsolute(runtime)
   const runtimeOk = isAbsPath ? existsSync(runtime) : true
-  const openclawOk = existsSync(openclawPath)
+  // System-binary mode passes a placeholder rather than a path — the runtime
+  // IS the entry point there, so existence-checking it reports a phantom
+  // failure on a perfectly healthy spawn. Mirrors channel-manager.ts.
+  const openclawOk = !path.isAbsolute(openclawPath) || existsSync(openclawPath)
   console.log(`[${tag}] spawn: args=[${args.join(' ')}]`)
   if (!runtimeOk) console.error(`[${tag}] *** MISSING runtime binary: ${runtime} ***`)
   if (!openclawOk) console.error(`[${tag}] *** MISSING openclaw entry point: ${openclawPath} ***`)
@@ -46,8 +52,15 @@ function logSpawnDiagnostics(tag: string, runtime: string, openclawPath: string,
  */
 export class OpenClawCommandExecutor {
   private openclawEnv: OpenClawEnvironment
-  /** When set, all commands use this system binary instead of the bundled one. */
+  /** When set explicitly via setSystemBinary, overrides auto-detection. */
   private systemBinaryPath: string | null = null
+  /**
+   * Cached auto-detection result. `undefined` means "not yet detected";
+   * `null` means "detected, nothing found"; string means "detected this path".
+   * Detection is async but executeCommand() is async too, so we lazily
+   * resolve on first call and cache for the executor's lifetime.
+   */
+  private detectionPromise: Promise<string | null> | null = null
 
   constructor(configPath: string) {
     this.openclawEnv = new OpenClawEnvironment(configPath)
@@ -67,7 +80,41 @@ export class OpenClawCommandExecutor {
     }
   }
 
-  async executeCommand(args: string[], timeoutMs: number = 10000): Promise<string | null> {
+  /**
+   * Resolve the binary to spawn. Priority:
+   *   1. Explicit override from setSystemBinary() (set by manager.start()
+   *      once gateway mode is detected).
+   *   2. Auto-detected system openclaw on disk. CRITICAL for the
+   *      pre-start path: when the user clicks "Check system health"
+   *      (Doctor) before clicking "Launch Assistant", the manager
+   *      hasn't called setSystemBinary yet, so without this fallback
+   *      the executor would fall through to the dev-mode bun+TS path —
+   *      Bun lacks node:sqlite and cascades into "Failed reading plugin-
+   *      state sidecar / missing node:sqlite" errors in the doctor
+   *      output. See managers/system-openclaw-resolver.ts.
+   *   3. `null` (caller falls back to bundled or dev-mode bun+TS).
+   */
+  private async resolveSystemBinary(): Promise<string | null> {
+    if (this.systemBinaryPath) return this.systemBinaryPath
+    if (!this.detectionPromise) {
+      this.detectionPromise = detectSystemOpenClaw()
+    }
+    return this.detectionPromise
+  }
+
+  async executeCommand(
+    args: string[],
+    timeoutMs: number = 10000,
+    opts?: {
+      /**
+       * Piped to the child's stdin, then stdin is closed. Used for CLI
+       * commands that read a secret from stdin (models auth paste-token /
+       * paste-api-key) so the secret never appears in argv or spawn logs.
+       */
+      stdinData?: string
+    },
+  ): Promise<string | null> {
+    const stdinData = opts?.stdinData
     const { app } = await import('electron')
     const isWindows = process.platform === 'win32'
     const home = process.env.HOME || process.env.USERPROFILE || ''
@@ -79,11 +126,19 @@ export class OpenClawCommandExecutor {
     let enhancedEnv: NodeJS.ProcessEnv
     let cwd: string
 
+    // Shared by the bundled + dev branches; the system-binary branch widens
+    // this with user-local bin dirs to find the installed binary's runtime.
+    const standardPath = isWindows
+      ? (process.env.PATH || '')
+      : ['/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin', process.env.PATH || ''].join(pathSep)
+
     // ── System binary mode ─────────────────────────────────────────────
-    // When a system openclaw binary is configured, use it directly.
-    // The binary is a self-contained CLI — no separate runtime needed.
-    if (this.systemBinaryPath) {
-      runtime = this.systemBinaryPath
+    // When a system openclaw binary is configured (or auto-detected on
+    // disk), use it directly. The binary is a self-contained CLI — no
+    // separate runtime needed.
+    const resolvedSystemBinary = await this.resolveSystemBinary()
+    if (resolvedSystemBinary) {
+      runtime = resolvedSystemBinary
       openclawPath = '' // Not used — system binary IS the entry point
       cwd = home
 
@@ -104,35 +159,34 @@ export class OpenClawCommandExecutor {
       }
     } else if (app.isPackaged) {
       // ── Bundled mode (production) ──────────────────────────────────────
-      // Use the bun binary bundled in the .app (extraResources/bun/)
-      // and the openclaw entry point installed at ~/.openclaw-easy/app/openclaw.mjs.
-      const bunBinaryName = isWindows
-        ? 'bun-windows.exe'
-        : `bun-${process.arch === 'arm64' ? 'arm64' : 'x64'}`
-      runtime = path.join(process.resourcesPath, 'bun', bunBinaryName)
-      openclawPath = path.join(home, '.openclaw-easy', 'app', 'openclaw.mjs')
-      cwd = path.join(home, '.openclaw-easy', 'app')
-
-      const expandedPath = isWindows
-        ? (process.env.PATH || '')
-        : ['/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin', process.env.PATH || ''].join(pathSep)
-
+      // Run openclaw under the bundled Node runtime (extraResources/node/) —
+      // openclaw needs node:sqlite for state-touching commands (doctor, cron,
+      // statistics, state migrations); bun does NOT provide it. The openclaw
+      // entry point is installed at ~/.openclaw-easy/app/openclaw.mjs. Bun is
+      // kept only as the dependency installer (bundle's bun install).
+      // ensureInstalled() is single-flight, so this is a no-op once the
+      // eager install kicked off at app init has completed.
+      const bundle = getOpenClawBundle()
+      await bundle.ensureInstalled()
+      runtime = bundle.getNodeBinary()
+      openclawPath = bundle.getOpenClawMjs()
+      cwd = bundle.getInstallDir()
       enhancedEnv = {
         ...process.env,
         ...openclawEnvVars,
-        PATH: expandedPath
+        PATH: standardPath
       }
     } else {
-      // ── Dev mode ───────────────────────────────────────────────────────
-      // Always run TypeScript source directly with bun
-      openclawPath = path.join(__dirname, '../../../../openclaw/src/index.ts')
-      runtime = 'bun'
-      cwd = path.join(__dirname, '../../../../openclaw/')
-      const bunPath = path.join(home, '.bun', 'bin')
+      // ── Dev mode ─────────────────────────────────────────────────────
+      // Built CLI under Node (see dev-openclaw-runtime.ts)
+      const dev = getDevOpenClawSpawn()
+      openclawPath = dev.entry
+      runtime = dev.runtime
+      cwd = dev.cwd
       enhancedEnv = {
         ...process.env,
         ...openclawEnvVars,
-        PATH: `${bunPath}${pathSep}${process.env.PATH}`
+        PATH: standardPath
       }
     }
 
@@ -162,18 +216,74 @@ export class OpenClawCommandExecutor {
 
         const stderrChunks: Buffer[] = []
 
-        // Redirect stdout directly to the file descriptor — bypasses Node pipe buffering
+        // Redirect stdout directly to the file descriptor — bypasses Node pipe buffering.
+        // stdin is 'ignore' (unless stdinData is piped) so the CLI sees
+        // /dev/null on stdin and never blocks on a read.
         const child = spawn(runtime, spawnArgs, {
           env: enhancedEnv,
           timeout: timeoutMs,
-          stdio: ['pipe', fd, 'pipe'],
+          killSignal: 'SIGKILL',
+          stdio: [stdinData !== undefined ? 'pipe' : 'ignore', fd, 'pipe'],
           cwd,
           windowsHide: true,
         })
 
-        child.stderr.on('data', (chunk: Buffer) => stderrChunks.push(chunk))
+        if (stdinData !== undefined) {
+          child.stdin?.end(stdinData)
+        }
+
+        child.stderr?.on('data', (chunk: Buffer) => stderrChunks.push(chunk))
+
+        // Early-resolve poller: many openclaw read commands print the full JSON
+        // payload long before the runtime exits — bundled-plugin scanning in dev
+        // mode can keep the process alive for 30+ s after the JSON is on disk.
+        // Once we see a complete JSON object, SIGKILL the child and resolve so
+        // the renderer doesn't stare at a spinner waiting for plugin shutdown.
+        let resolved = false
+        let pollTimer: NodeJS.Timeout | null = null
+        const tryEarlyResolve = () => {
+          if (resolved) return
+          let raw: string
+          try { raw = readFileSync(tempFile, 'utf8') } catch { return }
+          if (!raw) return
+          const stripped = raw.replace(/\x1b\[[0-9;]*[mGKHFABCDsuJK]/g, '')
+          const objStart = stripped.indexOf('{')
+          const arrStart = stripped.indexOf('[')
+          let start: number
+          if (objStart === -1 && arrStart === -1) return
+          if (objStart === -1) start = arrStart
+          else if (arrStart === -1) start = objStart
+          else start = Math.min(objStart, arrStart)
+          const closing = stripped[start] === '{' ? '}' : ']'
+          const end = stripped.lastIndexOf(closing)
+          if (end === -1 || end < start) return
+          const candidate = stripped.substring(start, end + 1)
+          try {
+            JSON.parse(candidate)
+          } catch {
+            return
+          }
+          resolved = true
+          if (pollTimer) { clearInterval(pollTimer); pollTimer = null }
+          console.log(`[OpenClawCommandExecutor] Early-resolved JSON (${raw.length} chars) — killing child`)
+          try { child.kill('SIGKILL') } catch {}
+          try { closeSync(fd) } catch {}
+          try { unlinkSync(tempFile) } catch {}
+          resolve(raw)
+        }
+        // Wait 1.5s before first poll so the process gets a chance to print.
+        const firstPoll = setTimeout(() => {
+          tryEarlyResolve()
+          if (!resolved) {
+            pollTimer = setInterval(tryEarlyResolve, 500)
+          }
+        }, 1500)
 
         child.on('error', (err: any) => {
+          if (resolved) return
+          resolved = true
+          clearTimeout(firstPoll)
+          if (pollTimer) clearInterval(pollTimer)
           try { closeSync(fd) } catch {}
           try { unlinkSync(tempFile) } catch {}
           if (err.code === 'ETIMEDOUT') {
@@ -184,6 +294,10 @@ export class OpenClawCommandExecutor {
         })
 
         child.on('close', (code) => {
+          clearTimeout(firstPoll)
+          if (pollTimer) { clearInterval(pollTimer); pollTimer = null }
+          if (resolved) return
+          resolved = true
           try { closeSync(fd) } catch {}
           const stderrRaw = Buffer.concat(stderrChunks).toString('utf8')
           const stderr = filterStderrNoise(stderrRaw)
@@ -225,10 +339,15 @@ export class OpenClawCommandExecutor {
         windowsHide: true,
       })
 
+      if (stdinData !== undefined) {
+        // Write the secret and close stdin so non-TTY prompts resolve.
+        child.stdin?.end(stdinData)
+      }
+
       const stdoutChunks: Buffer[] = []
       const stderrChunks: Buffer[] = []
-      child.stdout.on('data', (chunk: Buffer) => stdoutChunks.push(chunk))
-      child.stderr.on('data', (chunk: Buffer) => stderrChunks.push(chunk))
+      child.stdout?.on('data', (chunk: Buffer) => stdoutChunks.push(chunk))
+      child.stderr?.on('data', (chunk: Buffer) => stderrChunks.push(chunk))
 
       child.on('error', (err: any) => {
         if (err.code === 'ETIMEDOUT') {

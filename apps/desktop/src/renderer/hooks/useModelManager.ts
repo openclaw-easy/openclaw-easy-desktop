@@ -10,7 +10,6 @@ export interface ModelInfo {
   downloads: string;
   status: 'not_installed' | 'installing' | 'installed' | 'failed';
   icon: string;
-  premium?: boolean;
   progress?: number;
 }
 
@@ -173,14 +172,22 @@ export const useModelManager = () => {
         const installedList = await window.electronAPI?.getInstalledModels?.() || [];
         const installedSet = new Set(installedList.map((m: any) => m.name || m.id || m));
 
-        // Update status for any models that completed installation
-        setModels(prev => prev.map(model => {
-          if (model.status === 'installing' && installedSet.has(model.id)) {
-            console.log(`[DEBUG] Model ${model.id} installation detected as complete!`);
-            return { ...model, status: 'installed', progress: 100 };
-          }
-          return model;
-        }));
+        // Update status for any models that completed installation. Return the
+        // SAME array reference when nothing transitioned — `.map` always makes a
+        // new array, which (with the [models] effect dep) would re-trigger this
+        // effect immediately and spin a tight ollama-list loop during a download.
+        setModels(prev => {
+          let changed = false;
+          const next = prev.map(model => {
+            if (model.status === 'installing' && installedSet.has(model.id)) {
+              console.log(`[DEBUG] Model ${model.id} installation detected as complete!`);
+              changed = true;
+              return { ...model, status: 'installed' as const, progress: 100 };
+            }
+            return model;
+          });
+          return changed ? next : prev;
+        });
       } catch (error) {
         console.error('[DEBUG] Failed to check installation status:', error);
       }
@@ -414,7 +421,10 @@ export const useModelManager = () => {
     }
 
     try {
-      // Use the proper Electron API for model configuration
+      // Local-Ollama model configuration goes through the dedicated
+      // `model:configure` IPC which writes the right ollama/<id> slug
+      // into openclaw.json. Provider/model switches go through
+      // `config:save` only (no fallback path).
       if (window.electronAPI?.configureModel) {
         const result = await window.electronAPI.configureModel(modelId);
         if (result.success) {
@@ -422,20 +432,8 @@ export const useModelManager = () => {
         } else {
           console.error('Failed to configure model:', result.message);
         }
-      } else if (window.electronAPI?.updateOpenClawConfig) {
-        // Fallback to direct config update using correct OpenClaw format
-        await window.electronAPI.updateOpenClawConfig({
-          'agents.defaults.model.primary': modelId
-        });
-
-        // Restart OpenClaw to apply new model
-        if (window.electronAPI?.restartOpenClaw) {
-          await window.electronAPI.restartOpenClaw();
-        }
-
-        console.log(`Configured and activated model: ${modelId}`);
       } else {
-        console.log(`Would configure model: ${modelId} (API not available)`);
+        console.warn(`[useModelManager] electronAPI.configureModel unavailable — cannot activate ${modelId}`);
       }
     } catch (error) {
       console.error('Failed to configure model:', error);
