@@ -17,7 +17,13 @@ import {
   X
 } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
+import { useToast } from '../../../contexts/ToastContext'
 import { ColorTheme } from '../types'
+import { EmptyState } from '../../ui/empty-state'
+import { ErrorAlert } from '../../ui/error-alert'
+import { MascotIllustration } from '../../ui/mascot-illustration'
+import { AnimatedNumber } from '../../ui/animated-number'
+import { Skeleton, SkeletonCard } from '../../ui/skeleton'
 
 interface Hook {
   name: string
@@ -36,6 +42,7 @@ interface HooksSectionProps {
 
 export const HooksSection: React.FC<HooksSectionProps> = ({ colors }) => {
   const { t } = useTranslation()
+  const { addToast } = useToast()
   const [activeTab, setActiveTab] = useState<'manage' | 'install'>('manage')
   const [hooks, setHooks] = useState<Hook[]>([])
   const [loading, setLoading] = useState(true)
@@ -95,11 +102,11 @@ export const HooksSection: React.FC<HooksSectionProps> = ({ colors }) => {
       if (result.success) {
         await loadHooks(true)
       } else {
-        alert(result.error || 'Failed to update hook')
+        addToast(result.error || t('hooks.updateFailed', 'Failed to update hook'), 'error')
       }
     } catch (err: any) {
       console.error(`[HooksSection] Error toggling hook ${hookName}:`, err)
-      alert(err.message || 'Failed to update hook')
+      addToast(err.message || t('hooks.updateFailed', 'Failed to update hook'), 'error')
     } finally {
       setToggleLoading(prev => {
         const newSet = new Set(prev)
@@ -114,16 +121,13 @@ export const HooksSection: React.FC<HooksSectionProps> = ({ colors }) => {
     try {
       const result = await window.electronAPI.checkHooks()
       if (result.success) {
-        const summary = result.status
-          ? JSON.stringify(result.status, null, 2)
-          : 'All hooks passed eligibility checks.'
-        alert(summary)
+        addToast(t('hooks.checkComplete', 'Hook checks complete'), 'success')
       } else {
-        alert(result.error || t('hooks.checkFailed'))
+        addToast(result.error || t('hooks.checkFailed', 'Failed to check hooks'), 'error')
       }
     } catch (err: any) {
       console.error('[HooksSection] Error running hooks check:', err)
-      alert(err.message || 'Failed to check hooks')
+      addToast(err.message || t('hooks.checkFailed', 'Failed to check hooks'), 'error')
     } finally {
       setCheckLoading(false)
     }
@@ -165,12 +169,44 @@ export const HooksSection: React.FC<HooksSectionProps> = ({ colors }) => {
   }, [])
 
   if (loading) {
+    // Skeleton scaffold matches the manage-tab layout — stats pills,
+    // search bar, list of hook cards — so the section's shape lands
+    // immediately and only the content streams in.
+    return (
+      <div className="p-6 h-full flex flex-col space-y-4" aria-busy="true" aria-label={t('hooks.loadingHooks')}>
+        <div className="flex items-center gap-5">
+          {Array.from({ length: 3 }).map((_, i) => (
+            <Skeleton key={i} className="h-5 w-20 rounded-md" />
+          ))}
+        </div>
+        <Skeleton className="h-9 w-full max-w-md rounded-md" />
+        <div className="space-y-3 flex-1 overflow-hidden">
+          {Array.from({ length: 6 }).map((_, i) => (
+            <SkeletonCard key={i} />
+          ))}
+        </div>
+      </div>
+    )
+  }
+
+  // Surface the error state — previously set but never rendered, leaving the
+  // user with a blank-looking page when listHooks failed. Shared ErrorAlert
+  // keeps the look consistent with other sections.
+  if (error) {
     return (
       <div className="p-8 h-full flex items-center justify-center">
-        <div className="flex items-center space-x-3">
-          <Loader2 className="h-6 w-6 animate-spin" style={{ color: colors.accent.brand }} />
-          <span style={{ color: colors.text.normal }}>{t('hooks.loadingHooks')}</span>
-        </div>
+        <ErrorAlert
+          colors={colors}
+          title={t('hooks.loadFailed', 'Could not load hooks')}
+          message={error}
+          action={
+            <Button onClick={() => loadHooks()} size="sm" style={{ backgroundColor: colors.accent.brand, color: colors.button.primaryFg, border: 'none' }}>
+              <RefreshCw className="h-4 w-4 mr-2" />
+              {t('hooks.refresh')}
+            </Button>
+          }
+          className="max-w-md"
+        />
       </div>
     )
   }
@@ -204,7 +240,7 @@ export const HooksSection: React.FC<HooksSectionProps> = ({ colors }) => {
               <Button
                 onClick={() => loadHooks()}
                 size="sm"
-                style={{ backgroundColor: colors.accent.brand, color: '#ffffff', border: 'none' }}
+                style={{ backgroundColor: colors.accent.brand, color: colors.button.primaryFg, border: 'none' }}
               >
                 <RefreshCw className="h-4 w-4 mr-2" />
                 {t('hooks.refresh')}
@@ -249,18 +285,18 @@ export const HooksSection: React.FC<HooksSectionProps> = ({ colors }) => {
         {activeTab === 'manage' && (
           <>
             <div className="px-6 pt-3 pb-2 flex-shrink-0">
-              {/* Stats */}
+              {/* Stats — numbers tween via AnimatedNumber when toggles change them. */}
               <div className="flex items-center gap-5 mb-2">
                 <div className="flex items-center gap-1.5">
-                  <span className="text-base font-bold" style={{ color: colors.text.header }}>{hooksStats.total}</span>
+                  <span className="text-base font-bold" style={{ color: colors.text.header }}><AnimatedNumber value={hooksStats.total} /></span>
                   <span className="text-xs" style={{ color: colors.text.muted }}>{t('hooks.total')}</span>
                 </div>
                 <div className="flex items-center gap-1.5">
-                  <span className="text-base font-bold" style={{ color: colors.accent.green }}>{hooksStats.enabled}</span>
+                  <span className="text-base font-bold" style={{ color: colors.accent.green }}><AnimatedNumber value={hooksStats.enabled} /></span>
                   <span className="text-xs" style={{ color: colors.text.muted }}>{t('hooks.enabled')}</span>
                 </div>
                 <div className="flex items-center gap-1.5">
-                  <span className="text-base font-bold" style={{ color: colors.text.muted }}>{hooksStats.disabled}</span>
+                  <span className="text-base font-bold" style={{ color: colors.text.muted }}><AnimatedNumber value={hooksStats.disabled} /></span>
                   <span className="text-xs" style={{ color: colors.text.muted }}>{t('hooks.disabled')}</span>
                 </div>
               </div>
@@ -277,7 +313,7 @@ export const HooksSection: React.FC<HooksSectionProps> = ({ colors }) => {
                       onChange={(e) => setSearchFilter(e.target.value)}
                       className="pl-10 pr-4 py-2 border rounded-md text-sm w-96"
                       style={{
-                        backgroundColor: colors.bg.primary,
+                        backgroundColor: colors.bg.tertiary,
                         borderColor: colors.bg.tertiary,
                         color: colors.text.normal
                       }}
@@ -307,32 +343,26 @@ export const HooksSection: React.FC<HooksSectionProps> = ({ colors }) => {
                   )}
 
                   {filteredHooks.length === 0 && searchFilter ? (
-                    <div className="text-center py-8">
-                      <div className="text-6xl mb-4">🔍</div>
-                      <h3 className="text-lg font-medium mb-2" style={{ color: colors.text.header }}>
-                        {t('hooks.noHooksFound')}
-                      </h3>
-                      <p className="text-sm" style={{ color: colors.text.muted }}>
-                        {t('hooks.noHooksMatch', { search: searchFilter })}
-                      </p>
-                    </div>
+                    <EmptyState
+                      colors={colors}
+                      illustration={<MascotIllustration mood="thinking" size={64} />}
+                      title={t('hooks.noHooksFound')}
+                      description={t('hooks.noHooksMatch', { search: searchFilter })}
+                    />
                   ) : filteredHooks.length === 0 && !gatewayOff ? (
-                    <div className="text-center py-8">
-                      <div className="text-6xl mb-4">🪝</div>
-                      <h3 className="text-lg font-medium mb-2" style={{ color: colors.text.header }}>
-                        {t('hooks.noHooksAvailable')}
-                      </h3>
-                      <p className="text-sm" style={{ color: colors.text.muted }}>
-                        {t('hooks.noHooksAvailableDesc')}
-                      </p>
-                    </div>
+                    <EmptyState
+                      colors={colors}
+                      illustration={<MascotIllustration mood="napping" />}
+                      title={t('hooks.noHooksAvailable')}
+                      description={t('hooks.noHooksAvailableDesc')}
+                    />
                   ) : filteredHooks.length > 0 ? (
                     filteredHooks.map((hook) => (
                       <div
                         key={hook.name}
                         className="rounded-lg p-4 transition-all duration-200"
                         style={{
-                          backgroundColor: colors.bg.primary,
+                          backgroundColor: colors.bg.tertiary,
                         }}
                       >
                         <div className="flex items-start justify-between">
@@ -390,8 +420,11 @@ export const HooksSection: React.FC<HooksSectionProps> = ({ colors }) => {
                               title={hook.enabled ? t('hooks.disableHook') : t('hooks.enableHook')}
                               style={{
                                 backgroundColor: colors.bg.tertiary,
-                                color: hook.enabled ? colors.accent.red : colors.accent.green,
-                                borderColor: hook.enabled ? `${colors.accent.red}88` : `${colors.accent.green}88`
+                                // Toggle color = the action the click performs.
+                                color: hook.enabled ? colors.button.destructive : colors.button.primary,
+                                borderColor: hook.enabled
+                                  ? `${colors.button.destructive}88`
+                                  : `${colors.button.primary}88`
                               }}
                             >
                               {toggleLoading.has(hook.name)
@@ -453,7 +486,7 @@ export const HooksSection: React.FC<HooksSectionProps> = ({ colors }) => {
                   onKeyDown={(e) => e.key === 'Enter' && installCustomHook()}
                   className="flex-1 px-3 py-2 border rounded-md text-sm"
                   style={{
-                    backgroundColor: colors.bg.primary,
+                    backgroundColor: colors.bg.tertiary,
                     borderColor: colors.bg.hover,
                     color: colors.text.normal
                   }}
@@ -461,7 +494,7 @@ export const HooksSection: React.FC<HooksSectionProps> = ({ colors }) => {
                 <Button
                   onClick={installCustomHook}
                   disabled={customInstalling || !customInstallSpec.trim()}
-                  style={{ backgroundColor: colors.accent.brand, color: '#ffffff', border: 'none' }}
+                  style={{ backgroundColor: colors.accent.brand, color: colors.button.primaryFg, border: 'none' }}
                 >
                   {customInstalling ? (
                     <Loader2 className="h-4 w-4 animate-spin mr-2" />

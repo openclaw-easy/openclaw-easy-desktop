@@ -1,20 +1,25 @@
-import fs from "node:fs";
+// CLI dotenv loader that preserves workspace overrides before global runtime fallbacks.
 import path from "node:path";
-import dotenv from "dotenv";
 import { resolveStateDir } from "../config/paths.js";
+import { loadGlobalRuntimeDotEnvFiles, loadWorkspaceDotEnvFile } from "../infra/dotenv.js";
+import { tryProcessCwd } from "../infra/safe-cwd.js";
 
-export function loadCliDotEnv(opts?: { quiet?: boolean }) {
+/** Load `.env` files for normal CLI commands without overriding existing process env. */
+export function loadCliDotEnv(opts?: { loadGlobalEnv?: boolean; quiet?: boolean }) {
   const quiet = opts?.quiet ?? true;
-
-  // Load from process CWD first (dotenv default).
-  dotenv.config({ quiet });
-
-  // Then load the global fallback from the active state dir without overriding
-  // any env vars that were already set or loaded from CWD.
-  const globalEnvPath = path.join(resolveStateDir(process.env), ".env");
-  if (!fs.existsSync(globalEnvPath)) {
-    return;
+  const cwd = tryProcessCwd();
+  if (cwd) {
+    loadWorkspaceDotEnvFile(path.join(cwd, ".env"), { quiet });
   }
 
-  dotenv.config({ quiet, path: globalEnvPath, override: false });
+  if (opts?.loadGlobalEnv === false) {
+    return;
+  }
+  // Then load the global fallback set without overriding any env vars that
+  // were already set or loaded from CWD. This includes the Ubuntu fresh-install
+  // gateway.env compatibility path.
+  loadGlobalRuntimeDotEnvFiles({
+    quiet,
+    stateEnvPath: path.join(resolveStateDir(process.env), ".env"),
+  });
 }

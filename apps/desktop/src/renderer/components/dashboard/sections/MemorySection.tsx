@@ -1,249 +1,332 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react'
-import { Calendar, Search, Loader2, RefreshCw, FileText } from 'lucide-react'
+import React, { useCallback, useEffect, useState } from 'react'
+import { Brain, FileText, Loader2, RefreshCw, Search, Trash2, X } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
-import { ColorTheme } from '../types'
-import { MarkdownRenderer } from '../../chat/MarkdownRenderer'
+import { useToast } from '../../../contexts/ToastContext'
+import { Modal } from '../../ui/modal'
+import type { ColorTheme } from '../types'
 
-interface MemoryFile {
-  name: string
-  path: string
-  date: string
-  size: number
-  modified: number
+/**
+ * Memory & context controls: what the assistant remembers (MEMORY.md +
+ * memory/*.md in the agent workspace), search over the memory index, and
+ * per-file delete. Read-only view of contents; deletion reindexes so
+ * search stops surfacing removed facts.
+ */
+
+interface MemoryStatus {
+  agentId: string
+  files: number
+  chunks: number
+  dirty: boolean
+  workspaceDir: string
+  provider?: string
 }
 
-interface MemorySectionProps {
+interface MemoryFileInfo {
+  relPath: string
+  sizeBytes: number
+  modifiedAtMs: number
+}
+
+interface SearchResult {
+  path?: string
+  snippet?: string
+  score?: number
+}
+
+interface Props {
   colors: ColorTheme
 }
 
-export function MemorySection({ colors }: MemorySectionProps) {
-  const { t } = useTranslation()
-  const [files, setFiles] = useState<MemoryFile[]>([])
-  const [selectedPath, setSelectedPath] = useState<string | null>(null)
-  const [content, setContent] = useState('')
-  const [loading, setLoading] = useState(true)
-  const [fileLoading, setFileLoading] = useState(false)
-  const [searchQuery, setSearchQuery] = useState('')
-  const scrollContainerRef = useRef<HTMLDivElement>(null)
+function formatSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`
+  return `${(bytes / 1024).toFixed(1)} KB`
+}
 
-  const loadFiles = useCallback(async () => {
-    setLoading(true)
+export function MemorySection({ colors }: Props) {
+  const { t } = useTranslation()
+  const { addToast } = useToast()
+  const [status, setStatus] = useState<MemoryStatus | null>(null)
+  const [files, setFiles] = useState<MemoryFileInfo[]>([])
+  const [loading, setLoading] = useState(true)
+  const [reindexing, setReindexing] = useState(false)
+  const [query, setQuery] = useState('')
+  const [searching, setSearching] = useState(false)
+  const [results, setResults] = useState<SearchResult[] | null>(null)
+  const [viewer, setViewer] = useState<{ relPath: string; content: string } | null>(null)
+  const [viewerLoading, setViewerLoading] = useState<string | null>(null)
+  const [deleteConfirm, setDeleteConfirm] = useState<string | null>(null)
+  const [deleting, setDeleting] = useState(false)
+
+  const load = useCallback(async (silent = false) => {
+    if (!silent) setLoading(true)
     try {
-      const result = await window.electronAPI?.listMemoryFiles?.()
-      if (result?.success && result.files) {
-        setFiles(result.files)
-        if (!selectedPath && result.files.length > 0) {
-          loadFile(result.files[0].path)
-        }
-      }
-    } catch (err) {
-      console.error('[MemorySection] Failed to load files:', err)
+      const statusRes = await window.electronAPI?.getMemoryStatus?.()
+      const workspaceDir = statusRes?.status?.workspaceDir
+      if (statusRes?.success && statusRes.status) setStatus(statusRes.status)
+      const filesRes = await window.electronAPI?.listMemoryFiles?.(workspaceDir)
+      if (filesRes?.success) setFiles(filesRes.files)
     } finally {
       setLoading(false)
     }
   }, [])
 
-  const loadFile = async (path: string) => {
-    setFileLoading(true)
-    try {
-      const result = await window.electronAPI?.readMemoryFile?.(path)
-      if (result?.success && result.content !== undefined) {
-        setSelectedPath(path)
-        setContent(result.content)
-      }
-    } catch (err) {
-      console.error('[MemorySection] Failed to read file:', err)
-    } finally {
-      setFileLoading(false)
-    }
-  }
-
   useEffect(() => {
-    loadFiles()
-  }, [loadFiles])
+    load()
+  }, [load])
 
-  const filteredFiles = files.filter((f) =>
-    f.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
-    f.date.includes(searchQuery) ||
-    f.path.toLowerCase().includes(searchQuery.toLowerCase())
-  )
-
-  const formatSize = (bytes: number): string => {
-    if (bytes < 1024) return `${bytes} B`
-    return `${(bytes / 1024).toFixed(1)} KB`
-  }
-
-  const formatLabel = (file: MemoryFile): string => {
-    if (file.date) {
-      try {
-        const d = new Date(file.date + 'T00:00:00')
-        const dateLabel = d.toLocaleDateString(undefined, {
-          weekday: 'short',
-          month: 'short',
-          day: 'numeric',
-          year: 'numeric',
-        })
-        // If filename has a slug beyond the date (e.g. "2026-03-10-session-notes.md"), show it
-        const slug = file.name.replace(/^\d{4}-\d{2}-\d{2}-?/, '').replace(/\.md$/, '')
-        return slug ? `${dateLabel} — ${slug}` : dateLabel
-      } catch {
-        return file.name
+  const reindex = async () => {
+    setReindexing(true)
+    try {
+      const res = await window.electronAPI?.reindexMemory?.()
+      if (res?.success) {
+        addToast(t('memory.reindexed', 'Memory index rebuilt'), 'success')
+        await load(true)
+      } else {
+        addToast(res?.error || t('memory.reindexFailed', 'Reindex failed'), 'error')
       }
+    } finally {
+      setReindexing(false)
     }
-    // Non-dated files: show filename without extension
-    return file.name.replace(/\.md$/, '')
   }
 
-  const formatSelectedLabel = (path: string): string => {
-    const file = files.find(f => f.path === path)
-    return file ? formatLabel(file) : path
+  const search = async () => {
+    if (!query.trim()) {
+      setResults(null)
+      return
+    }
+    setSearching(true)
+    try {
+      const res = await window.electronAPI?.searchMemory?.(query)
+      if (res?.success) {
+        setResults(res.results || [])
+      } else {
+        addToast(res?.error || t('memory.searchFailed', 'Search failed'), 'error')
+      }
+    } finally {
+      setSearching(false)
+    }
   }
 
-  const totalEntries = files.length
-  const totalSize = files.reduce((sum, f) => sum + f.size, 0)
+  const openFile = async (relPath: string) => {
+    if (!status) return
+    setViewerLoading(relPath)
+    try {
+      const res = await window.electronAPI?.readMemoryFile?.(status.workspaceDir, relPath)
+      if (res?.success) {
+        setViewer({ relPath, content: res.content || '' })
+      } else {
+        addToast(res?.error || t('memory.readFailed', 'Could not read file'), 'error')
+      }
+    } finally {
+      setViewerLoading(null)
+    }
+  }
+
+  const doDelete = async () => {
+    if (!status || !deleteConfirm) return
+    setDeleting(true)
+    try {
+      const res = await window.electronAPI?.deleteMemoryFile?.(status.workspaceDir, deleteConfirm)
+      if (res?.success) {
+        addToast(t('memory.deleted', 'Memory file deleted'), 'success')
+        setDeleteConfirm(null)
+        setViewer(null)
+        setResults(null)
+        await load(true)
+      } else {
+        addToast(res?.error || t('memory.deleteFailed', 'Delete failed'), 'error')
+      }
+    } finally {
+      setDeleting(false)
+    }
+  }
+
+  if (loading) {
+    return (
+      <div className="flex h-full items-center justify-center">
+        <Loader2 className="h-8 w-8 animate-spin" style={{ color: colors.text.muted }} />
+      </div>
+    )
+  }
 
   return (
-    <div className="p-8 h-full flex flex-col">
-      <div
-        className="rounded-lg flex-1 flex flex-col min-h-0"
-        style={{ backgroundColor: colors.bg.secondary }}
-      >
-        {/* Header */}
-        <div className="p-6 pb-4 flex-shrink-0">
-          <div className="flex items-center justify-between">
-            <div className="flex items-baseline gap-3">
-              <h3
-                className="text-lg font-semibold"
-                style={{ color: colors.text.header }}
-              >
-                {t('memory.title')}
-              </h3>
-              <span className="text-sm" style={{ color: colors.text.muted }}>
-                {t('memory.entries', { count: totalEntries, size: formatSize(totalSize) })}
-              </span>
-            </div>
-            <button
-              onClick={loadFiles}
-              className="p-2 rounded-lg transition-colors hover:opacity-80"
-              style={{ color: colors.text.muted }}
-              title={t('common.refresh')}
-            >
-              <RefreshCw className="h-4 w-4" />
-            </button>
-          </div>
-
-          {/* Search */}
-          <div className="relative mt-3">
-            <Search
-              className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4"
-              style={{ color: colors.text.muted }}
-            />
-            <input
-              type="text"
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-              placeholder={t('memory.filterPlaceholder')}
-              className="w-full pl-9 pr-3 py-2 rounded-lg text-sm focus:outline-none"
-              style={{
-                backgroundColor: colors.bg.primary,
-                color: colors.text.normal,
-              }}
-            />
-          </div>
+    <div className="h-full overflow-y-auto p-6">
+      <div className="mb-6 flex items-center justify-between">
+        <div>
+          <h2 className="flex items-center gap-2 font-display text-lg font-bold tracking-tight" style={{ color: colors.text.header }}>
+            <Brain className="h-5 w-5" />
+            {t('memory.title', 'Memory')}
+          </h2>
+          <p className="text-sm" style={{ color: colors.text.muted }}>
+            {t('memory.subtitle', 'See and control what your assistant remembers across conversations.')}
+          </p>
         </div>
-
-        {/* Content */}
-        <div className="flex-1 px-6 pb-6 min-h-0 flex gap-4">
-          {/* File list (left) */}
-          <div
-            className="w-56 flex-shrink-0 rounded-lg overflow-y-auto"
-            style={{ backgroundColor: colors.bg.primary }}
+        <div className="flex items-center gap-2">
+          <button
+            onClick={reindex}
+            disabled={reindexing}
+            className="flex items-center gap-1.5 rounded px-3 py-1.5 text-sm font-medium hover:opacity-80 disabled:opacity-50"
+            style={{ backgroundColor: colors.bg.tertiary, color: colors.text.normal }}
           >
-            <div className="p-3 space-y-0.5">
-              {loading ? (
-                <div className="flex items-center justify-center py-8">
-                  <Loader2 className="h-5 w-5 animate-spin" style={{ color: colors.text.muted }} />
-                </div>
-              ) : filteredFiles.length === 0 ? (
-                <p className="text-sm px-2 py-4 text-center" style={{ color: colors.text.muted }}>
-                  {files.length === 0
-                    ? t('memory.noEntries')
-                    : t('memory.noMatch')}
-                </p>
-              ) : (
-                filteredFiles.map((file) => (
-                  <button
-                    key={file.path}
-                    onClick={() => loadFile(file.path)}
-                    className="w-full text-left px-3 py-2 rounded-md transition-colors flex items-center gap-2"
-                    style={{
-                      backgroundColor: selectedPath === file.path ? colors.bg.active : 'transparent',
-                      color: selectedPath === file.path ? colors.text.header : colors.text.normal,
-                    }}
-                  >
-                    {file.date ? (
-                      <Calendar className="h-3.5 w-3.5 flex-shrink-0" style={{ color: colors.accent.purple }} />
-                    ) : (
-                      <FileText className="h-3.5 w-3.5 flex-shrink-0" style={{ color: colors.accent.purple }} />
-                    )}
-                    <div className="min-w-0 flex-1">
-                      <div className="text-sm truncate">{formatLabel(file)}</div>
-                      <div className="text-xs" style={{ color: colors.text.muted }}>
-                        {formatSize(file.size)}
-                      </div>
-                    </div>
-                  </button>
-                ))
-              )}
-            </div>
-          </div>
-
-          {/* Content viewer (right) */}
-          <div
-            className="flex-1 rounded-lg relative min-w-0"
-            style={{ backgroundColor: colors.bg.primary }}
-          >
-            {selectedPath ? (
-              <>
-                {/* Selected file label */}
-                <div className="px-4 pt-3 pb-2 flex-shrink-0">
-                  <span className="text-sm font-medium" style={{ color: colors.text.header }}>
-                    {formatSelectedLabel(selectedPath)}
-                  </span>
-                  <span className="text-xs ml-2" style={{ color: colors.text.muted }}>
-                    {t('memory.readOnly')}
-                  </span>
-                </div>
-
-                {fileLoading ? (
-                  <div className="flex items-center justify-center h-32">
-                    <Loader2 className="h-5 w-5 animate-spin" style={{ color: colors.text.muted }} />
-                  </div>
-                ) : (
-                  <div
-                    ref={scrollContainerRef}
-                    className="absolute left-0 right-0 bottom-0 overflow-y-auto px-4 pb-4"
-                    style={{ top: '44px' }}
-                  >
-                    <div
-                      className="text-sm break-all"
-                      style={{ color: colors.text.normal }}
-                    >
-                      <MarkdownRenderer content={content} />
-                    </div>
-                  </div>
-                )}
-              </>
-            ) : (
-              <div className="flex items-center justify-center h-full">
-                <p className="text-sm" style={{ color: colors.text.muted }}>
-                  {t('memory.selectDate')}
-                </p>
-              </div>
-            )}
-          </div>
+            {reindexing ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+            {t('memory.reindex', 'Rebuild index')}
+          </button>
         </div>
       </div>
+
+      <div className="mb-4 grid grid-cols-3 gap-3">
+        {[
+          { label: t('memory.statFiles', 'Memory files'), value: String(files.length) },
+          { label: t('memory.statChunks', 'Indexed chunks'), value: String(status?.chunks ?? 0) },
+          {
+            label: t('memory.statIndex', 'Index'),
+            value: status?.dirty
+              ? t('memory.indexStale', 'needs rebuild')
+              : t('memory.indexFresh', 'up to date'),
+          },
+        ].map((stat) => (
+          <div key={stat.label} className="rounded-lg border p-3" style={{ borderColor: colors.bg.tertiary, backgroundColor: colors.bg.secondary }}>
+            <p className="text-xs" style={{ color: colors.text.muted }}>{stat.label}</p>
+            <p className="text-lg font-semibold" style={{ color: colors.text.header }}>{stat.value}</p>
+          </div>
+        ))}
+      </div>
+
+      <div className="mb-4">
+        <div className="flex gap-2">
+          <div className="relative flex-1">
+            <Search className="absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2" style={{ color: colors.text.muted }} />
+            <input
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') search()
+              }}
+              placeholder={t('memory.searchPlaceholder', 'Search what the assistant remembers…')}
+              className="w-full rounded py-2 pl-9 pr-3 text-sm outline-none"
+              style={{ backgroundColor: colors.bg.tertiary, color: colors.text.normal }}
+            />
+          </div>
+          <button
+            onClick={search}
+            disabled={searching}
+            className="rounded px-4 py-2 text-sm font-medium hover:opacity-80 disabled:opacity-50"
+            style={{ backgroundColor: colors.button.primary, color: colors.button.primaryFg }}
+          >
+            {searching ? <Loader2 className="h-4 w-4 animate-spin" /> : t('memory.search', 'Search')}
+          </button>
+        </div>
+
+        {results !== null && (
+          <div className="mt-3 space-y-2">
+            {results.length === 0 && (
+              <p className="text-sm" style={{ color: colors.text.muted }}>
+                {t('memory.noResults', 'No memories matched.')}
+              </p>
+            )}
+            {results.map((r, i) => (
+              <div key={i} className="rounded-lg border p-3" style={{ borderColor: colors.bg.tertiary, backgroundColor: colors.bg.secondary }}>
+                <div className="mb-1 flex items-center justify-between">
+                  <span className="font-mono text-xs" style={{ color: colors.text.muted }}>{r.path || ''}</span>
+                  {typeof r.score === 'number' && (
+                    <span className="text-xs" style={{ color: colors.text.muted }}>{r.score.toFixed(2)}</span>
+                  )}
+                </div>
+                <p className="whitespace-pre-wrap text-sm" style={{ color: colors.text.normal }}>{r.snippet || ''}</p>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      <h3 className="mb-2 text-sm font-semibold" style={{ color: colors.text.header }}>
+        {t('memory.filesTitle', 'Memory files')}
+      </h3>
+      {files.length === 0 ? (
+        <p className="text-sm" style={{ color: colors.text.muted }}>
+          {t('memory.noFiles', 'No memory files yet — the assistant writes memories as you talk to it.')}
+        </p>
+      ) : (
+        <div className="space-y-1.5">
+          {files.map((f) => (
+            <div
+              key={f.relPath}
+              className="flex items-center justify-between rounded-lg border px-3 py-2"
+              style={{ borderColor: colors.bg.tertiary, backgroundColor: colors.bg.secondary }}
+            >
+              <button
+                onClick={() => openFile(f.relPath)}
+                className="flex items-center gap-2 text-sm hover:underline"
+                style={{ color: colors.text.normal }}
+              >
+                {viewerLoading === f.relPath ? (
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                ) : (
+                  <FileText className="h-4 w-4" style={{ color: colors.text.muted }} />
+                )}
+                {f.relPath}
+              </button>
+              <div className="flex items-center gap-3">
+                <span className="text-xs" style={{ color: colors.text.muted }}>
+                  {formatSize(f.sizeBytes)} · {new Date(f.modifiedAtMs).toLocaleDateString()}
+                </span>
+                <button
+                  onClick={() => setDeleteConfirm(f.relPath)}
+                  className="rounded p-1 hover:opacity-80"
+                  style={{ color: colors.text.danger }}
+                  aria-label={t('memory.delete', 'Delete')}
+                >
+                  <Trash2 className="h-4 w-4" />
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {viewer && (
+        <Modal open onClose={() => setViewer(null)} maxWidthClass="max-w-2xl">
+          <div className="max-h-[70vh] overflow-y-auto p-4">
+            <div className="mb-3 flex items-center justify-between">
+              <h3 className="font-mono text-sm font-semibold" style={{ color: colors.text.header }}>{viewer.relPath}</h3>
+              <button onClick={() => setViewer(null)} aria-label={t('common.close', 'Close')} style={{ color: colors.text.muted }}>
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+            <pre className="whitespace-pre-wrap text-sm" style={{ color: colors.text.normal }}>{viewer.content}</pre>
+          </div>
+        </Modal>
+      )}
+
+      {deleteConfirm && (
+        <Modal open onClose={() => setDeleteConfirm(null)}>
+          <div className="p-4">
+            <h3 className="mb-2 text-sm font-semibold" style={{ color: colors.text.header }}>
+              {t('memory.deleteTitle', 'Delete this memory file?')}
+            </h3>
+            <p className="mb-4 text-sm" style={{ color: colors.text.muted }}>
+              {t('memory.deleteBody', 'The assistant will permanently forget everything in {{file}}. This cannot be undone.', { file: deleteConfirm })}
+            </p>
+            <div className="flex justify-end gap-2">
+              <button
+                onClick={() => setDeleteConfirm(null)}
+                className="rounded px-3 py-1.5 text-sm hover:opacity-80"
+                style={{ backgroundColor: colors.bg.tertiary, color: colors.text.normal }}
+              >
+                {t('common.cancel', 'Cancel')}
+              </button>
+              <button
+                onClick={doDelete}
+                disabled={deleting}
+                className="rounded px-3 py-1.5 text-sm font-medium hover:opacity-80 disabled:opacity-50"
+                style={{ backgroundColor: colors.button.destructive, color: colors.button.destructiveFg }}
+              >
+                {deleting ? t('memory.deleting', 'Deleting…') : t('memory.deleteConfirm', 'Delete')}
+              </button>
+            </div>
+          </div>
+        </Modal>
+      )}
     </div>
   )
 }

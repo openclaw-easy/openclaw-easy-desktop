@@ -25,12 +25,19 @@ const optimizer = {
   }
 }
 import icon from '../../resources/icons/icon.png?asset'
-import lobsterIcon from '../../resources/icons/lobster-emoji.png?asset'
+// Base path only — the @2x/@3x siblings must ship alongside it (see createTray).
+import lobsterTrayIcon from '../../resources/icons/lobster-tray.png?asset'
 import lobsterDockIcon from '../../resources/icons/lobster-dock.png?asset'
 import { registerMacHandlers, setupMacDockIcon } from './index-mac.js'
 import { registerWindowsHandlers } from './index-windows.js'
 import { OpenClawManager } from './openclaw-manager.js'
+import { getOpenClawBundle } from './openclaw-bundle'
+import { getDevOpenClawSpawn } from './dev-openclaw-runtime'
 import { ConfigManager, AppProviderConfig } from './managers/config-manager'
+import { AccessControlManager, ChannelAccessPatch } from './managers/access-control-manager'
+import { BrowserManager } from './managers/browser-manager'
+import { MemoryManager } from './managers/memory-manager'
+import { BYOK_PROVIDER_MODELS } from '../shared/providerModels'
 import { ModelManager } from './model-manager.js'
 import { EnvironmentManager } from './environment-manager.js'
 import { ToolsManager } from './tools-manager.js'
@@ -41,6 +48,8 @@ import { SttManager } from './managers/stt-manager'
 import { DEFAULT_GATEWAY_PORT } from '../shared/constants'
 import { WhisperServerManager } from './managers/whisper-server-manager'
 import { TelemetryManager } from './managers/telemetry-manager'
+import { safeOpenExternal } from './safe-open-external'
+import { fetchLatestRelease } from './release-feed'
 
 // Simple semver comparison: returns true if `latest` is strictly newer than `current`
 function isNewerVersion(latest: string, current: string): boolean {
@@ -111,9 +120,17 @@ function setupFileLogging() {
 class OpenclawEasyApp {
   private mainWindow: BrowserWindow | null = null
   private tray: Tray | null = null
+  // Tracks an in-flight start/stop triggered from the tray so the menu can
+  // disable both actions while the transition is running (the underlying
+  // ProcessStatus type has no 'stopping' state, and 'starting' is only set
+  // for non-system spawns — tray needs to gate clicks regardless of mode).
+  private trayTransition: 'starting' | 'stopping' | 'restarting' | null = null
   private isQuitting: boolean = false
   private openClawManager: OpenClawManager
   private configManager: ConfigManager
+  private accessControlManager: AccessControlManager
+  private browserManager: BrowserManager
+  private memoryManager: MemoryManager
   private modelManager: ModelManager
   private environmentManager: EnvironmentManager
   private toolsManager: ToolsManager
@@ -127,6 +144,14 @@ class OpenclawEasyApp {
   constructor() {
     this.openClawManager = new OpenClawManager()
     this.configManager = new ConfigManager()
+    // This ConfigManager instance also syncs credentials into the SQLite
+    // auth store (the config:save path) — share the manager's
+    // platform executor so those writes go through the OpenClaw CLI.
+    this.configManager.setCommandExecutor(this.openClawManager.getCommandExecutor())
+    const executor = this.openClawManager.getCommandExecutor()
+    this.accessControlManager = new AccessControlManager(this.configManager, executor)
+    this.browserManager = new BrowserManager(this.configManager, executor)
+    this.memoryManager = new MemoryManager(executor)
     this.modelManager = new ModelManager()
     this.environmentManager = new EnvironmentManager()
     const configPath = join(app.getPath('home'), '.openclaw', 'openclaw.json')
@@ -136,7 +161,7 @@ class OpenclawEasyApp {
     this.workspaceManager = new WorkspaceManager()
     this.sttManager = new SttManager()
     this.whisperServerManager = new WhisperServerManager()
-    this.telemetryManager = new TelemetryManager(this.configManager)
+    this.telemetryManager = new TelemetryManager(this.configManager, this.settingsManager)
   }
 
   async initialize() {
@@ -166,6 +191,8 @@ class OpenclawEasyApp {
     // Initialize environment variables based on current configuration
     await this.initializeEnvironment()
 
+    // Migrate legacy 'remote' provider to 'openai' (one-time, safe to call every startup)
+
     // Fix stale per-agent model overrides that don't match the current global provider
     await this.configManager.syncAgentModelsWithDefault()
 
@@ -178,6 +205,19 @@ class OpenclawEasyApp {
     // Auto-detect if a gateway is already running (e.g. official OpenClaw app).
     // If so, connect to it immediately so the UI shows "online" instead of "Launch Assistant".
     await this.autoDetectRunningGateway()
+
+    // Eagerly extract the bundled runtime in the background so onboarding,
+    // gateway start, and any spawned openclaw command all see ~/.openclaw-easy/app
+    // ready immediately. ensureInstalled() is single-flight, so the gateway
+    // start path will await this same promise instead of racing.
+    if (app.isPackaged) {
+      getOpenClawBundle().ensureInstalled((msg) => {
+        console.log(`[OpenclawEasyApp] ${msg}`)
+        this.mainWindow?.webContents.send('bundle:status', msg)
+      }).catch((err) => {
+        console.error('[OpenclawEasyApp] Bundle pre-install failed:', err)
+      })
+    }
 
     // Track when app is quitting to distinguish from minimize-to-tray
     app.on('before-quit', () => {
@@ -238,7 +278,14 @@ class OpenclawEasyApp {
   }
 
   private createMainWindow() {
-    // Create the browser window
+    // Brand-refresh: enable native window vibrancy on macOS (frosted blur
+    // behind the sidebar) and Mica on Windows 11. Falls back gracefully on
+    // older OS — Electron ignores the option silently. Setting
+    // `backgroundColor: '#00000000'` is required so the renderer's tinted
+    // surfaces composite over the system blur instead of an opaque fill.
+    const isDarwin = process.platform === 'darwin'
+    const isWindows = process.platform === 'win32'
+
     this.mainWindow = new BrowserWindow({
       width: 1320,
       height: 800,
@@ -248,9 +295,18 @@ class OpenclawEasyApp {
       autoHideMenuBar: true,
       frame: false,
       transparent: false,
-      titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'hidden',
-      trafficLightPosition: process.platform === 'darwin' ? { x: 20, y: 20 } : undefined,
+      titleBarStyle: isDarwin ? 'hiddenInset' : 'hidden',
+      trafficLightPosition: isDarwin ? { x: 20, y: 20 } : undefined,
       icon: nativeImage.createFromPath(icon),
+      // macOS: 'under-window' lets the OS blur whatever's behind us.
+      vibrancy: isDarwin ? 'under-window' : undefined,
+      visualEffectState: isDarwin ? 'active' : undefined,
+      // Windows 11: Mica gives a similar subtle backdrop blur effect.
+      backgroundMaterial: isWindows ? 'mica' : undefined,
+      // When vibrancy/Mica is active, set a transparent background so
+      // the system effect shows through. Other platforms keep an opaque
+      // fill to avoid render artifacts.
+      backgroundColor: isDarwin || isWindows ? '#00000000' : undefined,
       webPreferences: {
         preload: join(__dirname, '../preload/index.js'),
         sandbox: false,
@@ -278,8 +334,7 @@ class OpenclawEasyApp {
         const checkForUpdate = async () => {
           const settings = await this.settingsManager.getSettings()
           if (!settings.autoUpdate) return
-          const response = await fetch('https://openclaw-easy.com/downloads/latest.json')
-          const data = await response.json()
+          const data = await fetchLatestRelease()
           const current = app.getVersion()
           if (isNewerVersion(data.version, current)) {
             this.mainWindow?.webContents.send('app:update-available', {
@@ -334,9 +389,47 @@ class OpenclawEasyApp {
     })
 
     this.mainWindow.webContents.setWindowOpenHandler((details) => {
-      shell.openExternal(details.url)
+      // Route through the validator — pre-2026-06-17 this passed
+      // details.url straight to shell.openExternal with no protocol
+      // check, the same hole audit W2 flagged on the IPC handler.
+      void safeOpenExternal(details.url)
       return { action: 'deny' }
     })
+
+    // Defense-in-depth: never let the app window navigate away from its own
+    // renderer. A stray link/form/JS navigation would tear down the React tree
+    // + WebSocket and brick the app; route http(s) to the external browser and
+    // block everything else. Pairs with the renderer-side link handler.
+    this.mainWindow.webContents.on('will-navigate', (event, url) => {
+      const current = this.mainWindow?.webContents.getURL() ?? ''
+      if (url !== current) {
+        event.preventDefault()
+        void safeOpenExternal(url)
+      }
+    })
+
+    // The gateway (upstream 2026.7+) validates the browser Origin header on
+    // WS connect and rejects unparseable origins BEFORE consulting the
+    // gateway.controlUi.allowedOrigins allowlist. The built renderer loads
+    // from file://, so Chromium sends Origin "file://"/"null" — unparseable →
+    // CONTROL_UI_ORIGIN_NOT_ALLOWED and chat can never connect (packaged app
+    // included, not just e2e). Rewrite Origin to a loopback origin for
+    // gateway-bound WS requests; the gateway trusts loopback origins from
+    // local socket clients (origin-check.ts "local-loopback" rule).
+    // NOTE: Electron keeps ONE onBeforeSendHeaders listener per session —
+    // registering another anywhere silently replaces this one and kills
+    // chat. If another rewrite is ever needed, merge it into this handler.
+    this.mainWindow.webContents.session.webRequest.onBeforeSendHeaders(
+      { urls: ['ws://localhost/*', 'ws://127.0.0.1/*'] },
+      (details, callback) => {
+        const requestHeaders = { ...details.requestHeaders }
+        for (const key of Object.keys(requestHeaders)) {
+          if (key.toLowerCase() === 'origin') delete requestHeaders[key]
+        }
+        requestHeaders['Origin'] = 'http://localhost'
+        callback({ requestHeaders })
+      }
+    )
 
     // HMR for renderer based on electron-vite cli.
     if (is.dev && process.env['ELECTRON_RENDERER_URL']) {
@@ -347,56 +440,21 @@ class OpenclawEasyApp {
   }
 
   private createTray() {
-    // Use the red lobster icon for the menu bar, resized to 22x22 for macOS
-    const trayIconImage = nativeImage.createFromPath(lobsterIcon).resize({ width: 22, height: 22 })
+    // Load the 22pt menu-bar icon by its base path. createFromPath picks up the
+    // sibling @2x/@3x files automatically, so the image carries a real
+    // representation per scale factor.
+    //
+    // Do NOT go back to `.resize({width: 22, height: 22})` on a single large
+    // PNG: that produces a 1x-only bitmap, which macOS then upscales on a
+    // Retina display. The result is a washed-out blur that reads as the wrong
+    // icon entirely — which is exactly how this looked before.
+    const trayIconImage = nativeImage.createFromPath(lobsterTrayIcon)
     this.tray = new Tray(trayIconImage)
 
-    const contextMenu = Menu.buildFromTemplate([
-      {
-        label: '🦞 Openclaw Easy',
-        type: 'normal',
-        enabled: false
-      },
-      { type: 'separator' },
-      {
-        label: 'Open Dashboard',
-        type: 'normal',
-        click: () => {
-          if (this.mainWindow) {
-            this.mainWindow.show()
-            this.mainWindow.focus()
-          } else {
-            this.createMainWindow()
-          }
-        }
-      },
-      { type: 'separator' },
-      {
-        label: 'Start Assistant',
-        type: 'normal',
-        click: async () => {
-          await this.openClawManager.start()
-        }
-      },
-      {
-        label: 'Stop Assistant',
-        type: 'normal',
-        click: async () => {
-          await this.openClawManager.stop()
-        }
-      },
-      { type: 'separator' },
-      {
-        label: 'Quit',
-        type: 'normal',
-        click: () => {
-          app.quit()
-        }
-      }
-    ])
+    this.refreshTrayMenu()
 
-    this.tray.setToolTip('Openclaw Easy - AI Assistant Manager')
-    this.tray.setContextMenu(contextMenu)
+    // Rebuild the menu whenever the gateway transitions (running ↔ stopped/error).
+    this.openClawManager.onStatusChange(() => this.refreshTrayMenu())
 
     this.tray.on('double-click', () => {
       if (this.mainWindow) {
@@ -408,23 +466,199 @@ class OpenclawEasyApp {
     })
   }
 
+  private refreshTrayMenu() {
+    if (!this.tray) return
+    const status = this.openClawManager.getStatus()
+    const isRunning = status === 'running'
+    const transitioning = this.trayTransition !== null
+    const port = this.openClawManager.getActivePort()
+
+    // ── Labels ──
+    // Transition labels swap in an "…ing" suffix while a start/stop is in
+    // flight so the user knows their click was received. The Restart label
+    // also flips to "Restarting…" so the disabled state has an explanation.
+    // Each action carries a leading emoji so the menu reads glanceably
+    // (the action-glyph is the first thing the eye lands on, then the verb).
+    const startLabel =
+      this.trayTransition === 'starting' ? '▶ Starting…' : '▶ Start Assistant'
+    const stopLabel =
+      this.trayTransition === 'stopping' ? '⏹ Stopping…' : '⏹ Stop Assistant'
+    const restartLabel =
+      this.trayTransition === 'restarting' ? '🔄 Restarting…' : '🔄 Restart Assistant'
+
+    // ── Status row text ──
+    // U+25CF BLACK CIRCLE for running, U+25CB WHITE CIRCLE for stopped —
+    // gives a glanceable color-free indicator that survives template-image
+    // rendering on macOS dark/light menubars.
+    const statusBullet = transitioning ? '…' : isRunning ? '●' : '○'
+    const statusText = transitioning
+      ? this.trayTransition === 'starting'
+        ? 'Starting…'
+        : this.trayTransition === 'stopping'
+          ? 'Stopping…'
+          : 'Restarting…'
+      : isRunning
+        ? `Running on :${port || '?'}`
+        : 'Stopped'
+
+    const contextMenu = Menu.buildFromTemplate([
+      // Header: app name + shipped version. Sourced from package.json via
+      // app.getVersion() so it can never drift from the actual binary.
+      // No 🦞 emoji here — the brand mark is the 3D lobster image; the raw
+      // emoji is the retired old-style logo (see ui/brand-lobster.tsx).
+      { label: `Openclaw Easy v${app.getVersion()}`, type: 'normal', enabled: false },
+      { label: `${statusBullet} ${statusText}`, type: 'normal', enabled: false },
+      { type: 'separator' },
+      {
+        label: '✨ Open Dashboard',
+        type: 'normal',
+        click: () => {
+          if (this.mainWindow) {
+            this.mainWindow.show()
+            this.mainWindow.focus()
+          } else {
+            this.createMainWindow()
+          }
+        },
+      },
+      { type: 'separator' },
+      // Show BOTH Start and Stop at all times; disable the inapplicable one.
+      // (Was: hide one entirely.) The launcher.py pattern is more
+      // discoverable — the user always sees what actions exist.
+      {
+        label: startLabel,
+        type: 'normal',
+        enabled: !transitioning && !isRunning,
+        click: async () => {
+          if (this.trayTransition !== null) return
+          this.trayTransition = 'starting'
+          this.refreshTrayMenu()
+          try {
+            await this.openClawManager.start()
+          } finally {
+            this.trayTransition = null
+            this.refreshTrayMenu()
+          }
+        },
+      },
+      {
+        label: stopLabel,
+        type: 'normal',
+        enabled: !transitioning && isRunning,
+        click: async () => {
+          if (this.trayTransition !== null) return
+          this.trayTransition = 'stopping'
+          this.refreshTrayMenu()
+          try {
+            await this.openClawManager.stop()
+          } finally {
+            this.trayTransition = null
+            this.refreshTrayMenu()
+          }
+        },
+      },
+      {
+        label: restartLabel,
+        type: 'normal',
+        // Only meaningful when the gateway is currently running; otherwise
+        // Start is the right action.
+        enabled: !transitioning && isRunning,
+        click: async () => {
+          if (this.trayTransition !== null) return
+          this.trayTransition = 'restarting'
+          this.refreshTrayMenu()
+          try {
+            await this.openClawManager.restart()
+          } finally {
+            this.trayTransition = null
+            this.refreshTrayMenu()
+          }
+        },
+      },
+      { type: 'separator' },
+      {
+        label: '📁 Show Logs Folder',
+        type: 'normal',
+        click: () => {
+          // ~/.openclaw/logs/ holds gateway.log / gateway.err.log and the
+          // stability/ bundles. shell.openPath opens it in the OS file
+          // manager; resolved against userHome so it works across platforms.
+          shell.openPath(join(app.getPath('home'), '.openclaw', 'logs'))
+        },
+      },
+      { type: 'separator' },
+      {
+        label: '🚪 Quit',
+        type: 'normal',
+        click: () => {
+          app.quit()
+        },
+      },
+    ])
+
+    // Tooltip mirrors the status row plus the port — clear visibility on
+    // hover without opening the menu.
+    const tooltipState = transitioning
+      ? this.trayTransition === 'starting'
+        ? 'starting…'
+        : this.trayTransition === 'stopping'
+          ? 'stopping…'
+          : 'restarting…'
+      : isRunning
+        ? `running (port ${port || '?'})`
+        : 'stopped'
+    this.tray.setToolTip(`Openclaw Easy — ${tooltipState}`)
+    this.tray.setContextMenu(contextMenu)
+  }
+
   private setupIPCHandlers() {
     // OpenClaw process management
     ipcMain.handle('openclaw:start', async () => {
-      return await this.openClawManager.start()
+      // Flip the tray transition flag so the menu disables both Start/Stop
+      // while a renderer-initiated start is in flight.
+      this.trayTransition = 'starting'
+      this.refreshTrayMenu()
+      try {
+        return await this.openClawManager.start()
+      } finally {
+        this.trayTransition = null
+        this.refreshTrayMenu()
+      }
     })
 
     ipcMain.handle('openclaw:stop', async () => {
-      return await this.openClawManager.stop()
+      this.trayTransition = 'stopping'
+      this.refreshTrayMenu()
+      try {
+        return await this.openClawManager.stop()
+      } finally {
+        this.trayTransition = null
+        this.refreshTrayMenu()
+      }
     })
 
     ipcMain.handle('openclaw:status', async () => {
       const status = this.openClawManager.getStatus()
+      const modeInfo = this.openClawManager.getGatewayModeInfo()
+      const uptimeMs = this.openClawManager.getUptime()
       return {
         isRunning: status === 'running',
+        // Explicit status field so the renderer can distinguish
+        // 'error' (gateway failed to start / gave up after retries)
+        // from 'stopped' (clean stop). The legacy isRunning boolean
+        // collapsed all non-running states.
+        status,
         port: this.openClawManager.getActivePort(),
-        uptime: status === 'running' ? 60 : undefined, // Mock uptime for demo
-        version: '1.0.0'
+        // Real PID when we own the process (bundled/system modes), null in
+        // external mode. The renderer should hide the PID line when this is
+        // null instead of falling back to a misleading "Active" placeholder.
+        pid: this.openClawManager.getActivePid(),
+        gatewayMode: modeInfo.mode,
+        // Seconds of uptime since the current child was spawned (0 in
+        // external mode where we don't own the process). The renderer
+        // formats this for display.
+        uptime: status === 'running' && uptimeMs > 0 ? Math.floor(uptimeMs / 1000) : undefined,
+        version: app.getVersion()
       }
     })
 
@@ -454,7 +688,16 @@ class OpenclawEasyApp {
     })
 
     ipcMain.handle('openclaw:restart', async () => {
-      return await this.openClawManager.restart()
+      // Restart goes stopping → starting under the hood; show "Stopping…" to
+      // the user since the gateway is unavailable for the whole window.
+      this.trayTransition = 'stopping'
+      this.refreshTrayMenu()
+      try {
+        return await this.openClawManager.restart()
+      } finally {
+        this.trayTransition = null
+        this.refreshTrayMenu()
+      }
     })
 
     // Gateway API handlers for native dashboard
@@ -467,7 +710,14 @@ class OpenclawEasyApp {
       return {
         status: this.openClawManager.getStatus(),
         port: this.openClawManager.getActivePort(),
-        version: '2026.3.15',
+        // pid is null in external mode (we don't own the process) so the
+        // renderer can hide the line instead of showing the misleading
+        // placeholder it used to fall back to.
+        pid: this.openClawManager.getActivePid(),
+        // Read from app.getVersion() instead of a hardcoded string so this
+        // can never go stale on a release. Sources from package.json at
+        // build time → reflects the actual shipped version.
+        version: app.getVersion(),
         uptime: 'N/A', // TODO: Track actual uptime
         gatewayMode: modeInfo.mode,
         systemBinaryPath: modeInfo.systemBinaryPath || null
@@ -487,6 +737,8 @@ class OpenclawEasyApp {
     })
 
     ipcMain.handle('gateway:get-token', async () => {
+      const start = Date.now()
+      console.log('[Gateway] gateway:get-token called')
       try {
         const fs = require('fs').promises
         const path = require('path')
@@ -494,18 +746,26 @@ class OpenclawEasyApp {
         const configPath = path.join(os.homedir(), '.openclaw', 'openclaw.json')
         const configData = await fs.readFile(configPath, 'utf8')
         const config = JSON.parse(configData)
-        return config?.gateway?.auth?.token || null
+        const token = config?.gateway?.auth?.token || null
+        console.log(`[Gateway] gateway:get-token resolved in ${Date.now() - start}ms (token: ${token ? 'present' : 'null'})`)
+        return token
       } catch (error) {
-        console.error('[Gateway] Failed to read gateway token:', error)
+        console.error(`[Gateway] gateway:get-token failed in ${Date.now() - start}ms:`, error)
         return null
       }
     })
 
-    // Ed25519 device identity for gateway auth (renderer lacks Web Crypto Ed25519 in Electron 28)
+    // Ed25519 device identity for gateway auth (renderer lacks Web Crypto Ed25519 in Electron 28).
+    // Signs the V3 payload required by post-2026.5 openclaw gateway.
+    // platform + deviceFamily are part of the signed payload; if the renderer
+    // doesn't pass them, we fall back to '' (gateway normalizes both sides).
     ipcMain.handle('device:build-identity', async (_, opts: {
       clientId: string; clientMode: string; role: string;
       scopes: string[]; token: string; nonce: string;
+      platform?: string; deviceFamily?: string;
     }) => {
+      const start = Date.now()
+      console.log(`[Device] device:build-identity called (clientId=${opts.clientId}, scopes=${opts.scopes.length})`)
       try {
         const nodeCrypto = require('crypto')
         const fs = require('fs').promises
@@ -540,25 +800,53 @@ class OpenclawEasyApp {
         const publicKey = publicKeyRaw.toString('base64')
           .replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '')
 
-        // Payload format matches gateway web UI Pp() function exactly:
-        //   v1: "v1|deviceId|clientId|clientMode|role|scopes|signedAtMs|token"
+        // Payload format must match the gateway's verifier exactly. Source of truth:
+        //   src/gateway/device-auth.ts (gateway-side payload reconstruction).
+        // Versions:
+        //   v1: legacy, removed upstream in 2026
         //   v2: "v2|deviceId|clientId|clientMode|role|scopes|signedAtMs|token|nonce"
+        //   v3: v2 plus "|<normalized-platform>|<normalized-deviceFamily>" appended.
+        // Post-2026.5 gateway tries v3 first; v2 still works but triggers a
+        // metadata-upgrade re-pairing flow on first reconnect (NOT_PAIRED 1008).
+        // We sign v3 directly to skip that re-approval round-trip.
+        //
+        // Normalization (src/gateway/device-metadata-normalization.ts):
+        // trim, then lowercase ASCII A-Z only. We do the same here so both
+        // sides produce a byte-identical payload string.
+        const normalizeMeta = (s: string | undefined): string => {
+          if (!s) return ''
+          let out = ''
+          for (const ch of s.trim()) {
+            const c = ch.charCodeAt(0)
+            out += c >= 65 && c <= 90 ? String.fromCharCode(c + 32) : ch
+          }
+          return out
+        }
+
         const signedAt = Date.now()
-        const version = opts.nonce ? 'v2' : 'v1'
-        const payloadParts = [
-          version, deviceId, opts.clientId, opts.clientMode, opts.role,
-          opts.scopes.join(','), signedAt.toString(), opts.token || ''
-        ]
-        if (version === 'v2') payloadParts.push(opts.nonce)
-        const payloadStr = payloadParts.join('|')
+        const payloadStr = [
+          'v3',
+          deviceId,
+          opts.clientId,
+          opts.clientMode,
+          opts.role,
+          opts.scopes.join(','),
+          signedAt.toString(),
+          opts.token || '',
+          opts.nonce || '',
+          normalizeMeta(opts.platform),
+          normalizeMeta(opts.deviceFamily),
+        ].join('|')
 
         const sigBuffer = nodeCrypto.sign(null, Buffer.from(payloadStr), privateKeyPem)
         const signature = sigBuffer.toString('base64')
           .replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '')
 
-        return { id: deviceId, publicKey, signature, signedAt, nonce: opts.nonce }
+        const result = { id: deviceId, publicKey, signature, signedAt, nonce: opts.nonce }
+        console.log(`[Device] device:build-identity resolved in ${Date.now() - start}ms (deviceId: ${deviceId.slice(0, 16)}...)`)
+        return result
       } catch (error) {
-        console.error('[Device] Failed to build device identity:', error)
+        console.error(`[Device] device:build-identity failed in ${Date.now() - start}ms:`, error)
         return null
       }
     })
@@ -641,6 +929,10 @@ class OpenclawEasyApp {
       return await this.openClawManager.disconnectWhatsApp()
     })
 
+    ipcMain.handle('channels:disconnect-weixin', async () => {
+      return await this.openClawManager.disconnectWeixin()
+    })
+
     ipcMain.handle('channels:disconnect-telegram', async () => {
       return await this.openClawManager.disconnectTelegram()
     })
@@ -687,26 +979,59 @@ class OpenclawEasyApp {
         const providerChanged = config.aiProvider !== prev.aiProvider
         const byokProviderChanged = config.byok?.provider !== prev.byok?.provider
         const byokModelChanged = config.byok?.model !== prev.byok?.model
-        const byokKeyChanged =
-          config.byok?.apiKeys?.google !== prev.byok?.apiKeys?.google ||
-          config.byok?.apiKeys?.anthropic !== prev.byok?.apiKeys?.anthropic ||
-          config.byok?.apiKeys?.openai !== prev.byok?.apiKeys?.openai
+        // Iterate over EVERY known BYOK provider so a change to a venice
+        // or openrouter key triggers the same gateway restart that
+        // anthropic/openai/google would. The previous hand-rolled list
+        // missed venice + openrouter entirely, so swapping those keys
+        // wrote new config but kept the gateway running with the stale
+        // key in memory until next restart.
+        const byokKeyChanged = Object.keys(BYOK_PROVIDER_MODELS).some(
+          (provider) =>
+            (config.byok?.apiKeys as Record<string, string | undefined> | undefined)?.[provider] !==
+            (prev.byok?.apiKeys as Record<string, string | undefined> | undefined)?.[provider],
+        )
         const localModelChanged = config.local?.model !== prev.local?.model
 
+        // Any of these leaves the running gateway holding stale provider
+        // state in memory, so the same condition drives both the
+        // openclaw.json rewrite and the restart below.
         const needsRestart = providerChanged || byokProviderChanged ||
             byokModelChanged || byokKeyChanged || localModelChanged
-        const needsConfigUpdate = needsRestart
 
-        if (needsConfigUpdate) {
+        if (needsRestart) {
           console.log(`[Config] Applying provider config: ${config.aiProvider}`)
 
           await this.configManager.applyProviderToOpenClaw(config)
           console.log(`[Config] ✅ openclaw.json updated for provider: ${config.aiProvider}`)
 
-          if (needsRestart && this.openClawManager.isRunning()) {
+          // Re-pin per-agent harness BEFORE the gateway restart below
+          // so the restarted gateway loads from corrected agent state.
+          // `applyProviderToOpenClaw` may have changed the default
+          // model (and any agents that inherited that default); their
+          // `agentRuntime.id` is now stale. Without this, the codex
+          // harness's GPT-5 persona-latch can fire on a Claude/DeepSeek
+          // model after a provider switch. Same call already fires
+          // from setApiKey / syncRemoteBackend; this entry point was
+          // missing it.
+          await this.openClawManager.repairAgentHarnesses()
+
+          // Reachability, not isRunning() — see the agents:update handler:
+          // an externally-managed (launchd) gateway must be restarted too, or
+          // it keeps serving the previous provider/model.
+          if (needsRestart && (await this.openClawManager.isGatewayReachable())) {
+            // Synchronous restart: wait until the gateway is actually
+            // running the new config before resolving the IPC. The
+            // renderer's Apply button stays in "saving…" state for the
+            // duration (typically 3-5s after the 100ms-polling fix),
+            // and the dashboard pill shows live status. This is slower
+            // than fire-and-forget BUT is correct — by the time Apply
+            // returns, the gateway IS using the new model. The previous
+            // fire-and-forget (commit 2afae1df20) opened a window where
+            // chat could hit the OLD gateway with the OLD model and
+            // confuse users with stale responses.
             console.log('[Config] Restarting gateway to apply new provider config...')
             await this.openClawManager.restart()
-            console.log('[Config] Gateway restarted successfully')
+            console.log('[Config] Gateway restart complete')
           }
         }
 
@@ -784,10 +1109,6 @@ class OpenclawEasyApp {
 
     ipcMain.handle('config:get-api-key', async (_, provider) => {
       return await this.openClawManager.getApiKey(provider)
-    })
-
-    ipcMain.handle('config:update-openclaw', async (_, config) => {
-      return await this.openClawManager.updateOpenClawConfig(config)
     })
 
     ipcMain.handle('config:get-openclaw', async () => {
@@ -1076,6 +1397,18 @@ class OpenclawEasyApp {
       return await this.openClawManager.getWhatsAppQR()
     })
 
+    ipcMain.handle('channels:weixin-qr', async () => {
+      return await this.openClawManager.getWeixinQRFromLogin()
+    })
+
+    ipcMain.handle('channels:weixin-ensure-plugin', async () => {
+      return await this.openClawManager.ensureWeixinPlugin()
+    })
+
+    ipcMain.handle('channels:check-weixin-status', async () => {
+      return await this.openClawManager.checkWeixinStatus()
+    })
+
     ipcMain.handle('channels:whatsapp-start', async () => {
       console.log('Starting real WhatsApp setup with OpenClaw')
       try {
@@ -1109,7 +1442,7 @@ class OpenclawEasyApp {
     })
 
     ipcMain.handle('channels:connect-telegram', async (_, token, name) => {
-      console.log(`Connecting Telegram with token: [REDACTED]`)
+      console.log(`Connecting Telegram with token: ${token.slice(0, 10)}...`)
       return await this.openClawManager.connectTelegram(token, name)
     })
 
@@ -1132,7 +1465,7 @@ class OpenclawEasyApp {
     })
 
     ipcMain.handle('channels:connect-slack', async (_, botToken, appToken, name) => {
-      console.log(`Connecting Slack bot token: [REDACTED]`)
+      console.log(`Connecting Slack bot token: ${botToken.slice(0, 10)}...`)
       return await this.openClawManager.connectSlack(botToken, appToken, name)
     })
 
@@ -1184,12 +1517,22 @@ class OpenclawEasyApp {
       console.log(`Updating agent: ${agentId}`)
       const result = await this.openClawManager.updateAgent(agentId, config)
 
-      // Restart the gateway when the primary model changes.
-      // The gateway reads agents.defaults.model.primary only at startup — it is NOT hot-reloaded.
+      // Synchronous restart on model change — same rationale as
+      // config:save above. Gateway only reads agents.*.model.primary
+      // at startup, so chats sent during the restart window would
+      // otherwise hit the OLD model. Wait until the new model is live
+      // before resolving the IPC so Save returns "ready to chat".
       if (result.success && config.model && config.model !== result.prevModel) {
-        console.log(`[Agents] Primary model changed to ${config.model} — restarting gateway`)
-        if (this.openClawManager.isRunning()) {
+        // Reachability, not isRunning(): the gateway is often the launchd
+        // service rather than a child of this app, and isRunning() is false
+        // for it. Gating on isRunning() left an externally-started gateway on
+        // the previous model, so chat kept failing against the OLD provider
+        // ("No API key found for provider ollama") while the UI showed the
+        // new model as active.
+        if (await this.openClawManager.isGatewayReachable()) {
+          console.log(`[Agents] Primary model changed to ${config.model} — restarting gateway`)
           await this.openClawManager.restart()
+          console.log('[Agents] Gateway restart complete')
         }
       }
 
@@ -1203,39 +1546,18 @@ class OpenclawEasyApp {
 
     // System integration
     ipcMain.handle('system:open-external', async (_, url) => {
-      // Only allow http(s) URLs to prevent javascript:, file://, data: exploits
-      if (typeof url !== 'string') return
-      try {
-        const parsed = new URL(url)
-        if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-          console.warn(`[OpenclawApp] Blocked openExternal for unsafe protocol: ${parsed.protocol}`)
-          return
-        }
-      } catch {
-        console.warn(`[OpenclawApp] Blocked openExternal for invalid URL: ${url}`)
-        return
-      }
-      await shell.openExternal(url)
+      await safeOpenExternal(url)
     })
 
-    ipcMain.handle('system:show-in-folder', async (_, path) => {
-      shell.showItemInFolder(path)
-    })
+    // NOTE: 'system:show-in-folder' was removed (security/cleanliness). It
+    // passed a renderer-supplied path straight to shell.showItemInFolder with
+    // no validation and had no first-party caller. Re-add via a validated
+    // chokepoint (see safe-open-path.ts) if a real need appears.
 
     // Skills management
     ipcMain.handle('skills:list', async () => {
       console.log('[Skills] Listing skills')
       return await this.openClawManager.listSkills()
-    })
-
-    ipcMain.handle('skills:check', async () => {
-      console.log('[Skills] Checking skills status')
-      return await this.openClawManager.checkSkills()
-    })
-
-    ipcMain.handle('skills:info', async (_, skillName) => {
-      console.log(`[Skills] Getting info for skill: ${skillName}`)
-      return await this.openClawManager.getSkillInfo(skillName)
     })
 
     ipcMain.handle('skills:install', async (_, skillName) => {
@@ -1267,51 +1589,32 @@ class OpenclawEasyApp {
       return await this.openClawManager.listWorkspaceSkills()
     })
 
+    // Added 2026-06-15 after ClawHub docs audit:
+    // `openclaw skills check --json` reports eligibility breakdowns
+    // (eligible / blocked / missing-requirements lists). Powers UI
+    // surfaces like a "N skills need configuration" banner. Optional
+    // agentId narrows the scope to a single agent's skill set.
+    ipcMain.handle('skills:check', async (_, agentId?: string) => {
+      return await this.openClawManager.checkSkills(agentId)
+    })
+
+    // Added 2026-06-15 after ClawHub docs audit:
+    // `openclaw skills update --all` refreshes every ClawHub-installed
+    // skill in-place. Pure addition — desktop had no update path before.
+    ipcMain.handle('skills:update-all', async () => {
+      return await this.openClawManager.updateAllSkills()
+    })
+
     ipcMain.handle('skills:open-folder', async (_, skillName: string) => {
-      if (!skillName || !/^[a-zA-Z0-9_.-]+$/.test(skillName)) {
-        return { success: false, error: 'Invalid skill name' }
+      // Validation + lookup live on SkillsManager (used to be inline here).
+      // resolveSkillFolderPath returns null both for invalid names and for
+      // names that match nothing on disk.
+      const resolved = await this.openClawManager.resolveSkillFolderPath(skillName)
+      if (!resolved) {
+        return { success: false, error: `Could not find folder for skill: ${skillName}` }
       }
-      const { access, readdir, readFile } = await import('fs/promises')
-      const os = await import('os')
-      const p = await import('path')
-      const skillsDir = p.join(os.homedir(), '.openclaw', 'skills')
-
-      // 1. Direct match: directory name equals skill name
-      const directPath = p.join(skillsDir, skillName)
-      try {
-        await access(directPath)
-        shell.openPath(directPath)
-        return { success: true }
-      } catch {}
-
-      // 2. Scan directories and match by SKILL.md name: field
-      //    (skill name in SKILL.md often differs from the directory slug)
-      try {
-        const entries = await readdir(skillsDir, { withFileTypes: true })
-        for (const entry of entries) {
-          if (!entry.isDirectory()) continue
-          try {
-            const md = await readFile(p.join(skillsDir, entry.name, 'SKILL.md'), 'utf8')
-            const m = md.match(/^name:\s*(.+)$/m)
-            if (m && m[1].trim() === skillName) {
-              shell.openPath(p.join(skillsDir, entry.name))
-              return { success: true }
-            }
-          } catch {}
-        }
-      } catch {}
-
-      // 3. Bundled extensions dir
-      const extDir = process.env.OPENCLAW_BUNDLED_PLUGINS_DIR
-      if (extDir) {
-        const extPath = p.join(extDir, 'skills', skillName)
-        try {
-          await access(extPath)
-          shell.openPath(extPath)
-          return { success: true }
-        } catch {}
-      }
-      return { success: false, error: `Could not find folder for skill: ${skillName}` }
+      shell.openPath(resolved)
+      return { success: true }
     })
 
     // Hooks management
@@ -1410,6 +1713,84 @@ class OpenclawEasyApp {
     ipcMain.handle('cron:runs', async (_, id: string, limit?: number) => {
       console.log('[Cron] Getting runs for cron job:', id)
       return await this.openClawManager.getCronRuns(id, limit)
+    })
+
+    // Channel access control (dmPolicy / allowlists / group policy / pairing)
+    ipcMain.handle('access:get', async () => {
+      return await this.accessControlManager.getChannelAccess()
+    })
+
+    ipcMain.handle('access:set', async (_, channelId: string, patch: ChannelAccessPatch) => {
+      console.log('[Access] Updating channel access:', channelId)
+      const result = await this.accessControlManager.setChannelAccess(channelId, patch)
+      // Channel policy is read by the gateway's channel runtime; restart so
+      // the change applies to the live channel processes, mirroring the
+      // provider-change flow in config:save.
+      if (result.success && (await this.openClawManager.isGatewayReachable())) {
+        await this.openClawManager.restart()
+      }
+      return result
+    })
+
+    ipcMain.handle('access:pairing-list', async () => {
+      return await this.accessControlManager.listPairingRequests()
+    })
+
+    ipcMain.handle('access:pairing-approve', async (_, channel: string, code: string) => {
+      console.log('[Access] Approving pairing code for', channel)
+      return await this.accessControlManager.approvePairing(channel, code)
+    })
+
+    // Browser tool surface
+    ipcMain.handle('browser:status', async () => {
+      return await this.browserManager.getStatus()
+    })
+
+    ipcMain.handle('browser:set-enabled', async (_, enabled: boolean) => {
+      console.log('[Browser] Setting enabled:', enabled)
+      return await this.browserManager.setEnabled(enabled)
+    })
+
+    ipcMain.handle('browser:start', async () => {
+      console.log('[Browser] Starting dedicated browser')
+      return await this.browserManager.start()
+    })
+
+    ipcMain.handle('browser:stop', async () => {
+      console.log('[Browser] Stopping dedicated browser')
+      return await this.browserManager.stop()
+    })
+
+    ipcMain.handle('browser:screenshot', async () => {
+      console.log('[Browser] Capturing screenshot')
+      return await this.browserManager.screenshot()
+    })
+
+    // Memory surface
+    ipcMain.handle('memory:status', async () => {
+      return await this.memoryManager.getStatus()
+    })
+
+    ipcMain.handle('memory:search', async (_, query: string) => {
+      return await this.memoryManager.search(query)
+    })
+
+    ipcMain.handle('memory:reindex', async () => {
+      console.log('[Memory] Reindexing memory files')
+      return await this.memoryManager.reindex()
+    })
+
+    ipcMain.handle('memory:list-files', async (_, workspaceDir?: string) => {
+      return await this.memoryManager.listFiles(workspaceDir)
+    })
+
+    ipcMain.handle('memory:read-file', async (_, workspaceDir: string, relPath: string) => {
+      return await this.memoryManager.readFileContent(workspaceDir, relPath)
+    })
+
+    ipcMain.handle('memory:delete-file', async (_, workspaceDir: string, relPath: string) => {
+      console.log('[Memory] Deleting memory file:', relPath)
+      return await this.memoryManager.deleteFile(workspaceDir, relPath)
     })
 
     // Doctor management
@@ -1552,40 +1933,52 @@ class OpenclawEasyApp {
       return await this.openClawManager.updateSessionConfig(config)
     })
 
-    // Workspace file management
-    ipcMain.handle('workspace:list', async () => {
-      return await this.workspaceManager.listFiles()
+    // Workspace file management. The optional agentId scopes file ops to a
+    // specific agent's workspace dir (main → ~/.openclaw/workspace, others →
+    // their configured/sibling dir); omitted → main agent for back-compat.
+    ipcMain.handle('workspace:list', async (_, agentId?: string) => {
+      return await this.workspaceManager.listFiles(agentId)
     })
 
-    ipcMain.handle('workspace:read', async (_, name: string) => {
-      return await this.workspaceManager.readFile(name)
+    ipcMain.handle('workspace:read', async (_, name: string, agentId?: string) => {
+      return await this.workspaceManager.readFile(name, agentId)
     })
 
-    ipcMain.handle('workspace:write', async (_, name: string, content: string) => {
-      return await this.workspaceManager.writeFile(name, content)
+    ipcMain.handle('workspace:write', async (_, name: string, content: string, agentId?: string) => {
+      return await this.workspaceManager.writeFile(name, content, agentId)
     })
 
-    ipcMain.handle('workspace:create', async (_, name: string) => {
-      return await this.workspaceManager.createFile(name)
+    ipcMain.handle('workspace:create', async (_, name: string, agentId?: string) => {
+      return await this.workspaceManager.createFile(name, agentId)
     })
 
-    ipcMain.handle('workspace:delete', async (_, name: string) => {
-      return await this.workspaceManager.deleteFile(name)
+    ipcMain.handle('workspace:delete', async (_, name: string, agentId?: string) => {
+      return await this.workspaceManager.deleteFile(name, agentId)
     })
 
-    ipcMain.handle('workspace:list-memory', async () => {
-      return await this.workspaceManager.listMemoryFiles()
+    ipcMain.handle('workspace:open-dir', async (_, agentId?: string) => {
+      return await this.workspaceManager.openDir(agentId)
     })
 
-    ipcMain.handle('workspace:read-memory', async (_, name: string) => {
-      return await this.workspaceManager.readMemoryFile(name)
+    // Commands discovery — surfaces top-level openclaw CLI commands so
+    // the Commands page can show commands shipped by upstream after the
+    // static catalog was authored. Cached single-flight in the manager.
+    ipcMain.handle('commands:list-discovered', async () => {
+      return await this.openClawManager.listDiscoveredCommands()
     })
 
-    // Terminal management for onboarding wizard
-    // Spawns OpenClaw from the embedded source — always bypasses any globally installed openclaw
+    // Terminal management — spawns openclaw inside a node-pty so the
+    // renderer can attach an xterm session (Commands page Run flow,
+    // onboarding wizard). Runtime resolution mirrors the
+    // OpenClawCommandExecutor's: prefer a globally installed openclaw on
+    // disk, then the bundled runtime, then the dev-mode Node + built dist
+    // fallback (dev-openclaw-runtime.ts) — every path runs under Node
+    // because openclaw needs node:sqlite from first boot.
+    // See managers/system-openclaw-resolver.ts.
     ipcMain.handle('terminal:create-openclaw', async (_, args: string[]) => {
       try {
         const { spawn } = await import('node-pty')
+        const { detectSystemOpenClaw } = await import('./managers/system-openclaw-resolver')
         const isWindows = process.platform === 'win32'
         const home = process.env.HOME || process.env.USERPROFILE || ''
         const pathSep = isWindows ? ';' : ':'
@@ -1600,19 +1993,36 @@ class OpenclawEasyApp {
         let termCmd: string
         let termArgs: string[]
         let cwd: string
-        if (app.isPackaged) {
-          const bunBinaryName = isWindows
-            ? 'bun-windows.exe'
-            : `bun-${process.arch === 'arm64' ? 'arm64' : 'x64'}`
-          termCmd = join(process.resourcesPath, 'bun', bunBinaryName)
-          const openclawMjs = join(home, '.openclaw-easy', 'app', 'openclaw.mjs')
-          termArgs = [openclawMjs, ...args]
-          cwd = join(home, '.openclaw-easy', 'app')
+
+        // (1) Globally installed openclaw — wins everywhere it's present.
+        const systemOpenclaw = await detectSystemOpenClaw()
+        if (systemOpenclaw) {
+          termCmd = systemOpenclaw
+          termArgs = [...args]
+          cwd = home
+        } else if (app.isPackaged) {
+          // (2) Bundled mode — extract first; the bundled runtime may not
+          // exist yet on a fresh upgrade (the gateway extracts it lazily).
+          // Without this guard the onboarding wizard hangs at "Starting
+          // OpenClaw onboarding…" with ENOENT.
+          const bundle = getOpenClawBundle()
+          await bundle.ensureInstalled((msg) => {
+            console.log(`[Terminal] ${msg}`)
+            this.mainWindow?.webContents.send('bundle:status', msg)
+          })
+
+          // Run under bundled Node (has node:sqlite) — onboarding creates the
+          // first agent, which writes SQLite state and fails under bun.
+          termCmd = bundle.getNodeBinary()
+          termArgs = [bundle.getOpenClawMjs(), ...args]
+          cwd = bundle.getInstallDir()
         } else {
-          const openclawPath = join(__dirname, '../../../../openclaw/src/index.ts')
-          termCmd = 'bun'
-          termArgs = [openclawPath, ...args]
-          cwd = join(__dirname, '../../../../openclaw/')
+          // (3) Dev fallback — built CLI under Node (see
+          // dev-openclaw-runtime.ts). Only when no system openclaw exists.
+          const dev = getDevOpenClawSpawn()
+          termCmd = dev.runtime
+          termArgs = [dev.entry, ...args]
+          cwd = dev.cwd
         }
 
         const ptyProcess = spawn(termCmd, termArgs, {
@@ -1648,54 +2058,12 @@ class OpenclawEasyApp {
       }
     })
 
-    ipcMain.handle('terminal:create', async (_, command: string, args: string[], options?: { cwd?: string }) => {
-      try {
-        const { spawn } = await import('node-pty')
-
-        console.log('[Terminal] Creating PTY process:', { command, args, cwd: options?.cwd })
-
-        // Use node-pty for proper pseudo-terminal support
-        const ptyProcess = spawn(command, args, {
-          name: 'xterm-color',
-          cols: 120,
-          rows: 40,
-          cwd: options?.cwd || process.env.HOME,
-          env: {
-            ...process.env,
-            FORCE_COLOR: '1',
-            COLORTERM: 'truecolor',
-            TERM: 'xterm-256color'
-          }
-        })
-
-        const terminalId = `terminal-${Date.now()}`
-
-        // Store PTY reference
-        if (!global.terminals) {
-          global.terminals = {}
-        }
-        global.terminals[terminalId] = ptyProcess
-
-        // Forward PTY output to renderer
-        ptyProcess.onData((data: string) => {
-          this.mainWindow?.webContents.send('terminal:data', terminalId, data)
-        })
-
-        // Handle PTY exit
-        ptyProcess.onExit((exitInfo: { exitCode: number; signal?: number }) => {
-          console.log('[Terminal] PTY exited:', { terminalId, exitCode: exitInfo.exitCode })
-          this.mainWindow?.webContents.send('terminal:exit', terminalId, exitInfo.exitCode)
-          delete global.terminals[terminalId]
-        })
-
-        console.log('[Terminal] PTY created:', { terminalId, pid: ptyProcess.pid })
-        return { terminalId, pid: ptyProcess.pid }
-
-      } catch (error) {
-        console.error('[Terminal] Failed to create PTY:', error)
-        throw error
-      }
-    })
+    // NOTE: the generic 'terminal:create' handler was removed (security). It
+    // spawned a renderer-supplied command/args under node-pty with the full
+    // parent env and no allowlist — an arbitrary-code-execution surface if the
+    // renderer is ever compromised (it renders untrusted channel/markdown
+    // content). It had no first-party caller; all terminal use goes through
+    // 'terminal:create-openclaw', which hard-pins the openclaw runtime.
 
     ipcMain.handle('terminal:write', async (_, terminalId: string, data: string) => {
       const ptyProcess = global.terminals?.[terminalId]
@@ -1731,12 +2099,7 @@ class OpenclawEasyApp {
     ipcMain.handle('app:check-for-updates', async () => {
       const current = app.getVersion()
       try {
-        const response = await fetch('https://openclaw-easy.com/downloads/latest.json')
-        if (!response.ok) {
-          console.error(`[Update] HTTP ${response.status} checking for updates`)
-          return { hasUpdate: false, currentVersion: current, latestVersion: current, downloads: {} }
-        }
-        const data = await response.json()
+        const data = await fetchLatestRelease()
         const hasUpdate = isNewerVersion(data.version, current)
         return {
           hasUpdate,
@@ -1855,14 +2218,29 @@ app.on('before-quit', async (event) => {
   event.preventDefault()
 
   try {
-    await Promise.all([
-      openclawApp.openClawManager.stop(),
-      openclawApp.whisperServerManager.stop(),
+    await Promise.race([
+      Promise.all([
+        openclawApp.openClawManager.stop(),
+        openclawApp.whisperServerManager.stop(),
+      ]),
+      // Hard cap — external-mode stop chains several 15s execFile attempts;
+      // don't let a slow/hung stop stall app quit for ~45s.
+      new Promise((resolve) => setTimeout(resolve, 6000)),
     ])
     console.log('[OpenclawApp] All services stopped successfully')
   } catch (error) {
     console.error('[OpenclawApp] Error stopping services:', error)
   } finally {
+    // Guarantee the owned gateway child is SIGTERM'd and all health/monitor
+    // intervals + timers are cleared even if stop() threw or timed out —
+    // otherwise the gateway orphans and holds the port (system-mode has no
+    // port-reclaim on relaunch). The gateway is spawned non-detached, so a
+    // bare app.exit() does NOT reap it.
+    try {
+      openclawApp.openClawManager.destroy()
+    } catch (e) {
+      console.error('[OpenclawApp] destroy() during quit failed:', e)
+    }
     // Allow the app to quit after cleanup
     setImmediate(() => {
       app.exit(0)
@@ -1897,10 +2275,8 @@ process.on('SIGTERM', async () => {
   process.exit(0)
 })
 
-// Security: Prevent new window creation
-app.on('web-contents-created', (_, contents) => {
-  contents.on('new-window', (event, url) => {
-    event.preventDefault()
-    shell.openExternal(url)
-  })
-})
+// The deprecated `new-window` event was removed in Electron 31. The
+// main window already declares `setWindowOpenHandler` which covers the
+// same surface (intercepting target=_blank and `window.open` calls
+// from the renderer) AND honours the URL validator. No replacement
+// handler needed here.

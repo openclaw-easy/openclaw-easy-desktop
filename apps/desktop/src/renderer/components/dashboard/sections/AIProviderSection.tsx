@@ -5,6 +5,9 @@ import { ColorTheme } from '../types'
 import { useProviderConfig, AppProviderConfig } from '../../../hooks/useProviderConfig'
 import { useToast } from '../../../contexts/ToastContext'
 import { BYOK_PROVIDER_MODELS } from '../../../../shared/providerModels'
+import { SectionHeader } from '../../ui/section-header'
+import { LoadingSpinner } from '../../ui/loading-spinner'
+import { ProviderIcon } from '../../ui/provider-icons'
 
 interface AIProviderSectionProps {
   colors: ColorTheme
@@ -40,10 +43,13 @@ export const AIProviderSection: React.FC<AIProviderSectionProps> = ({ colors, on
 
   // --- Local form state (uncommitted until "Apply & Restart") ---
   const [aiProvider, setAiProvider] = useState<'local' | 'byok'>('local')
-  const [byokProvider, setByokProvider] = useState<'google' | 'anthropic' | 'openai' | 'venice' | 'openrouter'>('google')
+  const [byokProvider, setByokProvider] = useState<'google' | 'openai' | 'venice' | 'openrouter'>('google')
   const [byokModel, setByokModel] = useState('gemini-flash-latest')
   const [byokCustomModel, setByokCustomModel] = useState('')
-  const [byokApiKeys, setByokApiKeys] = useState({ google: '', anthropic: '', openai: '', venice: '', openrouter: '' })
+  // Anthropic removed from BYOK 2026-06-15 — direct sk-ant-* keys are not
+  // authorized for OpenClaw clients. Reach Claude through the OpenRouter
+  // aggregator instead (anthropic/claude-* entries).
+  const [byokApiKeys, setByokApiKeys] = useState({ google: '', openai: '', venice: '', openrouter: '' })
   const [changingKeyFor, setChangingKeyFor] = useState<string | null>(null)
   const [showByokKey, setShowByokKey] = useState(false)
   const [localModel, setLocalModel] = useState('llama3.2:3b')
@@ -171,13 +177,17 @@ export const AIProviderSection: React.FC<AIProviderSectionProps> = ({ colors, on
   // Populate form from loaded config
   useEffect(() => {
     if (!config) {return}
-    const loadedProvider = config.aiProvider
-    setAiProvider(loadedProvider === 'byok' ? 'byok' : 'local')
-setByokProvider((config.byok?.provider as any) || 'google')
+    setAiProvider(config.aiProvider || 'local')
+    // Migrate legacy `byok.provider: 'anthropic'` to 'google' so existing
+    // installs upgrading past 2026-06-15 land on a valid provider instead
+    // of an undefined entry in BYOK_PROVIDER_MODELS.
+    const persistedProvider = config.byok?.provider as string | undefined
+    const safeProvider =
+      persistedProvider === 'anthropic' || !persistedProvider ? 'google' : persistedProvider
+    setByokProvider(safeProvider as any)
     setByokModel(config.byok?.model || 'gemini-flash-latest')
     setByokApiKeys({
       google: config.byok?.apiKeys?.google || '',
-      anthropic: config.byok?.apiKeys?.anthropic || '',
       openai: config.byok?.apiKeys?.openai || '',
       venice: config.byok?.apiKeys?.venice || '',
       openrouter: config.byok?.apiKeys?.openrouter || '',
@@ -271,11 +281,11 @@ setByokProvider((config.byok?.provider as any) || 'google')
         return
       }
 
-      const validatableProviders = ['google', 'anthropic', 'openai'] as const
+      const validatableProviders = ['google', 'openai'] as const
       if (validatableProviders.includes(byokProvider as any)) {
         setIsValidating(true)
         try {
-          const isValid = await window.electronAPI?.validateApiKey?.(byokProvider as 'google' | 'anthropic' | 'openai', activeKey)
+          const isValid = await window.electronAPI?.validateApiKey?.(byokProvider as 'google' | 'openai', activeKey)
           if (!isValid) {
             setValidationError(t('aiProvider.invalidApiKeyFormat', { provider: byokProvider }))
             setIsValidating(false)
@@ -337,27 +347,17 @@ setByokProvider((config.byok?.provider as any) || 'google')
     key.length > 8 ? `${key.slice(0, 4)}${'•'.repeat(8)}${key.slice(-4)}` : '•'.repeat(key.length || 8)
 
   if (isLoading) {
-    return (
-      <div className="flex items-center justify-center h-full">
-        <Loader2 className="h-6 w-6 animate-spin" style={{ color: colors.text.muted }} />
-      </div>
-    )
+    return <LoadingSpinner size="lg" colors={colors} center />
   }
 
   return (
     <div className="flex flex-col h-full">
-      <div className="p-8 pb-4">
-        <div className="flex items-baseline gap-2">
-          <h3 className="text-lg font-bold" style={{ color: colors.text.header }}>
-            {t('aiProvider.title')}
-          </h3>
-          <p className="text-sm" style={{ color: colors.text.muted }}>
-            {t('aiProvider.subtitle')}
-          </p>
-        </div>
-
-        {/* Validation / save errors shown as floating toast */}
-      </div>
+      <SectionHeader
+        title={t('aiProvider.title')}
+        subtitle={t('aiProvider.subtitle')}
+        colors={colors}
+        border={false}
+      />
 
       <div className="flex-1 overflow-y-auto px-8 pb-8 space-y-6">
 
@@ -372,9 +372,9 @@ setByokProvider((config.byok?.provider as any) || 'google')
 
           <div className="space-y-1">
             {([
-              { id: 'local' as const, name: t('aiProvider.localLLM'), desc: t('aiProvider.localLLMDesc') },
-              { id: 'byok' as const, name: t('aiProvider.byok'), desc: t('aiProvider.byokDesc') },
-            ]).map(p => (
+              { id: 'local', name: t('aiProvider.localLLM'), desc: t('aiProvider.localLLMDesc') },
+              { id: 'byok', name: t('aiProvider.byok'), desc: t('aiProvider.byokDesc') },
+            ] as const).map(p => (
               <label
                 key={p.id}
                 className="flex items-center py-2 px-3 rounded cursor-pointer transition-colors"
@@ -441,28 +441,45 @@ setByokProvider((config.byok?.provider as any) || 'google')
           <div className="rounded-lg p-6 space-y-5" style={{ backgroundColor: colors.bg.secondary }}>
             <h4 className="text-lg font-semibold" style={{ color: colors.text.header }}>{t('aiProvider.cloudProvider')}</h4>
 
-            {/* Provider radio */}
-            <div className="flex flex-wrap gap-3">
+            {/* Provider radio — each option shows the provider's official
+                brand mark (provider-icons.tsx) for at-a-glance recognition. */}
+            <div className="flex flex-wrap gap-2">
               {([
                 { id: 'google', label: 'Google' },
-                { id: 'anthropic', label: 'Anthropic' },
                 { id: 'openai', label: 'OpenAI' },
                 { id: 'venice', label: 'Venice AI' },
                 { id: 'openrouter', label: 'OpenRouter' },
-              ] as const).map(p => (
-                <label key={p.id} className="flex items-center space-x-2 cursor-pointer">
-                  <input
-                    type="radio"
-                    name="byok-provider"
-                    value={p.id}
-                    checked={byokProvider === p.id}
-                    onChange={() => { setByokProvider(p.id); setShowByokKey(false) }}
-                  />
-                  <span className="text-sm" style={{ color: colors.text.normal }}>
-                    {p.label}
-                  </span>
-                </label>
-              ))}
+              ] as const).map(p => {
+                const selected = byokProvider === p.id
+                return (
+                  <label
+                    key={p.id}
+                    className="flex items-center gap-2 cursor-pointer rounded-lg px-3 py-2 transition-all hover:scale-[1.02]"
+                    style={{
+                      backgroundColor: selected ? colors.bg.secondary : colors.bg.tertiary,
+                      border: selected
+                        ? `2px solid ${colors.accent.brand}`
+                        : `2px solid ${colors.bg.tertiary}`,
+                    }}
+                  >
+                    <input
+                      type="radio"
+                      name="byok-provider"
+                      value={p.id}
+                      checked={selected}
+                      onChange={() => { setByokProvider(p.id); setShowByokKey(false) }}
+                      className="sr-only"
+                    />
+                    <ProviderIcon provider={p.id} size={20} />
+                    <span
+                      className="text-sm font-medium"
+                      style={{ color: selected ? colors.text.header : colors.text.normal }}
+                    >
+                      {p.label}
+                    </span>
+                  </label>
+                )
+              })}
             </div>
 
             {/* API Key */}
@@ -470,7 +487,7 @@ setByokProvider((config.byok?.provider as any) || 'google')
               {byokApiKeys[byokProvider] && changingKeyFor !== byokProvider ? (
                 <div className="flex items-center gap-3">
                   <label className="text-sm font-medium flex-shrink-0 whitespace-nowrap" style={{ color: colors.text.header }}>
-                    {byokProvider === 'google' ? 'Google' : byokProvider === 'anthropic' ? 'Anthropic' : byokProvider === 'openai' ? 'OpenAI' : byokProvider === 'venice' ? 'Venice AI' : 'OpenRouter'} {t('aiProvider.apiKey')}
+                    {byokProvider === 'google' ? 'Google' : byokProvider === 'openai' ? 'OpenAI' : byokProvider === 'venice' ? 'Venice AI' : 'OpenRouter'} {t('aiProvider.apiKey')}
                   </label>
                   <span className="flex-1 px-3 py-2 rounded text-sm font-mono"
                     style={{ backgroundColor: colors.bg.tertiary, color: colors.text.muted }}>
@@ -495,13 +512,13 @@ setByokProvider((config.byok?.provider as any) || 'google')
               ) : (
                 <div className="flex items-center gap-3">
                   <label className="text-sm font-medium flex-shrink-0 whitespace-nowrap" style={{ color: colors.text.header }}>
-                    {byokProvider === 'google' ? 'Google' : byokProvider === 'anthropic' ? 'Anthropic' : byokProvider === 'openai' ? 'OpenAI' : byokProvider === 'venice' ? 'Venice AI' : 'OpenRouter'} {t('aiProvider.apiKey')}
+                    {byokProvider === 'google' ? 'Google' : byokProvider === 'openai' ? 'OpenAI' : byokProvider === 'venice' ? 'Venice AI' : 'OpenRouter'} {t('aiProvider.apiKey')}
                   </label>
                   <input
                     type="password"
                     value={byokApiKeys[byokProvider]}
                     onChange={e => setByokApiKeys(prev => ({ ...prev, [byokProvider]: e.target.value }))}
-                    placeholder={byokProvider === 'google' ? 'AIza...' : byokProvider === 'anthropic' ? 'sk-ant-...' : byokProvider === 'openrouter' ? 'sk-or-...' : 'sk-...'}
+                    placeholder={byokProvider === 'google' ? 'AIza...' : byokProvider === 'openrouter' ? 'sk-or-...' : 'sk-...'}
                     className="flex-1 px-3 py-2 rounded text-sm"
                     style={{ backgroundColor: colors.bg.tertiary, color: colors.text.normal, border: 'none' }}
                   />
@@ -528,7 +545,7 @@ setByokProvider((config.byok?.provider as any) || 'google')
                   className="flex-1 px-3 py-2 rounded text-sm"
                   style={{ backgroundColor: colors.bg.tertiary, color: colors.text.normal, border: 'none' }}
                 >
-                  {BYOK_MODEL_OPTIONS[byokProvider].map(m => (
+                  {(BYOK_MODEL_OPTIONS[byokProvider] ?? []).map(m => (
                     <option key={m.id} value={m.id}>{m.id === 'custom' ? t('aiProvider.custom') : m.name}</option>
                   ))}
                 </select>
@@ -601,7 +618,7 @@ setByokProvider((config.byok?.provider as any) || 'google')
                 onClick={handleSaveStt}
                 disabled={sttSaving}
                 className="flex items-center gap-1.5 px-4 py-2 rounded text-sm font-medium transition-colors disabled:opacity-50 flex-shrink-0"
-                style={{ backgroundColor: sttSaved ? colors.accent.green : colors.accent.brand, color: 'white' }}
+                style={{ backgroundColor: sttSaved ? colors.accent.green : colors.accent.brand, color: colors.button.primaryFg }}
               >
                 {sttSaving ? (
                   <><Loader2 className="h-4 w-4 animate-spin" /> {t('aiProvider.saving')}</>
@@ -627,7 +644,7 @@ setByokProvider((config.byok?.provider as any) || 'google')
                       onChange={(e) => setSttOpenaiKey(e.target.value)}
                       placeholder="sk-..."
                       className="flex-1 px-3 py-2 rounded text-sm"
-                      style={{ backgroundColor: colors.bg.primary, color: colors.text.normal, border: `1px solid ${colors.bg.hover}` }}
+                      style={{ backgroundColor: colors.bg.tertiary, color: colors.text.normal, border: `1px solid ${colors.bg.hover}` }}
                     />
                     <button
                       type="button"
@@ -659,7 +676,7 @@ setByokProvider((config.byok?.provider as any) || 'google')
                 {/* Not installed — install prompt */}
                 {whisperInstalled === false && (
                   <div className="space-y-3">
-                    <div className="flex items-start gap-2 p-3 rounded" style={{ backgroundColor: colors.bg.primary }}>
+                    <div className="flex items-start gap-2 p-3 rounded" style={{ backgroundColor: colors.bg.tertiary }}>
                       <AlertCircle className="h-4 w-4 mt-0.5 flex-shrink-0" style={{ color: colors.accent.yellow }} />
                       <div className="flex-1">
                         <p className="text-sm font-medium" style={{ color: colors.text.header }}>
@@ -682,7 +699,7 @@ setByokProvider((config.byok?.provider as any) || 'google')
                           onClick={handleWhisperInstall}
                           disabled={whisperInstalling}
                           className="flex items-center gap-1.5 px-4 py-2 rounded text-sm font-medium transition-colors disabled:opacity-50"
-                          style={{ backgroundColor: colors.accent.brand, color: 'white' }}
+                          style={{ backgroundColor: colors.accent.brand, color: colors.button.primaryFg }}
                         >
                           {whisperInstalling ? (
                             <><Loader2 className="h-4 w-4 animate-spin" /> {t('common.installing')}</>
@@ -724,7 +741,7 @@ setByokProvider((config.byok?.provider as any) || 'google')
                         <button
                           onClick={handleWhisperStop}
                           className="flex items-center gap-1.5 px-3 py-1.5 rounded text-sm transition-colors"
-                          style={{ backgroundColor: colors.bg.primary, color: colors.text.normal }}
+                          style={{ backgroundColor: colors.bg.tertiary, color: colors.text.normal }}
                         >
                           <Square className="h-3.5 w-3.5" /> {t('aiProvider.stop')}
                         </button>
@@ -735,7 +752,7 @@ setByokProvider((config.byok?.provider as any) || 'google')
                           onClick={handleWhisperStart}
                           disabled={whisperStatus === 'installing'}
                           className="flex items-center gap-1.5 px-3 py-1.5 rounded text-sm font-medium transition-colors disabled:opacity-50"
-                          style={{ backgroundColor: colors.accent.green, color: 'white' }}
+                          style={{ backgroundColor: colors.button.primary, color: colors.button.primaryFg }}
                         >
                           <Play className="h-3.5 w-3.5" /> {t('aiProvider.start')}
                         </button>
@@ -751,7 +768,7 @@ setByokProvider((config.byok?.provider as any) || 'google')
                         value={whisperModel}
                         onChange={(e) => handleWhisperModelChange(e.target.value)}
                         className="flex-1 px-3 py-2 rounded text-sm"
-                        style={{ backgroundColor: colors.bg.primary, color: colors.text.normal, border: `1px solid ${colors.bg.hover}` }}
+                        style={{ backgroundColor: colors.bg.tertiary, color: colors.text.normal, border: `1px solid ${colors.bg.hover}` }}
                       >
                         {WHISPER_MODELS.map((m) => (
                           <option key={m.id} value={m.id}>{t(m.nameKey)}</option>
@@ -781,7 +798,7 @@ setByokProvider((config.byok?.provider as any) || 'google')
                               onChange={(e) => setSttLocalEndpoint(e.target.value)}
                               placeholder="http://localhost:8000"
                               className="flex-1 px-3 py-2 rounded text-sm"
-                              style={{ backgroundColor: colors.bg.primary, color: colors.text.normal, border: `1px solid ${colors.bg.hover}` }}
+                              style={{ backgroundColor: colors.bg.tertiary, color: colors.text.normal, border: `1px solid ${colors.bg.hover}` }}
                             />
                           </div>
                           <div className="flex items-center gap-3">
@@ -794,7 +811,7 @@ setByokProvider((config.byok?.provider as any) || 'google')
                               onChange={(e) => setSttLocalModel(e.target.value)}
                               placeholder="e.g. Systran/faster-whisper-large-v3"
                               className="flex-1 px-3 py-2 rounded text-sm"
-                              style={{ backgroundColor: colors.bg.primary, color: colors.text.normal, border: `1px solid ${colors.bg.hover}` }}
+                              style={{ backgroundColor: colors.bg.tertiary, color: colors.text.normal, border: `1px solid ${colors.bg.hover}` }}
                             />
                           </div>
                         </div>
@@ -818,7 +835,7 @@ setByokProvider((config.byok?.provider as any) || 'google')
                       onChange={(e) => setSttGoogleKey(e.target.value)}
                       placeholder="AIza..."
                       className="flex-1 px-3 py-2 rounded text-sm"
-                      style={{ backgroundColor: colors.bg.primary, color: colors.text.normal, border: `1px solid ${colors.bg.hover}` }}
+                      style={{ backgroundColor: colors.bg.tertiary, color: colors.text.normal, border: `1px solid ${colors.bg.hover}` }}
                     />
                     <button
                       type="button"
@@ -847,7 +864,7 @@ setByokProvider((config.byok?.provider as any) || 'google')
             onClick={handleValidateAndSave}
             disabled={isSaving || isValidating}
             className="w-full py-3 rounded-lg font-semibold transition-colors disabled:opacity-50 flex items-center justify-center space-x-2"
-            style={{ backgroundColor: colors.accent.brand, color: '#ffffff' }}
+            style={{ backgroundColor: colors.accent.brand, color: colors.button.primaryFg }}
           >
             {(isSaving || isValidating) && <Loader2 className="h-4 w-4 animate-spin" />}
             <span>

@@ -3,6 +3,7 @@ import { readFile, writeFile } from 'fs/promises'
 import { existsSync } from 'fs'
 import * as path from 'path'
 import { app } from 'electron'
+import { listAgents, ensureAgent } from './managers/agent-roster'
 
 export interface ToolsConfig {
   profile: 'minimal' | 'coding' | 'messaging' | 'full'
@@ -248,7 +249,13 @@ export class ToolsManager {
       }
 
       if (updates.elevated !== undefined) {
-        fullConfig.tools.elevated = updates.elevated
+        // Deep-merge — preserve `allowFrom` (per-channel allowlist for
+        // elevated tools, set via CLI). Previously this REPLACED the
+        // whole elevated object.
+        fullConfig.tools.elevated = {
+          ...(fullConfig.tools.elevated ?? {}),
+          ...updates.elevated,
+        }
       }
 
       if (updates.allow !== undefined) {
@@ -264,32 +271,52 @@ export class ToolsManager {
       }
 
       if (updates.media !== undefined) {
-        fullConfig.tools.media = {
-          ...fullConfig.tools.media,
-          ...updates.media
+        // Deep-merge each media subkey (image/audio/video) to preserve
+        // upstream-schema fields like `models`, `scope`, `attachments`,
+        // `maxBytes` etc. that the user may have set via CLI. The
+        // previous shallow merge replaced the entire subkey object,
+        // wiping anything beyond `enabled`.
+        const existingMedia = (fullConfig.tools.media ?? {}) as Record<string, any>
+        const updatedMedia: Record<string, any> = { ...existingMedia }
+        for (const [k, v] of Object.entries(updates.media)) {
+          if (v && typeof v === 'object' && !Array.isArray(v)) {
+            updatedMedia[k] = { ...(existingMedia[k] ?? {}), ...v }
+          } else {
+            updatedMedia[k] = v
+          }
         }
+        fullConfig.tools.media = updatedMedia
       }
 
       if (updates.links !== undefined) {
-        fullConfig.tools.links = updates.links
+        // Deep-merge — preserve `scope`, `maxLinks`, `timeoutSeconds`,
+        // `models`. Previously this REPLACED the whole links object.
+        fullConfig.tools.links = {
+          ...(fullConfig.tools.links ?? {}),
+          ...updates.links,
+        }
       }
 
       // Update all agents' exec config if requested
       if (applyToAllAgents && updates.exec !== undefined) {
-        if (fullConfig.agents?.list && Array.isArray(fullConfig.agents.list)) {
-          for (const agent of fullConfig.agents.list) {
-            if (!agent.tools) {
-              agent.tools = {}
-            }
-            if (!agent.tools.exec) {
-              agent.tools.exec = {}
-            }
-            agent.tools.exec = {
-              ...agent.tools.exec,
-              ...updates.exec
-            }
+        // Mutate through the canonical keyed roster; ensureAgent returns the
+        // live entry object so these writes land in agents.entries.
+        const agentIds = listAgents(fullConfig).map((entry) => entry.id)
+        for (const agentId of agentIds) {
+          const agent = ensureAgent(fullConfig, agentId)
+          if (!agent.tools) {
+            agent.tools = {}
           }
-          console.log(`[ToolsManager] Updated exec config for ${fullConfig.agents.list.length} agent(s)`)
+          if (!agent.tools.exec) {
+            agent.tools.exec = {}
+          }
+          agent.tools.exec = {
+            ...agent.tools.exec,
+            ...updates.exec
+          }
+        }
+        if (agentIds.length > 0) {
+          console.log(`[ToolsManager] Updated exec config for ${agentIds.length} agent(s)`)
         }
       }
 
@@ -333,19 +360,21 @@ export class ToolsManager {
 
     // Remove agent-level exec configs to let agents use global settings and exec-approvals.json
     // Agent-level exec configs without allowlists cause "allowlist miss" errors
-    if (fullConfig.agents?.list && Array.isArray(fullConfig.agents.list)) {
-      for (const agent of fullConfig.agents.list) {
+    const rosterIds = listAgents(fullConfig).map((entry) => entry.id)
+    if (rosterIds.length > 0) {
+      for (const agentId of rosterIds) {
         // Remove agent-level exec config entirely
         // Agents will inherit from global tools.exec and use exec-approvals.json for allowlists
+        const agent = ensureAgent(fullConfig, agentId)
         if (agent.tools?.exec) {
           delete agent.tools.exec
-          console.log(`[ToolsManager] Removed agent-level exec config for agent ${agent.id || 'unknown'} to use global settings`)
+          console.log(`[ToolsManager] Removed agent-level exec config for agent ${agentId} to use global settings`)
         }
       }
 
       // Write back
       await writeFile(configPath, JSON.stringify(fullConfig, null, 2))
-      console.log(`[ToolsManager] Cleaned up exec config for ${fullConfig.agents.list.length} agent(s) - now using global settings`)
+      console.log(`[ToolsManager] Cleaned up exec config for ${rosterIds.length} agent(s) - now using global settings`)
     }
   }
 

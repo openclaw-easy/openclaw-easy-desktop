@@ -17,6 +17,17 @@
 #
 # Windows .ico stays full-bleed (Windows doesn't use squircle).
 
+# SUPERSEDED (2026-07-26). This builds the retired design: a gradient squircle
+# with the flat lobster emoji composited on top. The shipped icons are now the
+# 3D lobster mark rendered edge-to-edge, generated directly from the source art,
+# and `lobster-emoji.png` has been deleted. Running this would regenerate the
+# old branding, so it fails closed rather than silently emitting a bare
+# background (both composite steps below were guarded by `if [ -f ]`).
+# Kept only for the macOS squircle/alpha notes above.
+echo "create-macos-icon.sh is superseded — icons come from the 3D lobster source art." >&2
+echo "Delete this guard only if you intend to restore the squircle+emoji design." >&2
+exit 1
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 ICONS_DIR="$PROJECT_ROOT/resources/icons"

@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
 import { ColorTheme } from '../types';
+import { SectionHeader } from '../../ui/section-header';
 import { WindowsPermissionsSection } from './WindowsPermissionsSection';
 import {
   Terminal,
@@ -22,6 +23,25 @@ interface ToolsSectionProps {
   colors: ColorTheme;
 }
 
+// Sub-objects use index signatures because the upstream zod schemas carry
+// many optional fields beyond `enabled` (models, scope, attachments,
+// allowFrom, maxLinks, etc.). The desktop UI only TOGGLES `enabled`, but
+// it must PRESERVE everything else when writing back — without the index
+// signature the toggle handlers spread an empty object and silently wipe
+// the user's CLI-set customizations. See the deep-merge in
+// handleMediaToggle/handleLinksToggle/handleElevatedToggle below.
+interface MediaUnderstandingNode {
+  enabled?: boolean
+  [k: string]: unknown
+}
+interface LinksNode {
+  enabled?: boolean
+  [k: string]: unknown
+}
+interface ElevatedNode {
+  enabled?: boolean
+  [k: string]: unknown
+}
 interface ToolsConfig {
   profile: 'minimal' | 'coding' | 'messaging' | 'full';
   exec?: {
@@ -34,16 +54,13 @@ interface ToolsConfig {
     fetch?: { enabled: boolean };
   };
   media?: {
-    image?: { enabled: boolean };
-    audio?: { enabled: boolean };
-    video?: { enabled: boolean };
+    image?: MediaUnderstandingNode;
+    audio?: MediaUnderstandingNode;
+    video?: MediaUnderstandingNode;
+    [k: string]: unknown
   };
-  links?: {
-    enabled: boolean;
-  };
-  elevated?: {
-    enabled: boolean;
-  };
+  links?: LinksNode;
+  elevated?: ElevatedNode;
 }
 
 type PermissionStatus = 'granted' | 'denied' | 'not-determined' | 'restricted';
@@ -74,6 +91,16 @@ export const ToolsSection: React.FC<ToolsSectionProps> = ({ colors }) => {
     loadConfig();
     loadPermissions();
     setPlatform(window.electronAPI?.getPlatform?.() ?? null);
+
+    // Refresh macOS permissions when the user comes back to the app.
+    // Common flow: click "Open Settings" for screen recording, grant in
+    // System Settings, switch back to the app. Without this listener the
+    // status pill stays at "Denied" until manual reload — confusing UX.
+    const onFocus = () => {
+      loadPermissions();
+    };
+    window.addEventListener('focus', onFocus);
+    return () => window.removeEventListener('focus', onFocus);
   }, []);
 
   const loadConfig = async () => {
@@ -106,6 +133,10 @@ export const ToolsSection: React.FC<ToolsSectionProps> = ({ colors }) => {
         };
 
         setConfig(toolsConfig);
+      } else {
+        // No config in the result (e.g. {success:false} when the gateway is
+        // offline) — surface an error instead of leaving the panel blank.
+        setError((result as any)?.error || 'Could not load tools configuration (the gateway may be offline)');
       }
     } catch (err: any) {
       console.error('[ToolsSection] Failed to load config:', err);
@@ -374,10 +405,13 @@ export const ToolsSection: React.FC<ToolsSectionProps> = ({ colors }) => {
       setSaveSuccess(false);
       setSaveError(null);
 
+      // Deep-merge: preserve scope/models/attachments/etc. that the user
+      // may have set via CLI. Replacing `[mediaType]` with `{enabled}`
+      // wholesale (the previous behavior) silently wiped those fields.
+      const currentNode = config?.media?.[mediaType] ?? {};
       const updates = {
         media: {
-          ...config?.media,
-          [mediaType]: { enabled }
+          [mediaType]: { ...currentNode, enabled }
         }
       };
 
@@ -388,7 +422,7 @@ export const ToolsSection: React.FC<ToolsSectionProps> = ({ colors }) => {
           ...prev,
           media: {
             ...prev.media,
-            [mediaType]: { enabled }
+            [mediaType]: { ...currentNode, enabled }
           }
         } : null);
 
@@ -411,8 +445,10 @@ export const ToolsSection: React.FC<ToolsSectionProps> = ({ colors }) => {
       setSaveSuccess(false);
       setSaveError(null);
 
+      // Deep-merge — preserve scope/maxLinks/timeoutSeconds/models.
+      const currentLinks = config?.links ?? {};
       const updates = {
-        links: { enabled }
+        links: { ...currentLinks, enabled }
       };
 
       const result = await window.electronAPI.updateToolsConfig(updates, applyToAllAgents);
@@ -420,7 +456,7 @@ export const ToolsSection: React.FC<ToolsSectionProps> = ({ colors }) => {
       if (result.success) {
         setConfig(prev => prev ? {
           ...prev,
-          links: { enabled }
+          links: { ...currentLinks, enabled }
         } : null);
 
         setSaveSuccess(true);
@@ -442,8 +478,11 @@ export const ToolsSection: React.FC<ToolsSectionProps> = ({ colors }) => {
       setSaveSuccess(false);
       setSaveError(null);
 
+      // Deep-merge — preserve `allowFrom` (the per-channel allowlist for
+      // elevated tools that the user may have set via CLI).
+      const currentElevated = config?.elevated ?? {};
       const updates = {
-        elevated: { enabled }
+        elevated: { ...currentElevated, enabled }
       };
 
       const result = await window.electronAPI.updateToolsConfig(updates, applyToAllAgents);
@@ -451,7 +490,7 @@ export const ToolsSection: React.FC<ToolsSectionProps> = ({ colors }) => {
       if (result.success) {
         setConfig(prev => prev ? {
           ...prev,
-          elevated: { enabled }
+          elevated: { ...currentElevated, enabled }
         } : null);
 
         setSaveSuccess(true);
@@ -469,17 +508,14 @@ export const ToolsSection: React.FC<ToolsSectionProps> = ({ colors }) => {
 
   return (
     <div className="flex flex-col h-full">
-      {/* Header */}
-      <div className="p-8 pb-4">
-        <div className="flex items-baseline gap-2 mb-4">
-          <h3 className="text-lg font-bold" style={{ color: colors.text.header }}>
-            {t('tools.title')}
-          </h3>
-          <p className="text-sm" style={{ color: colors.text.muted }}>
-            {t('tools.subtitle')}
-          </p>
-        </div>
+      <SectionHeader
+        title={t('tools.title')}
+        subtitle={t('tools.subtitle')}
+        colors={colors}
+        border={false}
+      />
 
+      <div className="px-8 pb-4">
         {/* Apply to All Agents Toggle */}
         <div
           className="flex items-center space-x-3 p-4 rounded-lg"
@@ -490,7 +526,8 @@ export const ToolsSection: React.FC<ToolsSectionProps> = ({ colors }) => {
             id="apply-to-all-agents"
             checked={applyToAllAgents}
             onChange={(e) => setApplyToAllAgents(e.target.checked)}
-            className="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500 cursor-pointer"
+            className="h-4 w-4 rounded border accent-primary focus:ring-ring cursor-pointer"
+            style={{ borderColor: colors.bg.tertiary }}
           />
           <label
             htmlFor="apply-to-all-agents"
@@ -534,7 +571,7 @@ export const ToolsSection: React.FC<ToolsSectionProps> = ({ colors }) => {
               <button
                 onClick={loadConfig}
                 className="px-4 py-2 rounded-lg font-medium transition-colors"
-                style={{ backgroundColor: colors.accent.brand, color: '#ffffff' }}
+                style={{ backgroundColor: colors.accent.brand, color: colors.button.primaryFg }}
               >
                 {t('common.retry')}
               </button>
@@ -546,7 +583,7 @@ export const ToolsSection: React.FC<ToolsSectionProps> = ({ colors }) => {
             {saveError && (
               <div
                 className="flex items-center justify-between p-3 rounded-lg"
-                style={{ backgroundColor: '#7f1d1d20', border: '1px solid #f87171' }}
+                style={{ backgroundColor: 'rgba(220, 38, 38, 0.12)', border: '1px solid rgba(248, 113, 113, 0.55)' }}
               >
                 <div className="flex items-center space-x-2">
                   <AlertCircle className="h-4 w-4 shrink-0" style={{ color: '#f87171' }} />
@@ -660,7 +697,7 @@ export const ToolsSection: React.FC<ToolsSectionProps> = ({ colors }) => {
                   </h4>
                 </div>
                 {saveSuccess && (
-                  <div className="flex items-center space-x-2 text-green-500">
+                  <div className="flex items-center space-x-2" style={{ color: colors.accent.green }}>
                     <Check className="h-4 w-4" />
                     <span className="text-sm">{t('tools.saved')}</span>
                   </div>
@@ -677,10 +714,11 @@ export const ToolsSection: React.FC<ToolsSectionProps> = ({ colors }) => {
                   onClick={() => handleProfileChange('minimal')}
                   disabled={saving || config.profile === 'minimal'}
                   className={`p-4 rounded-lg border-2 transition-all text-left ${
-                    config.profile === 'minimal' ? 'border-blue-500' : 'border-transparent hover:border-blue-400'
+                    config.profile === 'minimal' ? '' : 'border-transparent hover:border-blue-400'
                   }`}
                   style={{
                     backgroundColor: config.profile === 'minimal' ? colors.accent.brand + '20' : colors.bg.tertiary,
+                    borderColor: config.profile === 'minimal' ? colors.accent.blue : undefined,
                     opacity: saving ? 0.5 : 1
                   }}
                 >
@@ -702,10 +740,11 @@ export const ToolsSection: React.FC<ToolsSectionProps> = ({ colors }) => {
                   onClick={() => handleProfileChange('coding')}
                   disabled={saving || config.profile === 'coding'}
                   className={`p-4 rounded-lg border-2 transition-all text-left ${
-                    config.profile === 'coding' ? 'border-green-500' : 'border-transparent hover:border-green-400'
+                    config.profile === 'coding' ? '' : 'border-transparent hover:border-green-400'
                   }`}
                   style={{
                     backgroundColor: config.profile === 'coding' ? colors.accent.green + '20' : colors.bg.tertiary,
+                    borderColor: config.profile === 'coding' ? colors.accent.green : undefined,
                     opacity: saving ? 0.5 : 1
                   }}
                 >
@@ -727,10 +766,11 @@ export const ToolsSection: React.FC<ToolsSectionProps> = ({ colors }) => {
                   onClick={() => handleProfileChange('messaging')}
                   disabled={saving || config.profile === 'messaging'}
                   className={`p-4 rounded-lg border-2 transition-all text-left ${
-                    config.profile === 'messaging' ? 'border-purple-500' : 'border-transparent hover:border-purple-400'
+                    config.profile === 'messaging' ? '' : 'border-transparent hover:border-purple-400'
                   }`}
                   style={{
                     backgroundColor: config.profile === 'messaging' ? colors.accent.purple + '20' : colors.bg.tertiary,
+                    borderColor: config.profile === 'messaging' ? colors.accent.purple : undefined,
                     opacity: saving ? 0.5 : 1
                   }}
                 >
@@ -752,10 +792,11 @@ export const ToolsSection: React.FC<ToolsSectionProps> = ({ colors }) => {
                   onClick={() => handleProfileChange('full')}
                   disabled={saving || config.profile === 'full'}
                   className={`p-4 rounded-lg border-2 transition-all text-left ${
-                    config.profile === 'full' ? 'border-yellow-500' : 'border-transparent hover:border-yellow-400'
+                    config.profile === 'full' ? '' : 'border-transparent hover:border-yellow-400'
                   }`}
                   style={{
                     backgroundColor: config.profile === 'full' ? colors.accent.yellow + '20' : colors.bg.tertiary,
+                    borderColor: config.profile === 'full' ? colors.accent.yellow : undefined,
                     opacity: saving ? 0.5 : 1
                   }}
                 >
@@ -902,10 +943,14 @@ export const ToolsSection: React.FC<ToolsSectionProps> = ({ colors }) => {
                   <button
                     onClick={() => handleWebSearchToggle(!config.web?.search?.enabled)}
                     disabled={saving}
-                    className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
-                      config.web?.search?.enabled ? 'bg-green-500' : 'bg-gray-600'
-                    }`}
-                    style={{ opacity: saving ? 0.5 : 1 }}
+                    role="switch"
+                    aria-checked={!!config.web?.search?.enabled}
+                    aria-label={t('tools.searchTheWeb', 'Search the web')}
+                    className="relative inline-flex h-6 w-11 items-center rounded-full transition-colors"
+                    style={{
+                      backgroundColor: config.web?.search?.enabled ? colors.accent.green : colors.text.muted,
+                      opacity: saving ? 0.5 : 1,
+                    }}
                   >
                     <span
                       className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
@@ -928,10 +973,14 @@ export const ToolsSection: React.FC<ToolsSectionProps> = ({ colors }) => {
                   <button
                     onClick={() => handleWebFetchToggle(!config.web?.fetch?.enabled)}
                     disabled={saving}
-                    className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
-                      config.web?.fetch?.enabled ? 'bg-green-500' : 'bg-gray-600'
-                    }`}
-                    style={{ opacity: saving ? 0.5 : 1 }}
+                    role="switch"
+                    aria-checked={!!config.web?.fetch?.enabled}
+                    aria-label={t('tools.readWebPages', 'Read web pages')}
+                    className="relative inline-flex h-6 w-11 items-center rounded-full transition-colors"
+                    style={{
+                      backgroundColor: config.web?.fetch?.enabled ? colors.accent.green : colors.text.muted,
+                      opacity: saving ? 0.5 : 1,
+                    }}
                   >
                     <span
                       className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
@@ -972,10 +1021,14 @@ export const ToolsSection: React.FC<ToolsSectionProps> = ({ colors }) => {
                   <button
                     onClick={() => handleMediaToggle('image', !config.media?.image?.enabled)}
                     disabled={saving}
-                    className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
-                      config.media?.image?.enabled ? 'bg-green-500' : 'bg-gray-600'
-                    }`}
-                    style={{ opacity: saving ? 0.5 : 1 }}
+                    role="switch"
+                    aria-checked={!!config.media?.image?.enabled}
+                    aria-label={t('tools.photosImages', 'Photos & images')}
+                    className="relative inline-flex h-6 w-11 items-center rounded-full transition-colors"
+                    style={{
+                      backgroundColor: config.media?.image?.enabled ? colors.accent.green : colors.text.muted,
+                      opacity: saving ? 0.5 : 1,
+                    }}
                   >
                     <span
                       className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
@@ -998,10 +1051,14 @@ export const ToolsSection: React.FC<ToolsSectionProps> = ({ colors }) => {
                   <button
                     onClick={() => handleMediaToggle('audio', !config.media?.audio?.enabled)}
                     disabled={saving}
-                    className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
-                      config.media?.audio?.enabled ? 'bg-green-500' : 'bg-gray-600'
-                    }`}
-                    style={{ opacity: saving ? 0.5 : 1 }}
+                    role="switch"
+                    aria-checked={!!config.media?.audio?.enabled}
+                    aria-label={t('tools.voiceMessagesAudio', 'Voice messages & audio')}
+                    className="relative inline-flex h-6 w-11 items-center rounded-full transition-colors"
+                    style={{
+                      backgroundColor: config.media?.audio?.enabled ? colors.accent.green : colors.text.muted,
+                      opacity: saving ? 0.5 : 1,
+                    }}
                   >
                     <span
                       className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
@@ -1024,10 +1081,14 @@ export const ToolsSection: React.FC<ToolsSectionProps> = ({ colors }) => {
                   <button
                     onClick={() => handleMediaToggle('video', !config.media?.video?.enabled)}
                     disabled={saving}
-                    className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
-                      config.media?.video?.enabled ? 'bg-green-500' : 'bg-gray-600'
-                    }`}
-                    style={{ opacity: saving ? 0.5 : 1 }}
+                    role="switch"
+                    aria-checked={!!config.media?.video?.enabled}
+                    aria-label={t('tools.videos', 'Videos')}
+                    className="relative inline-flex h-6 w-11 items-center rounded-full transition-colors"
+                    style={{
+                      backgroundColor: config.media?.video?.enabled ? colors.accent.green : colors.text.muted,
+                      opacity: saving ? 0.5 : 1,
+                    }}
                   >
                     <span
                       className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
@@ -1063,10 +1124,14 @@ export const ToolsSection: React.FC<ToolsSectionProps> = ({ colors }) => {
                 <button
                   onClick={() => handleLinksToggle(!config.links?.enabled)}
                   disabled={saving}
-                  className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
-                    config.links?.enabled ? 'bg-green-500' : 'bg-gray-600'
-                  }`}
-                  style={{ opacity: saving ? 0.5 : 1 }}
+                  role="switch"
+                  aria-checked={!!config.links?.enabled}
+                  aria-label={t('tools.understandLinks', 'Understand links in messages')}
+                  className="relative inline-flex h-6 w-11 items-center rounded-full transition-colors"
+                  style={{
+                    backgroundColor: config.links?.enabled ? colors.accent.green : colors.text.muted,
+                    opacity: saving ? 0.5 : 1,
+                  }}
                 >
                   <span
                     className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
@@ -1101,10 +1166,14 @@ export const ToolsSection: React.FC<ToolsSectionProps> = ({ colors }) => {
                 <button
                   onClick={() => handleElevatedToggle(!config.elevated?.enabled)}
                   disabled={saving}
-                  className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
-                    config.elevated?.enabled ? 'bg-green-500' : 'bg-gray-600'
-                  }`}
-                  style={{ opacity: saving ? 0.5 : 1 }}
+                  role="switch"
+                  aria-checked={!!config.elevated?.enabled}
+                  aria-label={t('tools.allowSensitiveOps', 'Allow sensitive operations')}
+                  className="relative inline-flex h-6 w-11 items-center rounded-full transition-colors"
+                  style={{
+                    backgroundColor: config.elevated?.enabled ? colors.accent.green : colors.text.muted,
+                    opacity: saving ? 0.5 : 1,
+                  }}
                 >
                   <span
                     className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${

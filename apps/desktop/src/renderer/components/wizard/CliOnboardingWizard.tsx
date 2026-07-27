@@ -7,6 +7,8 @@ import { useTranslation } from 'react-i18next';
 import { Button } from '../ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '../ui/card';
 import { ColorTheme } from '../dashboard/types';
+import { useThemeStore } from '../../stores/themeStore';
+import { getXtermTheme } from '../../lib/xtermTheme';
 
 interface CliOnboardingWizardProps {
   onComplete: () => void;
@@ -20,6 +22,7 @@ export function CliOnboardingWizard({
   colors
 }: CliOnboardingWizardProps) {
   const { t } = useTranslation();
+  const resolvedTheme = useThemeStore((s) => s.resolved);
   const [showTerminal, setShowTerminal] = useState(false);
   const [isRunning, setIsRunning] = useState(false);
   const [isComplete, setIsComplete] = useState(false);
@@ -38,28 +41,8 @@ export function CliOnboardingWizard({
       const term = new Terminal({
         cursorBlink: true,
         fontSize: 14,
-        fontFamily: 'Menlo, Monaco, "Courier New", monospace',
-        theme: {
-          background: '#1e1e1e',
-          foreground: '#d4d4d4',
-          cursor: '#d4d4d4',
-          black: '#000000',
-          red: '#cd3131',
-          green: '#0dbc79',
-          yellow: '#e5e510',
-          blue: '#2472c8',
-          magenta: '#bc3fbc',
-          cyan: '#11a8cd',
-          white: '#e5e5e5',
-          brightBlack: '#666666',
-          brightRed: '#f14c4c',
-          brightGreen: '#23d18b',
-          brightYellow: '#f5f543',
-          brightBlue: '#3b8eea',
-          brightMagenta: '#d670d6',
-          brightCyan: '#29b8db',
-          brightWhite: '#ffffff'
-        }
+        fontFamily: '"SF Mono", "Fira Code", "JetBrains Mono", Menlo, Monaco, "Courier New", monospace',
+        theme: getXtermTheme(resolvedTheme),
       });
 
       const fitAddon = new FitAddon();
@@ -95,9 +78,23 @@ export function CliOnboardingWizard({
       return () => {
         window.removeEventListener('resize', handleResize);
         term.dispose();
+        // Null the refs after dispose — otherwise the `!xtermRef.current` guard
+        // above stays false on Retry, so no new terminal is created and the
+        // onData handler writes into the disposed instance.
+        xtermRef.current = null;
+        fitAddonRef.current = null;
       };
     }
   }, [showTerminal]);
+
+  // Live-update xterm theme when the app's light/dark mode flips while
+  // the terminal is already mounted. xterm exposes `term.options.theme`
+  // as a runtime setter — no re-render needed.
+  useEffect(() => {
+    if (xtermRef.current) {
+      xtermRef.current.options.theme = getXtermTheme(resolvedTheme);
+    }
+  }, [resolvedTheme]);
 
   // Cleanup terminal process and listeners on unmount
   useEffect(() => {
@@ -201,8 +198,8 @@ export function CliOnboardingWizard({
               size="lg"
               className="px-8 py-3 text-lg"
               style={{
-                backgroundColor: colors.accent.green,
-                color: '#FFFFFF',
+                backgroundColor: colors.button.primary,
+                color: colors.button.primaryFg,
               }}
             >
               {t('onboarding.letsGetStarted')}
@@ -213,6 +210,12 @@ export function CliOnboardingWizard({
     );
   }
 
+  // Match the xterm theme background so the container (visible
+  // BEFORE xterm initialises its canvas, ~2s) doesn't flash as a
+  // black slab against the rest of the themed UI.
+  const xtermBg = resolvedTheme === 'dark' ? '#0a0f1a' : '#fbf6ec';
+  const xtermFg = resolvedTheme === 'dark' ? '#e8e4df' : '#2d2b28';
+
   // Terminal screen
   return (
     <div className="h-screen flex flex-col p-0" style={{ backgroundColor: colors.bg.primary }}>
@@ -222,17 +225,22 @@ export function CliOnboardingWizard({
           ref={terminalRef}
           className="flex-1 min-h-0"
           style={{
-            backgroundColor: '#1e1e1e',
-            padding: '8px'
+            backgroundColor: xtermBg,
+            padding: '8px',
           }}
         />
 
         {/* Loading Spinner Overlay */}
         {isWaitingForOutput && (
-          <div className="absolute inset-0 flex items-center justify-center" style={{ backgroundColor: '#1e1e1e' }}>
+          <div className="absolute inset-0 flex items-center justify-center" style={{ backgroundColor: xtermBg }}>
             <div className="text-center">
-              <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-green-500 mx-auto mb-4"></div>
-              <p className="text-sm text-gray-400">Starting OpenClaw onboarding...</p>
+              <div
+                className="animate-spin rounded-full h-12 w-12 border-b-2 mx-auto mb-4"
+                style={{ borderBottomColor: 'rgb(var(--glow-color))' }}
+              />
+              <p className="text-sm" style={{ color: xtermFg, opacity: 0.7 }}>
+                Starting OpenClaw onboarding...
+              </p>
             </div>
           </div>
         )}

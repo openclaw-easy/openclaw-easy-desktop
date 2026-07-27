@@ -3,6 +3,8 @@ import { Route, Plus, Trash2, TestTube, AlertCircle, CheckCircle, X } from "luci
 import { useTranslation } from "react-i18next";
 import { ColorTheme } from "../types";
 import { AgentBinding, AgentBindingResult, ResolvedAgentRoute } from "../../types/electron";
+import { Modal } from "../../ui/modal";
+import { ErrorAlert } from "../../ui/error-alert";
 
 interface AgentRoutingSectionProps {
   colors: ColorTheme;
@@ -205,20 +207,7 @@ export const AgentRoutingSection: React.FC<AgentRoutingSectionProps> = ({
       </div>
 
       {/* Error Display */}
-      {error && (
-        <div
-          className="p-3 rounded-lg border"
-          style={{
-            backgroundColor: colors.bg.tertiary,
-            borderColor: "#dc2626",
-          }}
-        >
-          <div className="flex items-center space-x-2">
-            <AlertCircle className="h-4 w-4 text-red-500" />
-            <span className="text-sm text-red-500">{error}</span>
-          </div>
-        </div>
-      )}
+      {error && <ErrorAlert colors={colors} message={error} />}
 
       {/* Current Bindings Table */}
       <div
@@ -234,7 +223,7 @@ export const AgentRoutingSection: React.FC<AgentRoutingSectionProps> = ({
           <button
             onClick={() => setShowAddModal(true)}
             className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-sm font-medium transition-opacity"
-            style={{ backgroundColor: colors.accent.brand, color: "#ffffff" }}
+            style={{ backgroundColor: colors.accent.brand, color: colors.button.primaryFg }}
           >
             <Plus className="h-3.5 w-3.5" />
             {t('agentRouting.addNewRule')}
@@ -308,8 +297,9 @@ export const AgentRoutingSection: React.FC<AgentRoutingSectionProps> = ({
                           onClick={() => handleRemoveBinding(binding.agentId, binding.match.channel)}
                           className="p-1 rounded hover:bg-red-500/20"
                           title={t('agentRouting.removeRoutingRule')}
+                          aria-label={t('agentRouting.removeRoutingRule')}
                         >
-                          <Trash2 className="h-4 w-4 text-red-500" />
+                          <Trash2 className="h-4 w-4" style={{ color: colors.accent.red }} />
                         </button>
                       </td>
                     </tr>
@@ -321,13 +311,16 @@ export const AgentRoutingSection: React.FC<AgentRoutingSectionProps> = ({
         </div>
       </div>
 
-      {/* Add New Routing Rule Modal */}
-      {showAddModal && (
-        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50">
-          <div
-            className="rounded-xl max-w-lg w-full mx-4 overflow-hidden"
-            style={{ backgroundColor: colors.bg.secondary }}
-          >
+      {/* Add New Routing Rule Modal — Escape/backdrop dismiss suppressed
+          mid-submit so the user doesn't lose form state. */}
+      <Modal
+        open={showAddModal}
+        onClose={() => setShowAddModal(false)}
+        maxWidthClass="max-w-lg"
+        padded={false}
+        shellClassName="overflow-hidden"
+        dismissable={!isAddingBinding}
+      >
             {/* Modal header */}
             <div className="flex items-center justify-between px-5 py-4 border-b" style={{ borderColor: colors.bg.tertiary }}>
               <div className="flex items-center gap-2">
@@ -338,7 +331,7 @@ export const AgentRoutingSection: React.FC<AgentRoutingSectionProps> = ({
               </div>
               <button
                 onClick={() => setShowAddModal(false)}
-                className="p-1 rounded transition-colors"
+                className="press-pulse p-1 rounded transition-colors hover:bg-white/10 dark:hover:bg-white/5"
                 style={{ color: colors.text.muted }}
               >
                 <X className="h-4 w-4" />
@@ -354,7 +347,7 @@ export const AgentRoutingSection: React.FC<AgentRoutingSectionProps> = ({
                 <select
                   value={selectedChannel}
                   onChange={(e) => setSelectedChannel(e.target.value)}
-                  className="w-full px-3 py-2 rounded border-0 text-sm"
+                  className="input-glow w-full px-3 py-2 rounded border border-transparent text-sm"
                   style={{
                     backgroundColor: colors.bg.tertiary,
                     color: colors.text.normal,
@@ -376,7 +369,7 @@ export const AgentRoutingSection: React.FC<AgentRoutingSectionProps> = ({
                 <select
                   value={selectedAgent}
                   onChange={(e) => setSelectedAgent(e.target.value)}
-                  className="w-full px-3 py-2 rounded border-0 text-sm"
+                  className="input-glow w-full px-3 py-2 rounded border border-transparent text-sm"
                   style={{
                     backgroundColor: colors.bg.tertiary,
                     color: colors.text.normal,
@@ -398,7 +391,7 @@ export const AgentRoutingSection: React.FC<AgentRoutingSectionProps> = ({
                 <select
                   value={accountId}
                   onChange={(e) => setAccountId(e.target.value)}
-                  className="w-full px-3 py-2 rounded border-0 text-sm"
+                  className="input-glow w-full px-3 py-2 rounded border border-transparent text-sm"
                   style={{
                     backgroundColor: colors.bg.tertiary,
                     color: colors.text.normal,
@@ -414,7 +407,7 @@ export const AgentRoutingSection: React.FC<AgentRoutingSectionProps> = ({
             <div className="flex justify-end gap-2 px-5 py-4 border-t" style={{ borderColor: colors.bg.tertiary }}>
               <button
                 onClick={() => setShowAddModal(false)}
-                className="px-4 py-2 rounded-md text-sm font-medium"
+                className="press-pulse ripple-glow px-4 py-2 rounded-md text-sm font-medium transition-colors"
                 style={{ backgroundColor: colors.bg.tertiary, color: colors.text.normal }}
               >
                 {t('common.cancel')}
@@ -422,10 +415,10 @@ export const AgentRoutingSection: React.FC<AgentRoutingSectionProps> = ({
               <button
                 onClick={handleAddBinding}
                 disabled={isAddingBinding || !selectedChannel || !selectedAgent}
-                className="px-4 py-2 rounded-md text-sm font-medium transition-colors disabled:opacity-50"
+                className="press-pulse ripple-glow px-4 py-2 rounded-md text-sm font-medium transition-all hover:-translate-y-px hover:shadow-glow active:translate-y-0 disabled:opacity-50"
                 style={{
-                  backgroundColor: colors.accent.blue,
-                  color: "white",
+                  backgroundColor: colors.accent.brand,
+                  color: colors.button.primaryFg,
                 }}
               >
                 {isAddingBinding ? (
@@ -438,9 +431,7 @@ export const AgentRoutingSection: React.FC<AgentRoutingSectionProps> = ({
                 )}
               </button>
             </div>
-          </div>
-        </div>
-      )}
+      </Modal>
 
       {/* Test Routing Toggle */}
       <button
@@ -524,8 +515,8 @@ export const AgentRoutingSection: React.FC<AgentRoutingSectionProps> = ({
               disabled={isTesting || !testChannel}
               className="w-full px-4 py-1.5 rounded text-sm font-medium transition-colors disabled:opacity-50"
               style={{
-                backgroundColor: colors.accent.green,
-                color: "white",
+                backgroundColor: colors.button.primary,
+                color: colors.button.primaryFg,
               }}
             >
               {isTesting ? (
@@ -547,7 +538,7 @@ export const AgentRoutingSection: React.FC<AgentRoutingSectionProps> = ({
             style={{ backgroundColor: colors.bg.tertiary }}
           >
             <div className="flex items-center space-x-2 mb-2">
-              <CheckCircle className="h-4 w-4 text-green-500" />
+              <CheckCircle className="h-4 w-4" style={{ color: colors.accent.green }} />
               <span className="font-medium" style={{ color: colors.text.header }}>
                 {t('agentRouting.routingResult')}
               </span>

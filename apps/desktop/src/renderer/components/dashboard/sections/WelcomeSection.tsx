@@ -29,7 +29,17 @@ export const WelcomeSection: React.FC<WelcomeSectionProps> = ({
 }) => {
   const { t } = useTranslation()
 
-  const quickStartSteps = [
+  // Only step 1 has a real completion signal (the gateway running). The
+  // remaining steps have no trackable state available to this component,
+  // so they render as plain navigation shortcuts (no completed checkmark)
+  // rather than implying progress we can't actually detect.
+  const quickStartSteps: Array<{
+    title: string
+    description: string
+    icon: typeof Zap
+    completed?: boolean
+    action: () => void
+  }> = [
     {
       title: t('welcome.startAssistant'),
       description: t('welcome.startAssistantDesc'),
@@ -43,7 +53,6 @@ export const WelcomeSection: React.FC<WelcomeSectionProps> = ({
       title: t('welcome.connectChannels'),
       description: t('welcome.connectChannelsDesc'),
       icon: Hash,
-      completed: false, // You can add real channel status here
       action: () => {
         setSelectedServer("channels")
         setActiveChannel("whatsapp")
@@ -53,7 +62,6 @@ export const WelcomeSection: React.FC<WelcomeSectionProps> = ({
       title: t('welcome.configureModels'),
       description: t('welcome.configureModelsDesc'),
       icon: Bot,
-      completed: false, // You can add real model config status here
       action: () => {
         setSelectedServer("aiconfig")
         setActiveChannel("aiconfig")
@@ -63,7 +71,6 @@ export const WelcomeSection: React.FC<WelcomeSectionProps> = ({
       title: t('welcome.startChatting'),
       description: t('welcome.startChattingDesc'),
       icon: MessageSquare,
-      completed: false,
       action: () => {
         setSelectedServer("main")
         setActiveChannel("assistant")
@@ -135,7 +142,7 @@ export const WelcomeSection: React.FC<WelcomeSectionProps> = ({
             className="px-8 py-3 rounded-lg font-semibold transition-colors inline-flex items-center gap-2"
             style={{
               backgroundColor: colors.accent.brand,
-              color: "white",
+              color: colors.button.primaryFg,
             }}
           >
             <Zap className="h-5 w-5" />
@@ -165,13 +172,13 @@ export const WelcomeSection: React.FC<WelcomeSectionProps> = ({
                 className="flex items-center gap-4 p-4 rounded-lg transition-colors cursor-pointer hover:scale-[1.02]"
                 style={{
                   backgroundColor: colors.bg.tertiary,
-                  border: `1px solid ${step.completed ? colors.accent.green : colors.bg.primary}`
+                  border: `1px solid ${step.completed ? colors.accent.green : colors.bg.tertiary}`
                 }}
               >
                 <div
                   className={`p-2 rounded-full ${step.completed ? 'bg-green-500/20' : ''}`}
                   style={{
-                    backgroundColor: step.completed ? 'rgba(34, 197, 94, 0.2)' : colors.bg.primary
+                    backgroundColor: step.completed ? 'rgba(34, 197, 94, 0.2)' : colors.bg.tertiary
                   }}
                 >
                   <step.icon

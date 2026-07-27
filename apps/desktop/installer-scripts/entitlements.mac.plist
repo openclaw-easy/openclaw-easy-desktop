@@ -35,10 +35,16 @@
     <key>com.apple.security.automation.apple-events</key>
     <true/>
 
-    <!-- Keychain access group: prevents repeated password prompts across app updates -->
+    <!-- Keychain access group: prevents repeated password prompts across app updates.
+         $(AppIdentifierPrefix) expands to the signing team's prefix, so a fork
+         signs under its own identity rather than a hardcoded one.
+         Renamed 2026-06-17 to match the appId in electron-builder.yml
+         (com.openclaw-easy.app). Existing installs migrate via
+         keychain-migration.ts on first launch under the new entitlement
+         (audit W1.9). -->
     <key>com.apple.security.keychain-access-groups</key>
     <array>
-        <string>$(TEAM_ID).com.openclaw-easy.app</string>
+        <string>$(AppIdentifierPrefix)com.openclaw-easy.app</string>
     </array>
 </dict>
 </plist>

@@ -10,17 +10,23 @@ import { OpenClawCommandExecutor } from './managers/openclaw-command-executor'
 import { OpenClawCommandExecutorWindows } from './managers/openclaw-command-executor-windows'
 import { ConfigManager } from './managers/config-manager'
 import { DEFAULT_GATEWAY_PORT } from '../shared/constants'
+import { defaultByokAgentModelId } from '../shared/providerModels'
 import { AgentBindingManager } from './managers/agent-binding-manager'
 import { SkillsManager } from './managers/skills-manager'
 import { HooksManager } from './managers/hooks-manager'
 import { PluginsManager } from './managers/plugins-manager'
 import { CronManager, AddCronJobParams, CronJob } from './managers/cron-manager'
 import { DoctorManager } from './managers/doctor-manager'
+import { parseOpenClawHelp, DiscoveredCommand } from './managers/commands-discovery'
 import { StatisticsManager } from './managers/statistics-manager'
+import { runOpenaiCodexLegacyMigration } from './managers/openai-codex-legacy-migration'
+import { runKeychainMigration } from './managers/keychain-migration'
+import { repairInstalledWeixinPlugin } from './managers/weixin-plugin-repair'
+import { listAgents } from './managers/agent-roster'
 
 // Unified executor interface — both implementations expose executeCommand()
 type CommandExecutor = {
-  executeCommand(args: string[], timeoutMs?: number): Promise<string | null>
+  executeCommand(args: string[], timeoutMs?: number, opts?: { stdinData?: string }): Promise<string | null>
   setSystemBinary?(binaryPath: string | null): void
 }
 
@@ -43,6 +49,17 @@ export class OpenClawManager {
   private doctorManager: DoctorManager
   private statisticsManager: StatisticsManager
 
+  /**
+   * Single-flight cache for {@link listDiscoveredCommands}. `openclaw --help`
+   * is stable across a process lifetime and the spawn cost (~200ms) would
+   * otherwise stack up on every Commands-tab switch.
+   */
+  private discoveredCommandsCache: {
+    success: boolean
+    commands?: DiscoveredCommand[]
+    error?: string
+  } | null = null
+
   constructor() {
     const configPath = this.getConfigPath()
 
@@ -60,7 +77,11 @@ export class OpenClawManager {
       ? new OpenClawCommandExecutorWindows(configPath)
       : new OpenClawCommandExecutor(configPath)
 
-    this.agentBindingManager = new AgentBindingManager()
+    // ConfigManager shells out to `openclaw models auth paste-*` to sync
+    // credentials into the per-agent SQLite auth store.
+    this.configManager.setCommandExecutor(this.executor)
+
+    this.agentBindingManager = new AgentBindingManager(this.configManager)
     this.skillsManager = new SkillsManager(this.executor as OpenClawCommandExecutor, this.configManager)
     this.hooksManager = new HooksManager(this.executor as OpenClawCommandExecutor)
     this.pluginsManager = new PluginsManager(this.executor as OpenClawCommandExecutor, this.configManager)
@@ -74,9 +95,12 @@ export class OpenClawManager {
   }
 
   setMainWindow(window: BrowserWindow | null) {
+    this.mainWindow = window
     this.processManager.setMainWindow(window)
     this.channelManager.setMainWindow(window)
   }
+
+  private mainWindow: BrowserWindow | null = null
 
   // Process Management
   async start(): Promise<boolean> {
@@ -98,25 +122,112 @@ export class OpenClawManager {
     this.logger.addLog('🔍 Detecting OpenClaw installation...')
     const detectedMode = await this.processManager.detectGatewayMode()
 
-    if (detectedMode.mode !== 'external') {
-      // Only modify config when we are going to start the gateway ourselves.
-      // For external mode, the system OpenClaw owns the config — don't touch it.
-      if (!await this.configManager.configExists()) {
-        this.logger.addLog('⚠️ No OpenClaw configuration found, creating default config...')
-        await this.configManager.createDefaultConfig(this.gatewayPort)
-      } else {
-        this.logger.addLog('✅ Using existing OpenClaw configuration')
-        await this.configManager.ensureToolsConfigured()
-        await this.configManager.cleanupInvalidToolNames()
-      }
-      await this.configManager.loadAndValidateConfig()
-    } else {
+    // (1) Bootstrap config on first launch when we own the spawn path.
+    // External mode means a system gateway is already running — it owns
+    // the config and we never create one on its behalf.
+    if (detectedMode.mode !== 'external' && !await this.configManager.configExists()) {
+      this.logger.addLog('⚠️ No OpenClaw configuration found, creating default config...')
+      await this.configManager.createDefaultConfig(this.gatewayPort)
+    } else if (detectedMode.mode === 'external') {
       this.logger.addLog('✅ Connecting to existing OpenClaw gateway')
+    } else {
+      this.logger.addLog('✅ Using existing OpenClaw configuration')
+    }
+
+    // (2) Repair gateway-rejecting fields for EVERY mode. This pass is
+    // pure cleanup — it only removes / migrates fields the strict zod
+    // schema would crash on (provider compat junk, dangling plugin
+    // entries, legacy top-level `agents.list[].agentRuntime`). Skipping
+    // it on bundled/system mode is what caused the "Launch Assistant"
+    // hangs after the 2026.6 upstream merge: the gateway died at startup
+    // and the supervisor reported nothing.
+    const repaired = await this.configManager.repairGatewayRejections()
+    if (repaired) {
+      this.logger.addLog('🔧 Repaired gateway-rejecting fields in shared config')
+    }
+
+    // (2b) Migrate legacy `openai-codex` auth profiles + catalog entries
+    // to `openai`. Upstream 2026.6 folded the standalone openai-codex
+    // provider into openai; the codex harness's `.supports()` whitelist
+    // now rejects anything with provider id `openai-codex`, which trips
+    // chat on every upgrade where pre-2026.6 state survives.
+    //
+    // Upstream `openclaw doctor --fix` ships the same repair via
+    // src/commands/doctor-auth.ts +
+    // src/commands/doctor/shared/legacy-config-migrations.runtime.providers.ts,
+    // but the desktop's DoctorManager strips `--fix` for safety so the
+    // migration never fires automatically. This is the narrowly-scoped
+    // mirror — see openai-codex-legacy-migration.ts for the full why.
+    //
+    // Idempotent: a clean tree is a silent no-op. Safe for every mode —
+    // it only touches per-agent files we own (~/.openclaw/agents/*).
+    try {
+      const openClawHome = path.join(os.homedir(), '.openclaw')
+      await runOpenaiCodexLegacyMigration(openClawHome, this.logger)
+    } catch (err) {
+      // Never fail the gateway boot for a migration error. The codex
+      // harness will surface a clear message on the next chat attempt
+      // and the user can fall back to `openclaw doctor --fix`.
+      this.logger.addLog(
+        `⚠️ openai-codex legacy migration skipped: ${(err as Error)?.message ?? err}`,
+      )
+    }
+
+    // (2c) macOS keychain-access-group rename cleanup (audit W1.9).
+    // 2026-06-17 the entitlement was renamed from com.moltbot-easy.app
+    // to com.openclaw-easy.app. Old safeStorage-encrypted auth tokens
+    // can't be decrypted under the new entitlement — this eagerly
+    // clears the stale field so the user gets a clean sign-in prompt
+    // instead of a recurring decrypt-error log on every config read.
+    //
+    // Idempotent on a clean tree. Same try/catch policy as above —
+    // never block gateway boot.
+    try {
+      runKeychainMigration(undefined, this.logger)
+    } catch (err) {
+      this.logger.addLog(
+        `⚠️ keychain migration skipped: ${(err as Error)?.message ?? err}`,
+      )
+    }
+
+    // (3) Tool config + validation, only when we own the spawn path.
+    if (detectedMode.mode !== 'external') {
+      await this.configManager.ensureToolsConfigured()
+      await this.configManager.cleanupInvalidToolNames()
+      await this.configManager.loadAndValidateConfig()
+      // Re-project the UI-selected provider so openclaw.json's catalog can't
+      // stay drifted from app-config across restarts (e.g. Google selected
+      // but openclaw.json still holding the BYOK-OpenAI catalog). Idempotent.
+      await this.configManager.reconcileActiveProvider()
     }
 
     this.logger.addLog('ℹ️ Doctor diagnostics available - click "Run Doctor" button if needed')
 
-    const result = await this.processManager.start()
+    // Compat-repair the installed Weixin plugin BEFORE the gateway spawns:
+    // a reinstall/update outside the desktop restores the broken 2.4.6
+    // import and the channel would crash-loop at startup (all gateway
+    // modes load the plugin, so this runs unconditionally). Idempotent
+    // no-op once Tencent ships a 2026.7.x-compatible version.
+    try {
+      const { changedFiles } = repairInstalledWeixinPlugin(path.dirname(this.getConfigPath()))
+      if (changedFiles.length > 0) {
+        this.logger.addLog(`🔧 Repaired Weixin plugin SDK imports (${changedFiles.length} file(s)) for OpenClaw 2026.7.x`)
+      }
+    } catch (err) {
+      this.logger.addLog(`⚠️ Weixin plugin compat repair skipped: ${(err as Error)?.message ?? err}`)
+    }
+
+    // Make sure one-shot startup repairs (e.g. `agentRuntime.id` backfill)
+    // have committed before we spawn the gateway. The gateway watches the
+    // config file and would otherwise boot from stale agent metadata,
+    // re-introducing the codex/GPT-5 persona-latch on the first message.
+    await this.channelManager.ready()
+
+    // Pass the already-detected mode down so processManager.start()
+    // doesn't repeat the TCP probe + `which openclaw` work. Previously
+    // detection ran 3× per launch (here, inside processManager.start,
+    // and again for external-mode binary refresh below).
+    const result = await this.processManager.start(detectedMode)
 
     if (result) {
       this.gatewayPort = this.processManager.getActivePort() || DEFAULT_GATEWAY_PORT
@@ -198,16 +309,28 @@ export class OpenClawManager {
 
   async restart(): Promise<boolean> {
     this.logger.addLog('🔄 Restarting OpenClaw gateway...')
+    this.emitRestartStatus('restarting', 'gateway restart')
 
     const result = await this.processManager.restart()
 
     if (result) {
       this.logger.addLog('✅ OpenClaw gateway restarted successfully')
+      this.emitRestartStatus('ready', 'gateway restart')
     } else {
       this.logger.addLog('⚠️ Failed to restart OpenClaw gateway')
+      this.emitRestartStatus('failed', 'gateway restart')
     }
 
     return result
+  }
+
+  private emitRestartStatus(
+    status: 'queued' | 'restarting' | 'ready' | 'failed',
+    reason: string,
+  ): void {
+    if (this.mainWindow && !this.mainWindow.isDestroyed()) {
+      this.mainWindow.webContents.send('gateway:restart-status', { status, reason })
+    }
   }
 
   getStatus(): ProcessStatus {
@@ -223,12 +346,50 @@ export class OpenClawManager {
     return status
   }
 
+  /** Subscribe to underlying process-manager status changes (e.g. tray menu refresh). */
+  onStatusChange(fn: (status: ProcessStatus, previous: ProcessStatus) => void): () => void {
+    return this.processManager.onStatusChange(fn)
+  }
+
   isRunning(): boolean {
     return this.processManager.isRunning()
   }
 
+  /**
+   * True when a gateway is listening, including one this app did not start.
+   * Use for "must restart to apply" decisions — see
+   * ProcessManager.isGatewayReachable.
+   */
+  async isGatewayReachable(): Promise<boolean> {
+    return this.processManager.isGatewayReachable()
+  }
+
   getActivePort(): number {
     return this.gatewayPort
+  }
+
+  getActivePid(): number | null {
+    return this.processManager.getActivePid()
+  }
+
+  /** Milliseconds since the current gateway child was spawned (0 in external mode). */
+  getUptime(): number {
+    return this.processManager.getUptime()
+  }
+
+  /**
+   * Re-resolve `agentRuntime.id` for every agent whose harness can be
+   * inferred from its current model. Exposed publicly so the
+   * `config:save` IPC handler can fire it after a provider/model
+   * switch — without that call agents inheriting from the new
+   * `defaults.model.primary` keep their old harness ids (codex on a
+   * Claude model, pi on a GPT model) until the next desktop launch.
+   *
+   * Delegates to ChannelManager which owns the agent-config write
+   * path; safe to call multiple times (idempotent).
+   */
+  async repairAgentHarnesses(): Promise<void> {
+    await this.channelManager.repairAgentHarnesses()
   }
 
   getGatewayModeInfo(): GatewayModeInfo {
@@ -306,6 +467,23 @@ export class OpenClawManager {
 
   async getWhatsAppQRFromLogin(): Promise<{success: boolean, qrData?: string, logs: string[]}> {
     return await this.channelManager.getWhatsAppQRFromLogin()
+  }
+
+  // Weixin (personal WeChat) — external official plugin, installed on demand.
+  async getWeixinQRFromLogin(): Promise<{ success: boolean; qrData?: string; logs: string[] }> {
+    return await this.channelManager.getWeixinQRFromLogin()
+  }
+
+  async ensureWeixinPlugin(): Promise<{ success: boolean; alreadyInstalled: boolean; logs: string[] }> {
+    return await this.channelManager.ensureWeixinPlugin()
+  }
+
+  async checkWeixinStatus(): Promise<{ connected: boolean }> {
+    return await this.channelManager.checkWeixinStatus()
+  }
+
+  async disconnectWeixin(): Promise<boolean> {
+    return await this.channelManager.disconnectWeixin()
   }
 
   async getWhatsAppQR(): Promise<string> {
@@ -387,10 +565,14 @@ export class OpenClawManager {
       }
 
       const config = await this.configManager.loadConfig();
-      const agents = config.agents?.list || [];
+      const agents = listAgents(config);
       console.log('[OpenClawManager] Found agents in config:', agents.length);
 
-      const defaultModel = config.agents?.defaults?.model?.primary || 'anthropic/claude-sonnet-4-5';
+      // Last-resort fallback when openclaw.json has no default model
+      // configured yet. Sourced from the catalog so it tracks renames.
+      // Was `defaultByokAgentModelId('anthropic')` before Anthropic was
+      // removed as a BYOK provider on 2026-06-15.
+      const defaultModel = config.agents?.defaults?.model?.primary || defaultByokAgentModelId('openai');
       const fallbackModels = config.agents?.defaults?.model?.fallbacks || [];
 
       return agents.map((agent: any) => ({
@@ -429,87 +611,66 @@ export class OpenClawManager {
     return await this.configManager.validateApiKey(provider, apiKey)
   }
 
+  /**
+   * Configure a BYOK provider by writing its full provider+model block to
+   * openclaw.json. Single-source-of-truth implementation: delegates to
+   * ConfigManager.applyProviderToOpenClaw which uses BYOK_PROVIDER_MODELS
+   * (kept up-to-date in src/shared/providerModels.ts) so the model list
+   * never drifts. The legacy Google special-case in this method previously
+   * pinned its own gemini-2.5-flash list and silently shadowed the
+   * up-to-date catalog whenever this code path ran.
+   */
   async setApiKey(provider: string, apiKey: string): Promise<{ success: boolean; error?: string }> {
     try {
       const isValid = await this.validateApiKey(provider, apiKey)
       if (!isValid) {
-        return {
-          success: false,
-          error: `Invalid ${provider} API key format`
-        }
+        return { success: false, error: `Invalid ${provider} API key format` }
       }
 
-      // Google configuration
-      if (provider === 'google') {
-        // Write the entire provider config directly to avoid validation issues
-        try {
-          const currentConfig = await this.configManager.loadConfig()
+      // Build a minimal AppProviderConfig and let applyProviderToOpenClaw do
+      // the actual work — it knows the full model catalog, normalizes the
+      // primary model, runs the orphan-repair, and writes atomically.
+      // Anthropic removed 2026-06-15 — direct sk-ant-* keys aren't
+      // authorized for OpenClaw clients. Claude is still reachable via
+      // the OpenRouter aggregator.
+      const supportedByokProviders = ['google', 'openai', 'venice', 'openrouter'] as const
+      type ByokProvider = typeof supportedByokProviders[number]
+      if (!supportedByokProviders.includes(provider as ByokProvider)) {
+        return { success: false, error: `Unsupported provider: ${provider}` }
+      }
+      const byokProvider = provider as ByokProvider
 
-          // Ensure models structure exists
-          currentConfig.models = currentConfig.models || {}
-          currentConfig.models.providers = currentConfig.models.providers || {}
-
-          // Set the Google provider config using stable model aliases
-          // These aliases (gemini-flash-latest, gemini-pro-latest) automatically point to
-          // the newest versions, making the app forward-compatible with new Google releases
-          currentConfig.models.providers.google = {
-            baseUrl: 'https://generativelanguage.googleapis.com/v1beta',
-            api: 'google-generative-ai',
-            apiKey: apiKey,
-            headers: {
-              'X-goog-api-key': apiKey
-            },
-            models: [
-              { id: 'gemini-2.5-flash',      name: 'Gemini 2.5 Flash',      reasoning: false, input: ['text', 'image'], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 1000000, maxTokens: 8192  },
-              { id: 'gemini-2.5-flash-lite', name: 'Gemini 2.5 Flash Lite', reasoning: false, input: ['text', 'image'], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 1000000, maxTokens: 8192  },
-              { id: 'gemini-2.5-pro',        name: 'Gemini 2.5 Pro',        reasoning: true,  input: ['text', 'image'], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 1000000, maxTokens: 65536 },
-              { id: 'gemini-3-flash-preview', name: 'Gemini 3 Flash (Preview)', reasoning: false, input: ['text', 'image'], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 1000000, maxTokens: 8192  },
-            ]
-          }
-
-          // Also set the default model to Google Gemini if not already set
-          // Use the stable 'latest' alias for forward compatibility
-          currentConfig.agents = currentConfig.agents || {}
-          currentConfig.agents.defaults = currentConfig.agents.defaults || {}
-          currentConfig.agents.defaults.model = currentConfig.agents.defaults.model || {}
-
-          // IMPORTANT: Preserve agents.list if it exists, or create default "main" agent
-          if (!currentConfig.agents.list || currentConfig.agents.list.length === 0) {
-            currentConfig.agents.list = [{ id: 'main' }]
-          }
-
-          if (!currentConfig.agents.defaults.model.primary?.startsWith('google/')) {
-            currentConfig.agents.defaults.model.primary = 'google/gemini-2.5-flash'
-          }
-
-          await this.configManager.writeConfig(currentConfig)
-
-          this.logger.addLog(`✅ ${provider} API key configured successfully`)
-          return { success: true }
-        } catch (error: any) {
-          console.error('[OpenClawManager] Failed to configure Google:', error)
-          this.logger.addLog(`❌ Failed to configure ${provider}: ${error.message}`)
-          return {
-            success: false,
-            error: error.message
-          }
-        }
+      const existingAppConfig = (await this.configManager.getAppConfig()) ?? {}
+      const merged = {
+        aiProvider: 'byok' as const,
+        ...existingAppConfig,
+        byok: {
+          provider: byokProvider,
+          // Preserve previously selected model if it's for this same provider;
+          // otherwise let applyProviderToOpenClaw pick the default.
+          model: existingAppConfig?.byok?.provider === byokProvider
+            ? (existingAppConfig.byok?.model ?? '')
+            : '',
+          apiKeys: {
+            ...(existingAppConfig?.byok?.apiKeys ?? {}),
+            [byokProvider]: apiKey,
+          },
+        },
       }
 
-      // For other providers (openai, anthropic), use the old method
-      const command = ['config', 'set', `${provider}.api_key`, apiKey]
-      await this.executor.executeCommand(command)
-
+      await this.configManager.applyProviderToOpenClaw(merged)
+      // Switching the default model invalidates the per-agent
+      // `agentRuntime.id` cache: agents that inherit from defaults need
+      // their harness re-resolved (e.g. GPT-5 → Claude must flip codex
+      // → pi, or the codex harness's GPT-5 persona-latch will mis-
+      // identify the new model on the first message).
+      await this.channelManager.repairAgentHarnesses()
       this.logger.addLog(`✅ ${provider} API key configured successfully`)
       return { success: true }
-
     } catch (error: any) {
       console.error('[OpenClawManager] Set API key error:', error)
       this.logger.addLog(`❌ Failed to set ${provider} API key: ${error.message}`)
-      return {
-        success: false,
-        error: error.message
-      }
+      return { success: false, error: error.message }
     }
   }
 
@@ -555,111 +716,24 @@ export class OpenClawManager {
     return await this.configManager.configExists()
   }
 
-  async updateOpenClawConfig(config: any): Promise<boolean> {
-    try {
-      const currentConfig = await this.configManager.loadConfig()
+  // Removed: the @deprecated `updateOpenClawConfig` method (and its
+  // `config:update-openclaw` IPC handler + preload binding). It had no
+  // active callers and carried a hardcoded models list (gpt-4.1, gpt-4o,
+  // claude-opus-4-6, etc.) that had drifted far behind providerModels.ts.
+  // The canonical write path is `config:save` (main/index.ts) →
+  // `configManager.applyProviderToOpenClaw`, which always uses the
+  // catalog in shared/providerModels.ts as the single source of truth.
 
-      // Ensure models structure exists
-      currentConfig.models = currentConfig.models || {}
-      currentConfig.models.providers = currentConfig.models.providers || {}
-
-      // Ensure auth structure exists
-      currentConfig.auth = currentConfig.auth || {}
-      currentConfig.auth.profiles = currentConfig.auth.profiles || {}
-
-      // Ensure agents structure exists
-      currentConfig.agents = currentConfig.agents || {}
-      currentConfig.agents.defaults = currentConfig.agents.defaults || {}
-      currentConfig.agents.defaults.model = currentConfig.agents.defaults.model || {}
-
-      if (config.provider === 'byok' && config.selectedProvider) {
-        if (config.selectedProvider === 'openai' && config.apiKeys?.openai) {
-          currentConfig.models.providers.openai = {
-            baseUrl: 'https://api.openai.com/v1',
-            apiKey: config.apiKeys.openai,
-            api: 'openai-responses',
-            models: [
-              { id: 'gpt-4.1',      name: 'GPT-4.1',      reasoning: false, input: ['text', 'image'], cost: { input: 0.002,   output: 0.008,  cacheRead: 0, cacheWrite: 0 }, contextWindow: 1000000, maxTokens: 32768 },
-              { id: 'gpt-4.1-mini', name: 'GPT-4.1 Mini', reasoning: false, input: ['text', 'image'], cost: { input: 0.0004,  output: 0.0016, cacheRead: 0, cacheWrite: 0 }, contextWindow: 1000000, maxTokens: 32768 },
-              { id: 'gpt-4.1-nano', name: 'GPT-4.1 Nano', reasoning: false, input: ['text', 'image'], cost: { input: 0.0001,  output: 0.0004, cacheRead: 0, cacheWrite: 0 }, contextWindow: 1000000, maxTokens: 32768 },
-              { id: 'o3',           name: 'o3',           reasoning: true,  input: ['text', 'image'], cost: { input: 0.01,    output: 0.04,   cacheRead: 0, cacheWrite: 0 }, contextWindow: 200000,  maxTokens: 100000 },
-              { id: 'o4-mini',      name: 'o4-mini',      reasoning: true,  input: ['text', 'image'], cost: { input: 0.0011,  output: 0.0044, cacheRead: 0, cacheWrite: 0 }, contextWindow: 200000,  maxTokens: 100000 },
-              { id: 'gpt-4o',       name: 'GPT-4o',       reasoning: false, input: ['text', 'image'], cost: { input: 0.0025,  output: 0.01,   cacheRead: 0, cacheWrite: 0 }, contextWindow: 128000,  maxTokens: 16384  },
-              { id: 'gpt-4o-mini',  name: 'GPT-4o Mini',  reasoning: false, input: ['text', 'image'], cost: { input: 0.00015, output: 0.0006, cacheRead: 0, cacheWrite: 0 }, contextWindow: 128000,  maxTokens: 16384  },
-            ]
-          }
-          currentConfig.agents.defaults.model.primary = 'openai/gpt-4.1'
-        } else if (config.selectedProvider === 'anthropic' && config.apiKeys?.anthropic) {
-          currentConfig.models.providers.anthropic = {
-            baseUrl: 'https://api.anthropic.com/v1',
-            apiKey: config.apiKeys.anthropic,
-            api: 'anthropic-messages',
-            models: [
-              { id: 'claude-opus-4-6',   name: 'Claude Opus 4.6',   reasoning: true, input: ['text', 'image'], cost: { input: 0.005, output: 0.025, cacheRead: 0.0005, cacheWrite: 0.00125 }, contextWindow: 200000, maxTokens: 128000 },
-              { id: 'claude-sonnet-4-6', name: 'Claude Sonnet 4.6', reasoning: true, input: ['text', 'image'], cost: { input: 0.003, output: 0.015, cacheRead: 0.0003, cacheWrite: 0.00075 }, contextWindow: 200000, maxTokens: 64000  },
-              { id: 'claude-haiku-4-5',  name: 'Claude Haiku 4.5',  reasoning: true, input: ['text', 'image'], cost: { input: 0.001, output: 0.005, cacheRead: 0.0001, cacheWrite: 0.00025 }, contextWindow: 200000, maxTokens: 64000  },
-            ]
-          }
-          currentConfig.agents.defaults.model.primary = 'anthropic/claude-sonnet-4-6'
-        } else if (config.selectedProvider === 'google' && config.apiKeys?.google) {
-          currentConfig.models.providers.google = {
-            baseUrl: 'https://generativelanguage.googleapis.com/v1beta',
-            api: 'google-generative-ai',
-            apiKey: config.apiKeys.google,
-            headers: { 'X-goog-api-key': config.apiKeys.google },
-            models: [
-              {
-                id: 'gemini-2.5-flash',
-                name: 'Gemini 2.5 Flash',
-                reasoning: false,
-                input: ['text', 'image'],
-                cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-                contextWindow: 1000000,
-                maxTokens: 8192
-              }
-            ]
-          }
-          currentConfig.agents.defaults.model.primary = 'google/gemini-2.5-flash'
-        }
-      } else if (config.provider === 'local') {
-        currentConfig.models.providers.ollama = {
-          baseUrl: 'http://localhost:11434/v1',
-          apiKey: 'ollama',
-          api: 'openai-responses',
-          models: [
-            {
-              id: 'qwen3:latest',
-              name: 'Qwen 3',
-              reasoning: false,
-              input: ['text'],
-              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-              contextWindow: 32768,
-              maxTokens: 2048
-            }
-          ]
-        }
-        if (!currentConfig.agents.defaults.model.primary?.startsWith('ollama/')) {
-          currentConfig.agents.defaults.model.primary = 'ollama/qwen3:latest'
-        }
-      }
-
-      await this.configManager.writeConfig(currentConfig)
-
-      if (this.isRunning()) {
-        await this.restart()
-      }
-
-      return true
-    } catch (error) {
-      console.error('[OpenClawManager] Failed to update config:', error)
-      return false
-    }
-  }
   // Legacy methods for compatibility
   async getOpenClawInstallations(): Promise<any[]> {
+    // Use app.getVersion() so this stays in sync with the actual shipped
+    // version (read from package.json at build time). Hardcoding here
+    // meant the legacy diagnostic endpoint reported the wrong version
+    // forever after every release.
+    const { app } = await import('electron')
     return [{
       path: 'system-global',
-      version: '2026.3.15',
+      version: app.getVersion(),
       installMethod: 'npm-global',
       isProductionVersion: true
     }]
@@ -697,13 +771,15 @@ export class OpenClawManager {
     return await this.skillsManager.listSkills()
   }
 
-  async checkSkills(): Promise<{ success: boolean; status?: any; error?: string }> {
-    return await this.skillsManager.checkSkills()
+  /** Resolve a skill name to a folder path, or null if not found anywhere. */
+  async resolveSkillFolderPath(skillName: string): Promise<string | null> {
+    return await this.skillsManager.resolveSkillFolderPath(skillName)
   }
 
-  async getSkillInfo(skillName: string): Promise<{ success: boolean; info?: any; error?: string }> {
-    return await this.skillsManager.getSkillInfo(skillName)
-  }
+  // `checkSkills` and `getSkillInfo` wrappers (and their `skills:check` /
+  // `skills:info` IPC routes + preload bindings) were removed: nothing in
+  // the renderer called them. `SkillsManager.getSkillInfo` is still used
+  // internally by `installSkillRequirements`.
 
   async installSkillRequirements(skillName: string): Promise<{ success: boolean; message?: string; error?: string }> {
     return await this.skillsManager.installSkillRequirements(skillName)
@@ -735,6 +811,18 @@ export class OpenClawManager {
 
   async listWorkspaceSkills() {
     return await this.skillsManager.listWorkspaceSkills()
+  }
+
+  async checkSkills(agentId?: string) {
+    return await this.skillsManager.checkSkills(agentId)
+  }
+
+  async updateAllSkills() {
+    const result = await this.skillsManager.updateAllSkills()
+    if (result.success) {
+      await this.skillsManager.clearSkillsSnapshots()
+    }
+    return result
   }
 
   // Hooks Management (delegated to HooksManager)
@@ -826,6 +914,40 @@ export class OpenClawManager {
     error?: string;
   }> {
     return await this.doctorManager.runDoctor()
+  }
+
+  /**
+   * Discover the top-level commands the system openclaw CLI exposes by
+   * running `openclaw --help` and parsing its Commands: block.
+   *
+   * Powers the Commands page's "More from CLI" section — surfaces commands
+   * shipped by upstream after our static catalog was authored (acp,
+   * commitments, crestodian, message, onboard, …) so users don't have to
+   * wait for a desktop release just to access them. Pure-parser at the
+   * helper layer; this method owns the spawn + caching.
+   *
+   * Single-flight cached for the process lifetime: `openclaw --help` is
+   * stable across a session and the spawn cost is ~200ms, which would
+   * stack up on every Commands tab switch.
+   */
+  async listDiscoveredCommands(): Promise<{
+    success: boolean;
+    commands?: DiscoveredCommand[];
+    error?: string;
+  }> {
+    if (this.discoveredCommandsCache) return this.discoveredCommandsCache
+    try {
+      const output = await this.executor.executeCommand(['--help'], 10000)
+      if (!output) {
+        return { success: false, error: 'openclaw --help returned no output' }
+      }
+      const commands = parseOpenClawHelp(output)
+      const result = { success: true, commands }
+      this.discoveredCommandsCache = result
+      return result
+    } catch (error: any) {
+      return { success: false, error: error?.message || 'Unknown error' }
+    }
   }
 
   // Statistics Management (delegated to StatisticsManager)

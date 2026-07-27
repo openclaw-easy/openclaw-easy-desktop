@@ -2,19 +2,28 @@ import * as React from "react"
 
 import { cn } from "../../lib/utils"
 
-const Card = React.forwardRef<
-  HTMLDivElement,
-  React.HTMLAttributes<HTMLDivElement>
->(({ className, ...props }, ref) => (
-  <div
-    ref={ref}
-    className={cn(
-      "rounded-lg border bg-card text-card-foreground shadow-sm",
-      className
-    )}
-    {...props}
-  />
-))
+// `interactive` opts the card into hover-lift + coral-glow halo. Default
+// is the calm shadcn baseline so passive info-cards don't twitch under
+// the mouse — pass `interactive` only on cards that are themselves
+// clickable (e.g., a top-up package tile, an agent selector card).
+interface CardProps extends React.HTMLAttributes<HTMLDivElement> {
+  interactive?: boolean
+}
+
+const Card = React.forwardRef<HTMLDivElement, CardProps>(
+  ({ className, interactive = false, ...props }, ref) => (
+    <div
+      ref={ref}
+      className={cn(
+        "rounded-lg border bg-card text-card-foreground shadow-sm",
+        "transition-[box-shadow,transform,border-color] duration-200",
+        interactive && "hover-glass cursor-pointer hover:border-ring/40",
+        className
+      )}
+      {...props}
+    />
+  )
+)
 Card.displayName = "Card"
 
 const CardHeader = React.forwardRef<

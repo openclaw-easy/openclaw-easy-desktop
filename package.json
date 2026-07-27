@@ -1,20 +1,14 @@
 {
   "name": "moltbot-easy",
-  "version": "2026.3.15",
+  "version": "2026.7.27",
   "private": true,
-  "description": "User-friendly installer and managed AI backend for OpenClaw",
+  "description": "User-friendly desktop app for OpenClaw — bring your own AI provider key",
   "license": "MIT",
   "author": "ToniSan",
-  "workspaces": [
-    "apps/desktop",
-    "packages/shared"
-  ],
   "type": "module",
   "scripts": {
-    "backend:deploy": "pnpm --filter backend deploy",
-    "backend:dev": "pnpm --filter backend dev",
     "build": "pnpm --filter desktop build",
-    "build:all": "pnpm --filter shared build && pnpm --filter backend build && pnpm --filter desktop build",
+    "build:all": "pnpm --filter shared build && pnpm --filter desktop build",
     "dev": "pnpm --filter desktop dev",
     "format": "pnpm -r format",
     "lint": "pnpm -r lint",
@@ -27,12 +21,7 @@
     "vitest": "^1.2.0"
   },
   "engines": {
-    "node": ">=22.0.0"
+    "node": ">=22.22.3 <23 || >=24.15.0 <25 || >=25.9.0"
   },
-  "packageManager": "pnpm@9.15.4",
-  "pnpm": {
-    "overrides": {
-      "isbinaryfile": "^5.0.7"
-    }
-  }
+  "packageManager": "pnpm@11.15.1+sha512.81350b07e53c9538a02f1f2303b4290fa2d7be04e56e2a970c4cc4b417dc761de196edabd49d55c7dc9580db81007c44143e4e3d7e462b3000d23c255122d065"
 }

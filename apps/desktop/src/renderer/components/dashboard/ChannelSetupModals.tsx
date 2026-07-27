@@ -1,33 +1,20 @@
-import React from 'react';
+import React, { useState } from 'react';
 import { X, CheckCircle, Clock } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { Button } from '../ui/button';
 import { useToast } from '../../contexts/ToastContext';
+import { Modal } from '../ui/modal';
+import { QrLoginPanel } from './QrLoginPanel';
+import {
+  isHandledSetupChannel,
+  isQrLoginChannel,
+  type QrLoginChannel,
+} from './channel-setup-channels';
+import type { ColorTheme } from './types';
 
-interface ColorScheme {
-  bg: {
-    primary: string;
-    secondary: string;
-    tertiary: string;
-    hover: string;
-    active: string;
-  };
-  text: {
-    normal: string;
-    muted: string;
-    header: string;
-    link: string;
-    danger: string;
-  };
-  accent: {
-    brand: string;
-    green: string;
-    yellow: string;
-    red: string;
-    purple: string;
-    indigo: string;
-  };
-}
+// Local alias for back-compat with the prop name. Was a duplicated
+// interface declaration until the 2026-06-15 ColorTheme dedup pass.
+type ColorScheme = ColorTheme;
 
 interface ChannelSetupModalsProps {
   colors: ColorScheme;
@@ -62,6 +49,7 @@ interface ChannelSetupModalsProps {
   connectFeishuBot: (appId: string, appSecret: string, botName: string) => Promise<boolean>;
   connectLineBot: (channelAccessToken: string, channelSecret: string) => Promise<boolean>;
   disconnectWhatsApp: () => Promise<boolean>;
+  disconnectWeixin: () => Promise<boolean>;
   cancelSetup: () => void;
 }
 
@@ -98,23 +86,32 @@ export function ChannelSetupModals({
   connectFeishuBot,
   connectLineBot,
   disconnectWhatsApp,
+  disconnectWeixin,
   cancelSetup,
 }: ChannelSetupModalsProps) {
   const { t } = useTranslation();
   const { addToast } = useToast();
-
-  if (!activeSetup) {
-    return null;
-  }
+  const titleId = 'channel-setup-title';
+  // Gate disconnect behind a confirm so one click can't tear down a live
+  // channel. Mirrors SessionsSection's delete dialog. Holds the channel being
+  // disconnected rather than a boolean so the dialog names — and disconnects —
+  // the right one; a boolean silently disconnected WhatsApp for every channel.
+  const [disconnectTarget, setDisconnectTarget] = useState<QrLoginChannel | null>(null);
+  const qrChannelLabel = (channel: QrLoginChannel) =>
+    channel === 'Weixin' ? t('channels.weixin') : t('channels.whatsapp');
 
   return (
-    <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
-      <div
-        className="bg-gray-800 rounded-lg p-6 max-w-md w-full mx-4"
-        style={{ backgroundColor: colors.bg.secondary }}
-      >
+    <>
+    {/* Escape / backdrop click both call cancelSetup so partial state is
+        rolled back the same way the X button would. */}
+    <Modal
+      open={!!activeSetup}
+      onClose={cancelSetup}
+      labelledBy={titleId}
+    >
         <div className="flex items-center justify-between mb-4">
           <h3
+            id={titleId}
             className="text-xl font-semibold"
             style={{ color: colors.text.header }}
           >
@@ -129,197 +126,24 @@ export function ChannelSetupModals({
           </button>
         </div>
 
-        {activeSetup === 'WhatsApp' && (
-          <div className="space-y-4">
-            <p style={{ color: colors.text.muted }}>
-              {t('channels.scanQR')}
-            </p>
-            {qrCode ? (
-              <div className="flex justify-center">
-                {qrCode === 'SUCCESS' ? (
-                  <div
-                    className="text-center p-8 border rounded bg-green-500/10 border-green-500"
-                    style={{ color: colors.accent.green }}
-                  >
-                    <CheckCircle className="h-12 w-12 mx-auto mb-4" />
-                    <p className="text-lg font-semibold">
-                      {t('channels.whatsappConnected')}
-                    </p>
-                    <p className="text-sm mt-2">{t('channels.closingMoment')}</p>
-                  </div>
-                ) : qrCode === 'CONNECTION_ERROR' ? (
-                  <div
-                    className="text-center p-8 border rounded bg-red-500/10 border-red-500"
-                    style={{ color: colors.accent.red }}
-                  >
-                    <X className="h-12 w-12 mx-auto mb-4" />
-                    <p className="text-lg font-semibold">
-                      {t('channels.connectionFailed')}
-                    </p>
-                    <p className="text-sm mt-2">{t('channels.pleaseTryAgain')}</p>
-                  </div>
-                ) : qrCode === 'QR_TIMEOUT' ? (
-                  <div
-                    className="text-center p-8 border rounded bg-yellow-500/10 border-yellow-500"
-                    style={{ color: colors.accent.yellow }}
-                  >
-                    <Clock className="h-12 w-12 mx-auto mb-4" />
-                    <p className="text-lg font-semibold">{t('channels.timeout')}</p>
-                    <p className="text-sm mt-2">
-                      {t('channels.qrTimeout')}
-                    </p>
-                  </div>
-                ) : qrCode.includes('█') || qrCode.includes('▄') ? (
-                  <pre
-                    className="font-mono text-xs leading-none bg-white p-4 rounded border"
-                    style={{
-                      color: '#000',
-                      fontSize: '8px',
-                      lineHeight: '8px',
-                      letterSpacing: '0',
-                    }}
-                  >
-                    {qrCode}
-                  </pre>
-                ) : qrCode === 'ALREADY_CONNECTED' ? (
-                  <div
-                    className="text-center p-8 border rounded bg-blue-500/10 border-blue-500"
-                    style={{ color: colors.text.link }}
-                  >
-                    <CheckCircle className="h-12 w-12 mx-auto mb-4" />
-                    <p className="text-lg font-semibold">
-                      {t('channels.alreadyConnected')}
-                    </p>
-                    <p className="text-sm mt-2">
-                      {t('channels.alreadyConnectedDesc')}
-                    </p>
-                    <div className="flex gap-3 justify-center mt-6">
-                      <Button
-                        onClick={async () => {
-                          const success = await disconnectWhatsApp();
-                          if (success) {
-                            cancelSetup();
-                          }
-                        }}
-                        className="px-4 py-2 bg-red-600 hover:bg-red-700"
-                      >
-                        🔌 Disconnect
-                      </Button>
-                      <Button
-                        onClick={cancelSetup}
-                        className="px-4 py-2 bg-gray-700 hover:bg-gray-600"
-                      >
-                        {t('common.close')}
-                      </Button>
-                    </div>
-                  </div>
-                ) : qrCode === 'QR_GENERATION_FAILED' ? (
-                  <div
-                    className="text-center p-8 border rounded"
-                    style={{ color: colors.text.muted }}
-                  >
-                    <p>{t('channels.qrGenerationFailed')}</p>
-                    <p className="text-sm mt-2">
-                      {t('channels.checkConfig')}
-                    </p>
-                  </div>
-                ) : qrCode.startsWith('QR_ERROR') ? (
-                  <div
-                    className="text-center p-8 border rounded"
-                    style={{ color: colors.text.danger }}
-                  >
-                    <p>❌ QR Error</p>
-                    <p className="text-sm mt-2">
-                      {qrCode.replace('QR_ERROR: ', '')}
-                    </p>
-                  </div>
-                ) : qrCode.startsWith('http') ? (
-                  <img
-                    src={qrCode}
-                    alt="WhatsApp QR Code"
-                    className="rounded"
-                  />
-                ) : (
-                  <div
-                    className="text-center p-8 border rounded"
-                    style={{ color: colors.text.muted }}
-                  >
-                    <p>📱 QR Code Generated</p>
-                    <p className="text-sm mt-2">
-                      Check console for details
-                    </p>
-                  </div>
-                )}
-              </div>
-            ) : (
-              <div className="flex flex-col items-center justify-center py-12 space-y-4">
-                {isCheckingStatus ? (
-                  <>
-                    <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-600"></div>
-                    <p
-                      className="text-sm"
-                      style={{ color: colors.text.muted }}
-                    >
-                      {t('channels.checkingStatus')}
-                    </p>
-                  </>
-                ) : qrLoadingTimedOut ? (
-                  <>
-                    <Clock
-                      className="h-12 w-12"
-                      style={{ color: colors.accent.yellow }}
-                    />
-                    <p
-                      className="text-sm font-semibold"
-                      style={{ color: colors.accent.yellow }}
-                    >
-                      {t('channels.qrTakingLong')}
-                    </p>
-                    <p
-                      className="text-xs"
-                      style={{ color: colors.text.muted }}
-                    >
-                      {t('channels.problemWithOpenClaw')}
-                    </p>
-                    <Button
-                      onClick={cancelSetup}
-                      className="mt-4 px-4 py-2 bg-gray-700 hover:bg-gray-600"
-                    >
-                      {t('channels.cancelSetup')}
-                    </Button>
-                  </>
-                ) : (
-                  <>
-                    <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-indigo-600"></div>
-                    <p
-                      className="text-sm"
-                      style={{ color: colors.text.muted }}
-                    >
-                      {t('channels.generatingQR')}
-                    </p>
-                    <p
-                      className="text-xs"
-                      style={{ color: colors.text.muted, opacity: 0.7 }}
-                    >
-                      {t('channels.mayTake30Seconds')}
-                    </p>
-                  </>
-                )}
-              </div>
-            )}
-            {qrCode &&
-              !qrCode.includes('ERROR') &&
-              !qrCode.includes('FAILED') &&
-              qrCode !== 'SUCCESS' &&
-              qrCode !== 'QR_TIMEOUT' && (
-                <p
-                  className="text-sm text-center"
-                  style={{ color: colors.text.muted }}
-                >
-                  {t('channels.waitingForConnection')}
-                </p>
-              )}
+        {/* A label with no body below would render an empty modal, which is
+            indistinguishable from a failed setup. Say so instead. */}
+        {activeSetup && !isHandledSetupChannel(activeSetup) && (
+          <div className="text-center p-8" style={{ color: colors.text.danger }}>
+            <p>{t('channels.connectFailed', { channel: activeSetup })}</p>
           </div>
+        )}
+
+        {isQrLoginChannel(activeSetup) && (
+          <QrLoginPanel
+            colors={colors}
+            channelLabel={qrChannelLabel(activeSetup)}
+            qrCode={qrCode}
+            qrLoadingTimedOut={qrLoadingTimedOut}
+            isCheckingStatus={isCheckingStatus}
+            onRequestDisconnect={() => setDisconnectTarget(activeSetup)}
+            cancelSetup={cancelSetup}
+          />
         )}
 
         {activeSetup === 'Telegram' && (
@@ -368,7 +192,7 @@ export function ChannelSetupModals({
                   backgroundColor: telegramToken
                     ? colors.accent.brand
                     : colors.bg.tertiary,
-                  color: 'white',
+                  color: colors.button.primaryFg,
                   opacity: telegramToken ? 1 : 0.6,
                 }}
               >
@@ -443,7 +267,7 @@ export function ChannelSetupModals({
                     discordToken && discordServerId
                       ? colors.accent.brand
                       : colors.bg.tertiary,
-                  color: 'white',
+                  color: colors.button.primaryFg,
                   opacity: discordToken && discordServerId ? 1 : 0.6,
                 }}
               >
@@ -518,7 +342,7 @@ export function ChannelSetupModals({
                     slackBotToken && slackAppToken
                       ? '#4A154B'
                       : colors.bg.tertiary,
-                  color: 'white',
+                  color: colors.button.primaryFg,
                   opacity: slackBotToken && slackAppToken ? 1 : 0.6,
                 }}
               >
@@ -605,7 +429,7 @@ export function ChannelSetupModals({
                     feishuAppId && feishuAppSecret
                       ? '#00B1B0'
                       : colors.bg.tertiary,
-                  color: 'white',
+                  color: colors.button.primaryFg,
                   opacity: feishuAppId && feishuAppSecret ? 1 : 0.6,
                 }}
               >
@@ -680,7 +504,7 @@ export function ChannelSetupModals({
                     lineChannelAccessToken && lineChannelSecret
                       ? '#06C755'
                       : colors.bg.tertiary,
-                  color: 'white',
+                  color: colors.button.primaryFg,
                   opacity: lineChannelAccessToken && lineChannelSecret ? 1 : 0.6,
                 }}
               >
@@ -692,7 +516,49 @@ export function ChannelSetupModals({
             </div>
           </div>
         )}
+    </Modal>
+
+    {/* Disconnect confirmation — stops the channel receiving messages, so
+        require an explicit confirm before tearing it down. */}
+    <Modal
+      open={disconnectTarget !== null}
+      onClose={() => setDisconnectTarget(null)}
+      shellClassName="shadow-2xl"
+    >
+      <h3 className="font-bold text-lg mb-2" style={{ color: colors.text.header }}>
+        {t('channels.disconnectConfirmTitle', 'Disconnect {{channel}}?', {
+          channel: disconnectTarget ? qrChannelLabel(disconnectTarget) : '',
+        })}
+      </h3>
+      <p className="text-sm mb-4" style={{ color: colors.text.muted }}>
+        {t('channels.disconnectConfirmBody', 'This will stop receiving messages on it.')}
+      </p>
+      <div className="flex space-x-3">
+        <button
+          onClick={() => setDisconnectTarget(null)}
+          className="flex-1 px-4 py-2 rounded-lg text-sm font-medium transition-colors"
+          style={{ backgroundColor: colors.bg.tertiary, color: colors.text.normal }}
+        >
+          {t('common.cancel')}
+        </button>
+        <button
+          onClick={async () => {
+            const success =
+              disconnectTarget === 'Weixin'
+                ? await disconnectWeixin()
+                : await disconnectWhatsApp();
+            setDisconnectTarget(null);
+            if (success) {
+              cancelSetup();
+            }
+          }}
+          className="flex-1 px-4 py-2 rounded-lg text-sm font-medium transition-colors"
+          style={{ backgroundColor: colors.accent.red, color: colors.button.primaryFg }}
+        >
+          {t('channels.disconnect')}
+        </button>
       </div>
-    </div>
+    </Modal>
+    </>
   );
 }

@@ -29,10 +29,15 @@ export function useToast(): ToastContextValue {
   return ctx
 }
 
-const TYPE_STYLES: Record<ToastType, { bg: string; border: string; text: string }> = {
-  success: { bg: '#1a2e1a', border: '#3ba55d', text: '#4ade80' },
-  error:   { bg: '#2e1a1a', border: '#ed4245', text: '#f87171' },
-  info:    { bg: '#1a1e2e', border: '#60a5fa', text: '#93bbfc' },
+// Accent color per type — only tints the icon + the left rail + the
+// action-button border. Message text uses the theme's foreground token
+// so it's always readable in both light and dark modes (previously,
+// `text: '#4ade80'` etc. were tuned for dark and disappeared on light
+// glass).
+const TYPE_STYLES: Record<ToastType, { rail: string; iconBg: string; icon: string }> = {
+  success: { rail: '#22c55e', iconBg: 'rgba(34, 197, 94, 0.18)',  icon: '#22c55e' },
+  error:   { rail: '#ef4444', iconBg: 'rgba(239, 68, 68, 0.18)',  icon: '#ef4444' },
+  info:    { rail: '#14b8a6', iconBg: 'rgba(20, 184, 166, 0.18)', icon: '#14b8a6' },
 }
 
 const TYPE_ICONS: Record<ToastType, React.FC<{ className?: string; style?: React.CSSProperties }>> = {
@@ -94,68 +99,74 @@ export function ToastProvider({ children }: { children: React.ReactNode }) {
             return (
               <div
                 key={toast.id}
+                className="glass-strong text-foreground border border-border rounded-xl"
                 style={{
                   pointerEvents: 'auto',
                   display: 'flex',
-                  alignItems: 'flex-start',
-                  gap: 10,
-                  borderRadius: 10,
-                  padding: '12px 16px',
-                  backgroundColor: s.bg,
-                  border: `1px solid ${s.border}`,
-                  color: s.text,
+                  alignItems: 'stretch',
                   fontSize: 13,
                   lineHeight: '1.45',
                   maxWidth: 600,
-                  boxShadow: '0 8px 24px rgba(0,0,0,0.4)',
-                  transform: toast.entering ? 'translateX(120%)' : toast.exiting ? 'translateX(120%)' : 'translateX(0)',
+                  overflow: 'hidden',
+                  boxShadow: '0 12px 32px rgba(0,0,0,0.18), 0 0 18px rgba(var(--glow-color) / 0.10)',
+                  transform: toast.entering ? 'translateX(120%) scale(0.96)' : toast.exiting ? 'translateX(120%) scale(0.96)' : 'translateX(0) scale(1)',
                   opacity: toast.exiting ? 0 : 1,
-                  transition: 'transform 0.3s ease, opacity 0.3s ease',
+                  transition: 'transform 280ms cubic-bezier(0.16, 1, 0.3, 1), opacity 280ms ease',
                 }}
               >
-                <Icon style={{ width: 16, height: 16, flexShrink: 0, marginTop: 2 }} />
-                <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 6 }}>
-                  <span>{toast.message}</span>
-                  {toast.action && (
-                    <button
-                      onClick={() => { toast.action!.onClick(); dismiss(toast.id); }}
-                      style={{
-                        alignSelf: 'flex-start',
-                        background: 'none',
-                        border: `1px solid ${s.border}`,
-                        borderRadius: 5,
-                        padding: '3px 10px',
-                        color: s.text,
-                        fontSize: 12,
-                        fontWeight: 500,
-                        cursor: 'pointer',
-                        opacity: 0.85,
-                        transition: 'opacity 0.15s',
-                      }}
-                      onMouseEnter={e => (e.currentTarget.style.opacity = '1')}
-                      onMouseLeave={e => (e.currentTarget.style.opacity = '0.85')}
-                    >
-                      {toast.action.label}
-                    </button>
-                  )}
+                {/* Type-colored left rail */}
+                <div
+                  aria-hidden
+                  style={{ width: 3, flexShrink: 0, backgroundColor: s.rail }}
+                />
+                <div style={{ display: 'flex', alignItems: 'flex-start', gap: 10, padding: '12px 14px', flex: 1, minWidth: 0 }}>
+                  <span
+                    className="flex items-center justify-center rounded-md shrink-0"
+                    style={{ width: 24, height: 24, backgroundColor: s.iconBg, color: s.icon }}
+                    aria-hidden
+                  >
+                    <Icon style={{ width: 14, height: 14 }} />
+                  </span>
+                  <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 6, minWidth: 0 }}>
+                    <span className="text-foreground">{toast.message}</span>
+                    {toast.action && (
+                      <button
+                        onClick={() => { toast.action!.onClick(); dismiss(toast.id); }}
+                        className="press-pulse"
+                        style={{
+                          alignSelf: 'flex-start',
+                          background: 'none',
+                          border: `1px solid ${s.rail}`,
+                          borderRadius: 6,
+                          padding: '4px 10px',
+                          color: s.icon,
+                          fontSize: 12,
+                          fontWeight: 600,
+                          cursor: 'pointer',
+                          transition: 'background-color 150ms ease',
+                        }}
+                        onMouseEnter={e => { e.currentTarget.style.backgroundColor = s.iconBg }}
+                        onMouseLeave={e => { e.currentTarget.style.backgroundColor = 'transparent' }}
+                      >
+                        {toast.action.label}
+                      </button>
+                    )}
+                  </div>
+                  <button
+                    onClick={() => dismiss(toast.id)}
+                    className="press-pulse text-muted-foreground hover:text-foreground transition-colors"
+                    style={{
+                      background: 'none',
+                      border: 'none',
+                      cursor: 'pointer',
+                      padding: 2,
+                      flexShrink: 0,
+                      marginTop: 1,
+                    }}
+                  >
+                    <X style={{ width: 14, height: 14 }} />
+                  </button>
                 </div>
-                <button
-                  onClick={() => dismiss(toast.id)}
-                  style={{
-                    background: 'none',
-                    border: 'none',
-                    color: 'inherit',
-                    opacity: 0.5,
-                    cursor: 'pointer',
-                    padding: 0,
-                    flexShrink: 0,
-                    marginTop: 1,
-                  }}
-                  onMouseEnter={e => (e.currentTarget.style.opacity = '1')}
-                  onMouseLeave={e => (e.currentTarget.style.opacity = '0.5')}
-                >
-                  <X style={{ width: 14, height: 14 }} />
-                </button>
               </div>
             )
           })}

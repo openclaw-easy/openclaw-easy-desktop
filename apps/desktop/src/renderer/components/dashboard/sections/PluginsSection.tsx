@@ -19,7 +19,12 @@ import {
   X
 } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
+import { useToast } from '../../../contexts/ToastContext'
 import { ColorTheme } from '../types'
+import { EmptyState } from '../../ui/empty-state'
+import { MascotIllustration } from '../../ui/mascot-illustration'
+import { AnimatedNumber } from '../../ui/animated-number'
+import { Skeleton, SkeletonCard } from '../../ui/skeleton'
 
 interface Plugin {
   id: string
@@ -46,14 +51,56 @@ interface OfficialPlugin {
   category: string
 }
 
+// Curated featured-plugins set surfaced on the Install tab. These are
+// non-bundled extensions users would actually want one-click access to —
+// upstream ships ~134 bundled plugins (auto-enabled, no install needed)
+// plus a long tail of ClawHub community plugins (discoverable via
+// `openclaw plugins search`). The CLI is the source of truth; this list
+// only seeds the most commonly requested install flows for the desktop.
+//
+// To find more installable plugins:
+//   openclaw plugins search <query>
+//   openclaw plugins install clawhub:<package-name>
+//
+// Last refreshed against `openclaw plugins search` output on 2026-06-15
+// (OpenClaw 2026.6.2). Add new entries here only when the upstream docs
+// promote one to "featured" or when we ship a strong UX for it.
 const OFFICIAL_PLUGINS: OfficialPlugin[] = [
   {
     id: 'voice-call',
-    name: 'Voice Call Plugin',
-    description: 'AI-powered voice calls using Twilio, Telnyx, or Plivo. Enable your AI agent to make and receive phone calls with real-time transcription.',
+    name: 'Voice Call',
+    description:
+      'AI-powered voice calls using Twilio, Telnyx, or Plivo. Enable your AI agent to make and receive phone calls with real-time transcription.',
     installSpec: 'voice-call',
     docsUrl: 'https://docs.openclaw.ai/plugins/voice-call',
     category: 'Communication',
+  },
+  {
+    id: 'ai-readme-mcp',
+    name: 'AI README',
+    description:
+      'Manages AI_README.md files that document your project\'s conventions for AI assistants. Persistent memory of project rules across every session.',
+    installSpec: 'clawhub:ai-readme-mcp',
+    docsUrl: 'https://docs.openclaw.ai/plugins/clawhub',
+    category: 'Productivity',
+  },
+  {
+    id: 'ai-security-audit-pro',
+    name: 'AI Security Audit',
+    description:
+      'Universal security-audit plugin and CLI engine for AI agents with OWASP-mapped reports.',
+    installSpec: 'clawhub:ai-security-audit-pro',
+    docsUrl: 'https://docs.openclaw.ai/plugins/clawhub',
+    category: 'Security',
+  },
+  {
+    id: 'ai4scholar',
+    name: 'AI4Scholar',
+    description:
+      'Multi-source academic literature search, management, and analysis. Powered by ai4scholar.net.',
+    installSpec: 'clawhub:ai4scholar',
+    docsUrl: 'https://docs.openclaw.ai/plugins/clawhub',
+    category: 'Research',
   },
 ]
 
@@ -72,6 +119,7 @@ function parseMissingConfig(errMsg: string): string[] {
 
 export const PluginsSection: React.FC<PluginsSectionProps> = ({ colors }) => {
   const { t } = useTranslation()
+  const { addToast } = useToast()
   const [activeTab, setActiveTab] = useState<'installed' | 'install'>('installed')
   const [plugins, setPlugins] = useState<Plugin[]>([])
   const [loading, setLoading] = useState(true)
@@ -262,10 +310,7 @@ export const PluginsSection: React.FC<PluginsSectionProps> = ({ colors }) => {
     try {
       const result = await window.electronAPI.runPluginsDoctor()
       if (result.success) {
-        const summary = result.results
-          ? JSON.stringify(result.results, null, 2)
-          : t('plugins.doctorComplete')
-        alert(summary)
+        addToast(t('plugins.doctorComplete', 'Diagnostics complete'), 'success')
       } else {
         setError(result.error || t('plugins.doctorFailed'))
       }
@@ -335,11 +380,25 @@ export const PluginsSection: React.FC<PluginsSectionProps> = ({ colors }) => {
   }, [])
 
   if (loading) {
+    // Skeleton scaffold that mirrors the real layout: stats row + search
+    // bar + card list. Beats a centered spinner because the user sees
+    // the section's shape immediately and content streams in — no
+    // empty-then-full layout shift.
     return (
-      <div className="p-8 h-full flex items-center justify-center">
-        <div className="flex items-center space-x-3">
-          <Loader2 className="h-6 w-6 animate-spin" style={{ color: colors.accent.brand }} />
-          <span style={{ color: colors.text.normal }}>{t('plugins.loadingPlugins')}</span>
+      <div className="p-6 h-full flex flex-col space-y-4" aria-busy="true" aria-label={t('plugins.loadingPlugins')}>
+        {/* Stats row — three pills */}
+        <div className="flex items-center gap-5">
+          {Array.from({ length: 3 }).map((_, i) => (
+            <Skeleton key={i} className="h-5 w-20 rounded-md" />
+          ))}
+        </div>
+        {/* Search bar */}
+        <Skeleton className="h-9 w-full max-w-md rounded-md" />
+        {/* Plugin cards */}
+        <div className="space-y-3 flex-1 overflow-hidden">
+          {Array.from({ length: 6 }).map((_, i) => (
+            <SkeletonCard key={i} />
+          ))}
         </div>
       </div>
     )
@@ -375,7 +434,7 @@ export const PluginsSection: React.FC<PluginsSectionProps> = ({ colors }) => {
               <Button
                 onClick={() => loadPlugins()}
                 size="sm"
-                style={{ backgroundColor: colors.accent.brand, color: '#ffffff', border: 'none' }}
+                style={{ backgroundColor: colors.accent.brand, color: colors.button.primaryFg, border: 'none' }}
               >
                 <RefreshCw className="h-4 w-4 mr-2" />
                 {t('plugins.refresh')}
@@ -387,8 +446,10 @@ export const PluginsSection: React.FC<PluginsSectionProps> = ({ colors }) => {
             {t('plugins.subtitle')}
           </p>
 
-          {/* Install error banner */}
-          {error && plugins.length > 0 && (
+          {/* Error banner — shown whenever load/install failed, independent of
+              list length, so a gateway/IPC failure isn't hidden behind the
+              cheerful "No plugins installed" empty state. */}
+          {error && (
             <div
               className="flex items-start space-x-2 p-3 mb-4 rounded"
               style={{ backgroundColor: `${colors.accent.red}15`, border: `1px solid ${colors.accent.red}40` }}
@@ -434,18 +495,19 @@ export const PluginsSection: React.FC<PluginsSectionProps> = ({ colors }) => {
         {activeTab === 'installed' && (
           <>
             <div className="px-6 pt-3 pb-2 flex-shrink-0">
-              {/* Stats */}
+              {/* Stats — each number tweens via AnimatedNumber when
+                  enable/disable toggles change the count. */}
               <div className="flex items-center gap-5 mb-2">
                 <div className="flex items-center gap-1.5">
-                  <span className="text-base font-bold" style={{ color: colors.text.header }}>{pluginStats.total}</span>
+                  <span className="text-base font-bold" style={{ color: colors.text.header }}><AnimatedNumber value={pluginStats.total} /></span>
                   <span className="text-xs" style={{ color: colors.text.muted }}>{t('plugins.total')}</span>
                 </div>
                 <div className="flex items-center gap-1.5">
-                  <span className="text-base font-bold" style={{ color: colors.accent.green }}>{pluginStats.enabled}</span>
+                  <span className="text-base font-bold" style={{ color: colors.accent.green }}><AnimatedNumber value={pluginStats.enabled} /></span>
                   <span className="text-xs" style={{ color: colors.text.muted }}>{t('plugins.enabled')}</span>
                 </div>
                 <div className="flex items-center gap-1.5">
-                  <span className="text-base font-bold" style={{ color: colors.text.muted }}>{pluginStats.disabled}</span>
+                  <span className="text-base font-bold" style={{ color: colors.text.muted }}><AnimatedNumber value={pluginStats.disabled} /></span>
                   <span className="text-xs" style={{ color: colors.text.muted }}>{t('plugins.disabled')}</span>
                 </div>
               </div>
@@ -492,26 +554,28 @@ export const PluginsSection: React.FC<PluginsSectionProps> = ({ colors }) => {
                   )}
 
                   {filteredPlugins.length === 0 && searchFilter ? (
-                    <div className="text-center py-8">
-                      <div className="text-6xl mb-4">🔍</div>
-                      <h3 className="text-lg font-medium mb-2" style={{ color: colors.text.header }}>{t('plugins.noPluginsFound')}</h3>
-                      <p className="text-sm" style={{ color: colors.text.muted }}>{t('plugins.noPluginsMatch', { search: searchFilter })}</p>
-                    </div>
+                    <EmptyState
+                      colors={colors}
+                      illustration={<MascotIllustration mood="thinking" size={64} />}
+                      title={t('plugins.noPluginsFound')}
+                      description={t('plugins.noPluginsMatch', { search: searchFilter })}
+                    />
                   ) : filteredPlugins.length === 0 && !gatewayOff ? (
-                    <div className="text-center py-12">
-                      <div className="text-6xl mb-4">🧩</div>
-                      <h3 className="text-lg font-medium mb-2" style={{ color: colors.text.header }}>{t('plugins.noPluginsInstalled')}</h3>
-                      <p className="text-sm mb-6" style={{ color: colors.text.muted }}>
-                        {t('plugins.noPluginsInstalledDesc')}
-                      </p>
-                      <Button
-                        onClick={() => setActiveTab('install')}
-                        style={{ backgroundColor: colors.accent.brand, color: '#ffffff', border: 'none' }}
-                      >
-                        <Plus className="h-4 w-4 mr-2" />
-                        {t('plugins.browsePlugins')}
-                      </Button>
-                    </div>
+                    <EmptyState
+                      colors={colors}
+                      illustration={<MascotIllustration mood="napping" />}
+                      title={t('plugins.noPluginsInstalled')}
+                      description={t('plugins.noPluginsInstalledDesc')}
+                      action={
+                        <Button
+                          onClick={() => setActiveTab('install')}
+                          style={{ backgroundColor: colors.accent.brand, color: colors.button.primaryFg, border: 'none' }}
+                        >
+                          <Plus className="h-4 w-4 mr-2" />
+                          {t('plugins.browsePlugins')}
+                        </Button>
+                      }
+                    />
                   ) : filteredPlugins.length > 0 ? (
                     filteredPlugins.map((plugin, idx) => (
                       <div
@@ -586,8 +650,11 @@ export const PluginsSection: React.FC<PluginsSectionProps> = ({ colors }) => {
                               title={plugin.enabled ? t('plugins.disablePlugin') : t('plugins.enablePlugin')}
                               style={{
                                 backgroundColor: colors.bg.tertiary,
-                                color: plugin.enabled ? colors.accent.red : colors.accent.green,
-                                borderColor: plugin.enabled ? `${colors.accent.red}88` : `${colors.accent.green}88`
+                                // Toggle color = the action the click performs.
+                                color: plugin.enabled ? colors.button.destructive : colors.button.primary,
+                                borderColor: plugin.enabled
+                                  ? `${colors.button.destructive}88`
+                                  : `${colors.button.primary}88`
                               }}
                             >
                               {toggleLoading.has(plugin.id)
@@ -666,7 +733,7 @@ export const PluginsSection: React.FC<PluginsSectionProps> = ({ colors }) => {
                   <Button
                     onClick={installCustomPlugin}
                     disabled={customInstalling || !customInstallSpec.trim()}
-                    style={{ backgroundColor: colors.accent.brand, color: '#ffffff', border: 'none' }}
+                    style={{ backgroundColor: colors.accent.brand, color: colors.button.primaryFg, border: 'none' }}
                   >
                     {customInstalling ? (
                       <Loader2 className="h-4 w-4 animate-spin mr-2" />
@@ -781,7 +848,7 @@ export const PluginsSection: React.FC<PluginsSectionProps> = ({ colors }) => {
                               size="sm"
                               onClick={() => installOfficialPlugin(plugin)}
                               disabled={installLoading.has(plugin.id)}
-                              style={{ backgroundColor: colors.accent.brand, color: '#ffffff', border: 'none', fontSize: '11px', padding: '2px 8px' }}
+                              style={{ backgroundColor: colors.accent.brand, color: colors.button.primaryFg, border: 'none', fontSize: '11px', padding: '2px 8px' }}
                             >
                               {installLoading.has(plugin.id)
                                 ? <Loader2 className="h-3 w-3 animate-spin mr-1" />

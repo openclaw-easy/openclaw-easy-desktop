@@ -1,6 +1,8 @@
 import React, { useState, useEffect } from "react";
 import { useTranslation } from "react-i18next";
+import { useToast } from "../contexts/ToastContext";
 import { BYOK_PROVIDER_MODELS, byokAgentModelId, defaultByokAgentModelId } from "../../shared/providerModels";
+import { Modal } from "./ui/modal";
 
 interface ModelInfo {
   name: string;
@@ -40,7 +42,10 @@ interface AgentFormModalProps {
 // Derived from the shared providerModels.ts — single source of truth.
 
 function getCloudModelsForProvider(byokProvider: string): string[] {
-  const cfg = BYOK_PROVIDER_MODELS[byokProvider] ?? BYOK_PROVIDER_MODELS.anthropic;
+  // Fallback to OpenAI's catalog if the configured provider isn't in the
+  // table (e.g. an upgraded install whose persisted config still says
+  // `anthropic`, which was removed as a BYOK provider on 2026-06-15).
+  const cfg = BYOK_PROVIDER_MODELS[byokProvider] ?? BYOK_PROVIDER_MODELS.openai;
   return cfg.models.map(m => byokAgentModelId(byokProvider, m.id));
 }
 
@@ -59,16 +64,20 @@ export const AgentFormModal: React.FC<AgentFormModalProps> = ({
   onNavigateToLocalModels,
 }) => {
   const { t } = useTranslation();
+  const { addToast } = useToast();
   const [formData, setFormData] = useState<AgentFormData>({
     name: "",
-    model: "anthropic/claude-sonnet-4-6",
+    model: "openai/gpt-5.4-mini",
     fallbacks: [],
   });
   const [fallbackModels, setFallbackModels] = useState<string[]>([]);
   const [showFallbackConfig, setShowFallbackConfig] = useState(false);
   const [loading, setLoading] = useState(false);
   const [activeProvider, setActiveProvider] = useState<"byok" | "local">("byok");
-  const [byokProvider, setByokProvider] = useState<string>("anthropic");
+  // Anthropic removed from BYOK 2026-06-15. Defaults migrated to openai
+  // (the OpenAI BYOK path is the closest analog and gpt-5.4-mini is the
+  // catalog's fallback default).
+  const [byokProvider, setByokProvider] = useState<string>("openai");
   const [newFallbackModelState, setNewFallbackModelState] = useState("");
 
   // Load provider config and initialize form data whenever the modal opens
@@ -76,8 +85,14 @@ export const AgentFormModal: React.FC<AgentFormModalProps> = ({
     if (!isOpen) return;
 
     window.electronAPI.getConfig().then((config: any) => {
-      const provider: "byok" | "local" = (config?.aiProvider === "byok" || config?.aiProvider === "local") ? config.aiProvider : "byok";
-      const bProvider: string = config?.byok?.provider ?? "anthropic";
+      // Anything that isn't a provider this build supports falls back to BYOK.
+      // Covers configs written by a build that offered a hosted provider.
+      const provider: "byok" | "local" = config?.aiProvider === "local" ? "local" : "byok";
+      // Migrate legacy `byok.provider: 'anthropic'` configs to openai —
+      // Anthropic was removed as a BYOK provider on 2026-06-15.
+      const rawProvider = config?.byok?.provider as string | undefined;
+      const bProvider: string =
+        rawProvider === "anthropic" || !rawProvider ? "openai" : rawProvider;
       setActiveProvider(provider);
       setByokProvider(bProvider);
 
@@ -106,12 +121,12 @@ export const AgentFormModal: React.FC<AgentFormModalProps> = ({
     }).catch(() => {
       // Config load failed — fall back to safe defaults
       if (mode === "create") {
-        setFormData({ name: "", model: "anthropic/claude-sonnet-4-6", fallbacks: [] });
+        setFormData({ name: "", model: "openai/gpt-5.4-mini", fallbacks: [] });
         setFallbackModels([]);
       } else if (mode === "configure" && agent) {
         setFormData({
           name: agent.name,
-          model: agent.model || "anthropic/claude-sonnet-4-6",
+          model: agent.model || "openai/gpt-5.4-mini",
           fallbacks: agent.fallbacks || [],
         });
         setFallbackModels(agent.fallbacks || []);
@@ -121,8 +136,12 @@ export const AgentFormModal: React.FC<AgentFormModalProps> = ({
   }, [mode, agent, isOpen]);
 
   const handleSubmit = async () => {
+    // Synchronous double-submit guard: the button is only disabled on the async
+    // `loading` state, so a fast double-click before re-render could create the
+    // agent twice (the create write persists).
+    if (loading) return;
     if (!formData.name.trim()) {
-      alert(t('agentForm.pleaseEnterName'));
+      addToast(t('agentForm.pleaseEnterName'), 'error');
       return;
     }
 
@@ -135,7 +154,7 @@ export const AgentFormModal: React.FC<AgentFormModalProps> = ({
         if (window.electronAPI.configureModel) {
           const configResult = await window.electronAPI.configureModel(formData.model);
           if (!configResult.success) {
-            alert(t('agentForm.failedToConfigure', { message: configResult.message }));
+            addToast(t('agentForm.failedToConfigure', { message: configResult.message }), 'error');
             return;
           }
           console.log("Model configured successfully:", configResult.message);
@@ -158,42 +177,45 @@ export const AgentFormModal: React.FC<AgentFormModalProps> = ({
       if (result.success) {
         if (formData.model.startsWith("ollama/")) {
           const key = mode === "create" ? 'agentForm.agentCreatedLocal' : 'agentForm.agentUpdatedLocal';
-          alert(t(key, { name: formData.name, model: formData.model }));
+          addToast(t(key, { name: formData.name, model: formData.model }), 'success');
         }
         onSuccess();
         onClose();
       } else {
         const key = mode === "create" ? 'agentForm.failedToCreateAgent' : 'agentForm.failedToUpdateAgent';
-        alert(t(key, { error: result.error }));
+        addToast(t(key, { error: result.error }), 'error');
       }
     } catch (error) {
       console.error(`Failed to ${mode} agent:`, error);
-      alert(t(mode === "create" ? 'agentForm.failedToCreate' : 'agentForm.failedToUpdate'));
+      addToast(t(mode === "create" ? 'agentForm.failedToCreate' : 'agentForm.failedToUpdate'), 'error');
     } finally {
       setLoading(false);
     }
   };
 
-  if (!isOpen) return null;
-
   const filteredCloudModels = getCloudModelsForProvider(byokProvider);
   const isByokCloudModel =
-    formData.model.startsWith("anthropic/") ||
-      formData.model.startsWith("openai/") ||
-      formData.model.startsWith("google/");
+    formData.model.startsWith("openai/") ||
+    formData.model.startsWith("google/");
 
   const providerLabel: Record<string, string> = {
     google:     "Google",
-    anthropic:  "Anthropic",
     openai:     "OpenAI",
     venice:     "Venice AI",
     openrouter: "OpenRouter",
   };
 
+  const titleId = 'agent-form-title';
+
   return (
-    <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
-      <div className="bg-gray-800 text-white p-6 rounded-lg max-w-2xl w-full mx-4 max-h-[90vh] overflow-y-auto">
-        <h3 className="text-xl font-bold mb-4">
+    <Modal
+      open={isOpen}
+      onClose={onClose}
+      maxWidthClass="max-w-2xl"
+      shellClassName="text-foreground max-h-[90vh] overflow-y-auto"
+      labelledBy={titleId}
+    >
+        <h3 id={titleId} className="font-display text-xl font-bold tracking-tight mb-4">
           {mode === "create" ? t('agentForm.createNewAgent') : t('agentForm.configureAgent', { name: agent?.name })}
         </h3>
 
@@ -205,12 +227,12 @@ export const AgentFormModal: React.FC<AgentFormModalProps> = ({
               type="text"
               value={formData.name}
               onChange={(e) => setFormData({ ...formData, name: e.target.value })}
-              className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+              className="input-glow w-full px-3 py-2 bg-background/60 border border-border rounded-md focus:outline-none"
               placeholder={t('agentForm.agentNamePlaceholder')}
               disabled={mode === "configure"}
             />
             {mode === "configure" && (
-              <p className="text-xs text-gray-400 mt-1">
+              <p className="text-xs text-muted-foreground mt-1">
                 {t('agentForm.agentNameCannotChange')}
               </p>
             )}
@@ -241,7 +263,7 @@ export const AgentFormModal: React.FC<AgentFormModalProps> = ({
               <select
                 value={formData.model}
                 onChange={(e) => setFormData({ ...formData, model: e.target.value })}
-                className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+                className="input-glow w-full px-3 py-2 bg-background/60 border border-border rounded-md focus:outline-none"
                 disabled={loadingModels}
               >
                 {/* Local provider */}
@@ -273,7 +295,7 @@ export const AgentFormModal: React.FC<AgentFormModalProps> = ({
             )}
 
             {loadingModels && (
-              <p className="text-xs text-gray-400 mt-1">{t('agentForm.loadingLocalModels')}</p>
+              <p className="text-xs text-muted-foreground mt-1">{t('agentForm.loadingLocalModels')}</p>
             )}
 
             {/* BYOK cloud model reminder */}
@@ -304,14 +326,14 @@ export const AgentFormModal: React.FC<AgentFormModalProps> = ({
               <button
                 type="button"
                 onClick={() => setShowFallbackConfig(!showFallbackConfig)}
-                className="text-xs text-blue-400 hover:text-blue-300 transition-colors"
+                className="text-xs text-primary hover:text-primary/80 transition-colors"
               >
                 {showFallbackConfig ? t('agentForm.hideAdvanced') : t('agentForm.configureFallbacks')}
               </button>
             </div>
 
             {showFallbackConfig && (
-              <div className="bg-gray-900 p-4 rounded-lg border border-gray-700 space-y-3">
+              <div className="bg-background/60 p-4 rounded-lg border border-border space-y-3">
                 <div className="bg-blue-900/20 p-3 rounded border border-blue-800">
                   <div className="flex items-start space-x-2">
                     <div className="text-blue-400 mt-0.5">ℹ️</div>
@@ -324,17 +346,17 @@ export const AgentFormModal: React.FC<AgentFormModalProps> = ({
                   </div>
                 </div>
 
-                <div className="text-xs text-gray-400">
+                <div className="text-xs text-muted-foreground">
                   <span className="font-medium">{t('agentForm.primary')}</span> {formData.model}
                 </div>
 
                 {fallbackModels.length > 0 && (
                   <div className="space-y-2">
-                    <div className="text-xs font-medium text-gray-300">{t('agentForm.fallbackOrder')}</div>
+                    <div className="text-xs font-medium text-foreground/80">{t('agentForm.fallbackOrder')}</div>
                     {fallbackModels.map((modelId, index) => (
                       <div
                         key={`${modelId}-${index}`}
-                        className="flex items-center justify-between bg-gray-800 p-2 rounded"
+                        className="flex items-center justify-between bg-card/80 border border-border p-2 rounded"
                       >
                         <div className="flex items-center space-x-2">
                           <span className="text-xs text-yellow-400">#{index + 2}</span>
@@ -360,7 +382,7 @@ export const AgentFormModal: React.FC<AgentFormModalProps> = ({
                   <select
                     value={newFallbackModelState}
                     onChange={(e) => setNewFallbackModelState(e.target.value)}
-                    className="flex-1 px-3 py-2 bg-gray-800 border border-gray-700 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm"
+                    className="input-glow flex-1 px-3 py-2 bg-background/60 border border-border rounded-md focus:outline-none text-sm"
                   >
                     <option value="">{t('agentForm.selectBackupModel')}</option>
                     {activeProvider === "byok" && (
@@ -399,14 +421,14 @@ export const AgentFormModal: React.FC<AgentFormModalProps> = ({
                       }
                     }}
                     disabled={!newFallbackModelState}
-                    className="px-3 py-2 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-600 disabled:cursor-not-allowed rounded-md text-sm transition-colors"
+                    className="press-pulse ripple-glow px-3 py-2 bg-primary text-primary-foreground hover:bg-primary/90 disabled:bg-muted disabled:cursor-not-allowed rounded-md text-sm transition-all hover:-translate-y-px hover:shadow-glow active:translate-y-0"
                   >
                     {t('agentForm.add')}
                   </button>
                 </div>
 
                 {fallbackModels.length === 0 && (
-                  <div className="text-center py-3 text-gray-500 text-xs">
+                  <div className="text-center py-3 text-muted-foreground text-xs">
                     {t('agentForm.noFallbacksConfigured')}
                   </div>
                 )}
@@ -419,28 +441,32 @@ export const AgentFormModal: React.FC<AgentFormModalProps> = ({
         <div className="flex justify-end gap-2 mt-6">
           <button
             onClick={onClose}
-            className="px-4 py-2 bg-gray-600 hover:bg-gray-700 rounded-md text-sm font-medium transition-colors"
+            className="press-pulse ripple-glow px-4 py-2 bg-secondary text-secondary-foreground hover:bg-secondary/80 rounded-md text-sm font-medium transition-colors"
             disabled={loading}
           >
             {t('common.cancel')}
           </button>
           <button
             onClick={handleSubmit}
-            className="px-4 py-2 bg-blue-600 hover:bg-blue-700 rounded-md text-sm font-medium transition-colors"
+            className="press-pulse ripple-glow px-4 py-2 bg-primary text-primary-foreground hover:bg-primary/90 rounded-md text-sm font-medium transition-all hover:-translate-y-px hover:shadow-glow active:translate-y-0"
             disabled={loading || (activeProvider === "local" && localModels.length === 0 && !loadingModels)}
           >
             {loading ? (
               <div className="flex items-center gap-2">
                 <div className="inline-block animate-spin rounded-full h-4 w-4 border-b-2 border-white" />
-                {mode === "create" ? t('common.creating') : t('common.updating')}
+                {/* The Save button stays in this state for the full sync
+                    gateway restart (~3-5s) — the previous fast-return
+                    fire-and-forget left the gateway running the OLD
+                    model, causing chat to answer with the stale model.
+                    Honest copy here so the wait doesn't feel hung. */}
+                {t('agentForm.restartingWithNewModel', 'Restarting with new model…')}
               </div>
             ) : (
               mode === "create" ? t('agentForm.createAgent') : t('common.saveChanges')
             )}
           </button>
         </div>
-      </div>
-    </div>
+    </Modal>
   );
 };
 

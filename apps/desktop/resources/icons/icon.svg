@@ -1,24 +1,44 @@
 <svg width="512" height="512" viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg">
   <defs>
+    <!-- Warm coral→deep-orange gradient (matches BRAND.gradient in renderer).
+         Replaces the previous flat blue (#458EE6) so the dock icon reads
+         "warm/friendly" instead of "generic Twitter-style chat app" while
+         keeping the same recognizable lobster emoji. -->
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#FF8266"/>
+      <stop offset="50%" stop-color="#FF6B47"/>
+      <stop offset="100%" stop-color="#D4581F"/>
+    </linearGradient>
+    <!-- Soft inner glow — gives the lobster a subtle backlight without
+         disturbing the macOS superellipse mask. -->
+    <radialGradient id="halo" cx="50%" cy="48%" r="55%">
+      <stop offset="0%" stop-color="#FFD4C2" stop-opacity="0.55"/>
+      <stop offset="100%" stop-color="#FFD4C2" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="dropShadow" x="-10%" y="-10%" width="120%" height="120%">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="6"/>
+      <feOffset dy="6"/>
+      <feComponentTransfer><feFuncA type="linear" slope="0.35"/></feComponentTransfer>
+      <feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
     <style>
-      .bg { fill: #458EE6; }
-      .border { stroke: #3A7DD4; stroke-width: 8; fill: none; }
       .lobster {
         font-family: "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", "Helvetica", sans-serif;
-        font-size: 307.2px;
+        font-size: 320px;
         text-anchor: middle;
         dominant-baseline: central;
-        fill: white;
       }
     </style>
   </defs>
 
   <!-- Background (full bleed — macOS applies its own superellipse mask) -->
-  <rect x="0" y="0" width="512" height="512" class="bg"/>
+  <rect x="0" y="0" width="512" height="512" fill="url(#bg)"/>
 
-  <!-- Border -->
-  <rect x="8" y="8" width="496" height="496" class="border"/>
+  <!-- Soft halo behind the lobster -->
+  <ellipse cx="256" cy="246" rx="220" ry="220" fill="url(#halo)"/>
 
-  <!-- Lobster emoji -->
-  <text x="256" y="256" class="lobster">🦞</text>
+  <!-- Lobster emoji — slightly larger + soft drop-shadow for depth. -->
+  <g filter="url(#dropShadow)">
+    <text x="256" y="262" class="lobster">🦞</text>
+  </g>
 </svg>

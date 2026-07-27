@@ -1,31 +1,13 @@
 import React, { useState, useEffect, useCallback } from 'react'
-import { FileText, Save, Loader2, AlertCircle, RefreshCw, Plus, Trash2, X } from 'lucide-react'
+import { FileText, Save, Loader2, AlertCircle, RefreshCw, Plus, Trash2, X, FolderOpen } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import { useToast } from '../../../contexts/ToastContext'
+import { Modal } from '../../ui/modal'
+import type { ColorTheme } from '../types'
 
-interface ColorScheme {
-  bg: {
-    primary: string
-    secondary: string
-    tertiary: string
-    hover: string
-    active: string
-  }
-  text: {
-    normal: string
-    muted: string
-    header: string
-    link: string
-    danger: string
-  }
-  accent: {
-    brand: string
-    green: string
-    yellow: string
-    red: string
-    purple: string
-  }
-}
+// Local alias for back-compat with the prop name. Was a duplicated
+// interface declaration until the 2026-06-15 ColorTheme dedup pass.
+type ColorScheme = ColorTheme
 
 interface WorkspaceFile {
   name: string
@@ -57,21 +39,24 @@ export function WorkspaceSection({ colors }: WorkspaceSectionProps) {
   const [deleteConfirm, setDeleteConfirm] = useState<{ show: boolean; fileName: string }>({ show: false, fileName: '' })
   const [deleting, setDeleting] = useState(false)
 
+
   const { addToast } = useToast()
+
+  // Agent selector — which agent's workspace we're editing. 'main' = the
+  // default agent's ~/.openclaw/workspace; other agents get their own dir.
+  const [agents, setAgents] = useState<Array<{ id: string; name: string }>>([])
+  const [selectedAgent, setSelectedAgent] = useState<string>('main')
 
   const hasUnsavedChanges = content !== originalContent
 
-  const loadFiles = useCallback(async () => {
+  // Reload the file list for the current agent (Refresh button + post-save).
+  const refresh = useCallback(async () => {
     setLoading(true)
     setError(null)
     try {
-      const result = await window.electronAPI?.listWorkspaceFiles?.()
+      const result = await window.electronAPI?.listWorkspaceFiles?.(selectedAgent)
       if (result?.success && result.files) {
         setFiles(result.files)
-        // Auto-select first file if nothing selected
-        if (!selectedFile && result.files.length > 0) {
-          loadFile(result.files[0].name)
-        }
       } else {
         setError(result?.error || 'Failed to load workspace files')
       }
@@ -80,7 +65,7 @@ export function WorkspaceSection({ colors }: WorkspaceSectionProps) {
     } finally {
       setLoading(false)
     }
-  }, [])
+  }, [selectedAgent])
 
   const loadFile = async (name: string) => {
     // Warn about unsaved changes
@@ -92,7 +77,7 @@ export function WorkspaceSection({ colors }: WorkspaceSectionProps) {
     setFileLoading(true)
     setError(null)
     try {
-      const result = await window.electronAPI?.readWorkspaceFile?.(name)
+      const result = await window.electronAPI?.readWorkspaceFile?.(name, selectedAgent)
       if (result?.success && result.content !== undefined) {
         setSelectedFile(name)
         setContent(result.content)
@@ -113,10 +98,10 @@ export function WorkspaceSection({ colors }: WorkspaceSectionProps) {
     setSaving(true)
     setError(null)
     try {
-      const result = await window.electronAPI?.writeWorkspaceFile?.(selectedFile, content)
+      const result = await window.electronAPI?.writeWorkspaceFile?.(selectedFile, content, selectedAgent)
       if (result?.success) {
         setOriginalContent(content)
-        loadFiles()
+        refresh()
       } else {
         setError(result?.error || 'Failed to save file')
       }
@@ -141,13 +126,13 @@ export function WorkspaceSection({ colors }: WorkspaceSectionProps) {
         addToast('Create not available — restart the app to apply updates', 'error')
         return
       }
-      const result = await window.electronAPI.createWorkspaceFile(filename)
+      const result = await window.electronAPI.createWorkspaceFile(filename, selectedAgent)
       if (result?.success) {
         addToast(`Created ${filename}`, 'success')
         setShowCreateModal(false)
         setNewFileName('')
         // Refresh and auto-select the new file
-        const listResult = await window.electronAPI?.listWorkspaceFiles?.()
+        const listResult = await window.electronAPI?.listWorkspaceFiles?.(selectedAgent)
         if (listResult?.success && listResult.files) {
           setFiles(listResult.files)
         }
@@ -170,7 +155,7 @@ export function WorkspaceSection({ colors }: WorkspaceSectionProps) {
         addToast('Delete not available — restart the app to apply updates', 'error')
         return
       }
-      const result = await window.electronAPI.deleteWorkspaceFile(fileName)
+      const result = await window.electronAPI.deleteWorkspaceFile(fileName, selectedAgent)
       if (result?.success) {
         addToast(`Deleted ${fileName}`, 'success')
         setDeleteConfirm({ show: false, fileName: '' })
@@ -188,7 +173,7 @@ export function WorkspaceSection({ colors }: WorkspaceSectionProps) {
         }
 
         // Refresh file list
-        const listResult = await window.electronAPI?.listWorkspaceFiles?.()
+        const listResult = await window.electronAPI?.listWorkspaceFiles?.(selectedAgent)
         if (listResult?.success && listResult.files) {
           setFiles(listResult.files)
         }
@@ -202,9 +187,78 @@ export function WorkspaceSection({ colors }: WorkspaceSectionProps) {
     }
   }
 
+  // Load the agent list once so the picker can offer per-agent workspaces.
   useEffect(() => {
-    loadFiles()
-  }, [loadFiles])
+    let cancelled = false
+    window.electronAPI?.listAgents?.()
+      .then((list: any[]) => {
+        if (cancelled) return
+        const mapped = Array.isArray(list)
+          ? list.map((a) => ({ id: String(a.id), name: String(a.name || a.id) }))
+          : []
+        setAgents(mapped)
+        // Prefer 'main'; otherwise fall back to the first agent.
+        if (mapped.length > 0 && !mapped.some((a) => a.id === selectedAgent)) {
+          setSelectedAgent(mapped.some((a) => a.id === 'main') ? 'main' : mapped[0].id)
+        }
+      })
+      .catch(() => { /* agents optional — default to main */ })
+    return () => { cancelled = true }
+  }, [])
+
+  // (Re)load files whenever the selected agent changes (and on mount):
+  // reset the editor and auto-select the first file. Inline reads here
+  // avoid stale-closure auto-select bugs across agent switches.
+  useEffect(() => {
+    let cancelled = false
+    const run = async () => {
+      setLoading(true)
+      setError(null)
+      setSelectedFile(null)
+      setContent('')
+      setOriginalContent('')
+      try {
+        const result = await window.electronAPI?.listWorkspaceFiles?.(selectedAgent)
+        if (cancelled) return
+        if (result?.success && result.files) {
+          setFiles(result.files)
+          if (result.files.length > 0) {
+            const first = result.files[0].name
+            const fileRes = await window.electronAPI?.readWorkspaceFile?.(first, selectedAgent)
+            if (cancelled) return
+            if (fileRes?.success && fileRes.content !== undefined) {
+              setSelectedFile(first)
+              setContent(fileRes.content)
+              setOriginalContent(fileRes.content)
+            }
+          }
+        } else {
+          setError(result?.error || 'Failed to load workspace files')
+        }
+      } catch (err: any) {
+        if (!cancelled) setError(err.message || 'Failed to load workspace files')
+      } finally {
+        if (!cancelled) setLoading(false)
+      }
+    }
+    run()
+    return () => { cancelled = true }
+  }, [selectedAgent])
+
+  // Switch agents, guarding unsaved edits.
+  const handleAgentChange = (id: string) => {
+    if (id === selectedAgent) return
+    if (hasUnsavedChanges && !confirm('You have unsaved changes. Discard them?')) return
+    setSelectedAgent(id)
+  }
+
+  // Reveal the current agent's workspace dir in Finder/Explorer.
+  const handleOpenFolder = async () => {
+    const result = await window.electronAPI?.openWorkspaceDir?.(selectedAgent)
+    if (!result?.success) {
+      addToast(result?.error || 'Failed to open folder', 'error')
+    }
+  }
 
   // Keyboard shortcut: Cmd/Ctrl+S to save
   useEffect(() => {
@@ -216,7 +270,7 @@ export function WorkspaceSection({ colors }: WorkspaceSectionProps) {
     }
     window.addEventListener('keydown', handler)
     return () => window.removeEventListener('keydown', handler)
-  }, [selectedFile, content, originalContent])
+  }, [selectedFile, content, originalContent, selectedAgent])
 
   const formatSize = (bytes: number): string => {
     if (bytes < 1024) return `${bytes} B`
@@ -248,14 +302,39 @@ export function WorkspaceSection({ colors }: WorkspaceSectionProps) {
         style={{ borderColor: colors.bg.tertiary, backgroundColor: colors.bg.secondary }}
       >
         <div className="flex items-baseline gap-2">
-          <h2 className="text-lg font-bold" style={{ color: colors.text.header }}>
+          <h2 className="font-display text-lg font-bold tracking-tight" style={{ color: colors.text.header }}>
             {t('workspace.title')}
           </h2>
           <p className="text-sm" style={{ color: colors.text.muted }}>
             {t('workspace.subtitle')}
           </p>
         </div>
-        <div className="flex items-center gap-1">
+        <div className="flex items-center gap-2">
+          {agents.length > 0 && (
+            <select
+              value={selectedAgent}
+              onChange={(e) => handleAgentChange(e.target.value)}
+              className="px-2 py-1.5 rounded-md text-sm focus:outline-none"
+              style={{ backgroundColor: colors.bg.tertiary, color: colors.text.normal, border: 'none' }}
+              title={t('workspace.agent', 'Agent')}
+              aria-label={t('workspace.agent', 'Agent')}
+            >
+              {agents.map((a) => (
+                <option key={a.id} value={a.id}>
+                  {a.id === 'main' ? `${a.name} (main)` : a.name}
+                </option>
+              ))}
+            </select>
+          )}
+          <button
+            onClick={handleOpenFolder}
+            className="p-2 rounded-lg transition-colors"
+            style={{ color: colors.text.muted }}
+            title={t('workspace.openFolder', 'Open folder')}
+            aria-label={t('workspace.openFolder', 'Open folder')}
+          >
+            <FolderOpen className="h-4 w-4" />
+          </button>
           <button
             onClick={() => { setNewFileName(''); setShowCreateModal(true) }}
             className="p-2 rounded-lg transition-colors"
@@ -265,10 +344,11 @@ export function WorkspaceSection({ colors }: WorkspaceSectionProps) {
             <Plus className="h-4 w-4" />
           </button>
           <button
-            onClick={loadFiles}
+            onClick={refresh}
             className="p-2 rounded-lg transition-colors"
             style={{ color: colors.text.muted }}
             title={t('workspace.refreshFiles')}
+            aria-label={t('workspace.refreshFiles')}
           >
             <RefreshCw className="h-4 w-4" />
           </button>
@@ -279,7 +359,7 @@ export function WorkspaceSection({ colors }: WorkspaceSectionProps) {
       {error && (
         <div
           className="flex-shrink-0 flex items-center gap-2 px-6 py-2 text-sm"
-          style={{ backgroundColor: '#7f1d1d40', color: colors.accent.red }}
+          style={{ backgroundColor: 'rgba(220, 38, 38, 0.25)', color: colors.accent.red }}
         >
           <AlertCircle className="h-4 w-4 flex-shrink-0" />
           <span>{error}</span>
@@ -372,7 +452,7 @@ export function WorkspaceSection({ colors }: WorkspaceSectionProps) {
                   className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-sm font-medium transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
                   style={{
                     backgroundColor: hasUnsavedChanges ? colors.accent.brand : colors.bg.hover,
-                    color: '#ffffff',
+                    color: colors.button.primaryFg,
                   }}
                 >
                   {saving ? (
@@ -395,7 +475,7 @@ export function WorkspaceSection({ colors }: WorkspaceSectionProps) {
                   onChange={(e) => setContent(e.target.value)}
                   className="flex-1 w-full resize-none p-4 font-mono text-sm focus:outline-none"
                   style={{
-                    backgroundColor: colors.bg.primary,
+                    backgroundColor: colors.bg.tertiary,
                     color: colors.text.normal,
                     tabSize: 2,
                   }}
@@ -416,18 +496,14 @@ export function WorkspaceSection({ colors }: WorkspaceSectionProps) {
         </div>
       </div>
 
-      {/* Create File Modal */}
-      {showCreateModal && (
-        <div
-          className="fixed inset-0 flex items-center justify-center z-50"
-          style={{ backgroundColor: 'rgba(0, 0, 0, 0.7)' }}
-          onClick={() => !creating && setShowCreateModal(false)}
-        >
-          <div
-            className="rounded-xl p-6 max-w-md w-full mx-4 shadow-2xl"
-            style={{ backgroundColor: colors.bg.secondary }}
-            onClick={(e) => e.stopPropagation()}
-          >
+      {/* Create File Modal — dismiss suppressed mid-create or once the
+          user has typed a filename so a stray Escape doesn't drop input. */}
+      <Modal
+        open={showCreateModal}
+        onClose={() => setShowCreateModal(false)}
+        dismissable={!creating && !newFileName.trim()}
+        shellClassName="shadow-2xl"
+      >
             <div className="flex items-start space-x-3 mb-4">
               <div
                 className="p-2 rounded-lg"
@@ -447,6 +523,7 @@ export function WorkspaceSection({ colors }: WorkspaceSectionProps) {
                 onClick={() => setShowCreateModal(false)}
                 className="p-1 rounded"
                 style={{ color: colors.text.muted }}
+                aria-label={t('common.close', 'Close')}
               >
                 <X className="h-4 w-4" />
               </button>
@@ -459,7 +536,7 @@ export function WorkspaceSection({ colors }: WorkspaceSectionProps) {
               onKeyDown={(e) => { if (e.key === 'Enter') handleCreate() }}
               placeholder={t('workspace.createPlaceholder')}
               autoFocus
-              className="w-full px-3 py-2 rounded-lg text-sm mb-4 focus:outline-none focus:ring-2"
+              className="input-glow w-full px-3 py-2 rounded-lg text-sm mb-4 border focus:outline-none"
               style={{
                 backgroundColor: colors.bg.tertiary,
                 color: colors.text.normal,
@@ -482,7 +559,7 @@ export function WorkspaceSection({ colors }: WorkspaceSectionProps) {
               <button
                 onClick={() => setShowCreateModal(false)}
                 disabled={creating}
-                className="flex-1 px-4 py-2 rounded-lg text-sm font-medium transition-colors"
+                className="press-pulse ripple-glow flex-1 px-4 py-2 rounded-lg text-sm font-medium transition-all hover:-translate-y-px hover:shadow-glow active:translate-y-0"
                 style={{
                   backgroundColor: colors.bg.tertiary,
                   color: colors.text.normal,
@@ -493,32 +570,25 @@ export function WorkspaceSection({ colors }: WorkspaceSectionProps) {
               <button
                 onClick={handleCreate}
                 disabled={creating || !newFileName.trim()}
-                className="flex-1 px-4 py-2 rounded-lg text-sm font-medium transition-colors"
+                className="press-pulse ripple-glow flex-1 px-4 py-2 rounded-lg text-sm font-medium transition-all hover:-translate-y-px hover:shadow-glow active:translate-y-0"
                 style={{
                   backgroundColor: colors.accent.brand,
-                  color: '#FFFFFF',
+                  color: colors.button.primaryFg,
                   opacity: creating || !newFileName.trim() ? 0.6 : 1,
                 }}
               >
                 {creating ? t('common.loading') : t('workspace.createFile')}
               </button>
             </div>
-          </div>
-        </div>
-      )}
+      </Modal>
 
-      {/* Delete Confirmation Dialog */}
-      {deleteConfirm.show && (
-        <div
-          className="fixed inset-0 flex items-center justify-center z-50"
-          style={{ backgroundColor: 'rgba(0, 0, 0, 0.7)' }}
-          onClick={() => !deleting && setDeleteConfirm({ show: false, fileName: '' })}
-        >
-          <div
-            className="rounded-xl p-6 max-w-md w-full mx-4 shadow-2xl"
-            style={{ backgroundColor: colors.bg.secondary }}
-            onClick={(e) => e.stopPropagation()}
-          >
+      {/* Delete Confirmation Dialog — dismiss suppressed mid-delete. */}
+      <Modal
+        open={deleteConfirm.show}
+        onClose={() => setDeleteConfirm({ show: false, fileName: '' })}
+        dismissable={!deleting}
+        shellClassName="shadow-2xl"
+      >
             <div className="flex items-start space-x-3 mb-4">
               <div
                 className="p-2 rounded-lg"
@@ -549,7 +619,7 @@ export function WorkspaceSection({ colors }: WorkspaceSectionProps) {
               <button
                 onClick={() => setDeleteConfirm({ show: false, fileName: '' })}
                 disabled={deleting}
-                className="flex-1 px-4 py-2 rounded-lg text-sm font-medium transition-colors"
+                className="press-pulse ripple-glow flex-1 px-4 py-2 rounded-lg text-sm font-medium transition-all hover:-translate-y-px hover:shadow-glow active:translate-y-0"
                 style={{
                   backgroundColor: colors.bg.tertiary,
                   color: colors.text.normal,
@@ -560,19 +630,17 @@ export function WorkspaceSection({ colors }: WorkspaceSectionProps) {
               <button
                 onClick={() => handleDelete(deleteConfirm.fileName)}
                 disabled={deleting}
-                className="flex-1 px-4 py-2 rounded-lg text-sm font-medium transition-colors"
+                className="press-pulse ripple-glow flex-1 px-4 py-2 rounded-lg text-sm font-medium transition-all hover:-translate-y-px hover:shadow-glow active:translate-y-0"
                 style={{
                   backgroundColor: colors.accent.red,
-                  color: '#FFFFFF',
+                  color: colors.button.primaryFg,
                   opacity: deleting ? 0.6 : 1,
                 }}
               >
                 {deleting ? t('common.deleting') : t('workspace.deleteFile')}
               </button>
             </div>
-          </div>
-        </div>
-      )}
+      </Modal>
     </div>
   )
 }

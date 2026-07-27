@@ -1,6 +1,7 @@
 import React from 'react';
 import { ChevronDown } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
+import type { ColorTheme } from './types';
 
 interface ChannelInfo {
   id: string;
@@ -18,30 +19,9 @@ interface ServerConfig {
   color: string;
 }
 
-interface ColorScheme {
-  bg: {
-    primary: string;
-    secondary: string;
-    tertiary: string;
-    hover: string;
-    active: string;
-  };
-  text: {
-    normal: string;
-    muted: string;
-    header: string;
-    link: string;
-    danger: string;
-  };
-  accent: {
-    brand: string;
-    green: string;
-    yellow: string;
-    red: string;
-    purple: string;
-    indigo: string;
-  };
-}
+// Local alias for back-compat with the prop name. Was a duplicated
+// interface declaration until the 2026-06-15 ColorTheme dedup pass.
+type ColorScheme = ColorTheme;
 
 interface ChannelSidebarProps {
   colors: ColorScheme;
@@ -82,15 +62,26 @@ function ChannelButton({ channel, activeChannel, setActiveChannel, colors }: {
         </span>
       </div>
       {channel.status && (
-        <div
-          className={`h-2 w-2 rounded-full ${
-            channel.status === 'connected'
-              ? 'bg-green-500'
-              : channel.status === 'pending'
-                ? 'bg-yellow-500'
-                : 'bg-gray-500'
-          }`}
-        />
+        <div className="relative h-2 w-2 flex-shrink-0">
+          {/* Soft expanding pulse — only on 'connected' so it draws the
+              eye to a working channel without spamming on dead ones. */}
+          {channel.status === 'connected' && (
+            <span
+              className="absolute inset-0 rounded-full bg-green-500 animate-status-pulse"
+              aria-hidden="true"
+            />
+          )}
+          <span
+            className={`relative block h-2 w-2 rounded-full ${
+              channel.status === 'connected'
+                ? 'bg-green-500'
+                : channel.status === 'pending'
+                  ? 'bg-yellow-500'
+                  : 'bg-gray-500'
+            }`}
+            aria-label={`Status: ${channel.status}`}
+          />
+        </div>
       )}
     </button>
   );

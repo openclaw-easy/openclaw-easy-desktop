@@ -1,8 +1,10 @@
 import * as path from 'path'
 import * as os from 'os'
 import { spawn } from 'child_process'
+import { access, mkdir, mkdtemp, readdir, readFile, rename, rm, writeFile } from 'fs/promises'
 import { OpenClawCommandExecutor } from './openclaw-command-executor'
 import { ConfigManager } from './config-manager'
+import { CLAWHUB_BASE_URL } from '../../shared/constants'
 
 export interface RegistrySkill {
   slug: string
@@ -12,6 +14,25 @@ export interface RegistrySkill {
   stars: number
   version: string
   url: string
+}
+
+// Slug grammar matches the backend (skills-download.ts). Notably excludes
+// `.` and `..`, which the previous regex `[a-zA-Z0-9_.-]+` accepted — that
+// would have let a malicious `slug = '..'` escape the `~/.openclaw/skills/`
+// install root via path-join and write zip contents anywhere under
+// `~/.openclaw/`. Lowercase-only matches ClawHub's actual convention.
+const SLUG_REGEX = /^[a-z0-9][a-z0-9_-]*$/
+
+/**
+ * Verify a resolved path stays inside an expected root directory. Used as
+ * a defence-in-depth check on top of `SLUG_REGEX`: even if a malformed slug
+ * ever slipped through, this catches the attempted escape.
+ */
+function isPathInside(child: string, root: string): boolean {
+  const rChild = path.resolve(child)
+  const rRoot = path.resolve(root)
+  // Trailing separator prevents '/foo/skillsX' from passing as a child of '/foo/skills'.
+  return rChild === rRoot || rChild.startsWith(rRoot + path.sep)
 }
 
 /**
@@ -24,6 +45,52 @@ export class SkillsManager {
   constructor(executor: OpenClawCommandExecutor, configManager: ConfigManager) {
     this.executor = executor
     this.configManager = configManager
+  }
+
+  /**
+   * `~/.openclaw/skills/` — single source for the install root path. Uses
+   * `process.env.HOME || .USERPROFILE` rather than `app.getPath('home')`
+   * so the existing skills-manager tests (which mock the env var) keep
+   * working without an electron mock change.
+   */
+  private _skillsDir(): string {
+    const home = process.env.HOME || process.env.USERPROFILE || ''
+    return path.join(home, '.openclaw', 'skills')
+  }
+
+  /**
+   * Resolve a user-supplied skill name to its on-disk directory under
+   * `~/.openclaw/skills/`. Two lookup strategies:
+   *   1. Direct: directory whose name equals `skillName`.
+   *   2. By name: scan dirs, match the SKILL.md frontmatter `name:` field.
+   * Returns null if nothing matches. Caller is responsible for the
+   * SLUG_REGEX check on the input.
+   */
+  async findSkillDirByName(skillName: string): Promise<string | null> {
+    const skillsDir = this._skillsDir()
+
+    // Strategy 1: direct directory match.
+    const directDir = path.join(skillsDir, skillName)
+    try {
+      await access(directDir)
+      return directDir
+    } catch { /* fall through */ }
+
+    // Strategy 2: scan SKILL.md `name:` fields.
+    let entries: import('fs').Dirent[]
+    try {
+      entries = await readdir(skillsDir, { withFileTypes: true })
+    } catch { return null }
+
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue
+      try {
+        const md = await readFile(path.join(skillsDir, entry.name, 'SKILL.md'), 'utf8')
+        const m = md.match(/^name:\s*(.+)$/m)
+        if (m && m[1].trim() === skillName) return path.join(skillsDir, entry.name)
+      } catch { /* skip unreadable entry */ }
+    }
+    return null
   }
 
   async listSkills(): Promise<{ success: boolean; skills?: any[]; error?: string }> {
@@ -54,36 +121,58 @@ export class SkillsManager {
     }
   }
 
-  async checkSkills(): Promise<{ success: boolean; status?: any; error?: string }> {
+  /**
+   * Run `openclaw skills check --json` against the active agent and return
+   * the structured eligibility report. Powers UI surfaces like a
+   * "N skills need configuration" badge — the upstream report bucketizes
+   * results into eligible / blocked / missing-requirements lists so we
+   * don't have to re-derive that from `skills list`. Re-added 2026-06-15
+   * after the audit: the previous comment "no callers anywhere" was an
+   * artefact of an older Skills UI that scraped the list shape directly.
+   */
+  async checkSkills(agentId?: string): Promise<{
+    success: boolean
+    report?: {
+      agentId?: string
+      workspaceDir?: string
+      managedSkillsDir?: string
+      summary?: Record<string, number>
+      eligible?: any[]
+      modelVisible?: any[]
+      commandVisible?: any[]
+      disabled?: any[]
+      blocked?: any[]
+      agentFiltered?: any[]
+      notInjected?: any[]
+      missingRequirements?: any[]
+    }
+    error?: string
+  }> {
     try {
-      console.log('[SkillsManager] Checking skills status...')
-      const result = await this.executor.executeCommand(['skills', 'check', '--json'], 30000) // 30 second timeout for skills
-
-      if (result) {
-        const status = JSON.parse(result)
-        return {
-          success: true,
-          status
-        }
-      }
-
-      return {
-        success: false,
-        error: 'No skills status data received'
-      }
+      const args = ['skills', 'check', '--json']
+      if (agentId) args.push('--agent', agentId)
+      const result = await this.executor.executeCommand(args, 30000)
+      if (!result) return { success: false, error: 'No skills check data received' }
+      return { success: true, report: JSON.parse(result) }
     } catch (error: any) {
-      console.error('[SkillsManager] Error checking skills:', error)
-      return {
-        success: false,
-        error: error.message || 'Failed to check skills'
-      }
+      console.error('[SkillsManager] Error running skills check:', error)
+      return { success: false, error: error.message || 'Failed to run skills check' }
     }
   }
 
-  async getSkillInfo(skillName: string): Promise<{ success: boolean; info?: any; error?: string }> {
+  async getSkillInfo(
+    skillName: string,
+    agentId?: string,
+  ): Promise<{ success: boolean; info?: any; error?: string }> {
     try {
       console.log(`[SkillsManager] Getting info for skill: ${skillName}`)
-      const result = await this.executor.executeCommand(['skills', 'info', skillName, '--json'])
+      // Audit 2026-06-15: bumped timeout 10s → 30s for consistency with
+      // listSkills and to cover cold-cache cases where the gateway
+      // re-scans bundled plugins. Pass `--agent` when supplied so
+      // agent-scoped skills resolve correctly upstream.
+      const args = ['skills', 'info', skillName, '--json']
+      if (agentId) args.push('--agent', agentId)
+      const result = await this.executor.executeCommand(args, 30000)
 
       if (result) {
         const info = JSON.parse(result)
@@ -198,28 +287,35 @@ export class SkillsManager {
       const lines: string[] = []
       const autoResolved: string[] = []
 
-      // Auto-resolve missing config keys by setting them in openclaw.json
+      // Auto-resolve missing config keys by setting them in openclaw.json.
       // Credential keys (tokens, passwords, API keys) are skipped — they need real user input.
       const manualConfigKeys: string[] = []
       if (missing.config?.length) {
         try {
-          const config = await this.configManager.loadConfig()
-          for (const key of missing.config as string[]) {
-            // Skip if key already has a value (avoid overwriting existing config)
-            const existing = this._getNestedConfigValue(config, key)
-            if (existing !== undefined && existing !== null) continue
+          // Single atomic read-modify-write under the config write-lock.
+          // Previously this did `loadConfig → mutate → writeConfig` with the
+          // read outside the lock; a concurrent `config:save` IPC could
+          // land between read and write and get silently clobbered.
+          await this.configManager.mutateConfig((config) => {
+            let anyResolved = false
+            for (const key of missing.config as string[]) {
+              // Skip if key already has a value (avoid overwriting existing config).
+              const existing = this._getNestedConfigValue(config, key)
+              if (existing !== undefined && existing !== null) continue
 
-            const value = this._configValueForKey(key)
-            if (value === null) {
-              // Credential key — cannot auto-resolve, user must configure manually
-              manualConfigKeys.push(key)
-              continue
+              const value = this._configValueForKey(key)
+              if (value === null) {
+                // Credential key — cannot auto-resolve, user must configure manually.
+                manualConfigKeys.push(key)
+                continue
+              }
+              this._setNestedConfigValue(config, key, value)
+              autoResolved.push(key)
+              anyResolved = true
             }
-            this._setNestedConfigValue(config, key, value)
-            autoResolved.push(key)
-          }
+            return anyResolved
+          })
           if (autoResolved.length > 0) {
-            await this.configManager.writeConfig(config)
             console.log(`[SkillsManager] Auto-resolved config keys for ${skillName}: ${autoResolved.join(', ')}`)
           }
         } catch (err: any) {
@@ -265,14 +361,35 @@ export class SkillsManager {
     }
   }
 
-  // Cached top-600 skills from ClawHub (10-minute TTL)
+  // Cached top-1000 skills from ClawHub (10-minute TTL)
   private topSkillsCache: { skills: RegistrySkill[]; fetchedAt: number } | null = null
   private readonly TOP_SKILLS_CACHE_TTL_MS = 10 * 60 * 1000
 
+  // ClawHub server-side search results are short-lived. We cache them per
+  // query for 2 minutes so rapid keystrokes ("a" → "ap" → "app") don't
+  // hammer the API, but stay fresh enough that recent uploads surface
+  // in search within a few minutes of publication.
+  private searchCache = new Map<string, { skills: RegistrySkill[]; fetchedAt: number }>()
+  private readonly SEARCH_CACHE_TTL_MS = 2 * 60 * 1000
+  /** Max distinct queries kept in memory before LRU eviction. */
+  private readonly SEARCH_CACHE_MAX_ENTRIES = 64
+
   /**
-   * Search skills from the ClawHub API.
-   * Fetches the top 600 skills by downloads (cached 10 min), then filters client-side by query.
-   * If both ClawHub and S3 fallback fail, serves stale cache (if available).
+   * Search skills against the ClawHub registry.
+   *
+   * Empty query → uses the cached top-1000-by-downloads browse list (fast,
+   * already populated from page-1 hydration; matches the catalog view).
+   *
+   * Non-empty query → hits ClawHub's dedicated `/api/v1/search` endpoint
+   * which returns server-ranked results with a relevance `score`. This
+   * gives correct rankings for skills outside the top 1000 by downloads
+   * and respects ClawHub's own relevance heuristics — neither was
+   * possible with the previous client-side substring filter against the
+   * cached top-1000 list.
+   *
+   * Fallbacks: on search-endpoint failure we degrade to filtering the
+   * cached browse list (best-effort), then to the S3 mirror, then to
+   * stale cache.
    */
   async searchRegistry(query: string): Promise<{
     success: boolean
@@ -280,39 +397,104 @@ export class SkillsManager {
     total?: number
     error?: string
   }> {
-    try {
-      await this._ensureTopSkillsCache()
-    } catch (error: any) {
-      console.error('[SkillsManager] All skill sources failed:', error)
-      // If we have a stale cache, serve it rather than failing
-      if (this.topSkillsCache) {
-        console.log('[SkillsManager] Serving stale cache despite refresh failure')
-      } else {
-        return { success: false, error: error.message || 'Failed to search registry' }
+    const trimmed = (query || '').trim()
+
+    // Empty query → browse mode (existing behavior).
+    if (!trimmed) {
+      try {
+        await this._ensureTopSkillsCache()
+      } catch (error: any) {
+        if (!this.topSkillsCache) {
+          return { success: false, error: error.message || 'Failed to load registry' }
+        }
+        console.log('[SkillsManager] Serving stale browse cache after refresh failure')
       }
+      const skills = this.topSkillsCache?.skills ?? []
+      return { success: true, skills, total: skills.length }
     }
 
-    if (!this.topSkillsCache) {
-      return { success: false, error: 'Failed to load skills from ClawHub' }
+    // Non-empty query → dedicated search endpoint, cached per query.
+    const cacheKey = trimmed.toLowerCase()
+    const cached = this.searchCache.get(cacheKey)
+    if (cached && Date.now() - cached.fetchedAt < this.SEARCH_CACHE_TTL_MS) {
+      return { success: true, skills: cached.skills, total: cached.skills.length }
     }
-
-    let skills = this.topSkillsCache.skills
-    if (query && query.trim()) {
-      const q = query.trim().toLowerCase()
-      skills = skills.filter(s =>
-        s.slug.toLowerCase().includes(q) ||
-        s.displayName.toLowerCase().includes(q) ||
-        s.summary.toLowerCase().includes(q)
+    try {
+      const skills = await this._fetchSearchFromClawHub(trimmed)
+      // LRU bookkeeping: drop the oldest entry if we'd exceed the cap.
+      if (this.searchCache.size >= this.SEARCH_CACHE_MAX_ENTRIES) {
+        const oldest = this.searchCache.keys().next().value
+        if (oldest) this.searchCache.delete(oldest)
+      }
+      this.searchCache.set(cacheKey, { skills, fetchedAt: Date.now() })
+      return { success: true, skills, total: skills.length }
+    } catch (searchErr: any) {
+      console.warn(`[SkillsManager] /api/v1/search failed (${searchErr.message}); falling back to client-side filter`)
+      // Best-effort fallback: filter the cached browse list. Misses
+      // anything outside the top-1000-by-downloads but better than 0
+      // results when the search endpoint is rate-limited.
+      try {
+        await this._ensureTopSkillsCache()
+      } catch (browseErr: any) {
+        return { success: false, error: `Search failed: ${searchErr.message}; browse fallback: ${browseErr.message}` }
+      }
+      const q = trimmed.toLowerCase()
+      const skills = (this.topSkillsCache?.skills ?? []).filter(
+        (s) =>
+          s.slug.toLowerCase().includes(q) ||
+          s.displayName.toLowerCase().includes(q) ||
+          s.summary.toLowerCase().includes(q),
       )
+      return { success: true, skills, total: skills.length }
     }
-
-    return { success: true, skills, total: skills.length }
   }
 
-  // Skills cache fallback URL — uses the ClawHub cache proxy.
-  // Can be overridden via OPENCLAW_SKILLS_CACHE_URL env var.
-  private static readonly S3_FALLBACK_URL =
-    process.env.OPENCLAW_SKILLS_CACHE_URL || ''
+  /**
+   * Hit ClawHub's dedicated search endpoint and map the response to our
+   * RegistrySkill shape. The search-endpoint response shape differs from
+   * the browse-endpoint shape (no `stats` block, no `latestVersion`
+   * nested object), so the mapping is done here rather than inline at
+   * the cache layer.
+   */
+  private async _fetchSearchFromClawHub(query: string): Promise<RegistrySkill[]> {
+    const url = new URL(`${CLAWHUB_BASE_URL}/api/v1/search`)
+    url.searchParams.set('q', query)
+    url.searchParams.set('limit', '100')
+    url.searchParams.set('nonSuspiciousOnly', 'true')
+
+    const resp = await this._fetchWithTimeout(url.toString(), 15_000)
+    if (resp.status === 429) throw new Error('ClawHub search rate limited')
+    if (!resp.ok) {
+      const body = await resp.text().catch(() => '')
+      throw new Error(`ClawHub search returned HTTP ${resp.status}: ${body.slice(0, 120)}`)
+    }
+    const data = (await resp.json()) as {
+      results: Array<{
+        score?: number
+        slug: string
+        displayName?: string
+        summary?: string
+        version?: string
+        updatedAt?: number
+      }>
+    }
+    return (data.results || []).map((r) => ({
+      slug: r.slug,
+      displayName: r.displayName || r.slug,
+      summary: r.summary || '',
+      // Server-search response does NOT include download/star stats —
+      // those are browse-only. Leave zero; the UI uses the relevance
+      // ordering anyway when displaying search results.
+      downloads: 0,
+      stars: 0,
+      version: r.version || '',
+      url: `${CLAWHUB_BASE_URL}/skills/${r.slug}`,
+    }))
+  }
+
+  // Optional skills-cache mirror. This build ships no hosted backend, so the
+  // fallback is opt-in via env and disabled (empty) by default.
+  private static readonly S3_FALLBACK_URL = process.env.OPENCLAW_SKILLS_CACHE_URL || ''
 
   /**
    * Fetch top skills and populate cache.
@@ -363,7 +545,7 @@ export class SkillsManager {
     }
   }
 
-  /** Fetch skills directly from ClawHub API (pages of 100, up to 600). */
+  /** Fetch skills directly from ClawHub API (pages of 100, up to 1000). */
   private async _fetchFromClawHub(): Promise<void> {
     const allItems: Array<{
       slug: string
@@ -374,11 +556,11 @@ export class SkillsManager {
     }> = []
     let cursor: string | null = null
     const PAGE_SIZE = 100
-    const MAX_SKILLS = 600
+    const MAX_SKILLS = 1000
     const PAGE_TIMEOUT_MS = 15_000
 
     while (allItems.length < MAX_SKILLS) {
-      const url = new URL('https://clawhub.ai/api/v1/skills')
+      const url = new URL(`${CLAWHUB_BASE_URL}/api/v1/skills`)
       url.searchParams.set('sort', 'downloads')
       url.searchParams.set('limit', String(PAGE_SIZE))
       if (cursor) url.searchParams.set('cursor', cursor)
@@ -418,7 +600,7 @@ export class SkillsManager {
       downloads: item.stats?.downloads ?? 0,
       stars: item.stats?.stars ?? 0,
       version: item.latestVersion?.version || '',
-      url: `https://clawhub.ai/skills/${item.slug}`,
+      url: `${CLAWHUB_BASE_URL}/skills/${item.slug}`,
     }))
 
     console.log(`[SkillsManager] Cached ${skills.length} top skills from ClawHub`)
@@ -439,7 +621,7 @@ export class SkillsManager {
         }
 
         const data = await resp.json() as { skills: RegistrySkill[]; total: number; updatedAt: string }
-        const skills = (data.skills || []).slice(0, 600)
+        const skills = (data.skills || []).slice(0, 1000)
 
         if (skills.length === 0) {
           throw new Error('S3 fallback returned 0 skills')
@@ -463,7 +645,16 @@ export class SkillsManager {
    * then extract to ~/.openclaw/skills/<slug>/.
    */
   private async _installViaProxy(slug: string): Promise<{ success: boolean; output?: string; error?: string }> {
-    // Skills download proxy — can be overridden via OPENCLAW_SKILLS_PROXY_URL env var.
+    // Defence in depth: the slug is already validated by SLUG_REGEX at
+    // every public entry point, but if a future caller forgets, fail
+    // closed here too. encodeURIComponent in the URL only protects against
+    // injection into the request line — it does NOT protect against
+    // path-traversal on the local filesystem.
+    if (!SLUG_REGEX.test(slug)) {
+      return { success: false, error: 'Invalid skill slug' }
+    }
+
+    // Optional download proxy — opt-in via env, no hosted default here.
     const proxyBase = process.env.OPENCLAW_SKILLS_PROXY_URL || ''
     const proxyUrl = `${proxyBase}/${encodeURIComponent(slug)}`
     console.log(`[SkillsManager] Proxy install: ${proxyUrl}`)
@@ -480,19 +671,30 @@ export class SkillsManager {
     const zipBuffer = Buffer.from(data.zipBase64, 'base64')
     if (zipBuffer.length < 10) throw new Error('Proxy returned empty or corrupt zip')
 
-    const { mkdir, writeFile, rm } = await import('fs/promises')
-
     const home = process.env.HOME || process.env.USERPROFILE || ''
-    const skillDir = path.join(home, '.openclaw', 'skills', slug)
+    const skillsRoot = this._skillsDir()
+    const skillDir = path.join(skillsRoot, slug)
+
+    // Last-line defence: even with SLUG_REGEX in place, refuse to extract
+    // if the resolved target somehow escapes the skills root.
+    if (!isPathInside(skillDir, skillsRoot)) {
+      throw new Error(`Refusing to install: target path escapes skills root (slug="${slug}")`)
+    }
+
     await mkdir(skillDir, { recursive: true })
 
-    const tmpZip = path.join(home, '.openclaw', `_tmp_${slug}.zip`)
+    // Use a private mkdtemp directory so two concurrent installs of the
+    // same slug can't corrupt each other's staging zip (previously the
+    // tmp path was deterministic: `~/.openclaw/_tmp_<slug>.zip`).
+    const tmpDir = await mkdtemp(path.join(home, '.openclaw', '_tmp_skill_'))
+    const tmpZip = path.join(tmpDir, 'skill.zip')
     await writeFile(tmpZip, zipBuffer)
 
     try {
       await this._extractZip(tmpZip, skillDir)
     } finally {
-      await rm(tmpZip, { force: true }).catch(() => {})
+      // Clean up the whole mkdtemp directory (best-effort).
+      await rm(tmpDir, { recursive: true, force: true }).catch(() => {})
     }
 
     // Write _meta.json (matches clawhub CLI format)
@@ -509,7 +711,7 @@ export class SkillsManager {
     await mkdir(clawhubDir, { recursive: true })
     const origin = {
       version: 1,
-      registry: 'https://clawhub.ai',
+      registry: CLAWHUB_BASE_URL,
       slug,
       installedVersion: data.version,
       installedAt: Date.now(),
@@ -546,111 +748,105 @@ export class SkillsManager {
   }
 
   /**
-   * Install a skill from the registry using the bundled bun binary.
-   * Runs: bun x clawhub@latest install <slug>
-   * Slug is validated before use — no shell injection possible (args array, no shell:true).
+   * Install a skill from the registry.
+   *
+   * Primary path: `openclaw skills install <slug> --force` via the shared
+   *   command executor (the same path used by `doctor`, `plugins list`,
+   *   etc.). Executor resolves to a system openclaw if installed (Node
+   *   runtime, has node:sqlite, matches the documented contract), or
+   *   falls back to bundled bun + openclaw.mjs in production. Both honor
+   *   the documented `openclaw skills install` CLI surface.
+   *
+   *   Was previously `bun x clawhub@latest install <slug>` — the
+   *   separately-shipped clawhub CLI. That path still works but spawns a
+   *   bun + npm download on first use (cold install was ~5s vs ~200ms now)
+   *   and diverges from the documented command name.
+   *
+   * Fallback: backend S3 proxy (`_installViaProxy`). Catches rate-limit
+   * cases, network failures, and "Skill not found" stays definitive
+   * (no point trying the proxy for a slug ClawHub itself rejected).
+   *
+   * Slug validation matches the backend (see SLUG_REGEX). Accepts both
+   * bare slugs ("gifgrep") and owner-prefixed ("steipete/gifgrep").
    */
   async installFromRegistry(slug: string): Promise<{
     success: boolean
     output?: string
     error?: string
   }> {
-    // Accept "skill-name" or "author/skill-name" — each part must be safe
     const slugParts = slug.split('/')
-    if (slugParts.length > 2 || slugParts.some(p => !/^[a-zA-Z0-9_.-]+$/.test(p))) {
+    if (slugParts.length > 2 || slugParts.some((p) => !SLUG_REGEX.test(p))) {
       return { success: false, error: 'Invalid skill slug' }
     }
 
-    try {
-      const { app } = await import('electron')
-      const isWindows = process.platform === 'win32'
-      const home = process.env.HOME || process.env.USERPROFILE || ''
-      const pathSep = isWindows ? ';' : ':'
-
-      let bunBinary: string
-      let env: NodeJS.ProcessEnv
-
-      const skillsWorkdir = path.join(home, '.openclaw')
-
-      if (app.isPackaged) {
-        const bunBinaryName = isWindows
-          ? 'bun-windows.exe'
-          : `bun-${process.arch === 'arm64' ? 'arm64' : 'x64'}`
-        bunBinary = path.join(process.resourcesPath, 'bun', bunBinaryName)
-        const bundledBunDir = path.join(process.resourcesPath, 'bun')
-        const expandedPath = isWindows
-          ? [bundledBunDir, process.env.PATH || ''].join(pathSep)
-          : [bundledBunDir, '/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin', process.env.PATH || ''].join(pathSep)
-        env = { ...process.env, PATH: expandedPath, CLAWHUB_WORKDIR: skillsWorkdir }
-      } else {
-        bunBinary = 'bun'
-        const bunPath = path.join(home, '.bun', 'bin')
-        env = { ...process.env, PATH: `${bunPath}${pathSep}${process.env.PATH || ''}`, CLAWHUB_WORKDIR: skillsWorkdir }
+    // Sentinel detection — output substrings that should short-circuit
+    // (success-on-output OR definitive-failure-don't-retry). Lifted to a
+    // helper because we need to inspect both stdout (when executor
+    // resolves) and the error message (when executor throws on non-zero
+    // exit) for the same patterns.
+    const sniffSentinels = (raw: string): {
+      hitRateLimit: boolean
+      isSkillNotFound: boolean
+    } => {
+      const s = raw.toLowerCase()
+      return {
+        hitRateLimit: s.includes('rate limit exceeded'),
+        isSkillNotFound: s.includes('skill not found'),
       }
+    }
 
-      const args = ['x', 'clawhub@latest', 'install', '--force', slug]
-      console.log(`[SkillsManager] Installing from registry: ${bunBinary} ${args.join(' ')} (cwd: ${skillsWorkdir})`)
+    let cliOutput = ''
+    try {
+      // 90s timeout matches the previous bun-spawn budget — installs can
+      // include git clones for some skills.
+      const result = await this.executor.executeCommand(
+        ['skills', 'install', slug, '--force'],
+        90_000,
+      )
+      cliOutput = (result ?? '').trim()
+      const { hitRateLimit, isSkillNotFound } = sniffSentinels(cliOutput)
 
-      return new Promise((resolve) => {
-        const child = spawn(bunBinary, args, { env, cwd: skillsWorkdir, windowsHide: true })
+      // "Skill not found" is definitive — don't retry via proxy (the
+      // proxy hits the same registry and would also fail).
+      if (isSkillNotFound) {
+        return {
+          success: false,
+          output: cliOutput,
+          error: `Skill "${slug}" not found in the ClawHub registry.`,
+        }
+      }
+      // Clean exit-0, real output, no rate-limit warning → done.
+      if (cliOutput && !hitRateLimit) {
+        return { success: true, output: cliOutput }
+      }
+      // Empty output OR rate-limit warning OR ambiguous → try proxy.
+      console.log(
+        `[SkillsManager] openclaw skills install ${slug} did not complete cleanly; trying proxy fallback`,
+      )
+    } catch (cliErr: any) {
+      const errMsg = cliErr?.message || ''
+      const { isSkillNotFound } = sniffSentinels(errMsg)
+      if (isSkillNotFound) {
+        // CLI exited non-zero AND signalled "skill not found" — definitive.
+        return {
+          success: false,
+          error: `Skill "${slug}" not found in the ClawHub registry.`,
+        }
+      }
+      console.log(
+        `[SkillsManager] openclaw skills install ${slug} threw (${errMsg}); trying proxy fallback`,
+      )
+      cliOutput = errMsg
+    }
 
-        const stdoutChunks: Buffer[] = []
-        const stderrChunks: Buffer[] = []
-        child.stdout.on('data', (chunk: Buffer) => stdoutChunks.push(chunk))
-        child.stderr.on('data', (chunk: Buffer) => stderrChunks.push(chunk))
-
-        child.on('error', (err: any) => {
-          // Spawn failed entirely (e.g. bun binary not found) — try proxy
-          console.log(`[SkillsManager] Spawn error: ${err.message}, trying proxy fallback for "${slug}"`)
-          this._installViaProxy(slug).then(
-            proxyResult => resolve(proxyResult),
-            proxyErr => resolve({ success: false, error: `Spawn failed (${err.message}) + proxy fallback failed: ${proxyErr.message}` })
-          )
-        })
-
-        const timeout = setTimeout(() => {
-          child.kill()
-          console.log(`[SkillsManager] clawhub install timed out, trying proxy fallback for "${slug}"`)
-          this._installViaProxy(slug).then(
-            proxyResult => resolve(proxyResult),
-            proxyErr => resolve({ success: false, error: `Install timed out + proxy fallback failed: ${proxyErr.message}` })
-          )
-        }, 90000)
-
-        child.on('close', (code) => {
-          clearTimeout(timeout)
-          const stdout = Buffer.concat(stdoutChunks).toString('utf8')
-          const stderr = Buffer.concat(stderrChunks).toString('utf8')
-          const output = [stdout, stderr].filter(Boolean).join('\n').trim()
-
-          const outputLower = output.toLowerCase()
-
-          // clawhub can exit 0 but print "Rate limit exceeded" when the
-          // install actually failed — fall through to proxy in that case.
-          const hitRateLimit = outputLower.includes('rate limit exceeded')
-          if (code === 0 && !hitRateLimit) {
-            resolve({ success: true, output })
-            return
-          }
-
-          // "Skill not found" is a definitive answer — don't fallback
-          if (outputLower.includes('skill not found')) {
-            resolve({ success: false, output, error: `Skill "${slug}" not found in the ClawHub registry.` })
-            return
-          }
-
-          // For any other failure (rate limit, module errors, network issues),
-          // try installing via our proxy before giving up
-          console.log(`[SkillsManager] clawhub install failed (code ${code}), trying proxy fallback for "${slug}"`)
-          this._installViaProxy(slug).then(
-            proxyResult => resolve(proxyResult),
-            proxyErr => resolve({ success: false, output, error: `Install failed + proxy fallback failed: ${proxyErr.message}` })
-          )
-        })
-      })
-    } catch (error: any) {
-      console.error(`[SkillsManager] Error installing from registry: ${slug}`, error)
-      return { success: false, error: error.message || 'Failed to install skill' }
+    try {
+      return await this._installViaProxy(slug)
+    } catch (proxyErr: any) {
+      return {
+        success: false,
+        output: cliOutput,
+        error: `Install failed + proxy fallback failed: ${proxyErr.message}`,
+      }
     }
   }
 
@@ -691,9 +887,11 @@ export class SkillsManager {
     const raw = frontmatter.metadata
     if (!raw) return {}
     try {
-      // The metadata value is JSON (or JSON5-ish); parse it
+      // The metadata value is JSON (or JSON5-ish); parse it. Some
+      // skills nest under an `openclaw` key; older ones inline at the
+      // top level.
       const parsed = JSON.parse(raw)
-      const oc = parsed?.openclaw || parsed?.clawdbot || parsed
+      const oc = parsed?.openclaw || parsed
       return {
         emoji: oc.emoji,
         requires: oc.requires,
@@ -709,7 +907,6 @@ export class SkillsManager {
    */
   private async _readSkillVersion(skillDir: string): Promise<string> {
     try {
-      const { readFile } = await import('fs/promises')
       const raw = await readFile(path.join(skillDir, '_meta.json'), 'utf8')
       const meta = JSON.parse(raw)
       return meta.version || ''
@@ -739,9 +936,7 @@ export class SkillsManager {
     error?: string
   }> {
     try {
-      const { readdir, readFile } = await import('fs/promises')
-      const home = process.env.HOME || process.env.USERPROFILE || ''
-      const skillsDir = path.join(home, '.openclaw', 'skills')
+      const skillsDir = this._skillsDir()
 
       let entries: import('fs').Dirent[]
       try {
@@ -819,43 +1014,54 @@ export class SkillsManager {
    * Looks up the directory by name first, then falls back to scanning SKILL.md name: fields
    * (the directory slug often differs from the skill name).
    */
+  /**
+   * Resolve a skill name to a folder path the user can open. Tries the
+   * three lookup strategies the `skills:open-folder` IPC handler used to
+   * implement inline:
+   *   1. `~/.openclaw/skills/<name>/`
+   *   2. `~/.openclaw/skills/<dir>/` where SKILL.md `name:` matches
+   *   3. `<OPENCLAW_BUNDLED_PLUGINS_DIR>/skills/<name>/` (bundled skill)
+   *
+   * Returns the absolute path on hit, or null if no source has it. The
+   * IPC handler is the only caller (it then `shell.openPath`s the result).
+   */
+  async resolveSkillFolderPath(skillName: string): Promise<string | null> {
+    if (!SLUG_REGEX.test(skillName)) return null
+
+    // Workspace lookups (1 + 2) share with findSkillDirByName.
+    const workspaceDir = await this.findSkillDirByName(skillName)
+    if (workspaceDir) return workspaceDir
+
+    // 3. Bundled extensions dir — a different root that lives outside
+    // ~/.openclaw/. Validate the resolved target stays under it as defence
+    // in depth (SLUG_REGEX already rejects traversal-ish names).
+    const extDir = process.env.OPENCLAW_BUNDLED_PLUGINS_DIR
+    if (extDir) {
+      const extPath = path.join(extDir, 'skills', skillName)
+      if (!isPathInside(extPath, extDir)) return null
+      try {
+        await access(extPath)
+        return extPath
+      } catch { /* not bundled */ }
+    }
+    return null
+  }
+
   async removeSkill(skillName: string): Promise<{ success: boolean; error?: string }> {
-    if (!skillName || !/^[a-zA-Z0-9_.-]+$/.test(skillName)) {
+    if (!skillName || !SLUG_REGEX.test(skillName)) {
       return { success: false, error: 'Invalid skill name' }
     }
     try {
-      const { rm, access, readdir, readFile } = await import('fs/promises')
-      const home = process.env.HOME || process.env.USERPROFILE || ''
-      const skillsDir = path.join(home, '.openclaw', 'skills')
-
-      // 1. Direct match: directory name equals skill name
-      const directDir = path.join(skillsDir, skillName)
-      try {
-        await access(directDir)
-        console.log(`[SkillsManager] Removing skill folder: ${directDir}`)
-        await rm(directDir, { recursive: true })
-        return { success: true }
-      } catch {}
-
-      // 2. Scan directories and match by SKILL.md name: field
-      try {
-        const entries = await readdir(skillsDir, { withFileTypes: true })
-        for (const entry of entries) {
-          if (!entry.isDirectory()) continue
-          try {
-            const md = await readFile(path.join(skillsDir, entry.name, 'SKILL.md'), 'utf8')
-            const m = md.match(/^name:\s*(.+)$/m)
-            if (m && m[1].trim() === skillName) {
-              const matchedDir = path.join(skillsDir, entry.name)
-              console.log(`[SkillsManager] Removing skill folder: ${matchedDir} (matched by name: ${skillName})`)
-              await rm(matchedDir, { recursive: true })
-              return { success: true }
-            }
-          } catch {}
+      const dir = await this.findSkillDirByName(skillName)
+      if (!dir) {
+        return {
+          success: false,
+          error: `"${skillName}" is a bundled skill and cannot be removed here. Only workspace-installed skills (via clawhub install) can be deleted.`,
         }
-      } catch {}
-
-      return { success: false, error: `"${skillName}" is a bundled skill and cannot be removed here. Only workspace-installed skills (via clawhub install) can be deleted.` }
+      }
+      console.log(`[SkillsManager] Removing skill folder: ${dir}`)
+      await rm(dir, { recursive: true })
+      return { success: true }
     } catch (error: any) {
       console.error(`[SkillsManager] Error removing skill ${skillName}:`, error)
       return { success: false, error: error.message || 'Failed to remove skill' }
@@ -866,10 +1072,20 @@ export class SkillsManager {
    * Clear cached skillsSnapshot from all session entries so the gateway
    * rebuilds the snapshot (picking up newly installed/removed skills)
    * on the next message.
+   *
+   * KNOWN LIMITATION: sessions.json is co-owned by the gateway. A true
+   * concurrent-writer fix requires an IPC ("ask the gateway to drop
+   * snapshots") rather than the desktop mutating gateway-owned state;
+   * that's an upstream OpenClaw change and out of scope here. The
+   * tmp-file + rename below is a partial mitigation — it prevents a
+   * half-written sessions.json from ever being observed if the desktop
+   * is killed mid-write, but it does NOT eliminate the lost-update race
+   * with concurrent gateway writes. Acceptable because the gateway
+   * rebuilds the snapshot lazily anyway; the worst case from a lost
+   * write is "snapshot not cleared this round, will clear next session boot."
    */
   async clearSkillsSnapshots(): Promise<void> {
     try {
-      const { readdir, readFile, writeFile } = await import('fs/promises')
       const agentsDir = path.join(os.homedir(), '.openclaw', 'agents')
       let agentDirs: string[]
       try {
@@ -893,7 +1109,14 @@ export class SkillsManager {
             }
           }
           if (changed) {
-            await writeFile(storePath, JSON.stringify(store, null, 2), 'utf8')
+            // Atomic-replace pattern: write to a sibling tmp file then
+            // rename onto the canonical path. rename(2) is atomic within
+            // a filesystem on POSIX, and node's fs.rename does the same
+            // on Windows for files on the same volume. Readers always
+            // see either the old or new file, never a partial one.
+            const tmpPath = `${storePath}.tmp-${process.pid}-${Date.now()}`
+            await writeFile(tmpPath, JSON.stringify(store, null, 2), 'utf8')
+            await rename(tmpPath, storePath)
             console.log(`[SkillsManager] Cleared skillsSnapshot from ${storePath}`)
           }
         } catch {
@@ -906,29 +1129,53 @@ export class SkillsManager {
   }
 
   /**
+   * Run `openclaw skills update --all` to refresh every ClawHub-installed
+   * skill in place. Streams the CLI output back so the Skills page can
+   * surface "skill X updated to version Y" lines without us re-parsing.
+   * 5-minute timeout — updates can be sizeable on machines with many
+   * skills, and the upstream command does its own per-skill timing.
+   */
+  async updateAllSkills(): Promise<{
+    success: boolean
+    output?: string
+    error?: string
+  }> {
+    try {
+      console.log('[SkillsManager] Running skills update --all')
+      const result = await this.executor.executeCommand(['skills', 'update', '--all'], 300_000)
+      if (result === null || result === undefined) {
+        return { success: false, error: 'No output from skills update' }
+      }
+      return { success: true, output: result }
+    } catch (error: any) {
+      console.error('[SkillsManager] Error updating skills:', error)
+      return { success: false, error: error.message || 'Failed to update skills' }
+    }
+  }
+
+  /**
    * Enable or disable a skill by writing to ~/.openclaw/openclaw.json.
    * Setting enabled=false prevents the skill from loading even if bundled.
    */
   async setSkillEnabled(skillName: string, enabled: boolean): Promise<{ success: boolean; error?: string }> {
     try {
       console.log(`[SkillsManager] Setting skill "${skillName}" enabled=${enabled}`)
-      const config = await this.configManager.loadConfig()
-
-      if (!config.skills) {config.skills = {}}
-      if (!config.skills.entries) {config.skills.entries = {}}
-      if (!config.skills.entries[skillName]) {config.skills.entries[skillName] = {}}
-
-      config.skills.entries[skillName].enabled = enabled
-
-      await this.configManager.writeConfig(config)
+      // Single atomic RMW under the config write-lock. Previously this
+      // did load+mutate+write outside the lock — a concurrent
+      // `config:save` IPC between read and write would clobber this update.
+      await this.configManager.mutateConfig((config) => {
+        if (!config.skills) config.skills = {}
+        if (!config.skills.entries) config.skills.entries = {}
+        if (!config.skills.entries[skillName]) config.skills.entries[skillName] = {}
+        if (config.skills.entries[skillName].enabled === enabled) return false  // no-op
+        config.skills.entries[skillName].enabled = enabled
+        return true
+      })
       console.log(`[SkillsManager] Skill "${skillName}" enabled=${enabled} saved to config`)
       return { success: true }
     } catch (error: any) {
       console.error(`[SkillsManager] Error setting skill enabled for ${skillName}:`, error)
-      return {
-        success: false,
-        error: error.message || 'Failed to update skill'
-      }
+      return { success: false, error: error.message || 'Failed to update skill' }
     }
   }
 }

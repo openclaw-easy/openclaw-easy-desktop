@@ -1,30 +1,18 @@
 import React, { useState, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
 import { MessageSquare, Calendar, Trash2, Plus, RefreshCw, Search } from 'lucide-react';
+import { useToast } from '../../../contexts/ToastContext';
+import { SectionHeader } from '../../ui/section-header';
+import { SkeletonCard } from '../../ui/skeleton';
+import { MascotIllustration } from '../../ui/mascot-illustration';
+import { EmptyState } from '../../ui/empty-state';
+import { ErrorAlert } from '../../ui/error-alert';
+import { Modal } from '../../ui/modal';
+import type { ColorTheme } from '../types';
 
-interface ColorScheme {
-  bg: {
-    primary: string;
-    secondary: string;
-    tertiary: string;
-    hover: string;
-    active: string;
-  };
-  text: {
-    normal: string;
-    muted: string;
-    header: string;
-    link: string;
-    danger: string;
-  };
-  accent: {
-    brand: string;
-    green: string;
-    yellow: string;
-    red: string;
-    purple: string;
-  };
-}
+// Local alias for back-compat with the prop name. Was a duplicated
+// interface declaration until the 2026-06-15 ColorTheme dedup pass.
+type ColorScheme = ColorTheme;
 
 interface SessionsSectionProps {
   colors: ColorScheme;
@@ -44,8 +32,12 @@ interface Session {
 
 export function SessionsSection({ colors, onSelectSession, currentSession }: SessionsSectionProps) {
   const { t } = useTranslation();
+  const { addToast } = useToast();
   const [sessions, setSessions] = useState<Session[]>([]);
   const [loading, setLoading] = useState(true);
+  // Surfaces load failures instead of silently rendering an empty "no sessions"
+  // state when listSessions actually errored.
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
   const [filterActive, setFilterActive] = useState<number>(0); // 0 = all, N = last N minutes
   const [deleteConfirm, setDeleteConfirm] = useState<{ show: boolean; sessionKey: string; displayName: string }>({
@@ -57,6 +49,7 @@ export function SessionsSection({ colors, onSelectSession, currentSession }: Ses
 
   const loadSessions = async () => {
     setLoading(true);
+    setLoadError(null);
     try {
       console.log('[SessionsSection] Loading sessions with filter:', filterActive || 'all');
       // Pass filterActive to API if set (0 means all sessions)
@@ -70,9 +63,11 @@ export function SessionsSection({ colors, onSelectSession, currentSession }: Ses
         setSessions(result.sessions);
       } else {
         console.warn('[SessionsSection] Failed to load sessions:', result?.error);
+        setLoadError(result?.error || t('sessions.loadFailed', 'Failed to load sessions'));
       }
-    } catch (error) {
+    } catch (error: any) {
       console.error('[SessionsSection] Error loading sessions:', error);
+      setLoadError(error?.message || t('sessions.loadFailed', 'Failed to load sessions'));
     } finally {
       setLoading(false);
     }
@@ -132,11 +127,14 @@ export function SessionsSection({ colors, onSelectSession, currentSession }: Ses
         await loadSessions();
       } else {
         console.error('[SessionsSection] Failed to delete session:', result?.error);
-        alert(`Failed to delete session: ${result?.error || 'Unknown error'}`);
+        addToast(
+          `${t('sessions.deleteFailed', 'Failed to delete session')}: ${result?.error || t('common.unknownError', 'Unknown error')}`,
+          'error'
+        );
       }
     } catch (error) {
       console.error('[SessionsSection] Error deleting session:', error);
-      alert('Error deleting session');
+      addToast(t('sessions.deleteFailed', 'Failed to delete session'), 'error');
     } finally {
       setDeleting(false);
       setDeleteConfirm({ show: false, sessionKey: '', displayName: '' });
@@ -152,20 +150,15 @@ export function SessionsSection({ colors, onSelectSession, currentSession }: Ses
 
   return (
     <div className="flex flex-col h-full">
-      {/* Header */}
-      <div className="px-6 pt-4 pb-3 border-b" style={{ borderColor: colors.bg.tertiary }}>
-        <div className="flex items-center justify-between mb-3">
-          <div className="flex items-baseline gap-2">
-            <h3 className="text-lg font-bold" style={{ color: colors.text.header }}>
-              {t('sessions.title')}
-            </h3>
-            <p className="text-xs" style={{ color: colors.text.muted }}>
-              {t('sessions.subtitle')}
-            </p>
-          </div>
+      <SectionHeader
+        title={t('sessions.title')}
+        subtitle={t('sessions.subtitle')}
+        colors={colors}
+        actions={
           <button
             onClick={loadSessions}
             disabled={loading}
+            aria-label="Refresh sessions"
             className="p-2 rounded-lg transition-colors"
             style={{
               backgroundColor: colors.bg.tertiary,
@@ -174,9 +167,11 @@ export function SessionsSection({ colors, onSelectSession, currentSession }: Ses
           >
             <RefreshCw className={`h-4 w-4 ${loading ? 'animate-spin' : ''}`} />
           </button>
-        </div>
+        }
+      />
 
-        {/* Search and Filter */}
+      {/* Search and Filter */}
+      <div className="px-6 py-3 flex-shrink-0">
         <div className="flex gap-2">
           <div className="flex-1 relative">
             <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4" style={{ color: colors.text.muted }} />
@@ -216,16 +211,43 @@ export function SessionsSection({ colors, onSelectSession, currentSession }: Ses
       {/* Sessions List */}
       <div className="flex-1 overflow-y-auto px-6 py-4">
         {loading ? (
-          <div className="flex items-center justify-center py-12">
-            <RefreshCw className="h-6 w-6 animate-spin" style={{ color: colors.text.muted }} />
+          <div className="space-y-3 animate-fade-up">
+            {Array.from({ length: 4 }).map((_, i) => (
+              <SkeletonCard key={i} />
+            ))}
           </div>
+        ) : loadError ? (
+          <ErrorAlert
+            colors={colors}
+            title={t('sessions.loadFailed', 'Failed to load sessions')}
+            message={loadError}
+            action={
+              <button
+                onClick={loadSessions}
+                className="flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm font-medium transition-colors"
+                style={{ backgroundColor: colors.accent.brand, color: colors.button.primaryFg }}
+              >
+                <RefreshCw className="h-4 w-4" />
+                {t('common.retry', 'Retry')}
+              </button>
+            }
+          />
         ) : filteredSessions.length === 0 ? (
-          <div className="text-center py-12">
-            <MessageSquare className="h-12 w-12 mx-auto mb-3" style={{ color: colors.text.muted, opacity: 0.5 }} />
-            <p className="text-sm" style={{ color: colors.text.muted }}>
-              {searchQuery || filterActive > 0 ? t('sessions.noMatch') : t('sessions.noSessions')}
-            </p>
-          </div>
+          <EmptyState
+            illustration={
+              <MascotIllustration
+                mood={searchQuery || filterActive > 0 ? 'thinking' : 'napping'}
+                size={searchQuery || filterActive > 0 ? 64 : 80}
+              />
+            }
+            title={searchQuery || filterActive > 0 ? t('sessions.noMatch') : t('sessions.noSessions')}
+            description={
+              searchQuery || filterActive > 0
+                ? undefined
+                : 'Start a chat to see your sessions appear here.'
+            }
+            colors={colors}
+          />
         ) : (
           <div className="space-y-2">
             {filteredSessions.map((session) => (
@@ -265,7 +287,8 @@ export function SessionsSection({ colors, onSelectSession, currentSession }: Ses
                         backgroundColor: colors.bg.tertiary,
                         color: colors.accent.red,
                       }}
-                      title="Delete session"
+                      title={t('sessions.deleteSession', 'Delete session')}
+                      aria-label={t('sessions.deleteSession', 'Delete session')}
                     >
                       <Trash2 className="h-3.5 w-3.5" />
                     </button>
@@ -300,18 +323,14 @@ export function SessionsSection({ colors, onSelectSession, currentSession }: Ses
         </div>
       </div>
 
-      {/* Delete Confirmation Dialog */}
-      {deleteConfirm.show && (
-        <div
-          className="fixed inset-0 flex items-center justify-center z-50"
-          style={{ backgroundColor: 'rgba(0, 0, 0, 0.7)' }}
-          onClick={() => !deleting && setDeleteConfirm({ show: false, sessionKey: '', displayName: '' })}
-        >
-          <div
-            className="rounded-xl p-6 max-w-md w-full mx-4 shadow-2xl"
-            style={{ backgroundColor: colors.bg.secondary }}
-            onClick={(e) => e.stopPropagation()}
-          >
+      {/* Delete Confirmation Dialog — Escape/backdrop dismiss suppressed
+          mid-delete so the user can't drop themselves before the IPC settles. */}
+      <Modal
+        open={deleteConfirm.show}
+        onClose={() => setDeleteConfirm({ show: false, sessionKey: '', displayName: '' })}
+        dismissable={!deleting}
+        shellClassName="shadow-2xl"
+      >
             <div className="flex items-start space-x-3 mb-4">
               <div
                 className="p-2 rounded-lg"
@@ -345,7 +364,7 @@ export function SessionsSection({ colors, onSelectSession, currentSession }: Ses
               <button
                 onClick={() => setDeleteConfirm({ show: false, sessionKey: '', displayName: '' })}
                 disabled={deleting}
-                className="flex-1 px-4 py-2 rounded-lg text-sm font-medium transition-colors"
+                className="press-pulse ripple-glow flex-1 px-4 py-2 rounded-lg text-sm font-medium transition-all hover:-translate-y-px hover:shadow-glow active:translate-y-0"
                 style={{
                   backgroundColor: colors.bg.tertiary,
                   color: colors.text.normal,
@@ -356,19 +375,17 @@ export function SessionsSection({ colors, onSelectSession, currentSession }: Ses
               <button
                 onClick={() => handleDeleteSession(deleteConfirm.sessionKey)}
                 disabled={deleting}
-                className="flex-1 px-4 py-2 rounded-lg text-sm font-medium transition-colors"
+                className="press-pulse ripple-glow flex-1 px-4 py-2 rounded-lg text-sm font-medium transition-all hover:-translate-y-px hover:shadow-glow active:translate-y-0"
                 style={{
                   backgroundColor: colors.accent.red,
-                  color: '#FFFFFF',
+                  color: colors.button.primaryFg,
                   opacity: deleting ? 0.6 : 1,
                 }}
               >
                 {deleting ? t('common.deleting') : t('sessions.deleteSession')}
               </button>
             </div>
-          </div>
-        </div>
-      )}
+      </Modal>
     </div>
   );
 }

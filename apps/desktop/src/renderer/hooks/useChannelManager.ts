@@ -28,13 +28,22 @@ function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
 
 export const useChannelManager = () => {
   const [connectionError, setConnectionError] = useState<string | null>(null);
-  const [channels, setChannels] = useState({
-    whatsapp: { id: 'whatsapp', name: 'whatsapp', type: 'text' as const, status: 'disconnected' as const },
-    telegram: { id: 'telegram', name: 'telegram', type: 'text' as const, status: 'disconnected' as const },
-    discord: { id: 'discord', name: 'discord', type: 'text' as const, status: 'disconnected' as const },
-    slack: { id: 'slack', name: 'slack', type: 'text' as const, status: 'disconnected' as const },
-    feishu: { id: 'feishu', name: 'feishu', type: 'text' as const, status: 'disconnected' as const },
-    line: { id: 'line', name: 'line', type: 'text' as const, status: 'disconnected' as const },
+  // Explicit type so `status` is the full union, not the literal 'disconnected'
+  // inferred from `as const` — otherwise setChannels(... status: 'connected')
+  // fails to type-check and the connect/disconnect updates can't compile.
+  type ChannelEntry = { id: string; name: string; type: 'text'; status: 'connected' | 'pending' | 'disconnected' };
+  const [channels, setChannels] = useState<{
+    whatsapp: ChannelEntry; telegram: ChannelEntry; discord: ChannelEntry;
+    slack: ChannelEntry; feishu: ChannelEntry; line: ChannelEntry;
+    weixin: ChannelEntry;
+  }>({
+    whatsapp: { id: 'whatsapp', name: 'whatsapp', type: 'text', status: 'disconnected' },
+    telegram: { id: 'telegram', name: 'telegram', type: 'text', status: 'disconnected' },
+    discord: { id: 'discord', name: 'discord', type: 'text', status: 'disconnected' },
+    slack: { id: 'slack', name: 'slack', type: 'text', status: 'disconnected' },
+    feishu: { id: 'feishu', name: 'feishu', type: 'text', status: 'disconnected' },
+    line: { id: 'line', name: 'line', type: 'text', status: 'disconnected' },
+    weixin: { id: 'weixin', name: 'weixin', type: 'text', status: 'disconnected' },
   });
 
   const [setupChannels] = useState<SetupChannel[]>([
@@ -188,13 +197,14 @@ export const useChannelManager = () => {
   useEffect(() => {
     const checkInitialStatus = async () => {
       // Run all checks in parallel for fast startup
-      const [whatsappResult, telegramResult, discordResult, slackResult, feishuResult, lineResult] = await Promise.allSettled([
+      const [whatsappResult, telegramResult, discordResult, slackResult, feishuResult, lineResult, weixinResult] = await Promise.allSettled([
         window.electronAPI?.checkWhatsAppStatus ? withTimeout(window.electronAPI.checkWhatsAppStatus(), 10000) : Promise.reject(),
         window.electronAPI?.checkTelegramStatus ? withTimeout(window.electronAPI.checkTelegramStatus(), 10000) : Promise.reject(),
         window.electronAPI?.checkDiscordStatus ? withTimeout(window.electronAPI.checkDiscordStatus(), 10000) : Promise.reject(),
         window.electronAPI?.checkSlackStatus ? withTimeout(window.electronAPI.checkSlackStatus(), 10000) : Promise.reject(),
         window.electronAPI?.checkFeishuStatus ? withTimeout(window.electronAPI.checkFeishuStatus(), 10000) : Promise.reject(),
         window.electronAPI?.checkLineStatus ? withTimeout(window.electronAPI.checkLineStatus(), 10000) : Promise.reject(),
+        window.electronAPI?.checkWeixinStatus ? withTimeout(window.electronAPI.checkWeixinStatus(), 10000) : Promise.reject(),
       ]);
 
       setChannels(prev => ({
@@ -229,6 +239,11 @@ export const useChannelManager = () => {
           status: lineResult.status === 'fulfilled' && lineResult.value?.connected
             ? 'connected' : 'disconnected'
         },
+        weixin: {
+          ...prev.weixin,
+          status: weixinResult.status === 'fulfilled' && weixinResult.value?.connected
+            ? 'connected' : 'disconnected'
+        },
       }));
     };
 
@@ -256,12 +271,13 @@ export const useChannelManager = () => {
 
       setIsCheckingStatus(false);
 
-      // Set a 1 minute timeout for QR generation
+      // Hang guard: if QR generation never returns within 60s, surface a
+      // timeout. Cleared unconditionally once setup resolves/throws below — the
+      // old `if (!qrCode)` guard read a stale closure value and never fired
+      // correctly, and it let QR_TIMEOUT clobber a real failure error.
       qrTimeoutRef.current = setTimeout(() => {
-        if (!qrCode) {
-          setQrLoadingTimedOut(true);
-          setQrCode('QR_TIMEOUT');
-        }
+        setQrLoadingTimedOut(true);
+        setQrCode('QR_TIMEOUT');
       }, 60000);
 
       // Generate QR code for WhatsApp using real OpenClaw
@@ -286,8 +302,9 @@ export const useChannelManager = () => {
           setQrCode('QR_GENERATION_FAILED');
         }
 
-        // Clear timeout on successful QR generation
-        if (qrTimeoutRef.current && qrResult && !qrResult.includes('QR_GENERATION_FAILED')) {
+        // Setup returned (success OR failure) — always clear the hang timeout
+        // so a real QR_GENERATION_FAILED isn't overwritten by QR_TIMEOUT.
+        if (qrTimeoutRef.current) {
           clearTimeout(qrTimeoutRef.current);
           qrTimeoutRef.current = null;
         }
@@ -296,6 +313,10 @@ export const useChannelManager = () => {
         setQrCode('https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=WhatsApp-Demo-Connection-' + Date.now());
       }
     } catch (error) {
+      if (qrTimeoutRef.current) {
+        clearTimeout(qrTimeoutRef.current);
+        qrTimeoutRef.current = null;
+      }
       setQrCode('QR_ERROR: ' + (error instanceof Error ? error.message : String(error)));
     }
   }, []);
@@ -325,13 +346,88 @@ export const useChannelManager = () => {
     setSetupStep(0);
   }, []);
 
+  // Weixin is an external plugin: the main process installs+enables it on
+  // demand inside getWeixinQR, so this only has to open the QR surface.
+  const startWeixinSetup = useCallback(async () => {
+    setActiveSetup('Weixin');
+    setSetupStep(0);
+    setQrCode(null);
+    setIsConnecting(prev => ({ ...prev, weixin: true }));
+    setConnectionError(null);
+    try {
+      if (!window.electronAPI?.getWeixinQR) return;
+      // Plugin install + npm fetch runs inside this call, so it needs a far
+      // longer budget than the 10s used by credential-only channels.
+      const result = await withTimeout(window.electronAPI.getWeixinQR(), 180000);
+      if (result?.success && result.qrData && result.qrData !== 'ALREADY_CONNECTED') {
+        setQrCode(result.qrData);
+      } else if (result?.qrData === 'ALREADY_CONNECTED' || result?.success) {
+        setChannels(prev => ({ ...prev, weixin: { ...prev.weixin, status: 'connected' } }));
+        setActiveSetup(null);
+      } else {
+        setConnectionError('Weixin setup failed — see Activity log');
+      }
+    } catch (error) {
+      setConnectionError(error instanceof Error ? error.message : 'Weixin setup failed');
+    } finally {
+      setIsConnecting(prev => ({ ...prev, weixin: false }));
+    }
+  }, []);
+
+  // The scan outcome cannot come back through startWeixinSetup: that promise
+  // resolves the moment the QR is on screen, long before the user picks up
+  // their phone. Without this subscription the modal keeps showing the QR even
+  // though the channel is connected and already receiving messages.
+  useEffect(() => {
+    if (!window.electronAPI?.onWeixinStatusChange) return;
+    return window.electronAPI.onWeixinStatusChange((status) => {
+      setIsConnecting(prev => ({ ...prev, weixin: false }));
+      if (status === 'connected') {
+        setQrCode(null);
+        setChannels(prev => ({ ...prev, weixin: { ...prev.weixin, status: 'connected' } }));
+        setConnectionError(null);
+        setActiveSetup(null);
+      } else {
+        // Usually the QR expired unscanned. QR_TIMEOUT is the sentinel
+        // QrLoginPanel renders as the expiry state; clearing qrCode instead
+        // would drop the modal back to its "generating…" spinner and hang
+        // there, since nothing is generating any more.
+        setQrCode('QR_TIMEOUT');
+        setConnectionError('Weixin login did not complete — the QR may have expired. Try again.');
+      }
+    });
+  }, []);
+
+  const disconnectWeixin = useCallback(async () => {
+    setIsDisconnecting(prev => ({ ...prev, weixin: true }));
+    setConnectionError(null);
+    try {
+      if (!window.electronAPI?.disconnectWeixin) return false;
+      // Main returns a bare boolean here, unlike the {success} shape used by
+      // the credential-based channels.
+      const ok = await withTimeout(window.electronAPI.disconnectWeixin(), 15000);
+      if (ok) {
+        setChannels(prev => ({ ...prev, weixin: { ...prev.weixin, status: 'disconnected' } }));
+      }
+      return ok;
+    } catch (error) {
+      setConnectionError(error instanceof Error ? error.message : 'Disconnect failed');
+      return false;
+    } finally {
+      setIsDisconnecting(prev => ({ ...prev, weixin: false }));
+    }
+  }, []);
+
   const connectTelegramBot = useCallback(async (token: string) => {
     setIsConnecting(prev => ({ ...prev, telegram: true }));
     setConnectionError(null);
     try {
       if (window.electronAPI?.connectTelegram) {
-        const success = await withTimeout(window.electronAPI.connectTelegram(token), 15000);
-        if (success) {
+        // Main returns { success, error } — an object is always truthy, so a
+        // failed connect (bad token) must be detected via .success, not the
+        // value itself, or every failure would show "connected".
+        const result = await withTimeout(window.electronAPI.connectTelegram(token), 15000);
+        if (result?.success === true) {
           setChannels(prev => ({
             ...prev,
             telegram: { ...prev.telegram, status: 'connected' }
@@ -339,6 +435,7 @@ export const useChannelManager = () => {
           setActiveSetup(null);
           return true;
         }
+        if (result?.error) setConnectionError(result.error);
       }
       return false;
     } catch (error) {
@@ -356,8 +453,10 @@ export const useChannelManager = () => {
     setConnectionError(null);
     try {
       if (window.electronAPI?.connectDiscord) {
-        const success = await withTimeout(window.electronAPI.connectDiscord(token, serverId), 15000);
-        if (success) {
+        // Main returns { success, error } — detect failure via .success, not
+        // the always-truthy object (see connectTelegramBot).
+        const result = await withTimeout(window.electronAPI.connectDiscord(token, serverId), 15000);
+        if (result?.success === true) {
           setChannels(prev => ({
             ...prev,
             discord: { ...prev.discord, status: 'connected' }
@@ -365,6 +464,7 @@ export const useChannelManager = () => {
           setActiveSetup(null);
           return true;
         }
+        if (result?.error) setConnectionError(result.error);
       }
       return false;
     } catch (error) {
@@ -484,7 +584,11 @@ export const useChannelManager = () => {
     setConnectionError(null);
     try {
       if (window.electronAPI?.disconnectWhatsApp) {
-        const result = await withTimeout(window.electronAPI.disconnectWhatsApp(), 10000);
+        // 35s — generous wraparound the main process's 30s spawn cap so
+        // a healthy disconnect never trips this guard. The verify-by-state
+        // logic in main returns success as soon as the local auth is
+        // cleared, even if the upstream CLI's gateway-WS call timed out.
+        const result = await withTimeout(window.electronAPI.disconnectWhatsApp(), 35_000);
 
         if (result.success) {
           // Update channels state to show disconnected
@@ -519,7 +623,7 @@ export const useChannelManager = () => {
     setConnectionError(null);
     try {
       if (window.electronAPI?.disconnectTelegram) {
-        const result = await withTimeout(window.electronAPI.disconnectTelegram(), 10000);
+        const result = await withTimeout(window.electronAPI.disconnectTelegram(), 35_000);
 
         if (result.success) {
           // Update channels state to show disconnected
@@ -548,7 +652,7 @@ export const useChannelManager = () => {
     setConnectionError(null);
     try {
       if (window.electronAPI?.disconnectDiscord) {
-        const result = await withTimeout(window.electronAPI.disconnectDiscord(), 10000);
+        const result = await withTimeout(window.electronAPI.disconnectDiscord(), 35_000);
 
         if (result.success) {
           // Update channels state to show disconnected
@@ -734,6 +838,7 @@ export const useChannelManager = () => {
     startSlackSetup,
     startFeishuSetup,
     startLineSetup,
+    startWeixinSetup,
     connectTelegramBot,
     connectDiscordBot,
     connectSlackBot,
@@ -745,6 +850,7 @@ export const useChannelManager = () => {
     disconnectSlack,
     disconnectFeishu,
     disconnectLine,
+    disconnectWeixin,
     cancelSetup,
     nextStep,
     prevStep

@@ -39,9 +39,9 @@ export function StreamingIndicator({
 }: StreamingIndicatorProps) {
   const { t } = useTranslation();
   return (
-    <div className="flex justify-start animate-fade-in">
+    <div className="flex justify-start animate-fade-up">
       <div
-        className="max-w-[75%] rounded-lg rounded-bl-none px-4 py-3"
+        className="max-w-[75%] rounded-2xl rounded-bl-md px-4 py-3 glow-ambient shadow-sm ring-1 ring-black/[0.04] dark:ring-white/[0.06]"
         style={{
           backgroundColor: colors.background.secondary,
           color: colors.text.normal
@@ -65,32 +65,20 @@ export function StreamingIndicator({
         {text ? (
           <div className="text-sm">
             <MarkdownRenderer content={text} />
-            <span className="inline-block w-2 h-4 ml-1 bg-current animate-pulse" />
+            {/* Soft coral caret — marks live streaming without the harsh
+                full-block blink of the old bg-current cursor. */}
+            <span className="inline-block w-[3px] h-4 ml-1 rounded-full align-text-bottom bg-brand-400 dark:bg-brand-500 animate-pulse" />
           </div>
         ) : (
           <div className="flex items-center space-x-2">
             <div className="flex space-x-1">
-              <div
-                className="w-2 h-2 rounded-full animate-bounce"
-                style={{
-                  backgroundColor: colors.text.muted,
-                  animationDelay: '0ms'
-                }}
-              />
-              <div
-                className="w-2 h-2 rounded-full animate-bounce"
-                style={{
-                  backgroundColor: colors.text.muted,
-                  animationDelay: '150ms'
-                }}
-              />
-              <div
-                className="w-2 h-2 rounded-full animate-bounce"
-                style={{
-                  backgroundColor: colors.text.muted,
-                  animationDelay: '300ms'
-                }}
-              />
+              {[0, 150, 300].map((delay) => (
+                <div
+                  key={delay}
+                  className="w-1.5 h-1.5 rounded-full animate-bounce bg-brand-400/70 dark:bg-brand-500/70"
+                  style={{ animationDelay: `${delay}ms` }}
+                />
+              ))}
             </div>
             <span className="text-sm" style={{ color: colors.text.muted }}>
               {t('chat.thinking')}

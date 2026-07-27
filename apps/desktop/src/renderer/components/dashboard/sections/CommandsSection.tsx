@@ -7,6 +7,22 @@ import { Search, Play, ArrowLeft, RefreshCw, AlertTriangle } from 'lucide-react'
 import { ColorTheme } from '../types'
 import { COMMANDS, CATEGORY_LABELS, CommandDef, CommandCategory } from './commandCatalog'
 
+/**
+ * A top-level CLI command discovered at runtime via `openclaw --help`
+ * (see main/managers/commands-discovery.ts). Surfaced when the static
+ * catalog doesn't know about it — gives upstream additions a path into
+ * the UI without us having to refresh `commandCatalog.ts` on every merge.
+ */
+interface DiscoveredCommandEntry {
+  name: string
+  description: string
+  hasSubcommands: boolean
+}
+import { SectionHeader } from '../../ui/section-header'
+import { Modal } from '../../ui/modal'
+import { useThemeStore } from '../../../stores/themeStore'
+import { getXtermTheme } from '../../../lib/xtermTheme'
+
 interface CommandsSectionProps {
   colors: ColorTheme
 }
@@ -15,9 +31,15 @@ type FilterCategory = 'all' | CommandCategory
 
 export const CommandsSection: React.FC<CommandsSectionProps> = ({ colors }) => {
   const { t } = useTranslation()
+  const resolvedTheme = useThemeStore((s) => s.resolved)
   // Browse state
   const [search, setSearch] = useState('')
   const [activeCategory, setActiveCategory] = useState<FilterCategory>('all')
+
+  // Discovered (CLI-only) commands — top-level entries from
+  // `openclaw --help` that aren't in the static catalog. Loaded once at
+  // mount; null = not yet loaded, [] = loaded with empty result.
+  const [discovered, setDiscovered] = useState<DiscoveredCommandEntry[] | null>(null)
 
   // Run state
   const [selectedCommand, setSelectedCommand] = useState<CommandDef | null>(null)
@@ -26,6 +48,9 @@ export const CommandsSection: React.FC<CommandsSectionProps> = ({ colors }) => {
   const [isRunning, setIsRunning] = useState(false)
   const [isComplete, setIsComplete] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  // Danger-flagged commands (e.g. reset/purge) get a confirm gate so one
+  // click can't fire a state-changing CLI command. Mirrors SessionsSection.
+  const [showDangerConfirm, setShowDangerConfirm] = useState(false)
 
   // Terminal refs
   const terminalRef = useRef<HTMLDivElement>(null)
@@ -50,6 +75,33 @@ export const CommandsSection: React.FC<CommandsSectionProps> = ({ colors }) => {
 
   useEffect(() => () => cleanupTerminal(), [cleanupTerminal])
 
+  // Load discovered commands once at mount. Failures degrade silently —
+  // the catalog still works; we just don't surface the extra section.
+  useEffect(() => {
+    let cancelled = false
+    window.electronAPI
+      .listDiscoveredCommands?.()
+      .then((result) => {
+        if (cancelled) return
+        if (result?.success && Array.isArray(result.commands)) {
+          // Strip out commands already covered by the static catalog so
+          // the "More from CLI" section is genuinely additive, not a
+          // duplicate of what's already curated above.
+          const cataloged = new Set(COMMANDS.map((c) => c.args[0]))
+          const extras = result.commands.filter((c) => !cataloged.has(c.name))
+          setDiscovered(extras)
+        } else {
+          setDiscovered([])
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setDiscovered([])
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
   // Initialize xterm when terminal panel becomes visible
   useEffect(() => {
     if (!showTerminal || !terminalRef.current || xtermRef.current) return
@@ -57,28 +109,8 @@ export const CommandsSection: React.FC<CommandsSectionProps> = ({ colors }) => {
     const term = new Terminal({
       cursorBlink: true,
       fontSize: 13,
-      fontFamily: 'Menlo, Monaco, "Courier New", monospace',
-      theme: {
-        background: '#1e1e1e',
-        foreground: '#d4d4d4',
-        cursor: '#d4d4d4',
-        black: '#000000',
-        red: '#cd3131',
-        green: '#0dbc79',
-        yellow: '#e5e510',
-        blue: '#2472c8',
-        magenta: '#bc3fbc',
-        cyan: '#11a8cd',
-        white: '#e5e5e5',
-        brightBlack: '#666666',
-        brightRed: '#f14c4c',
-        brightGreen: '#23d18b',
-        brightYellow: '#f5f543',
-        brightBlue: '#3b8eea',
-        brightMagenta: '#d670d6',
-        brightCyan: '#29b8db',
-        brightWhite: '#ffffff',
-      },
+      fontFamily: '"SF Mono", "Fira Code", "JetBrains Mono", Menlo, Monaco, "Courier New", monospace',
+      theme: getXtermTheme(resolvedTheme),
     })
 
     const fitAddon = new FitAddon()
@@ -107,6 +139,14 @@ export const CommandsSection: React.FC<CommandsSectionProps> = ({ colors }) => {
     window.addEventListener('resize', handleResize)
     return () => window.removeEventListener('resize', handleResize)
   }, [showTerminal])
+
+  // Live-update xterm theme when the app's light/dark mode flips while
+  // the terminal is mounted.
+  useEffect(() => {
+    if (xtermRef.current) {
+      xtermRef.current.options.theme = getXtermTheme(resolvedTheme)
+    }
+  }, [resolvedTheme])
 
   const filteredCommands = COMMANDS.filter((cmd) => {
     const matchCat = activeCategory === 'all' || cmd.category === activeCategory
@@ -150,6 +190,12 @@ export const CommandsSection: React.FC<CommandsSectionProps> = ({ colors }) => {
       if (val) {
         if (param.flag) {
           args.push(param.flag, val)
+        } else if (/\s/.test(val)) {
+          // Positional value with embedded whitespace — split into
+          // multiple raw args. Lets the discovered-command "Additional
+          // arguments" field accept inputs like `list --json` or
+          // `--limit 10 --json` without our needing a shell.
+          args.push(...val.split(/\s+/).filter(Boolean))
         } else {
           args.push(val)
         }
@@ -157,6 +203,33 @@ export const CommandsSection: React.FC<CommandsSectionProps> = ({ colors }) => {
     }
     return args
   }
+
+  /** Synthesize a CommandDef for a discovered CLI command so the
+   *  existing selection / run / terminal flow handles it identically
+   *  to a catalog entry. The single "Additional arguments" param is
+   *  optional — runs `openclaw <name>` bare if left empty, or
+   *  `openclaw <name> <extras>` after whitespace-splitting. */
+  const discoveredToCommandDef = (d: DiscoveredCommandEntry): CommandDef => ({
+    id: `discovered:${d.name}`,
+    category: 'system',
+    icon: d.hasSubcommands ? '📁' : '⚡',
+    title: d.name,
+    description:
+      d.description || t('commands.discoveredFallbackDesc', 'Discovered CLI command'),
+    args: [d.name],
+    params: [
+      {
+        paramId: 'extraArgs',
+        flag: '',
+        label: d.hasSubcommands
+          ? t('commands.subcommandAndFlags', 'Subcommand + flags')
+          : t('commands.additionalFlags', 'Additional flags'),
+        type: 'text',
+        placeholder: d.hasSubcommands ? 'e.g. list --json' : 'e.g. --help',
+        required: false,
+      },
+    ],
+  })
 
   const handleRun = async () => {
     const args = buildArgs()
@@ -207,6 +280,24 @@ export const CommandsSection: React.FC<CommandsSectionProps> = ({ colors }) => {
     setTimeout(() => handleRun(), 100)
   }
 
+  // Entry points (Run button + Enter key) for danger commands open the
+  // confirm first; safe commands run immediately as before.
+  const requestRun = () => {
+    if (selectedCommand?.danger) {
+      setShowDangerConfirm(true)
+      return
+    }
+    handleRun()
+  }
+
+  const requestRunAgain = () => {
+    if (selectedCommand?.danger) {
+      setShowDangerConfirm(true)
+      return
+    }
+    handleRunAgain()
+  }
+
   // ─── Run Panel ────────────────────────────────────────────────────────────
   if (selectedCommand) {
     const cmd = selectedCommand
@@ -227,7 +318,7 @@ export const CommandsSection: React.FC<CommandsSectionProps> = ({ colors }) => {
           <div className="flex items-center gap-3">
             <span className="text-2xl">{cmd.icon}</span>
             <div>
-              <h3 className="text-lg font-bold" style={{ color: colors.text.header }}>
+              <h3 className="font-display text-lg font-bold tracking-tight" style={{ color: colors.text.header }}>
                 {cmd.title}
               </h3>
               <p className="text-sm" style={{ color: colors.text.muted }}>
@@ -251,7 +342,7 @@ export const CommandsSection: React.FC<CommandsSectionProps> = ({ colors }) => {
                     style={{ color: colors.text.muted }}
                   >
                     {param.label}
-                    {param.required && <span className="text-red-400 ml-0.5">*</span>}
+                    {param.required && <span className="ml-0.5" style={{ color: colors.accent.red }}>*</span>}
                   </label>
                   {param.type === 'select' ? (
                     <select
@@ -280,7 +371,7 @@ export const CommandsSection: React.FC<CommandsSectionProps> = ({ colors }) => {
                       onChange={(e) =>
                         setParamValues((v) => ({ ...v, [param.paramId]: e.target.value }))
                       }
-                      onKeyDown={(e) => e.key === 'Enter' && !isRunning && handleRun()}
+                      onKeyDown={(e) => e.key === 'Enter' && !isRunning && requestRun()}
                       placeholder={param.placeholder}
                       className="w-full px-3 py-1.5 rounded text-sm outline-none"
                       style={{
@@ -301,10 +392,10 @@ export const CommandsSection: React.FC<CommandsSectionProps> = ({ colors }) => {
           <div className="px-6 pb-3 flex-shrink-0">
             <div
               className="flex items-start gap-2 rounded-lg p-3"
-              style={{ backgroundColor: '#7f1d1d33' }}
+              style={{ backgroundColor: `${colors.accent.red}33` }}
             >
-              <AlertTriangle className="h-4 w-4 text-red-400 flex-shrink-0 mt-0.5" />
-              <p className="text-xs text-red-400">{cmd.dangerMessage}</p>
+              <AlertTriangle className="h-4 w-4 flex-shrink-0 mt-0.5" style={{ color: colors.accent.red }} />
+              <p className="text-xs" style={{ color: colors.accent.red }}>{cmd.dangerMessage}</p>
             </div>
           </div>
         )}
@@ -312,14 +403,14 @@ export const CommandsSection: React.FC<CommandsSectionProps> = ({ colors }) => {
         {/* Run button */}
         {!showTerminal && (
           <div className="px-6 pb-4 flex-shrink-0">
-            {error && <p className="text-xs text-red-400 mb-2">{error}</p>}
+            {error && <p className="text-xs mb-2" style={{ color: colors.accent.red }}>{error}</p>}
             <button
-              onClick={handleRun}
+              onClick={requestRun}
               disabled={isRunning}
               className="flex items-center gap-2 px-5 py-2 rounded-lg font-medium text-sm transition-all disabled:opacity-50"
               style={{
                 backgroundColor: cmd.danger ? colors.accent.red : colors.accent.brand,
-                color: 'white',
+                color: colors.button.primaryFg,
               }}
             >
               <Play className="h-4 w-4" />
@@ -334,16 +425,21 @@ export const CommandsSection: React.FC<CommandsSectionProps> = ({ colors }) => {
             <div
               ref={terminalRef}
               className="flex-1 min-h-0 rounded-lg overflow-hidden"
-              style={{ backgroundColor: '#1e1e1e', padding: '4px' }}
+              // Match the xterm theme bg so the container doesn't flash
+              // black before xterm renders its canvas.
+              style={{
+                backgroundColor: resolvedTheme === 'dark' ? '#0a0f1a' : '#fbf6ec',
+                padding: '4px',
+              }}
             />
             {(isComplete || error) && (
               <div className="flex items-center gap-3 pt-3 flex-shrink-0">
                 {isComplete && (
-                  <span className="text-sm text-green-400 font-medium">✅ {t('commands.completed')}</span>
+                  <span className="text-sm font-medium" style={{ color: colors.accent.green }}>✅ {t('commands.completed')}</span>
                 )}
-                {error && <span className="text-sm text-red-400">{error}</span>}
+                {error && <span className="text-sm" style={{ color: colors.accent.red }}>{error}</span>}
                 <button
-                  onClick={handleRunAgain}
+                  onClick={requestRunAgain}
                   className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded ml-auto transition-opacity hover:opacity-80"
                   style={{ backgroundColor: colors.bg.tertiary, color: colors.text.muted }}
                 >
@@ -354,25 +450,68 @@ export const CommandsSection: React.FC<CommandsSectionProps> = ({ colors }) => {
             )}
           </div>
         )}
+
+        {/* Danger command confirmation — a danger-flagged command makes
+            state changes, so gate it behind an explicit confirm. */}
+        <Modal
+          open={showDangerConfirm}
+          onClose={() => setShowDangerConfirm(false)}
+          shellClassName="shadow-2xl"
+        >
+          <div className="flex items-start gap-3 mb-4">
+            <AlertTriangle className="h-5 w-5 flex-shrink-0 mt-0.5" style={{ color: colors.accent.red }} />
+            <div className="flex-1">
+              <h3 className="font-bold text-lg mb-1" style={{ color: colors.text.header }}>
+                {t('commands.dangerConfirmTitle', 'Run {{command}}?', { command: cmd.args.join(' ') })}
+              </h3>
+              <p className="text-sm" style={{ color: colors.text.muted }}>
+                {cmd.dangerMessage || t('commands.dangerConfirmBody', 'This may make changes.')}
+              </p>
+            </div>
+          </div>
+          <div className="flex space-x-3">
+            <button
+              onClick={() => setShowDangerConfirm(false)}
+              className="flex-1 px-4 py-2 rounded-lg text-sm font-medium transition-colors"
+              style={{ backgroundColor: colors.bg.tertiary, color: colors.text.normal }}
+            >
+              {t('common.cancel')}
+            </button>
+            <button
+              onClick={() => {
+                setShowDangerConfirm(false)
+                // When the terminal is already up the user hit "Run again";
+                // otherwise it's the first run from the param form.
+                if (showTerminal) {
+                  handleRunAgain()
+                } else {
+                  handleRun()
+                }
+              }}
+              className="flex-1 px-4 py-2 rounded-lg text-sm font-medium transition-colors flex items-center justify-center gap-2"
+              style={{ backgroundColor: colors.accent.red, color: colors.button.primaryFg }}
+            >
+              <Play className="h-4 w-4" />
+              {t('commands.runCommand')}
+            </button>
+          </div>
+        </Modal>
       </div>
     )
   }
 
   // ─── Browse Panel ─────────────────────────────────────────────────────────
   return (
-    <div className="h-full flex flex-col overflow-hidden px-6 pt-6 pb-0">
-      {/* Header */}
-      <div className="mb-4 flex items-baseline gap-3 flex-shrink-0">
-        <h3 className="text-lg font-bold" style={{ color: colors.text.header }}>
-          {t('commands.title')}
-        </h3>
-        <p className="text-sm" style={{ color: colors.text.muted }}>
-          {t('commands.subtitle')}
-        </p>
-      </div>
+    <div className="h-full flex flex-col overflow-hidden">
+      <SectionHeader
+        title={t('commands.title')}
+        subtitle={t('commands.subtitle')}
+        colors={colors}
+        border={false}
+      />
 
       {/* Search */}
-      <div className="relative mb-3 flex-shrink-0">
+      <div className="relative mb-3 mx-6 flex-shrink-0">
         <Search
           className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4"
           style={{ color: colors.text.muted }}
@@ -392,7 +531,7 @@ export const CommandsSection: React.FC<CommandsSectionProps> = ({ colors }) => {
       </div>
 
       {/* Category pills */}
-      <div className="flex gap-2 overflow-x-auto pb-2 mb-3 flex-shrink-0 scrollbar-none">
+      <div className="flex gap-2 overflow-x-auto pb-2 mb-3 mx-6 flex-shrink-0 scrollbar-none">
         <button
           onClick={() => setActiveCategory('all')}
           className="px-3 py-1 rounded-full text-xs font-medium whitespace-nowrap flex-shrink-0 transition-colors"
@@ -423,7 +562,7 @@ export const CommandsSection: React.FC<CommandsSectionProps> = ({ colors }) => {
       </div>
 
       {/* Command list */}
-      <div className="flex-1 overflow-y-auto overflow-x-hidden pb-8">
+      <div className="flex-1 overflow-y-auto overflow-x-hidden px-6 pb-8">
         <div className="grid grid-cols-1 gap-3">
           {filteredCommands.map((cmd) => (
             <div
@@ -451,7 +590,7 @@ export const CommandsSection: React.FC<CommandsSectionProps> = ({ colors }) => {
                       >
                         {cmd.args.join(' ')}
                       </code>
-                      {cmd.danger && <span className="text-xs text-red-400">⚠️ Careful</span>}
+                      {cmd.danger && <span className="text-xs" style={{ color: colors.accent.red }}>⚠️ Careful</span>}
                     </div>
                   </div>
                 </div>
@@ -460,7 +599,7 @@ export const CommandsSection: React.FC<CommandsSectionProps> = ({ colors }) => {
                   className="flex items-center gap-2 px-4 py-2 rounded font-medium text-sm flex-shrink-0 transition-colors"
                   style={{
                     backgroundColor: cmd.danger ? colors.accent.red : colors.accent.brand,
-                    color: 'white',
+                    color: colors.button.primaryFg,
                   }}
                 >
                   <Play className="h-3.5 w-3.5" />
@@ -476,6 +615,89 @@ export const CommandsSection: React.FC<CommandsSectionProps> = ({ colors }) => {
               <p className="text-sm">{t('commands.noResults', { search })}</p>
             </div>
           )}
+
+          {/* More from CLI — top-level openclaw commands the static catalog
+              doesn't curate yet. Surfaced via `openclaw --help` so upstream
+              additions (acp, commitments, crestodian, message, onboard, …)
+              are reachable without us refreshing the catalog. Only renders
+              when the discovery probe actually found extras and we're not
+              hiding them via category filter. */}
+          {discovered && discovered.length > 0 && activeCategory === 'all' && (() => {
+            const q = search.toLowerCase()
+            const filteredDiscovered = discovered.filter(
+              (d) => !q || d.name.includes(q) || d.description.toLowerCase().includes(q),
+            )
+            if (filteredDiscovered.length === 0) return null
+            return (
+              <div className="mt-6">
+                <div className="flex items-baseline gap-2 mb-2">
+                  <h3
+                    className="text-sm font-semibold uppercase tracking-wider"
+                    style={{ color: colors.text.muted }}
+                  >
+                    {t('commands.moreFromCli', 'More from CLI')}
+                  </h3>
+                  <span className="text-xs" style={{ color: colors.text.muted }}>
+                    ({filteredDiscovered.length})
+                  </span>
+                </div>
+                <p className="text-xs mb-3" style={{ color: colors.text.muted }}>
+                  {t(
+                    'commands.discoveredCaption',
+                    'Commands discovered from openclaw --help that the curated catalog above does not cover yet. Run them with optional flags or subcommands.',
+                  )}
+                </p>
+                <div className="grid grid-cols-1 gap-3">
+                  {filteredDiscovered.map((d) => (
+                    <div
+                      key={d.name}
+                      className="rounded-lg px-5 py-3 transition-all hover:scale-[1.01]"
+                      style={{ backgroundColor: colors.bg.secondary }}
+                    >
+                      <div className="flex items-center justify-between">
+                        <div className="flex items-center space-x-3">
+                          <div className="text-xl">{d.hasSubcommands ? '📁' : '⚡'}</div>
+                          <div>
+                            <h4
+                              className="text-sm font-semibold"
+                              style={{ color: colors.text.header }}
+                            >
+                              openclaw {d.name}{' '}
+                              {d.hasSubcommands && (
+                                <span
+                                  className="text-xs ml-1"
+                                  style={{ color: colors.text.muted }}
+                                >
+                                  *
+                                </span>
+                              )}
+                            </h4>
+                            <p
+                              className="text-xs"
+                              style={{ color: colors.text.muted }}
+                            >
+                              {d.description || t('commands.noDescription', 'No description')}
+                            </p>
+                          </div>
+                        </div>
+                        <button
+                          onClick={() => handleSelectCommand(discoveredToCommandDef(d))}
+                          className="flex items-center gap-2 px-3 py-1.5 rounded font-medium text-xs flex-shrink-0 transition-colors"
+                          style={{
+                            backgroundColor: colors.bg.tertiary,
+                            color: colors.text.normal,
+                          }}
+                        >
+                          <Play className="h-3 w-3" />
+                          {t('commands.run', 'Run')}
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )
+          })()}
         </div>
       </div>
     </div>

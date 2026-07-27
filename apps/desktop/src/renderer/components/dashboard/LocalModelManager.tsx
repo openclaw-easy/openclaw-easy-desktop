@@ -1,5 +1,6 @@
 import { useEffect, useState, useMemo } from "react";
 import { useTranslation } from "react-i18next";
+import { useToast } from "../../contexts/ToastContext";
 import { Card, CardContent, CardHeader, CardTitle } from "../ui/card";
 import { Button } from "../ui/button";
 import { Progress } from "../ui/progress";
@@ -49,26 +50,11 @@ interface AvailableModel {
   recommended?: boolean;
 }
 
-interface ColorTheme {
-  bg: {
-    primary: string;
-    secondary: string;
-    tertiary: string;
-    hover: string;
-  };
-  text: {
-    header: string;
-    normal: string;
-    muted: string;
-  };
-  accent: {
-    brand: string;
-    green: string;
-    yellow: string;
-    red: string;
-    purple: string;
-  };
-}
+// Local ColorTheme was a duplicated interface declaration until the
+// 2026-06-15 dedup pass. Re-exported under the same name from the
+// canonical types module so the prop reference is unchanged.
+import type { ColorTheme as CanonicalColorTheme } from './types';
+type ColorTheme = CanonicalColorTheme;
 
 interface LocalModelManagerProps {
   colors: ColorTheme;
@@ -76,6 +62,7 @@ interface LocalModelManagerProps {
 
 export function LocalModelManager({ colors }: LocalModelManagerProps) {
   const { t } = useTranslation();
+  const { addToast } = useToast();
   const [installedModels, setInstalledModels] = useState<ModelInfo[]>([]);
   const [availableModels, setAvailableModels] = useState<AvailableModel[]>([]);
   const [storageInfo, setStorageInfo] = useState<StorageInfo | null>(null);
@@ -98,7 +85,7 @@ export function LocalModelManager({ colors }: LocalModelManagerProps) {
   const [modelStats, setModelStats] = useState<
     Map<
       string,
-      { lastUsed?: string; usageCount?: number; avgResponseTime?: number }
+      { lastUsed?: string; usageCount?: number }
     >
   >(new Map());
 
@@ -269,7 +256,6 @@ export function LocalModelManager({ colors }: LocalModelManagerProps) {
       ...currentStats,
       lastUsed: new Date().toISOString(),
       usageCount: (currentStats.usageCount || 0) + 1,
-      avgResponseTime: Math.round(Math.random() * 2000 + 500), // Mock data for demo
     };
 
     const updatedStats = new Map(modelStats);
@@ -355,14 +341,14 @@ export function LocalModelManager({ colors }: LocalModelManagerProps) {
     try {
       const result = await window.electronAPI.installOllama();
       if (result.success) {
-        alert(result.message);
+        addToast(result.message, 'success');
         await checkOllamaStatus();
       } else {
-        alert(`Failed to install Ollama: ${result.message}`);
+        addToast(t('models.installOllamaFailed', { message: result.message, defaultValue: 'Failed to install Ollama: {{message}}' }), 'error');
       }
     } catch (error) {
       console.error("Error installing Ollama:", error);
-      alert("Failed to install Ollama");
+      addToast(t('models.installOllamaError', 'Failed to install Ollama'), 'error');
     }
   };
 
@@ -389,7 +375,7 @@ export function LocalModelManager({ colors }: LocalModelManagerProps) {
           return newMap;
         });
       } else {
-        alert(`Failed to install model: ${result.message}`);
+        addToast(t('models.installModelFailed', { message: result.message, defaultValue: 'Failed to install model: {{message}}' }), 'error');
         setDownloadProgress((prev) => {
           const newMap = new Map(prev);
           newMap.delete(modelId);
@@ -398,7 +384,7 @@ export function LocalModelManager({ colors }: LocalModelManagerProps) {
       }
     } catch (error) {
       console.error("Error installing model:", error);
-      alert("Failed to install model");
+      addToast(t('models.installModelError', 'Failed to install model'), 'error');
       setDownloadProgress((prev) => {
         const newMap = new Map(prev);
         newMap.delete(modelId);
@@ -421,11 +407,11 @@ export function LocalModelManager({ colors }: LocalModelManagerProps) {
       if (result.success) {
         await loadData(true); // Force refresh after successful install
       } else {
-        alert(`Failed to remove model: ${result.message}`);
+        addToast(t('models.removeModelFailed', { message: result.message, defaultValue: 'Failed to remove model: {{message}}' }), 'error');
       }
     } catch (error) {
       console.error("Error removing model:", error);
-      alert("Failed to remove model");
+      addToast(t('models.removeModelError', 'Failed to remove model'), 'error');
     }
   };
 
@@ -434,7 +420,7 @@ export function LocalModelManager({ colors }: LocalModelManagerProps) {
       await window.electronAPI.openModelFolder();
     } catch (error) {
       console.error("Error opening model folder:", error);
-      alert("Failed to open model folder");
+      addToast(t('models.openFolderError', 'Failed to open model folder'), 'error');
     }
   };
 
@@ -446,7 +432,7 @@ export function LocalModelManager({ colors }: LocalModelManagerProps) {
       (id) => !isModelInstalled(id),
     );
     if (modelsToInstall.length === 0) {
-      alert("No uninstalled models selected.");
+      addToast(t('models.noUninstalledSelected', 'No uninstalled models selected.'), 'error');
       return;
     }
 
@@ -473,7 +459,7 @@ export function LocalModelManager({ colors }: LocalModelManagerProps) {
       isModelInstalled(id),
     );
     if (modelsToDelete.length === 0) {
-      alert("No installed models selected.");
+      addToast(t('models.noInstalledSelected', 'No installed models selected.'), 'error');
       return;
     }
 
@@ -503,16 +489,18 @@ export function LocalModelManager({ colors }: LocalModelManagerProps) {
         setActiveModel(modelId);
         localStorage.setItem("activeModel", modelId);
         updateModelStats(modelId);
-        alert(
-          `✅ Success!\n\n${modelId} is now your default AI model.\n\nAll agents will use this model unless configured otherwise.`,
+        addToast(
+          t('models.setDefaultSuccess', { model: modelId, defaultValue: '{{model}} is now your default AI model. All agents will use this model unless configured otherwise.' }),
+          'success',
         );
       } else {
-        alert(`❌ Failed to set default model\n\n${result.message}`);
+        addToast(t('models.setDefaultFailed', { message: result.message, defaultValue: 'Failed to set default model: {{message}}' }), 'error');
       }
     } catch (error) {
       console.error("Error setting default model:", error);
-      alert(
-        "❌ Failed to set default model\n\nPlease ensure OpenClaw is installed and running.",
+      addToast(
+        t('models.setDefaultError', 'Failed to set default model. Please ensure OpenClaw is installed and running.'),
+        'error',
       );
     } finally {
       setConfiguringModel(null);
@@ -654,7 +642,7 @@ export function LocalModelManager({ colors }: LocalModelManagerProps) {
           <Button
             onClick={handleInstallOllama}
             className="w-full"
-            style={{ backgroundColor: colors.accent.brand, color: '#ffffff', border: 'none' }}
+            style={{ backgroundColor: colors.accent.brand, color: colors.button.primaryFg, border: 'none' }}
           >
             {t('ollama.installOllama')}
           </Button>
@@ -679,45 +667,13 @@ export function LocalModelManager({ colors }: LocalModelManagerProps) {
 
   return (
     <div className="space-y-6">
-      {/* System Recommendations */}
-      {systemSpecs && (
-        <Card
-          className="border-0 shadow-none"
-          style={{
-            backgroundColor: colors.bg.secondary,
-          }}
-        >
-          <CardHeader>
-            <CardTitle
-              className="flex items-center space-x-2"
-              style={{ color: colors.text.header }}
-            >
-              <Cpu
-                className="h-5 w-5"
-                style={{ color: colors.accent.purple }}
-              />
-              <span>{t('models.systemRecommendations', 'System Recommendations')}</span>
-            </CardTitle>
-          </CardHeader>
-          <CardContent>
-            <div className="space-y-1">
-              {getRecommendedModels().map((rec, idx) => (
-                <div key={idx} className="flex items-center space-x-2">
-                  <Star
-                    className="h-4 w-4 flex-shrink-0"
-                    style={{ color: colors.accent.yellow }}
-                  />
-                  <p className="text-sm">
-                    <span style={{ color: colors.text.muted }}>Based on your system ({Math.floor(systemSpecs.memory)} GB RAM):</span>
-                    {' '}
-                    <span style={{ color: colors.text.normal }}>{rec}</span>
-                  </p>
-                </div>
-              ))}
-            </div>
-          </CardContent>
-        </Card>
-      )}
+      {/* Removed: "System Recommendations" card — generic guidance
+          ("13B = Good balance of quality and performance") was not
+          informed by anything beyond installed RAM and added vertical
+          noise users had to scroll past on every visit. The detailed
+          per-model RAM/disk requirement is already shown inline on
+          each model card below where the user actually makes a
+          decision. */}
 
       {/* All Models */}
       <Card
@@ -746,6 +702,7 @@ export function LocalModelManager({ colors }: LocalModelManagerProps) {
                 size="sm"
                 onClick={() => setShowOnlyRecommended(!showOnlyRecommended)}
                 title="Show only recommended models"
+                aria-label={t('models.showRecommendedOnly', 'Show only recommended models')}
                 style={{
                   backgroundColor: showOnlyRecommended ? colors.accent.yellow + '33' : colors.bg.tertiary,
                   color: showOnlyRecommended ? colors.accent.yellow : colors.text.muted,
@@ -790,7 +747,7 @@ export function LocalModelManager({ colors }: LocalModelManagerProps) {
                         disabled={Array.from(selectedModels).every((id) =>
                           isModelInstalled(id),
                         )}
-                        style={{ backgroundColor: colors.accent.brand, color: '#ffffff', border: 'none' }}
+                        style={{ backgroundColor: colors.accent.brand, color: colors.button.primaryFg, border: 'none' }}
                       >
                         {t('models.installSelected', 'Install Selected')}
                       </Button>
@@ -800,7 +757,7 @@ export function LocalModelManager({ colors }: LocalModelManagerProps) {
                         disabled={Array.from(selectedModels).every(
                           (id) => !isModelInstalled(id),
                         )}
-                        style={{ backgroundColor: colors.accent.red, color: '#ffffff', border: 'none' }}
+                        style={{ backgroundColor: colors.accent.red, color: colors.button.primaryFg, border: 'none' }}
                       >
                         {t('models.deleteSelected', 'Delete Selected')}
                       </Button>
@@ -836,14 +793,14 @@ export function LocalModelManager({ colors }: LocalModelManagerProps) {
                         .map((model) => model.id);
                       setSelectedModels(new Set(allVisibleModels));
                     }}
-                    style={{ backgroundColor: colors.bg.primary, color: colors.text.normal, border: `1px solid ${colors.bg.hover}` }}
+                    style={{ backgroundColor: colors.bg.tertiary, color: colors.text.normal, border: `1px solid ${colors.bg.hover}` }}
                   >
                     {t('models.selectAllVisible', 'Select All Visible')}
                   </Button>
                   <Button
                     size="sm"
                     onClick={() => setSelectedModels(new Set())}
-                    style={{ backgroundColor: colors.bg.primary, color: colors.text.normal, border: `1px solid ${colors.bg.hover}` }}
+                    style={{ backgroundColor: colors.bg.tertiary, color: colors.text.normal, border: `1px solid ${colors.bg.hover}` }}
                   >
                     {t('models.clearSelection', 'Clear Selection')}
                   </Button>
@@ -864,7 +821,7 @@ export function LocalModelManager({ colors }: LocalModelManagerProps) {
                 placeholder={t('models.searchModels', 'Search models...')}
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
-                className="w-full pl-10 pr-4 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                className="w-full pl-10 pr-4 py-2 border rounded-lg input-glow focus:outline-none"
                 style={{
                   backgroundColor: colors.bg.tertiary,
                   borderColor: colors.bg.tertiary,
@@ -875,7 +832,7 @@ export function LocalModelManager({ colors }: LocalModelManagerProps) {
             <select
               value={selectedCategory}
               onChange={(e) => setSelectedCategory(e.target.value)}
-              className="px-4 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+              className="px-4 py-2 border rounded-lg input-glow focus:outline-none"
               style={{
                 backgroundColor: colors.bg.tertiary,
                 borderColor: colors.bg.tertiary,
@@ -991,7 +948,7 @@ export function LocalModelManager({ colors }: LocalModelManagerProps) {
                       key={model.id}
                       className="flex flex-col sm:flex-row items-start sm:items-center justify-between p-4 rounded-lg"
                       style={{
-                        backgroundColor: isInstalled ? colors.accent.green + '11' : colors.bg.primary,
+                        backgroundColor: isInstalled ? colors.accent.green + "11" : colors.bg.tertiary,
                       }}
                     >
                       {bulkMode && (
@@ -1008,7 +965,7 @@ export function LocalModelManager({ colors }: LocalModelManagerProps) {
                               }
                               setSelectedModels(newSelected);
                             }}
-                            className="w-4 h-4 text-blue-600 bg-gray-100 border-gray-300 rounded focus:ring-blue-500 focus:ring-2"
+                            className="w-4 h-4 accent-primary bg-secondary border-border rounded focus:ring-2 focus:ring-ring"
                           />
                         </div>
                       )}
@@ -1072,12 +1029,6 @@ export function LocalModelManager({ colors }: LocalModelManagerProps) {
                                 Count:{" "}
                                 {modelStats.get(model.id)?.usageCount || 0}
                               </span>
-                              {modelStats.get(model.id)?.avgResponseTime && (
-                                <span>
-                                  Avg:{" "}
-                                  {modelStats.get(model.id)?.avgResponseTime}ms
-                                </span>
-                              )}
                             </div>
                           )}
 
@@ -1118,7 +1069,7 @@ export function LocalModelManager({ colors }: LocalModelManagerProps) {
                                 size="sm"
                                 onClick={() => handleUseModel(model.id)}
                                 disabled={configuringModel === model.id}
-                                style={{ backgroundColor: colors.accent.brand, color: '#ffffff', border: 'none' }}
+                                style={{ backgroundColor: colors.accent.brand, color: colors.button.primaryFg, border: 'none' }}
                               >
                                 <Play
                                   className={`h-4 w-4 mr-1 ${configuringModel === model.id ? "animate-spin" : ""}`}
@@ -1131,7 +1082,7 @@ export function LocalModelManager({ colors }: LocalModelManagerProps) {
                             <Button
                               size="sm"
                               onClick={() => handleRemoveModel(model.id)}
-                              style={{ backgroundColor: colors.accent.red, color: '#ffffff', border: 'none' }}
+                              style={{ backgroundColor: colors.accent.red, color: colors.button.primaryFg, border: 'none' }}
                             >
                               <Trash2 className="h-4 w-4" />
                             </Button>

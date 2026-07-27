@@ -15,7 +15,11 @@ files:
 afterPack: ./scripts/after-pack.cjs
 
 extraResources:
-  # Bundle Bun runtime (arm64 + x64 binaries) — required by process-manager and command-executor
+  # Bundle Node runtime (arm64 + x64 + windows) — RUNS openclaw (gateway + CLI);
+  # required for node:sqlite, which bun lacks.
+  - from: installer-resources/node
+    to: node
+  # Bundle Bun runtime (arm64 + x64 binaries) — dependency installer (bun install)
   - from: installer-resources/bun
     to: bun
   # Bundle OpenClaw with pre-installed dependencies
@@ -82,11 +86,8 @@ dmg:
 publish:
   - provider: github
     owner: openclaw-easy
-    repo: desktop-app
+    repo: openclaw-easy-desktop
     releaseType: release
-  - provider: generic
-    url: https://updates.openclaw-easy.com
-    channel: latest
 
 # Windows Configuration
 win:

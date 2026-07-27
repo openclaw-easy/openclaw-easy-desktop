@@ -1,6 +1,7 @@
 import React from "react";
 import { useTranslation } from "react-i18next";
 import { OllamaInstallState } from "../hooks/useModelManager";
+import { Modal } from "./ui/modal";
 
 interface OllamaInstallPopupProps {
   isOpen: boolean;
@@ -18,8 +19,7 @@ const OllamaInstallPopup: React.FC<OllamaInstallPopupProps> = ({
   modelName,
 }) => {
   const { t } = useTranslation();
-
-  if (!isOpen) {return null;}
+  const titleId = 'ollama-install-title';
 
   const handleInstall = async () => {
     const success = await onInstall();
@@ -32,17 +32,24 @@ const OllamaInstallPopup: React.FC<OllamaInstallPopupProps> = ({
   };
 
   return (
-    <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
-      <div className="bg-white dark:bg-gray-800 rounded-lg p-6 max-w-md w-full mx-4 shadow-xl">
+    // Dismiss on Escape/backdrop is suppressed mid-install so the user
+    // can't accidentally orphan the spawn. `onInstall` keeps running
+    // even when the modal closes between attempts, so safe-otherwise.
+    <Modal
+      open={isOpen}
+      onClose={onClose}
+      dismissable={!installState.isInstalling}
+      labelledBy={titleId}
+    >
         {/* Header */}
         <div className="flex items-center justify-between mb-4">
-          <h2 className="text-xl font-semibold text-gray-900 dark:text-white">
+          <h2 id={titleId} className="font-display text-xl font-semibold tracking-tight text-foreground">
             {t('ollama.required')}
           </h2>
           {!installState.isInstalling && (
             <button
               onClick={onClose}
-              className="text-gray-400 hover:text-gray-600 dark:text-gray-500 dark:hover:text-gray-300"
+              className="press-pulse text-muted-foreground hover:text-foreground transition-colors"
             >
               <svg
                 className="w-6 h-6"
@@ -67,10 +74,10 @@ const OllamaInstallPopup: React.FC<OllamaInstallPopupProps> = ({
           installState.progress === 0 && (
             <>
               <div className="mb-4">
-                <p className="text-gray-600 dark:text-gray-300 mb-2">
+                <p className="text-foreground/80 mb-2">
                   {t('ollama.requiredDesc', { modelName: modelName || "AI models" })}
                 </p>
-                <p className="text-sm text-gray-500 dark:text-gray-400">
+                <p className="text-sm text-muted-foreground">
                   {t('ollama.aboutOllama')}
                 </p>
               </div>
@@ -78,13 +85,13 @@ const OllamaInstallPopup: React.FC<OllamaInstallPopupProps> = ({
               <div className="flex flex-col space-y-3">
                 <button
                   onClick={handleInstall}
-                  className="w-full bg-blue-600 hover:bg-blue-700 text-white font-medium py-2 px-4 rounded-lg transition-colors"
+                  className="press-pulse ripple-glow w-full bg-primary text-primary-foreground hover:bg-primary/90 font-medium py-2 px-4 rounded-lg transition-all hover:-translate-y-px hover:shadow-glow active:translate-y-0"
                 >
                   {t('ollama.installOllama')}
                 </button>
                 <button
                   onClick={onClose}
-                  className="w-full bg-gray-200 hover:bg-gray-300 dark:bg-gray-700 dark:hover:bg-gray-600 text-gray-700 dark:text-gray-300 font-medium py-2 px-4 rounded-lg transition-colors"
+                  className="press-pulse w-full bg-secondary text-secondary-foreground hover:bg-secondary/80 font-medium py-2 px-4 rounded-lg transition-colors"
                 >
                   {t('common.cancel')}
                 </button>
@@ -96,23 +103,23 @@ const OllamaInstallPopup: React.FC<OllamaInstallPopupProps> = ({
         {installState.isInstalling && (
           <div className="text-center">
             <div className="mb-4">
-              <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-600 mx-auto"></div>
+              <div className="animate-spin rounded-full h-12 w-12 border-b-2 mx-auto" style={{ borderBottomColor: 'rgb(var(--glow-color))' }} />
             </div>
-            <h3 className="text-lg font-medium text-gray-900 dark:text-white mb-2">
+            <h3 className="font-display text-lg font-medium tracking-tight text-foreground mb-2">
               {t('ollama.installingTitle')}
             </h3>
-            <p className="text-gray-600 dark:text-gray-300 mb-4">
+            <p className="text-foreground/80 mb-4">
               {t('ollama.installingDesc')}
             </p>
             {installState.progress > 0 && (
-              <div className="w-full bg-gray-200 dark:bg-gray-700 rounded-full h-2">
+              <div className="w-full bg-secondary rounded-full h-2 overflow-hidden">
                 <div
-                  className="bg-blue-600 h-2 rounded-full transition-all duration-300"
+                  className="bg-primary h-2 rounded-full transition-all duration-300"
                   style={{ width: `${installState.progress}%` }}
                 ></div>
               </div>
             )}
-            <p className="text-sm text-gray-500 dark:text-gray-400 mt-2">
+            <p className="text-sm text-muted-foreground mt-2">
               {t('ollama.doNotClose')}
             </p>
           </div>
@@ -138,10 +145,10 @@ const OllamaInstallPopup: React.FC<OllamaInstallPopupProps> = ({
                   />
                 </svg>
               </div>
-              <h3 className="text-lg font-medium text-gray-900 dark:text-white mb-2">
+              <h3 className="font-display text-lg font-medium tracking-tight text-foreground mb-2">
                 {t('ollama.installedTitle')}
               </h3>
-              <p className="text-gray-600 dark:text-gray-300">
+              <p className="text-foreground/80">
                 {t('ollama.installedDesc')}
               </p>
             </div>
@@ -165,10 +172,10 @@ const OllamaInstallPopup: React.FC<OllamaInstallPopupProps> = ({
                 />
               </svg>
             </div>
-            <h3 className="text-lg font-medium text-gray-900 dark:text-white mb-2">
+            <h3 className="font-display text-lg font-medium tracking-tight text-foreground mb-2">
               {t('ollama.installFailedTitle')}
             </h3>
-            <p className="text-red-600 dark:text-red-400 text-sm mb-4">
+            <p className="text-destructive text-sm mb-4">
               {installState.error}
             </p>
             <div className="flex flex-col space-y-2">
@@ -177,21 +184,20 @@ const OllamaInstallPopup: React.FC<OllamaInstallPopupProps> = ({
                   // Reset error state and try again
                   handleInstall();
                 }}
-                className="w-full bg-blue-600 hover:bg-blue-700 text-white font-medium py-2 px-4 rounded-lg transition-colors"
+                className="press-pulse ripple-glow w-full bg-primary text-primary-foreground hover:bg-primary/90 font-medium py-2 px-4 rounded-lg transition-all hover:-translate-y-px hover:shadow-glow active:translate-y-0"
               >
                 {t('common.tryAgain')}
               </button>
               <button
                 onClick={onClose}
-                className="w-full bg-gray-200 hover:bg-gray-300 dark:bg-gray-700 dark:hover:bg-gray-600 text-gray-700 dark:text-gray-300 font-medium py-2 px-4 rounded-lg transition-colors"
+                className="press-pulse w-full bg-secondary text-secondary-foreground hover:bg-secondary/80 font-medium py-2 px-4 rounded-lg transition-colors"
               >
                 {t('common.cancel')}
               </button>
             </div>
           </div>
         )}
-      </div>
-    </div>
+    </Modal>
   );
 };
 

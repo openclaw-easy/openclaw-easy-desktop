@@ -1,7 +1,9 @@
 import { readdir, readFile, writeFile, copyFile, stat, unlink, mkdir } from 'fs/promises'
-import { join, basename, relative } from 'path'
+import { join, basename, resolve } from 'path'
 import { homedir } from 'os'
-import { existsSync } from 'fs'
+import { existsSync, readFileSync } from 'fs'
+import { safeOpenWorkspaceDir } from '../safe-open-path'
+import { getAgent } from './agent-roster'
 
 interface WorkspaceFile {
   name: string
@@ -9,43 +11,78 @@ interface WorkspaceFile {
   modified: number
 }
 
-interface MemoryFile {
-  name: string
-  /** Relative path from workspace root, used to read the file */
-  path: string
-  /** YYYY-MM-DD date extracted from filename, or empty for non-dated files */
-  date: string
-  size: number
-  modified: number
-}
-
 // Only allow uppercase letters, digits, hyphens, underscores + .md extension
 const WORKSPACE_FILE_PATTERN = /^[A-Z0-9_-]+\.md$/
-// Extract YYYY-MM-DD prefix from filenames like "2026-03-10.md" or "2026-03-10-session-notes.md"
-const DATE_PREFIX_PATTERN = /^(\d{4}-\d{2}-\d{2})/
+
+// Desktop's default (routing) agent id. The main agent's workspace is the
+// bare `~/.openclaw/workspace`; every other agent gets its own dir.
+const DEFAULT_AGENT_ID = 'main'
 
 export class WorkspaceManager {
-  private workspaceDir: string
-  private memoryDir: string
+  /**
+   * Resolve the workspace directory for an agent. Mirrors the gateway's
+   * `resolveAgentWorkspaceDir` (src/agents/agent-scope-config.ts) so the
+   * desktop edits exactly the files the agent injects as Project Context:
+   *   1. a configured `agents.list[].workspace` wins
+   *   2. main agent → `OPENCLAW_WORKSPACE_DIR` or `~/.openclaw/workspace`
+   *      (or `agents.defaults.workspace` when set)
+   *   3. other agent → `<defaults.workspace>/<id>` or sibling
+   *      `~/.openclaw/workspace-<id>`
+   * agentId comes from the renderer; the PATH is always derived here from
+   * trusted config — the renderer never supplies a raw filesystem path.
+   */
+  private resolveDir(agentId?: string): string {
+    const id = (agentId || DEFAULT_AGENT_ID).trim() || DEFAULT_AGENT_ID
 
-  constructor() {
-    this.workspaceDir = join(homedir(), '.openclaw', 'workspace')
-    this.memoryDir = join(homedir(), '.openclaw', 'workspace', 'memory')
+    let cfg: any = {}
+    try {
+      cfg = JSON.parse(readFileSync(join(homedir(), '.openclaw', 'openclaw.json'), 'utf-8'))
+    } catch {
+      // No config yet — fall back to the default layout below.
+    }
+
+    const entry = getAgent(cfg, id)
+    const configured = typeof entry?.workspace === 'string' ? entry.workspace.trim() : ''
+    if (configured) return this.expandHome(configured)
+
+    const fallback =
+      typeof cfg?.agents?.defaults?.workspace === 'string'
+        ? cfg.agents.defaults.workspace.trim()
+        : ''
+
+    if (id === DEFAULT_AGENT_ID) {
+      if (fallback) return this.expandHome(fallback)
+      const envDir = process.env.OPENCLAW_WORKSPACE_DIR?.trim()
+      return envDir ? resolve(envDir) : join(homedir(), '.openclaw', 'workspace')
+    }
+    return fallback
+      ? join(this.expandHome(fallback), id)
+      : join(homedir(), '.openclaw', `workspace-${id}`)
   }
 
-  async listFiles(): Promise<{ success: boolean; files?: WorkspaceFile[]; error?: string }> {
+  /** Expand a leading `~` to the home dir (config paths may be tilde-prefixed). */
+  private expandHome(p: string): string {
+    if (p === '~') return homedir()
+    if (p.startsWith('~/') || p.startsWith('~\\')) return join(homedir(), p.slice(2))
+    return p
+  }
+
+  async listFiles(
+    agentId?: string,
+  ): Promise<{ success: boolean; files?: WorkspaceFile[]; error?: string }> {
+    const workspaceDir = this.resolveDir(agentId)
     try {
-      if (!existsSync(this.workspaceDir)) {
+      if (!existsSync(workspaceDir)) {
         return { success: true, files: [] }
       }
 
-      const entries = await readdir(this.workspaceDir, { withFileTypes: true })
+      const entries = await readdir(workspaceDir, { withFileTypes: true })
       const files: WorkspaceFile[] = []
 
       for (const entry of entries) {
         if (!entry.isFile() || !entry.name.endsWith('.md')) continue
         try {
-          const filePath = join(this.workspaceDir, entry.name)
+          const filePath = join(workspaceDir, entry.name)
           const stats = await stat(filePath)
           files.push({
             name: entry.name,
@@ -65,7 +102,10 @@ export class WorkspaceManager {
     }
   }
 
-  async readFile(name: string): Promise<{ success: boolean; content?: string; error?: string }> {
+  async readFile(
+    name: string,
+    agentId?: string,
+  ): Promise<{ success: boolean; content?: string; error?: string }> {
     if (!WORKSPACE_FILE_PATTERN.test(name) && !name.endsWith('.md')) {
       return { success: false, error: 'Invalid filename' }
     }
@@ -77,7 +117,7 @@ export class WorkspaceManager {
     }
 
     try {
-      const filePath = join(this.workspaceDir, sanitized)
+      const filePath = join(this.resolveDir(agentId), sanitized)
       const content = await readFile(filePath, 'utf-8')
       return { success: true, content }
     } catch (error: any) {
@@ -87,7 +127,8 @@ export class WorkspaceManager {
 
   async writeFile(
     name: string,
-    content: string
+    content: string,
+    agentId?: string,
   ): Promise<{ success: boolean; error?: string }> {
     if (!WORKSPACE_FILE_PATTERN.test(name)) {
       return { success: false, error: 'Invalid filename. Only uppercase letters, digits, hyphens, underscores allowed.' }
@@ -99,7 +140,12 @@ export class WorkspaceManager {
     }
 
     try {
-      const filePath = join(this.workspaceDir, sanitized)
+      const workspaceDir = this.resolveDir(agentId)
+      // Create on demand so a never-launched agent's workspace can be seeded.
+      if (!existsSync(workspaceDir)) {
+        await mkdir(workspaceDir, { recursive: true })
+      }
+      const filePath = join(workspaceDir, sanitized)
 
       // Create .bak backup before overwriting
       if (existsSync(filePath)) {
@@ -113,7 +159,7 @@ export class WorkspaceManager {
     }
   }
 
-  async createFile(name: string): Promise<{ success: boolean; error?: string }> {
+  async createFile(name: string, agentId?: string): Promise<{ success: boolean; error?: string }> {
     if (!WORKSPACE_FILE_PATTERN.test(name)) {
       return { success: false, error: 'Invalid filename. Only uppercase letters, digits, hyphens, underscores allowed with .md extension.' }
     }
@@ -124,12 +170,13 @@ export class WorkspaceManager {
     }
 
     try {
+      const workspaceDir = this.resolveDir(agentId)
       // Ensure workspace directory exists
-      if (!existsSync(this.workspaceDir)) {
-        await mkdir(this.workspaceDir, { recursive: true })
+      if (!existsSync(workspaceDir)) {
+        await mkdir(workspaceDir, { recursive: true })
       }
 
-      const filePath = join(this.workspaceDir, sanitized)
+      const filePath = join(workspaceDir, sanitized)
       if (existsSync(filePath)) {
         return { success: false, error: `File "${name}" already exists` }
       }
@@ -142,7 +189,7 @@ export class WorkspaceManager {
     }
   }
 
-  async deleteFile(name: string): Promise<{ success: boolean; error?: string }> {
+  async deleteFile(name: string, agentId?: string): Promise<{ success: boolean; error?: string }> {
     if (!WORKSPACE_FILE_PATTERN.test(name)) {
       return { success: false, error: 'Invalid filename' }
     }
@@ -153,7 +200,7 @@ export class WorkspaceManager {
     }
 
     try {
-      const filePath = join(this.workspaceDir, sanitized)
+      const filePath = join(this.resolveDir(agentId), sanitized)
       if (!existsSync(filePath)) {
         return { success: false, error: `File "${name}" not found` }
       }
@@ -166,106 +213,20 @@ export class WorkspaceManager {
   }
 
   /**
-   * List all memory-related files:
-   * - MEMORY.md / memory.md from workspace root (long-term curated memory)
-   * - All .md files under memory/ directory (daily logs, session summaries)
+   * Reveal the agent's workspace directory in the OS file manager so the
+   * user can drop in files the markdown editor can't handle (images,
+   * non-context files, `skills/<x>/SKILL.md`). Creates the dir on demand
+   * so a freshly-added agent always opens to something.
    */
-  async listMemoryFiles(): Promise<{ success: boolean; files?: MemoryFile[]; error?: string }> {
+  async openDir(agentId?: string): Promise<{ success: boolean; error?: string }> {
+    const workspaceDir = this.resolveDir(agentId)
     try {
-      const files: MemoryFile[] = []
-
-      // 1. Check for root-level MEMORY.md / memory.md
-      for (const name of ['MEMORY.md', 'memory.md']) {
-        const filePath = join(this.workspaceDir, name)
-        if (!existsSync(filePath)) continue
-        try {
-          const stats = await stat(filePath)
-          files.push({
-            name,
-            path: name,
-            date: '',
-            size: stats.size,
-            modified: stats.mtimeMs,
-          })
-        } catch {
-          // Skip if can't stat
-        }
+      if (!existsSync(workspaceDir)) {
+        await mkdir(workspaceDir, { recursive: true })
       }
-
-      // 2. Recursively collect all .md files under memory/
-      if (existsSync(this.memoryDir)) {
-        await this.collectMemoryFiles(this.memoryDir, files)
-      }
-
-      // Sort: MEMORY.md first, then by modified time descending (newest first)
-      files.sort((a, b) => {
-        // Root memory files always come first
-        if (!a.date && !b.date) return a.name.localeCompare(b.name)
-        if (!a.date) return -1
-        if (!b.date) return 1
-        // Dated files: newest first by modified time
-        return b.modified - a.modified
-      })
-
-      return { success: true, files }
     } catch (error: any) {
       return { success: false, error: error.message }
     }
-  }
-
-  /** Recursively collect .md files from a directory into the files array. */
-  private async collectMemoryFiles(dir: string, files: MemoryFile[]): Promise<void> {
-    const entries = await readdir(dir, { withFileTypes: true })
-    for (const entry of entries) {
-      const fullPath = join(dir, entry.name)
-      if (entry.isDirectory()) {
-        await this.collectMemoryFiles(fullPath, files)
-      } else if (entry.isFile() && entry.name.endsWith('.md')) {
-        try {
-          const stats = await stat(fullPath)
-          const relPath = relative(this.workspaceDir, fullPath)
-          const dateMatch = entry.name.match(DATE_PREFIX_PATTERN)
-          files.push({
-            name: entry.name,
-            path: relPath,
-            date: dateMatch ? dateMatch[1] : '',
-            size: stats.size,
-            modified: stats.mtimeMs,
-          })
-        } catch {
-          // Skip files we can't stat
-        }
-      }
-    }
-  }
-
-  /**
-   * Read a memory file by its relative path from workspace root.
-   * Accepts paths like "MEMORY.md", "memory/2026-03-10-notes.md".
-   */
-  async readMemoryFile(relPath: string): Promise<{ success: boolean; content?: string; error?: string }> {
-    // Prevent directory traversal
-    if (relPath.includes('..') || relPath.startsWith('/')) {
-      return { success: false, error: 'Invalid memory file path' }
-    }
-
-    // Validate it's a .md file
-    if (!relPath.endsWith('.md')) {
-      return { success: false, error: 'Invalid memory file path' }
-    }
-
-    // Ensure the resolved path stays within workspace
-    const fullPath = join(this.workspaceDir, relPath)
-    const resolvedRelative = relative(this.workspaceDir, fullPath)
-    if (resolvedRelative.startsWith('..')) {
-      return { success: false, error: 'Invalid memory file path' }
-    }
-
-    try {
-      const content = await readFile(fullPath, 'utf-8')
-      return { success: true, content }
-    } catch (error: any) {
-      return { success: false, error: error.message }
-    }
+    return safeOpenWorkspaceDir(workspaceDir)
   }
 }

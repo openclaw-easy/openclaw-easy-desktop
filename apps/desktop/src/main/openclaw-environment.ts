@@ -2,6 +2,10 @@ import * as path from 'path'
 import * as fs from 'fs'
 import { spawn, ChildProcess } from 'child_process'
 import { existsSync } from 'fs'
+import { getOpenClawBundle } from './openclaw-bundle'
+import { getDevOpenClawSpawn, isPathResolvedRuntime } from './dev-openclaw-runtime'
+import { isExtensionsDirUsable, describeMissingLoaders } from './managers/extensions-dir-usability'
+import { getVendoredCoreRoot } from './vendored-core-root'
 
 interface ModelProvider {
   baseUrl?: string
@@ -114,16 +118,15 @@ export class OpenClawEnvironment {
         }
         if (config.apiKey) {
           envVars.OLLAMA_API_KEY = config.apiKey
+          // Redact — these logs persist to ~/Library/Logs and are exportable
+          // in-app. Mirrors the OpenAI/Gemini redaction below.
           console.log(`[OpenClawEnvironment] Setting OLLAMA_API_KEY: [REDACTED]`)
         }
         break
 
-      case 'anthropic':
-        if (config.apiKey) {
-          envVars.ANTHROPIC_API_KEY = config.apiKey
-          console.log(`[OpenClawEnvironment] Setting ANTHROPIC_API_KEY: [REDACTED]`)
-        }
-        break
+      // Anthropic BYOK was removed 2026-06-15. No ANTHROPIC_API_KEY env
+      // var is set anymore — Claude is reached through OpenRouter, which
+      // uses OPENROUTER_API_KEY.
 
       case 'openai':
         if (config.apiKey) {
@@ -175,8 +178,8 @@ export class OpenClawEnvironment {
    * Production: openclaw is installed by process-manager.ts into ~/.openclaw-easy/app/.
    *   The bundled skills/plugins live at ~/.openclaw-easy/app/dist/bundled/.
    *
-   * Development: extensions/ lives at the monorepo root, five levels above __dirname
-   *   (apps/desktop/out/main → ../../../openclaw).
+   * Development: extensions/ lives inside the vendored core at the repo
+   *   root — see getVendoredCoreRoot().
    */
   private resolveExtensionsDirectory(): string | null {
     try {
@@ -196,23 +199,33 @@ export class OpenClawEnvironment {
         return null
       }
 
-      // Development: extensions/ is at the monorepo root
-      const workspaceRoot = path.join(__dirname, '../../../../openclaw/')
-      const extensionsDir = path.join(workspaceRoot, 'extensions')
+      // Development: extensions/ lives inside the vendored core.
+      //
+      // CRITICAL: only return this path if the extensions are actually
+      // *built* (have loadable JS entry points). The monorepo ships
+      // TypeScript SOURCES; pointing the gateway at them forces the
+      // plugin loader to resolve `.ts` files, which cascades into
+      // workspace subpath-import failures (e.g. `Cannot find module
+      // '@openclaw/normalization-core/string-normalization'`) and
+      // crashes Doctor with a wall of "failed to load" errors. If the
+      // local tree isn't built, return null so the system gateway uses
+      // its own bundled plugins — which always work.
+      const extensionsDir = path.join(getVendoredCoreRoot(), 'extensions')
 
-      if (fs.existsSync(extensionsDir)) {
-        const whatsappExtension = path.join(extensionsDir, 'whatsapp')
-        if (fs.existsSync(whatsappExtension)) {
-          console.log(`[OpenClawEnvironment] Found extensions directory at: ${extensionsDir}`)
-          return extensionsDir
-        } else {
-          console.warn(`[OpenClawEnvironment] Extensions directory found but missing WhatsApp extension: ${extensionsDir}`)
-        }
-      } else {
+      if (!fs.existsSync(extensionsDir)) {
         console.warn(`[OpenClawEnvironment] Extensions directory not found at: ${extensionsDir}`)
+        return null
       }
-
-      return null
+      if (!isExtensionsDirUsable(extensionsDir)) {
+        console.log(
+          `[OpenClawEnvironment] Local extensions at ${extensionsDir} are not built; ` +
+          `deferring to the system gateway's bundled plugins. ` +
+          `(To use local extensions: ${describeMissingLoaders(extensionsDir)})`,
+        )
+        return null
+      }
+      console.log(`[OpenClawEnvironment] Found built extensions directory at: ${extensionsDir}`)
+      return extensionsDir
     } catch (error) {
       console.error('[OpenClawEnvironment] Error resolving extensions directory:', error)
       return null
@@ -343,39 +356,40 @@ export class OpenClawEnvironment {
 
   /**
    * Run an OpenClaw command with proper environment.
-   * In production uses the bundled bun binary and ~/.openclaw-easy/app/openclaw.mjs.
-   * In development uses the local bun and TypeScript source.
+   * In production uses the bundled Node and ~/.openclaw-easy/app/openclaw.mjs.
+   * In development uses Node and the built repo dist (dev-openclaw-runtime.ts).
    */
   private async runOpenClawCommand(args: string[], timeout: number = 10000): Promise<string> {
     const { app } = await import('electron')
     const isWindows = process.platform === 'win32'
-    const home = process.env.HOME || process.env.USERPROFILE || ''
     const pathSep = isWindows ? ';' : ':'
     const env = this.getEnvironmentVariables()
 
+    const expandedPath = isWindows
+      ? (process.env.PATH || '')
+      : ['/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin', process.env.PATH || ''].join(pathSep)
+    const enhancedEnv: NodeJS.ProcessEnv = { ...process.env, ...env, PATH: expandedPath }
+
     let runtime: string
     let openclawPath: string
-    let enhancedEnv: NodeJS.ProcessEnv
+    let spawnCwd: string | undefined
 
     if (app.isPackaged) {
-      const bunBinaryName = isWindows
-        ? 'bun-windows.exe'
-        : `bun-${process.arch === 'arm64' ? 'arm64' : 'x64'}`
-      runtime = path.join(process.resourcesPath, 'bun', bunBinaryName)
-      openclawPath = path.join(home, '.openclaw-easy', 'app', 'openclaw.mjs')
-      const expandedPath = isWindows
-        ? (process.env.PATH || '')
-        : ['/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin', process.env.PATH || ''].join(pathSep)
-      enhancedEnv = { ...process.env, ...env, PATH: expandedPath }
+      const bundle = getOpenClawBundle()
+      await bundle.ensureInstalled()
+      // Run under bundled Node (has node:sqlite); bun is install-only.
+      runtime = bundle.getNodeBinary()
+      openclawPath = bundle.getOpenClawMjs()
     } else {
-      const bunPath = path.join(home, '.bun', 'bin')
-      runtime = 'bun'
-      openclawPath = path.join(__dirname, '../../../../openclaw/src/index.ts')
-      enhancedEnv = { ...process.env, ...env, PATH: `${bunPath}:${process.env.PATH}` }
+      const dev = getDevOpenClawSpawn()
+      runtime = dev.runtime
+      openclawPath = dev.entry
+      spawnCwd = dev.cwd
     }
 
-    // Diagnostic logging for production troubleshooting.
-    const runtimeOk = existsSync(runtime)
+    // Diagnostic logging for production troubleshooting. Bare names ('node')
+    // resolve via PATH at spawn time, so only path-shaped runtimes get checked.
+    const runtimeOk = isPathResolvedRuntime(runtime) || existsSync(runtime)
     const openclawOk = existsSync(openclawPath)
     console.log(`[OpenClawEnvironment] runOpenClawCommand: args=[${args.join(' ')}]`)
     console.log(`[OpenClawEnvironment]   runtime     : ${runtime} (exists=${runtimeOk})`)
@@ -386,6 +400,7 @@ export class OpenClawEnvironment {
     return new Promise((resolve, reject) => {
       const proc = spawn(runtime, [openclawPath, ...args], {
         env: enhancedEnv,
+        cwd: spawnCwd,
         stdio: ['pipe', 'pipe', 'pipe']
       })
 

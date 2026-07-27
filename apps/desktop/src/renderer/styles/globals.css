@@ -4,48 +4,88 @@
 
 @layer base {
   :root {
-    --background: 0 0% 100%;
-    --foreground: 222.2 84% 4.9%;
-    --card: 0 0% 100%;
-    --card-foreground: 222.2 84% 4.9%;
-    --popover: 0 0% 100%;
-    --popover-foreground: 222.2 84% 4.9%;
-    --primary: 221.2 83.2% 53.3%;
-    --primary-foreground: 210 40% 98%;
-    --secondary: 210 40% 96.1%;
-    --secondary-foreground: 222.2 47.4% 11.2%;
-    --muted: 210 40% 96.1%;
-    --muted-foreground: 215.4 16.3% 46.9%;
-    --accent: 210 40% 96.1%;
-    --accent-foreground: 222.2 47.4% 11.2%;
-    --destructive: 0 84.2% 60.2%;
-    --destructive-foreground: 210 40% 98%;
-    --border: 214.3 31.8% 91.4%;
-    --input: 214.3 31.8% 91.4%;
-    --ring: 221.2 83.2% 53.3%;
-    --radius: 0.5rem;
+    /* OpenClaw light palette. Coral #ef4b58 brand, slate-ink text. The
+       background is intentionally warmed slightly from openclaw.ai's
+       cool ice (#fcfeff) into a soft cream (#fdf9f1) — desktop apps
+       sit on a user's wallpaper for hours and the cooler ice felt
+       sterile through the vibrancy layer. The shift is small enough
+       to still read as "white" but warm enough to feel inviting. */
+    --background: 38 60% 97%;          /* #fdf9f1 warm cream */
+    --foreground: 220 49% 8%;          /* #0b1220 text-primary */
+    --card: 38 50% 99%;                /* #fefcf8 near-white warm */
+    --card-foreground: 220 49% 8%;
+    --popover: 38 50% 99%;
+    --popover-foreground: 220 49% 8%;
+    --primary: 355 84% 62%;            /* #ef4b58 coral-bright */
+    --primary-foreground: 0 0% 100%;
+    --secondary: 38 55% 95%;           /* #faf3e6 warm elevated */
+    --secondary-foreground: 217 33% 27%;
+    --muted: 38 55% 95%;
+    --muted-foreground: 224 17% 43%;   /* #5a6480 text-muted */
+    --accent: 355 80% 97%;             /* pale coral wash */
+    --accent-foreground: 355 70% 35%;
+    --destructive: 355 84% 55%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 38 25% 86%;              /* warm-tinted hairline */
+    --input: 38 25% 86%;
+    --ring: 355 84% 62%;
+    --radius: 0.75rem;
+
+    /* Brand-fonts. Resolve to `var(...)` so components can opt into
+       display vs body explicitly when needed. */
+    --font-display: "Clash Display", "Inter Variable", "Inter", -apple-system, BlinkMacSystemFont, "SF Pro Display", ui-sans-serif, system-ui, sans-serif;
+    --font-body:    "Satoshi", "Inter Variable", "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", ui-sans-serif, system-ui, sans-serif;
+    --font-mono:    ui-monospace, SFMono-Regular, "SF Mono", "Fira Code", "JetBrains Mono", Menlo, Monaco, monospace;
+
+    /* Glass-specific tokens. RGBA so they don't need HSL alpha tricks.
+       Light-mode glass is a warm cream instead of pure white so it
+       harmonises with the warmed `--background`. */
+    --glass-bg: 253 249 241;           /* #fdf9f1 warm cream */
+    --glass-alpha: 0.72;
+    --glass-border: 255 255 255;
+    --glass-border-alpha: 0.55;
+    --glow-color: 239 75 88;           /* coral RGB triplet */
+    --glow-teal:  0 143 135;           /* secondary teal glow */
+
+    /* Sidebar geometry (used by collapse keyframes). */
+    --sidebar-w-expanded: 240px;
+    --sidebar-w-collapsed: 64px;
   }
 
   .dark {
-    --background: 222.2 84% 4.9%;
-    --foreground: 210 40% 98%;
-    --card: 222.2 84% 4.9%;
-    --card-foreground: 210 40% 98%;
-    --popover: 222.2 84% 4.9%;
-    --popover-foreground: 210 40% 98%;
-    --primary: 217.2 91.2% 59.8%;
-    --primary-foreground: 222.2 47.4% 11.2%;
-    --secondary: 217.2 32.6% 17.5%;
-    --secondary-foreground: 210 40% 98%;
-    --muted: 217.2 32.6% 17.5%;
-    --muted-foreground: 215 20.2% 65.1%;
-    --accent: 217.2 32.6% 17.5%;
-    --accent-foreground: 210 40% 98%;
-    --destructive: 0 62.8% 30.6%;
-    --destructive-foreground: 210 40% 98%;
-    --border: 217.2 32.6% 17.5%;
-    --input: 217.2 32.6% 17.5%;
-    --ring: 224.3 76.3% 48%;
+    /* OpenClaw dark palette. */
+    --background: 224 52% 4%;          /* #050810 bg-deep */
+    --foreground: 224 100% 97%;        /* #f0f4ff text-primary */
+    --card: 222 44% 7%;                /* #0a0f1a bg-surface */
+    --card-foreground: 224 100% 97%;
+    --popover: 222 44% 7%;
+    --popover-foreground: 224 100% 97%;
+    --primary: 0 100% 65%;             /* #ff4d4d coral-bright dark */
+    --primary-foreground: 0 0% 100%;
+    --secondary: 222 39% 11%;          /* #111827 bg-elevated */
+    --secondary-foreground: 224 100% 97%;
+    --muted: 222 39% 11%;
+    --muted-foreground: 217 21% 47%;   /* #5f7290 text-muted */
+    --accent: 350 41% 17%;             /* deep coral-tinted surface */
+    --accent-foreground: 355 80% 85%;
+    --destructive: 0 100% 65%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 222 20% 14%;
+    --input: 222 20% 14%;
+    --ring: 0 100% 65%;
+
+    /* Dark glass surface — exact openclaw.ai bg-surface #0a0f1a, fully
+       opaque so wallpaper bleed-through can't create uneven color
+       gradients (the bottom-right was sampling warm/green wallpaper
+       pixels through the vibrancy layer). The "glass" feel in dark
+       mode now comes from the subtle inner highlight + backdrop-blur
+       on hover overlays rather than transparency to the desktop. */
+    --glass-bg: 10 15 26;
+    --glass-alpha: 1;
+    --glass-border: 136 146 176;
+    --glass-border-alpha: 0.12;
+    --glow-color: 255 77 77;           /* dark-mode coral glow */
+    --glow-teal:  0 229 204;
   }
 }
 
@@ -55,17 +95,197 @@
   }
   html, body {
     @apply bg-background text-foreground antialiased;
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'SF Pro Display', 'Inter', ui-sans-serif, system-ui, sans-serif;
+    /* OpenClaw brand fonts:
+       - Body: Satoshi (loaded from Fontshare via index.html <link>)
+       - Display/headings: Clash Display
+       Inter Variable is bundled (@fontsource-variable/inter) and used
+       as the offline / loading fallback so first paint never FOITs and
+       the app stays usable without an internet connection. */
+    font-family: var(--font-body);
+    /* Default body weight bumped from 400 → 500 so the UI reads with
+       more presence and matches the heft of the openclaw.ai site. */
+    font-weight: 500;
+    font-feature-settings: 'cv11', 'ss01', 'ss03'; /* Inter's stylistic sets, harmless on Satoshi */
+  }
+
+  /* Display font + heavier weights for the heading hierarchy. Tracks
+     tightened slightly (-0.01em / -0.02em on h1) the way Clash Display
+     is intended to be set. */
+  h1, h2, h3, h4, h5, h6 {
+    font-family: var(--font-display);
+    font-weight: 700;
+    letter-spacing: -0.01em;
+  }
+  h1 { letter-spacing: -0.02em; font-weight: 700; }
+  h2, h3 { font-weight: 600; }
+
+  strong, b { font-weight: 700; }
+
+  code, kbd, samp, pre {
+    font-family: var(--font-mono);
+  }
+
+  /* Glass mode: let macOS vibrancy / Windows Mica show through, but
+     tint the body so the area outside the glass card (the `m-3`
+     margin and any uncovered pixels) reads the brand background
+     instead of raw wallpaper. The tint is translucent enough that
+     vibrancy still hints at the edges. */
+  html[data-ui="glass"],
+  html[data-ui="glass"] #root {
+    background: transparent !important;
+  }
+  html[data-ui="glass"] body {
+    /* Light glass: warm cream tint at ~70% so vibrancy peeks through but
+       the dominant color is the warm app background, not wallpaper. */
+    background: rgba(253, 249, 241, 0.70) !important;
+    min-height: 100vh;
+  }
+  html[data-ui="glass"].dark body {
+    /* Dark glass: fully opaque navy. Vibrancy is disabled entirely in
+       dark mode because the under-window sample was bleeding the
+       user's wallpaper (warm/green spots in the bottom-right) into
+       what should be a flat dark surface. min-height guarantees the
+       solid fill always reaches the viewport edges. */
+    background: rgb(10, 15, 26) !important;
+    min-height: 100vh;
+  }
+
+  /* In dark mode, kill backdrop-filter on glass surfaces. With a fully
+     opaque body underneath, the blur is purely decorative — but in
+     Electron some compositors sample the underlying native vibrancy
+     material directly through backdrop-filter, which was producing
+     uneven brightness in the corners. Removing it guarantees a flat
+     solid surface. Light mode still uses the blur. */
+  html[data-ui="glass"].dark .glass,
+  html[data-ui="glass"].dark .glass-card,
+  html[data-ui="glass"].dark .glass-strong {
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+  }
+
+  /* Dark-mode elevation fix for floating panels (cmd palette, toasts).
+     The default `.glass-strong` sets `background: rgba(--glass-bg / 0.82)`
+     — but in dark mode `--glass-bg` (10,15,26) MATCHES the body
+     background, so an 82% alpha rendered the panel as the same color as
+     the body = visually invisible (the cmd palette looked "too
+     transparent" because there was no contrast against the page).
+     Override with `--secondary` (HSL 222 39% 11%, ≈#111827) — the
+     design system's "elevated" shade — fully opaque so the panel reads
+     as a floating surface above the body. */
+  html[data-ui="glass"].dark .glass-strong {
+    background: hsl(var(--secondary));
+  }
+
+  /* Glass-sheen overlay is single-shot intro decoration. Disable it
+     in dark mode entirely — the brand sheen against navy reads as a
+     persistent bright stripe on slower compositors. */
+  html[data-ui="glass"].dark .glass-sheen::before {
+    display: none;
   }
 }
 
 @layer utilities {
+  /* Frosted glass surface. Uses CSS variables so the same class adapts
+     between light/dark themes without rewriting Tailwind classes. The
+     `saturate(1.4)` is what gives these surfaces their lively, warm
+     glow — pure blur on its own looks gray and dead. */
   .glass {
-    @apply backdrop-blur-xl bg-white/70 dark:bg-gray-900/70 border border-white/20 dark:border-gray-700/50;
+    background: rgba(var(--glass-bg) / var(--glass-alpha));
+    backdrop-filter: blur(20px) saturate(1.4);
+    -webkit-backdrop-filter: blur(20px) saturate(1.4);
+    border: 1px solid rgba(var(--glass-border) / var(--glass-border-alpha));
+  }
+
+  /* Heavier glass for floating panels (modals, popovers, command palette). */
+  .glass-strong {
+    background: rgba(var(--glass-bg) / 0.82);
+    backdrop-filter: blur(30px) saturate(1.6);
+    -webkit-backdrop-filter: blur(30px) saturate(1.6);
+    border: 1px solid rgba(var(--glass-border) / var(--glass-border-alpha));
   }
 
   .glass-card {
-    @apply glass rounded-xl shadow-xl;
+    @apply glass rounded-2xl;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.12),
+                inset 0 1px 0 rgba(255, 255, 255, 0.10);
+  }
+
+  .dark .glass-card {
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.45),
+                inset 0 1px 0 rgba(255, 255, 255, 0.05);
+  }
+
+  /* Brand gradient button — primary CTA in the new shell. Mirrors the
+     `--hero-title-start/end` gradient on openclaw.ai's hero. */
+  .btn-brand-gradient {
+    background: linear-gradient(135deg, #c93342, #f04d5a);
+    color: #fff;
+    transition: background 150ms ease, box-shadow 150ms ease, transform 100ms ease;
+  }
+  .btn-brand-gradient:hover {
+    background: linear-gradient(135deg, #b8202f, #de3f4d);
+    box-shadow: 0 4px 14px rgba(11, 18, 32, 0.10), 0 0 20px rgba(239, 75, 88, 0.27);
+    transform: translateY(-1px);
+  }
+  .btn-brand-gradient:active {
+    transform: translateY(0);
+  }
+
+  /* Card hover with brand-tinted glow — drop this on any interactive
+     card surface. Compounds with `.glass-card` cleanly. */
+  .glow-on-hover {
+    transition: box-shadow 200ms ease, border-color 200ms ease, transform 200ms cubic-bezier(0.4, 0, 0.2, 1);
+  }
+  .glow-on-hover:hover {
+    box-shadow: 0 12px 28px rgba(0, 0, 0, 0.08), 0 0 20px rgba(var(--glow-color) / 0.18);
+    border-color: rgba(var(--glow-color) / 0.20);
+    transform: translateY(-2px);
+  }
+
+  /* Tactile press feedback — scale-down + brief brand-tinted glow ring.
+     Works on any focusable surface (buttons, sidebar items, cards). Pair
+     with `transition-all` on the same element so the spring-back reads
+     naturally. */
+  .press-pulse {
+    transition: transform 120ms cubic-bezier(0.4, 0, 0.2, 1),
+                box-shadow 180ms ease-out;
+  }
+  .press-pulse:active {
+    transform: scale(0.97);
+    box-shadow: 0 0 0 4px rgba(var(--glow-color) / 0.18),
+                0 0 16px rgba(var(--glow-color) / 0.32);
+  }
+
+  /* Ambient glow halo for the currently-active nav item. Pulses softly
+     so the user's eye is gently pulled back to where they are. Soft
+     enough to never feel noisy. */
+  .glow-ambient {
+    animation: glow-ambient 2800ms ease-in-out infinite;
+  }
+
+  /* Click ripple — a one-shot expanding glow centered on the element.
+     Pure CSS; uses `::after` so it doesn't need a wrapper. Triggered by
+     toggling the `.is-clicked` class via JS, or just via `:active` for
+     a cheap built-in version. */
+  .ripple-glow {
+    position: relative;
+    overflow: hidden;
+    isolation: isolate;
+  }
+  .ripple-glow::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    background: radial-gradient(circle at center,
+                rgba(var(--glow-color) / 0.35) 0%,
+                rgba(var(--glow-color) / 0) 60%);
+    opacity: 0;
+    pointer-events: none;
+    z-index: -1;
+  }
+  .ripple-glow:active::after {
+    animation: ripple-glow 420ms cubic-bezier(0.16, 1, 0.3, 1);
   }
 
   .animate-in {
@@ -77,12 +297,271 @@
   }
 }
 
+/* ── Animation library ─────────────────────────────────────────────────
+   All keyframes used by the glass UI live here. Keep them GPU-cheap
+   (transform, opacity, box-shadow) so they stay 60fps even when many
+   surfaces animate at once. */
+
+@keyframes glow-ambient {
+  0%, 100% {
+    box-shadow: inset 0 0 0 1px rgba(var(--glow-color) / 0.20),
+                0 0 12px rgba(var(--glow-color) / 0.10);
+  }
+  50% {
+    box-shadow: inset 0 0 0 1px rgba(var(--glow-color) / 0.30),
+                0 0 22px rgba(var(--glow-color) / 0.20);
+  }
+}
+
+@keyframes ripple-glow {
+  0%   { opacity: 0;   transform: scale(0.6); }
+  40%  { opacity: 0.9; }
+  100% { opacity: 0;   transform: scale(1.6); }
+}
+
+/* Glassier page transition — subtle slide-up + scale-snap + brief glow
+   ring so switching tabs feels like a surface materialising. The 100%
+   keyframe clears `transform` to `none` instead of `scale(1)` because
+   ANY non-none transform on a parent creates a new containing block,
+   which makes descendant `position: fixed` clip to that parent
+   instead of the viewport — and we have modals (Configure Agent,
+   etc.) that need to span the full window, including the sidebar.
+   No `fill-mode` so the element reverts cleanly after 260ms; the
+   60% keyframe already drives the element to its visible state, so
+   there's no end-of-animation flash. */
+@keyframes page-glass-in {
+  0% {
+    opacity: 0;
+    transform: translateY(8px) scale(0.985);
+    filter: blur(2px);
+  }
+  60% {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+    filter: blur(0);
+  }
+  100% {
+    opacity: 1;
+    transform: none;
+    filter: blur(0);
+  }
+}
+.animate-page-glass {
+  animation: page-glass-in 260ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+/* ── Generalised glass-glow primitives ────────────────────────────────
+   These are the canonical utilities for hover, focus, and entrance
+   motion across the app. Compose them on shadcn primitives or any
+   custom element. Each one is GPU-cheap (transform / opacity /
+   box-shadow only) so they stay 60fps even with many on-screen. */
+
+/* HOVER LIFT + GLOW — generic interactive surface treatment. Use on
+   any clickable card or button-like element. */
+.hover-glass {
+  transition: transform 180ms cubic-bezier(0.4, 0, 0.2, 1),
+              box-shadow 200ms ease-out,
+              border-color 180ms ease-out,
+              background-color 150ms ease-out;
+}
+.hover-glass:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.08),
+              0 0 18px rgba(var(--glow-color) / 0.20);
+}
+.hover-glass:active {
+  transform: translateY(0);
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.06),
+              0 0 12px rgba(var(--glow-color) / 0.30);
+}
+
+/* INPUT FOCUS GLOW — animated coral halo when an input receives
+   keyboard focus. Plays smoothly with the global :focus-visible
+   outline (which is also coral). */
+.input-glow {
+  transition: border-color 150ms ease-out,
+              box-shadow 220ms ease-out,
+              background-color 150ms ease-out;
+}
+.input-glow:hover:not(:focus) {
+  border-color: rgba(var(--glow-color) / 0.30);
+}
+.input-glow:focus,
+.input-glow:focus-visible {
+  border-color: rgba(var(--glow-color) / 0.55);
+  box-shadow: 0 0 0 3px rgba(var(--glow-color) / 0.15);
+  outline: none;
+}
+
+/* Same focus halo for NATIVE form controls (raw <input>, <select>,
+   <textarea> not wrapped in the shadcn Input component). About 9
+   sections still use raw native elements (AIProvider config, Sessions
+   filter, Commands, Workspace path field, etc.) and previously got only
+   the hard 2px global :focus-visible outline. Now they pick up the same
+   soft coral glow as shadcn Input, which keeps the brand consistent
+   across the entire app without a per-section refactor.
+   The `.input-glow` rule above wins when an element opts in explicitly;
+   `.no-focus-glow` opts out for places where it would clash. */
+input:not([type='checkbox']):not([type='radio']):not([type='range']):not([type='button']):not([type='submit']):not([type='reset']):not(.no-focus-glow):not(.input-glow),
+select:not(.no-focus-glow):not(.input-glow),
+textarea:not(.no-focus-glow):not(.input-glow) {
+  transition: border-color 150ms ease-out,
+              box-shadow 220ms ease-out,
+              background-color 150ms ease-out;
+}
+input:not([type='checkbox']):not([type='radio']):not([type='range']):not([type='button']):not([type='submit']):not([type='reset']):not(.no-focus-glow):not(.input-glow):focus-visible,
+select:not(.no-focus-glow):not(.input-glow):focus-visible,
+textarea:not(.no-focus-glow):not(.input-glow):focus-visible {
+  border-color: rgba(var(--glow-color) / 0.55);
+  box-shadow: 0 0 0 3px rgba(var(--glow-color) / 0.15);
+  outline: none;
+}
+
+/* MOUNT FADE-UP — drop on any element that mounts mid-flight (toasts,
+   inline alerts, newly-added list rows). Cheap one-shot animation. */
+@keyframes fade-up-in {
+  0% { opacity: 0; transform: translateY(6px); }
+  100% { opacity: 1; transform: translateY(0); }
+}
+.animate-fade-up {
+  animation: fade-up-in 220ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+/* MODAL / DIALOG ENTRANCE — for full-screen overlays and centered
+   sheets. Combines fade + scale-snap + brief blur-clear so the modal
+   feels like a pane of glass settling into place. Transform stays
+   relative (no translate) so it works with both flex-centered and
+   absolute-centered modals. Pair with a backdrop that uses
+   `animate-fade-up` or its own short fade. */
+@keyframes modal-glass-in {
+  0%   { opacity: 0; transform: scale(0.94); filter: blur(4px); }
+  60%  { filter: blur(0); }
+  100% { opacity: 1; transform: scale(1); filter: blur(0); }
+}
+.animate-modal-glass {
+  animation: modal-glass-in 240ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+/* Backdrop fade — pair with modal-glass on the overlay element. */
+@keyframes backdrop-fade-in {
+  from { opacity: 0; backdrop-filter: blur(0); -webkit-backdrop-filter: blur(0); }
+  to   { opacity: 1; backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px); }
+}
+.animate-backdrop {
+  animation: backdrop-fade-in 200ms ease-out both;
+}
+
+/* Canonical modal backdrop — drop this on every fullscreen overlay so
+   every modal in the app shares the same dim + blur intensity. Pairs
+   with `animate-backdrop` for the entrance fade. Modals should use:
+   `<div className="modal-backdrop animate-backdrop">…</div>` */
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background-color: rgba(11, 18, 32, 0.55);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+}
+.dark .modal-backdrop {
+  background-color: rgba(0, 0, 0, 0.65);
+}
+
+/* Canonical modal surface — translucent glass that sits above the
+   .modal-backdrop. Unlike `.glass-strong` (which goes fully opaque
+   in dark mode to prevent wallpaper bleed in the main card), modals
+   stay translucent in BOTH themes because the dimmed backdrop already
+   blocks the wallpaper. Result: same glass appearance everywhere. */
+.modal-shell {
+  background: rgba(var(--glass-bg) / 0.82);
+  backdrop-filter: blur(28px) saturate(1.4);
+  -webkit-backdrop-filter: blur(28px) saturate(1.4);
+  border: 1px solid rgba(var(--glass-border) / var(--glass-border-alpha));
+}
+.dark .modal-shell {
+  background: rgba(10, 15, 26, 0.82);
+}
+
+/* SHEET / DRAWER SLIDE-IN — for side drawers (e.g. command palette
+   already has its own; this is the generic version for future use). */
+@keyframes sheet-glass-in {
+  0%   { opacity: 0; transform: translateY(12px) scale(0.99); }
+  100% { opacity: 1; transform: translateY(0)    scale(1); }
+}
+.animate-sheet-glass {
+  animation: sheet-glass-in 220ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+/* SOFT PULSE — for loading states or "pay attention" hints. Cheaper
+   than a real spinner and reads as a glass surface breathing. */
+@keyframes soft-pulse {
+  0%, 100% { opacity: 0.55; }
+  50%      { opacity: 1; }
+}
+.animate-soft-pulse {
+  animation: soft-pulse 1800ms ease-in-out infinite;
+}
+
+/* SHIMMER — for skeleton loading rows. */
+@keyframes shimmer-sweep {
+  0%   { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+.animate-shimmer {
+  background: linear-gradient(
+    90deg,
+    rgba(var(--glow-color) / 0) 0%,
+    rgba(var(--glow-color) / 0.10) 50%,
+    rgba(var(--glow-color) / 0) 100%
+  );
+  background-size: 200% 100%;
+  animation: shimmer-sweep 1600ms linear infinite;
+}
+
+/* Sheen — a single diagonal highlight that sweeps across a surface
+   once on mount. Use on the GlassShell card so it reads as a freshly-
+   poured pane of glass when the app launches. */
+@keyframes glass-sheen {
+  0%   { background-position: -150% 0; opacity: 0; }
+  20%  { opacity: 0.6; }
+  100% { background-position: 150% 0; opacity: 0; }
+}
+.glass-sheen {
+  position: relative;
+  overflow: hidden;
+  isolation: isolate;
+}
+.glass-sheen::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: linear-gradient(
+    115deg,
+    transparent 30%,
+    rgba(255, 255, 255, 0.22) 50%,
+    transparent 70%
+  );
+  background-size: 250% 100%;
+  background-position: -150% 0;
+  opacity: 0;                    /* invisible by default; only animation reveals */
+  pointer-events: none;
+  z-index: 1;
+  animation: glass-sheen 1400ms cubic-bezier(0.4, 0, 0.2, 1) 200ms 1 forwards;
+}
+
 @keyframes fadeIn {
   from { opacity: 0; transform: translateY(10px); }
   to { opacity: 1; transform: translateY(0); }
 }
 
-/* macOS-style overlay scrollbars: hidden by default, appear on hover/scroll */
+/* macOS-style overlay scrollbars: hidden by default, appear on hover.
+   Color uses the foreground token at low alpha so the thumb is dark
+   on the cream light theme and bright on the navy dark theme — the
+   prior `rgba(255,255,255,...)` only read on dark surfaces. */
 ::-webkit-scrollbar {
   width: 6px;
   height: 6px;
@@ -98,14 +577,15 @@
   transition: background-color 0.2s ease;
 }
 
-/* Show when the scrollable container is hovered */
+/* Show when the scrollable container is hovered. `hsl(var(--foreground)
+   / 0.2)` resolves to dark slate-ink in light mode (visible on cream)
+   and off-white in dark mode (visible on navy). */
 *:hover::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.2);
+  background: hsl(var(--foreground) / 0.20);
 }
 
-/* Slightly brighter when hovering the thumb itself */
 *:hover::-webkit-scrollbar-thumb:hover {
-  background: rgba(255, 255, 255, 0.35);
+  background: hsl(var(--foreground) / 0.35);
 }
 
 /* Chat markdown styles */
@@ -210,4 +690,379 @@
 
 .animate-fade-in {
   animation: fade-in 0.2s ease-out;
+}
+/* ── Brand-refresh animations (2026.5 splash + mascot) ─────────────────── */
+
+/* Mascot bobs gently — used on splash and idle states. */
+@keyframes mascot-bob {
+  0%, 100% { transform: translateY(0); }
+  50%      { transform: translateY(-10px); }
+}
+
+/* Right claw waves on hover / first-launch celebration. */
+@keyframes mascot-wave {
+  0%, 100% { transform: rotate(0deg); }
+  25%      { transform: rotate(-15deg); }
+  75%      { transform: rotate(15deg); }
+}
+
+/* Splash entrance — fade up from 30% with slight scale. */
+@keyframes splash-enter {
+  0%   { opacity: 0; transform: translateY(20px) scale(0.92); }
+  100% { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+/* Tagline character-by-character reveal (used by splash subtitle). */
+@keyframes splash-tagline-reveal {
+  0%   { opacity: 0; transform: translateY(8px); }
+  100% { opacity: 1; transform: translateY(0); }
+}
+
+/* Subtle radial gradient pulse behind the mascot — gives "underwater" feel. */
+@keyframes splash-glow-pulse {
+  0%, 100% { opacity: 0.5; transform: scale(1); }
+  50%      { opacity: 0.8; transform: scale(1.1); }
+}
+
+/* Card hover lift — reusable utility for any tappable surface. */
+@keyframes card-lift {
+  to {
+    transform: translateY(-2px);
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35), 0 2px 6px rgba(0, 0, 0, 0.25);
+  }
+}
+
+.animate-mascot-bob   { animation: mascot-bob 2.4s ease-in-out infinite; }
+.animate-mascot-wave  { animation: mascot-wave 0.8s ease-in-out 2; }
+.animate-splash-enter { animation: splash-enter 0.6s cubic-bezier(0.16, 1, 0.3, 1) both; }
+.animate-splash-glow  { animation: splash-glow-pulse 3s ease-in-out infinite; }
+
+/* Status indicator heartbeat — used on the "connected" channel pill in the
+   sidebar. Soft expanding green ring 1.6s. Subtle so it doesn't spam, but
+   visible enough to confirm a channel is actively reachable. */
+@keyframes status-pulse {
+  0%   { opacity: 0.7; transform: scale(1); }
+  70%  { opacity: 0;   transform: scale(2.2); }
+  100% { opacity: 0;   transform: scale(2.2); }
+}
+.animate-status-pulse { animation: status-pulse 1.6s ease-out infinite; }
+
+/* Page-transition fade — applied to the active dashboard section so
+   switching tabs doesn't pop. Pairs with React's key-on-route-change
+   pattern; very cheap (single GPU comp), no JS animation runtime. */
+@keyframes page-fade-in {
+  from { opacity: 0; transform: translateY(4px); }
+  /* End at transform: none (not translateY(0)) so the element doesn't
+     create a containing block once the animation settles — that would
+     otherwise trap any `position: fixed` modal inside the content
+     pane. No fill-mode for the same reason. */
+  to   { opacity: 1; transform: none; }
+}
+.animate-page-fade { animation: page-fade-in 180ms ease-out; }
+
+/* Global focus-visible ring — keyboard accessibility. Tab navigation now
+   shows a clear coral brand-colored outline on every focusable element
+   (inputs, selects, buttons, links). focus-visible (not :focus) means the
+   ring only appears for keyboard focus, never for mouse clicks — so
+   power users aren't visually noisy and a11y users get the indicator
+   they need. */
+:focus-visible {
+  outline: 2px solid hsl(var(--ring));
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* Hover lift utility — for any tappable card. Pairs with cursor-pointer
+   on the same element. Cheap GPU transform (no reflow), 150ms feels
+   tactile without being floaty. */
+.hover-lift {
+  transition: transform 150ms ease-out, box-shadow 150ms ease-out;
+}
+.hover-lift:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.25);
+}
+
+/* ── Command palette (Cmd+K) ───────────────────────────────────────────
+   cmdk ships unstyled. Everything below is the visual layer for the
+   <CommandPalette /> component. Brand colors come through as inline
+   styles (so theme switching works); structure / motion / layout are
+   here so they're cacheable and easy to tune in one place.
+*/
+[data-cmdk-overlay] {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  z-index: 100;
+  animation: cmdk-overlay-in 140ms ease-out;
+}
+@keyframes cmdk-overlay-in {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+.cmdk-root[cmdk-dialog],
+[cmdk-dialog] {
+  position: fixed;
+  top: 18%;
+  left: 50%;
+  transform: translateX(-50%);
+  width: min(92vw, 640px);
+  max-height: 70vh;
+  z-index: 101;
+  animation: cmdk-pop-in 180ms cubic-bezier(0.16, 1, 0.3, 1) both;
+  outline: none;
+}
+@keyframes cmdk-pop-in {
+  from { opacity: 0; transform: translateX(-50%) translateY(-8px) scale(0.97); }
+  to   { opacity: 1; transform: translateX(-50%) translateY(0)    scale(1); }
+}
+
+.cmdk-shell {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid;
+  border-radius: 14px;
+  overflow: hidden;
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.55), 0 2px 8px rgba(0, 0, 0, 0.35);
+  /* Near-opaque elevated surface so the palette reads as a floating panel
+     in EVERY theme. `.glass-strong` alone is only 0.82 alpha in light /
+     non-glass modes (the dark-glass override already forces it opaque),
+     which made the dialog look too see-through. `--secondary` is the
+     design system's elevated shade and has real contrast against the body
+     (unlike `--glass-bg`, which matches it in dark mode); 0.97 keeps a
+     faint hint of the backdrop blur. Unlayered, so it wins over the
+     layered `.glass-strong` base. */
+  background: hsl(var(--secondary) / 0.97);
+}
+
+.cmdk-input-wrapper {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 14px 16px;
+  border-bottom: 1px solid;
+}
+.cmdk-input-el {
+  flex: 1;
+  background: transparent;
+  border: 0;
+  outline: 0;
+  font-size: 15px;
+  font-family: inherit;
+}
+.cmdk-input-el::placeholder { opacity: 0.55; }
+.cmdk-kbd {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  border: 1px solid;
+  letter-spacing: 0.04em;
+}
+
+.cmdk-list {
+  max-height: 60vh;
+  overflow-y: auto;
+  padding: 8px;
+  scroll-behavior: smooth;
+}
+.cmdk-list::-webkit-scrollbar { width: 8px; }
+.cmdk-list::-webkit-scrollbar-thumb {
+  background: hsl(var(--foreground) / 0.12);
+  border-radius: 4px;
+}
+
+.cmdk-empty {
+  padding: 28px 16px;
+  text-align: center;
+  font-size: 13px;
+}
+
+.cmdk-group [cmdk-group-heading] {
+  padding: 8px 12px 4px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: rgba(255, 255, 255, 0.45);
+}
+
+.cmdk-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 9px 12px;
+  border-radius: 8px;
+  cursor: pointer;
+  user-select: none;
+  transition: background 120ms ease-out;
+}
+.cmdk-item[data-selected='true'] {
+  /* Subtle brand-tint when keyboard-selected. OpenClaw coral @ 14% alpha. */
+  background: rgba(239, 75, 88, 0.14);
+}
+.cmdk-item-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  flex-shrink: 0;
+}
+.cmdk-item-body {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.cmdk-item-title {
+  font-size: 14px;
+  font-weight: 500;
+  line-height: 1.2;
+}
+.cmdk-item-hint {
+  font-size: 12px;
+  margin-top: 2px;
+  line-height: 1.2;
+}
+.cmdk-item-chev {
+  opacity: 0;
+  transition: opacity 120ms ease-out, transform 120ms ease-out;
+  flex-shrink: 0;
+}
+.cmdk-item[data-selected='true'] .cmdk-item-chev {
+  opacity: 0.7;
+  transform: translateX(2px);
+}
+
+.cmdk-footer {
+  display: flex;
+  gap: 16px;
+  padding: 8px 14px;
+  border-top: 1px solid;
+  font-size: 11px;
+  align-items: center;
+}
+.cmdk-footer-hint {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.cmdk-footer-kbd {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10px;
+  padding: 1px 5px;
+  border-radius: 3px;
+  border: 1px solid;
+}
+
+/* ── Activity Log section ──────────────────────────────────────────────
+   The dedicated full-width Activity page. Each row is a card-like timeline
+   entry with a colored channel pill, lucide icon, title, optional detail,
+   and a relative time on the right. Time-bucket headers separate clusters
+   ("Just now", "Past hour", etc.) the way a chat thread groups messages
+   by day. New rows slide in via the rail-in keyframe; the section keeps
+   the keyframe even though the rail is gone, since this is the new home
+   for the visual treatment. */
+@keyframes rail-in {
+  from { opacity: 0; transform: translateX(8px); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+.animate-rail-in {
+  animation: rail-in 220ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+.activity-section-scroll::-webkit-scrollbar { width: 8px; }
+.activity-section-scroll::-webkit-scrollbar-thumb {
+  background: hsl(var(--foreground) / 0.10);
+  border-radius: 4px;
+}
+.activity-section-scroll::-webkit-scrollbar-thumb:hover {
+  background: hsl(var(--foreground) / 0.22);
+}
+
+.activity-section-row {
+  display: grid;
+  grid-template-columns: 18px auto 1fr auto;
+  gap: 10px;
+  align-items: center;
+  padding: 10px 12px;
+  border-radius: 8px;
+  margin: 1px 0;
+  transition: background 120ms ease-out, transform 120ms ease-out;
+}
+.activity-section-row-clickable {
+  cursor: pointer;
+}
+.activity-section-row-clickable:hover {
+  background: rgba(255, 255, 255, 0.04);
+  transform: translateX(2px);
+}
+.activity-section-row-clickable:focus-visible {
+  background: rgba(239, 75, 88, 0.10);
+  outline: none;
+}
+
+.activity-section-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.activity-section-pill {
+  font-size: 10.5px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 999px;
+  white-space: nowrap;
+  letter-spacing: 0.02em;
+}
+
+.activity-section-body {
+  min-width: 0;
+}
+.activity-section-title {
+  font-size: 13.5px;
+  line-height: 1.35;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+.activity-section-detail {
+  font-size: 11.5px;
+  line-height: 1.35;
+  margin-top: 2px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.activity-section-time {
+  font-size: 11px;
+  line-height: 1.3;
+  white-space: nowrap;
+}
+
+/* ── App-wide finish details (2026.7 visual refresh) ─────────────── */
+
+/* Brand-tinted text selection — small, everywhere, unmistakably ours. */
+::selection {
+  background: rgba(var(--glow-color) / 0.22);
+}
+
+/* Reduced motion: collapse every animation/transition to its end state.
+   Bubbles, mascots, pings, glows, and modal pops all settle instantly;
+   nothing is information-bearing motion, so nothing is lost. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
 }
