@@ -2,18 +2,20 @@
   "name": "moltbot-easy",
   "version": "2026.7.27",
   "private": true,
-  "description": "User-friendly desktop app for OpenClaw — bring your own AI provider key",
+  "description": "User-friendly desktop app for OpenClaw \u2014 bring your own AI provider key",
   "license": "MIT",
   "author": "ToniSan",
   "type": "module",
   "scripts": {
-    "build": "pnpm --filter desktop build",
-    "build:all": "pnpm --filter shared build && pnpm --filter desktop build",
-    "dev": "pnpm --filter desktop dev",
+    "build": "pnpm --filter ./apps/desktop build",
+    "build:all": "pnpm --filter ./packages/shared build && pnpm --filter ./apps/desktop build",
+    "core:build": "pnpm --filter ./openclaw build:docker",
+    "dev": "pnpm --filter ./apps/desktop dev",
     "format": "pnpm -r format",
     "lint": "pnpm -r lint",
-    "package": "pnpm --filter desktop package",
-    "test": "pnpm -r test"
+    "package": "pnpm --filter ./apps/desktop package",
+    "test": "pnpm --filter ./apps/desktop test -- --run",
+    "test:e2e": "pnpm --filter ./apps/desktop test:e2e"
   },
   "devDependencies": {
     "@types/node": "^20.11.0",
