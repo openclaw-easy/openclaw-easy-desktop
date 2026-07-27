@@ -17,7 +17,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: '24'
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
@@ -28,3 +28,7 @@ jobs:
       - name: Build desktop
         working-directory: ./apps/desktop
         run: pnpm build
+
+      - name: Unit tests
+        working-directory: ./apps/desktop
+        run: pnpm vitest run

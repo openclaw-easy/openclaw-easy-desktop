@@ -5,6 +5,9 @@ on:
     tags:
       - 'v*'
 
+permissions:
+  contents: write
+
 jobs:
   release:
     runs-on: ${{ matrix.os }}
@@ -20,13 +23,29 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: '24'
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.3.9'
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
 
       - name: Install dependencies
         run: pnpm install --no-frozen-lockfile
+
+      - name: Build OpenClaw core
+        working-directory: ./openclaw
+        run: pnpm build:docker
+        env:
+          OPENCLAW_A2UI_SKIP_MISSING: '1'
+
+      - name: Prepare installer bundle
+        shell: bash
+        working-directory: ./apps/desktop
+        run: bash scripts/prepare-bundle.sh
 
       - name: Build desktop app
         working-directory: ./apps/desktop
@@ -35,21 +54,21 @@ jobs:
       - name: Package (Windows)
         if: matrix.os == 'windows-latest'
         working-directory: ./apps/desktop
-        run: npx electron-builder --win --publish never --config electron-builder.yml
+        run: npx electron-builder --win --publish always --config electron-builder.yml
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Package (macOS)
         if: matrix.os == 'macos-latest'
         working-directory: ./apps/desktop
-        run: npx electron-builder --mac dmg --arm64 --x64 --publish never --config electron-builder.yml
+        run: npx electron-builder --mac dmg --arm64 --x64 --publish always --config electron-builder.yml
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Package (Linux)
         if: matrix.os == 'ubuntu-latest'
         working-directory: ./apps/desktop
-        run: npx electron-builder --linux --publish never --config electron-builder.yml
+        run: npx electron-builder --linux --publish always --config electron-builder.yml
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

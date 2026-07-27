@@ -55,7 +55,7 @@
 | :brain: | **All Major AI Models** | Claude, ChatGPT, Gemini, DeepSeek, Llama, and more. |
 | :house: | **Local AI with Ollama** | Run models 100% offline on your machine. No API keys needed. |
 | :lock: | **100% Local & Private** | Your data stays on your machine. Nothing uploaded to any cloud. |
-| :sparkles: | **Managed AI Option** | Don't want to deal with API keys? Just sign in and go. |
+| :key: | **Bring Your Own Key** | Use your own provider account. No sign-up, no account, no middleman. |
 | :gift: | **Free to Use** | Download and use with your own API keys at no cost. |
 | :arrows_counterclockwise: | **Auto-Updates** | The app updates itself. No manual work. |
 
@@ -73,19 +73,17 @@
 ## Supported AI Providers
 
 <p>
-  <img src="https://img.shields.io/badge/Anthropic_(Claude)-D97757?style=for-the-badge&logo=anthropic&logoColor=white" alt="Anthropic" />
   <img src="https://img.shields.io/badge/OpenAI_(GPT)-412991?style=for-the-badge&logo=openai&logoColor=white" alt="OpenAI" />
   <img src="https://img.shields.io/badge/Google_(Gemini)-4285F4?style=for-the-badge&logo=google&logoColor=white" alt="Google" />
   <img src="https://img.shields.io/badge/Ollama_(Local)-333333?style=for-the-badge&logo=ollama&logoColor=white" alt="Ollama" />
   <img src="https://img.shields.io/badge/OpenRouter-6366F1?style=for-the-badge" alt="OpenRouter" />
   <img src="https://img.shields.io/badge/Venice-FF6B35?style=for-the-badge" alt="Venice" />
-  <img src="https://img.shields.io/badge/DeepSeek-0A84FF?style=for-the-badge" alt="DeepSeek" />
 </p>
 
 ## Features
 
 - :rocket: **One-click gateway** -- Start/stop the OpenClaw gateway from the dashboard
-- :key: **Bring Your Own Key** -- Use API keys from OpenAI, Anthropic, Google, Venice, OpenRouter, or DeepSeek
+- :key: **Bring Your Own Key** -- Use API keys from OpenAI, Google, Venice, or OpenRouter (Claude and DeepSeek are reachable through OpenRouter)
 - :robot: **Agent management** -- Create, configure, and route multiple AI agents
 - :jigsaw: **Skills & plugins** -- Browse and install skills from ClawHub
 - :alarm_clock: **Cron jobs** -- Schedule recurring AI tasks
