@@ -187,7 +187,7 @@
 @layer utilities {
   /* Frosted glass surface. Uses CSS variables so the same class adapts
      between light/dark themes without rewriting Tailwind classes. The
-     `saturate(1.4)` is what gives ViralMint surfaces that lively, warm
+     `saturate(1.4)` is what gives these surfaces their lively, warm
      glow — pure blur on its own looks gray and dead. */
   .glass {
     background: rgba(var(--glass-bg) / var(--glass-alpha));
