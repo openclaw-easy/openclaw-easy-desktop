@@ -181,7 +181,7 @@ We welcome contributions! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guid
 
 ## License
 
-This project is open source under the [Apache-2.0 License](LICENSE). The core OpenClaw engine included in `openclaw/` is licensed under [MIT/Apache-2.0](openclaw/LICENSE).
+This project is open source under the [Apache-2.0 License](LICENSE). The core OpenClaw engine included in `openclaw/` is licensed under the [MIT License](openclaw/LICENSE) by the OpenClaw Foundation.
 
 ---
 
