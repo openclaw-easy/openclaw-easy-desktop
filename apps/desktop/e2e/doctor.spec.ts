@@ -64,6 +64,11 @@ test.describe("Doctor", () => {
           const btns = Array.from(document.querySelectorAll("button"));
           return !btns.some((b) => /running/i.test(b.textContent || ""));
         },
+        // Options go in the THIRD position — waitForFunction(fn, arg, options).
+        // Passing them second makes them the page-function argument and the
+        // wait silently falls back to the 30s default, which a real doctor run
+        // (MCP server probes over the network) blows straight past.
+        undefined,
         { timeout: 120_000 },
       );
 

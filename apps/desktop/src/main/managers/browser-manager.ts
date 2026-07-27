@@ -1,3 +1,4 @@
+import * as nodePath from 'path'
 import { readFile, stat } from 'fs/promises'
 import type { ConfigManager } from './config-manager'
 import type { OpenClawCommandExecutor } from './openclaw-command-executor'
@@ -57,15 +58,21 @@ export class BrowserManager {
     }
   }
 
-  async setEnabled(enabled: boolean): Promise<{ success: boolean; error?: string }> {
+  /**
+   * Writes `browser.enabled`. `changed` tells the caller whether a gateway
+   * restart is owed: plugin activation reads this at server bootstrap
+   * (upstream server-plugin-bootstrap.ts applyPluginAutoEnable), so a live
+   * gateway keeps the old state until it reloads.
+   */
+  async setEnabled(enabled: boolean): Promise<{ success: boolean; changed?: boolean; error?: string }> {
     try {
-      await this.configManager.mutateConfig((config: any) => {
+      const changed = await this.configManager.mutateConfig((config: any) => {
         const current = config.browser && typeof config.browser === 'object' ? config.browser : {}
         if (current.enabled === enabled) return false
         config.browser = { ...current, enabled }
         return true
       })
-      return { success: true }
+      return { success: true, changed }
     } catch (error: any) {
       console.error('[BrowserManager] Failed to set enabled:', error)
       return { success: false, error: error.message || 'Failed to update browser config' }
@@ -106,9 +113,12 @@ export class BrowserManager {
         ?.split('\n')
         .map((l) => l.trim())
         .filter(Boolean)
-        // The path is the last line that looks like an absolute path.
+        // The path is the last line that looks like an absolute path. Test
+        // both flavours explicitly: a POSIX-only check ("/…") silently never
+        // matches the "C:\…" the CLI prints on Windows, which made the whole
+        // screenshot feature fail there with "produced no file path".
         .reverse()
-        .find((l) => l.startsWith('/'))
+        .find((l) => nodePath.win32.isAbsolute(l) || nodePath.posix.isAbsolute(l))
       if (!path) return { success: false, error: 'Screenshot command produced no file path' }
       const info = await stat(path)
       // Screenshots are PNGs of one viewport; anything huge is unexpected.

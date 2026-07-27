@@ -26,6 +26,10 @@ function copyRecursive(src: string, dest: string): void {
  * callers share the same install promise.
  */
 export class OpenClawBundle {
+  // Install-dir entries created by `bun install`/this class rather than shipped
+  // by the bundle — an upgrade mirror must not treat them as stale orphans.
+  private static readonly INSTALL_OWNED = ['node_modules', '.package-hash']
+
   private installPromise: Promise<void> | null = null
 
   constructor(private readonly resourcesPath: string) {}
@@ -131,25 +135,44 @@ export class OpenClawBundle {
     }
   }
 
+  /**
+   * Mirror the packaged payload into the install dir.
+   *
+   * Copies every top-level entry the bundle ships rather than an allowlist:
+   * prepare-openclaw-bundle.mjs is the single source of truth for what a
+   * release contains, and a second list here silently drops whatever the build
+   * starts emitting. That is exactly how `vendor/` — the file: targets the
+   * rewritten package.json deps point at — never reached the install dir, so
+   * `bun install` failed outright and left the runtime with no node_modules.
+   */
   private syncAssets(installDir: string, resourceDir: string, prune = false): void {
-    for (const dir of ['dist', 'docs', 'extensions', 'skills']) {
-      const src = path.join(resourceDir, dir)
-      const dest = path.join(installDir, dir)
-      if (!fs.existsSync(src)) continue
-      // On a bundle upgrade, MIRROR (wipe dest first) instead of overlaying.
-      // An additive copy leaves files removed/renamed upstream as orphans — a
-      // stale plugin manifest pointing at a deleted setup entry breaks the
-      // gateway's plugins list after an over-the-top update.
-      if (prune && fs.existsSync(dest)) {
+    const shipped = fs.readdirSync(resourceDir)
+    // On a bundle upgrade, MIRROR (wipe first) instead of overlaying. An
+    // additive copy leaves files removed/renamed upstream as orphans — a stale
+    // plugin manifest pointing at a deleted setup entry breaks the gateway's
+    // plugins list after an over-the-top update. INSTALL_OWNED entries are
+    // produced by `bun install` here, not by the bundle, so they are not stale.
+    if (prune) {
+      const keep = new Set([...shipped, ...OpenClawBundle.INSTALL_OWNED])
+      for (const entry of fs.readdirSync(installDir)) {
+        // Dotfiles are tool state (install stamps, package-manager metadata),
+        // never shipped payload — deleting them buys nothing and can wipe
+        // state whose owner lives outside this class.
+        if (keep.has(entry) || entry.startsWith('.')) continue
+        try {
+          fs.rmSync(path.join(installDir, entry), { recursive: true, force: true })
+        } catch { /* best effort */ }
+      }
+    }
+    for (const entry of shipped) {
+      const src = path.join(resourceDir, entry)
+      const dest = path.join(installDir, entry)
+      if (prune && fs.statSync(src).isDirectory() && fs.existsSync(dest)) {
         try { fs.rmSync(dest, { recursive: true, force: true }) } catch { /* best effort */ }
       }
       copyRecursive(src, dest)
     }
-    for (const file of ['openclaw.mjs', 'package.json']) {
-      const src = path.join(resourceDir, file)
-      if (fs.existsSync(src)) fs.copyFileSync(src, path.join(installDir, file))
-    }
-    for (const lockfile of ['package-lock.json', 'pnpm-lock.yaml', 'yarn.lock', 'bun.lockb']) {
+    for (const lockfile of ['package-lock.json', 'pnpm-lock.yaml', 'yarn.lock', 'bun.lock', 'bun.lockb']) {
       const lf = path.join(installDir, lockfile)
       if (fs.existsSync(lf)) {
         try { fs.unlinkSync(lf) } catch { /* best effort */ }
@@ -197,18 +220,27 @@ export class OpenClawBundle {
         proc.kill()
         reject(new Error('bun install timed out after 3 minutes'))
       }, 3 * 60 * 1000)
+      // Keep the tail of stderr: a bare exit code is undiagnosable after the
+      // fact, and this install failing is what leaves the runtime unusable.
+      const errTail: string[] = []
       proc.stdout?.on('data', (d: Buffer) => {
         const t = d.toString().trim()
         if (t) log(`  ${t}`)
       })
       proc.stderr?.on('data', (d: Buffer) => {
         const t = d.toString().trim()
-        if (t && !t.includes('warn')) log(`  ${t}`)
+        if (!t) return
+        errTail.push(t)
+        if (errTail.length > 10) errTail.shift()
+        if (!t.includes('warn')) log(`  ${t}`)
       })
       proc.on('exit', (code) => {
         clearTimeout(timeout)
         if (code === 0) resolve()
-        else reject(new Error(`bun install exited with code ${code}`))
+        else {
+          const detail = errTail.join('\n').trim()
+          reject(new Error(`bun install exited with code ${code}${detail ? `:\n${detail}` : ''}`))
+        }
       })
       proc.on('error', (err) => { clearTimeout(timeout); reject(err) })
     })

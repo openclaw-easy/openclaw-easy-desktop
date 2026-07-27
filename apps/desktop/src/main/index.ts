@@ -214,8 +214,14 @@ class OpenclawEasyApp {
       getOpenClawBundle().ensureInstalled((msg) => {
         console.log(`[OpenclawEasyApp] ${msg}`)
         this.mainWindow?.webContents.send('bundle:status', msg)
-      }).catch((err) => {
-        console.error('[OpenclawEasyApp] Bundle pre-install failed:', err)
+      }).catch((err: unknown) => {
+        // electron-log serializes a bare Error to `{}`, which is how a total
+        // runtime-install failure previously reached the log as no information
+        // at all. Stringify before logging, and tell the renderer so the user
+        // sees a reason instead of a loading screen that never resolves.
+        const detail = err instanceof Error ? (err.stack ?? err.message) : String(err)
+        console.error(`[OpenclawEasyApp] Bundle pre-install failed: ${detail}`)
+        this.mainWindow?.webContents.send('bundle:status', `⚠️ OpenClaw runtime setup failed: ${detail}`)
       })
     }
 
@@ -1748,7 +1754,15 @@ class OpenclawEasyApp {
 
     ipcMain.handle('browser:set-enabled', async (_, enabled: boolean) => {
       console.log('[Browser] Setting enabled:', enabled)
-      return await this.browserManager.setEnabled(enabled)
+      const result = await this.browserManager.setEnabled(enabled)
+      // Plugin activation is resolved when the gateway boots, so a live
+      // gateway ignores this flag until it reloads — same reason access:set
+      // restarts. Only on a real change, so re-clicking the current state
+      // never interrupts a chat.
+      if (result.success && result.changed && (await this.openClawManager.isGatewayReachable())) {
+        await this.openClawManager.restart()
+      }
+      return result
     })
 
     ipcMain.handle('browser:start', async () => {

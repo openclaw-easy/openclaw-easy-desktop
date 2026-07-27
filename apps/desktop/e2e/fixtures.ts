@@ -106,6 +106,31 @@ export async function waitForDashboard(page: Page) {
     .locator('[aria-label="Collapse sidebar"], [aria-label="Expand sidebar"]')
     .first()
     .waitFor({ state: "visible", timeout: 30_000 });
+  await dismissWhatsNew(page);
+}
+
+/**
+ * Dismiss the "What's New" dialog if this launch is the first one after a
+ * version bump.
+ *
+ * Its backdrop swallows every pointer event, so leaving it up makes the whole
+ * suite fail on unrelated clicks with "<div class="modal-backdrop"> intercepts
+ * pointer events". That is worst exactly at release time — the dialog only
+ * appears when the version changed — so the suite went blind on the very run
+ * that was supposed to validate a release. Dismissing is also what a real
+ * user does before touching anything else.
+ */
+export async function dismissWhatsNew(page: Page) {
+  const backdrop = page.locator(".modal-backdrop");
+  if ((await backdrop.count()) === 0) return;
+  const cta = page.getByRole("button", { name: /continue/i }).first();
+  if ((await cta.count()) > 0) {
+    await cta.click({ timeout: 5_000 }).catch(() => {});
+  }
+  await backdrop
+    .first()
+    .waitFor({ state: "detached", timeout: 10_000 })
+    .catch(() => {});
 }
 
 /**
@@ -255,6 +280,10 @@ export async function startAssistant(page: Page, timeoutMs = 90_000): Promise<vo
         runningCueVisible
       );
     },
+    // Options are the THIRD parameter — waitForFunction(fn, arg, options).
+    // In the second slot they become the page-function argument and the
+    // caller's timeout is silently replaced by the 30s default.
+    undefined,
     { timeout: timeoutMs },
   );
 }
@@ -273,6 +302,7 @@ export async function stopAssistant(page: Page, timeoutMs = 30_000): Promise<voi
   await stopBtn.click();
   await page.waitForFunction(
     () => /stopped|offline|inactive|assistant is offline/i.test(document.body.textContent || ""),
+    undefined,
     { timeout: timeoutMs },
   );
 }

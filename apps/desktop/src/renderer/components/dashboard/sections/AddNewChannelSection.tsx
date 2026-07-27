@@ -65,6 +65,16 @@ export const AddNewChannelSection: React.FC<AddNewChannelSectionProps> = ({
       brandColor: '#25D366',
     },
     {
+      // External official plugin: connecting installs
+      // @tencent-weixin/openclaw-weixin on demand, then does a QR login.
+      // No credentials to type in — same shape as WhatsApp.
+      name: t('channels.weixin'),
+      desc: t('channels.weixinDesc'),
+      requires: 'QR scan',
+      key: 'weixin',
+      brandColor: '#07C160',
+    },
+    {
       name: t('channels.telegram'),
       desc: t('channels.telegramDesc'),
       requires: 'Bot token',
@@ -98,16 +108,6 @@ export const AddNewChannelSection: React.FC<AddNewChannelSectionProps> = ({
       requires: 'Channel tokens',
       key: 'line',
       brandColor: '#06C755',
-    },
-    {
-      // External official plugin: connecting installs
-      // @tencent-weixin/openclaw-weixin on demand, then does a QR login.
-      // No credentials to type in — same shape as WhatsApp.
-      name: t('channels.weixin'),
-      desc: t('channels.weixinDesc'),
-      requires: 'QR scan',
-      key: 'weixin',
-      brandColor: '#07C160',
     },
   ]
 

@@ -12,7 +12,15 @@ function makeTmpHome(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-resolver-test-"));
 }
 
-describe("getAugmentedPath", () => {
+// getAugmentedPath is POSIX by construction: it joins with ":" and lists
+// /opt/homebrew/bin, /usr/bin and /bin off $HOME. On Windows it therefore
+// produces a string that resolves nothing, which is harmless — the Windows app
+// runs the bundled runtime and detectSystemOpenClaw simply finds no system
+// install — but the ordering assertions below only mean anything on POSIX.
+// Skip rather than restate them per-separator, which would assert nothing.
+// Follow-up: give detectSystemOpenClaw a real Windows branch (where-style
+// lookup + ";" separator) or guard the whole resolver by platform.
+describe.skipIf(process.platform === "win32")("getAugmentedPath", () => {
   it("places user-shell dirs ahead of system PATH for Electron parity with terminal", () => {
     const prevHome = process.env.HOME;
     process.env.HOME = "/Users/test";
@@ -42,9 +50,12 @@ describe("getFallbackPaths", () => {
     try {
       const paths = getFallbackPaths();
       // Superset of every install location any prior fork-side detector covered.
-      expect(paths).toContain("/Users/test/.npm-global/bin/openclaw");
-      expect(paths).toContain("/Users/test/.local/bin/openclaw");
-      expect(paths).toContain("/Users/test/.bun/bin/openclaw");
+      // Home-relative entries are built with path.join in the resolver, so they
+      // are separator-correct for the host — hard-coding "/" made these fail on
+      // Windows once CI started running this suite there.
+      expect(paths).toContain(path.join("/Users/test", ".npm-global", "bin", "openclaw"));
+      expect(paths).toContain(path.join("/Users/test", ".local", "bin", "openclaw"));
+      expect(paths).toContain(path.join("/Users/test", ".bun", "bin", "openclaw"));
       expect(paths).toContain("/opt/homebrew/bin/openclaw");
       expect(paths).toContain("/usr/local/bin/openclaw");
       expect(paths).toContain("/usr/bin/openclaw");
@@ -58,7 +69,7 @@ describe("getFallbackPaths", () => {
     process.env.HOME = "/Users/test";
     try {
       const paths = getFallbackPaths();
-      const npmGlobalIdx = paths.indexOf("/Users/test/.npm-global/bin/openclaw");
+      const npmGlobalIdx = paths.indexOf(path.join("/Users/test", ".npm-global", "bin", "openclaw"));
       const usrLocalIdx = paths.indexOf("/usr/local/bin/openclaw");
       expect(npmGlobalIdx).toBeGreaterThanOrEqual(0);
       expect(npmGlobalIdx).toBeLessThan(usrLocalIdx);

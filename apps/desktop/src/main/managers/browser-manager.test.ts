@@ -62,6 +62,19 @@ describe('BrowserManager', () => {
     expect(res.dataUrl).toMatch(/^data:image\/png;base64,/)
   })
 
+  it('recognizes the Windows path the CLI prints there', async () => {
+    // Regression: a POSIX-only "starts with /" check never matched "C:\…", so
+    // the screenshot panel was dead on every Windows build. Asserted with a
+    // literal Windows path so the test is meaningful on POSIX CI too.
+    const { mgr } = makeManager({
+      'browser screenshot': 'Saved screenshot\nC:\\Users\\alice\\AppData\\shot.png\n',
+    })
+    const res = await mgr.screenshot()
+    // stat() on that path fails on POSIX; the point is that it got PAST
+    // path extraction instead of reporting "produced no file path".
+    expect(res.error).not.toMatch(/produced no file path/)
+  })
+
   it('fails cleanly when the screenshot output has no path', async () => {
     const { mgr } = makeManager({ 'browser screenshot': 'nothing useful' })
     const res = await mgr.screenshot()
