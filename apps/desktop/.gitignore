@@ -39,6 +39,11 @@ installer-resources/version.json
 *.temp
 
 # Test results
+test-results/
 test-results-*/
 test-results-*/*.txt
 test-results-*/*.log
+
+# Playwright output
+playwright-report/
+.playwright-artifacts-*/
