@@ -1,14 +1,21 @@
 #!/bin/bash
-# Prepare installer-resources/bun and installer-resources/openclaw before building the DMG.
-# Run this once (after building openclaw: pnpm run build at repo root) before building the app.
+# Prepare installer-resources/{bun,openclaw} before building the DMG.
+# Run this once (after building openclaw: pnpm run build at repo root)
+# before building the desktop app.
+#
+# Responsibilities are split into:
+#   1. Download Bun binaries — stays in this script (mac-local-only flavor).
+#   2. Copy OpenClaw compiled output into installer-resources/openclaw/ —
+#      delegated to prepare-openclaw-bundle.mjs (shared with CI workflows).
 #
 # Output layout (used by electron-builder extraResources):
 #   installer-resources/bun/bun-arm64                     ← Bun binary for Apple Silicon
 #   installer-resources/bun/bun-x64                       ← Bun binary for Intel
+#   installer-resources/bun/bun-windows.exe               ← Bun binary for Windows
 #   installer-resources/openclaw/dist/                    ← compiled OpenClaw JS
-#   installer-resources/openclaw/extensions/              ← bundled channel plugins (whatsapp, telegram, etc.)
+#   installer-resources/openclaw/extensions/              ← bundled channel plugins
 #   installer-resources/openclaw/skills/                  ← bundled agent skills
-#   installer-resources/openclaw/docs/reference/templates ← workspace templates (AGENTS.md etc.)
+#   installer-resources/openclaw/docs/reference/templates ← workspace templates
 #   installer-resources/openclaw/openclaw.mjs
 #   installer-resources/openclaw/package.json
 
@@ -16,12 +23,20 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DESKTOP_DIR="$(dirname "$SCRIPT_DIR")"
-# OpenClaw source lives in the openclaw/ subdirectory at repo root
+# The OpenClaw core is vendored at the repo root:
 # apps/desktop → apps → repo root → openclaw/
-WORKSPACE_DIR="$(cd "$DESKTOP_DIR/../.." && pwd)/openclaw"
+WORKSPACE_DIR="$(cd "$DESKTOP_DIR/../../openclaw" && pwd)"
 
-BUN_VERSION="1.3.9"   # pin to a known-good release
+# Keep this version in sync with .github/workflows/{build-desktop,release}.yml
+# so the gateway runtime is identical across local + CI builds.
+BUN_VERSION="1.3.9"
 BUN_DIR="$DESKTOP_DIR/installer-resources/bun"
+# Node runtime used to RUN openclaw (gateway + CLI). openclaw requires
+# node:sqlite (Node 22.5+/24+), which bun does not provide — so the gateway
+# and `agents add` need a real Node runtime. Bun stays only as the dependency
+# installer. Keep in sync with .github/workflows/{build-desktop,release}.yml.
+NODE_VERSION="24.18.0"
+NODE_DIR="$DESKTOP_DIR/installer-resources/node"
 OPENCLAW_DIR="$DESKTOP_DIR/installer-resources/openclaw"
 
 GREEN='\033[0;32m'; BLUE='\033[0;34m'; NC='\033[0m'
@@ -80,53 +95,77 @@ download_bun_windows() {
 
 download_bun_windows
 
-# ── OpenClaw dist ─────────────────────────────────────────────────────────────
-info "Copying OpenClaw compiled dist from workspace..."
+# ── node binaries ────────────────────────────────────────────────────────────
+# Runtime that actually executes openclaw.mjs (gateway + CLI). Needed for
+# node:sqlite; bun above is install-only.
+mkdir -p "$NODE_DIR"
 
-if [ ! -d "$WORKSPACE_DIR/dist" ]; then
-  echo ""
-  echo "ERROR: $WORKSPACE_DIR/dist not found."
-  echo "Run the OpenClaw build first:"
-  echo "  cd $WORKSPACE_DIR && pnpm install && pnpm build"
-  exit 1
+download_node() {
+  local arch="$1"        # arm64 | x64
+  local out_name="$2"    # node-arm64 | node-x64
+  local out_path="$NODE_DIR/$out_name"
+
+  if [ -f "$out_path" ]; then
+    log "node $arch already downloaded"
+    return
+  fi
+
+  info "Downloading node v$NODE_VERSION for darwin-$arch..."
+  local url="https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-darwin-${arch}.tar.gz"
+  local tmp_tgz="/tmp/node-darwin-${arch}.tar.gz"
+
+  curl -L --progress-bar -o "$tmp_tgz" "$url"
+  # Extract just the node binary to stdout → out_path (no full unpack needed).
+  tar -xzO -f "$tmp_tgz" "node-v${NODE_VERSION}-darwin-${arch}/bin/node" > "$out_path"
+  chmod +x "$out_path"
+  rm -f "$tmp_tgz"
+
+  log "node $arch downloaded → installer-resources/node/$out_name ($(du -sh "$out_path" | cut -f1))"
+}
+
+download_node "arm64" "node-arm64"
+download_node "x64"   "node-x64"
+
+download_node_windows() {
+  local out_path="$NODE_DIR/node-windows.exe"
+
+  if [ -f "$out_path" ]; then
+    log "node windows-x64 already downloaded"
+    return
+  fi
+
+  info "Downloading node v$NODE_VERSION for win-x64..."
+  local url="https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-win-x64.zip"
+  local tmp_zip="/tmp/node-win-x64.zip"
+
+  curl -L --progress-bar -o "$tmp_zip" "$url"
+  unzip -p "$tmp_zip" "node-v${NODE_VERSION}-win-x64/node.exe" > "$out_path"
+  chmod +x "$out_path"
+  rm -f "$tmp_zip"
+
+  log "node windows-x64 downloaded → installer-resources/node/node-windows.exe ($(du -sh "$out_path" | cut -f1))"
+}
+
+download_node_windows
+
+# ── Auto-build Control UI for local dev ──────────────────────────────────────
+# CI workflows always run `pnpm ui:build` explicitly before invoking the
+# shared Node script. For local dev convenience, build it here if missing
+# so `dist:s3` doesn't fail on a fresh `pnpm run build` (which doesn't run
+# ui:build).
+if [ ! -f "$WORKSPACE_DIR/dist/control-ui/index.html" ]; then
+  info "dist/control-ui not built yet — running pnpm ui:build (one-time per dist)..."
+  (cd "$WORKSPACE_DIR" && pnpm ui:build) || {
+    echo ""
+    echo "ERROR: pnpm ui:build failed in $WORKSPACE_DIR."
+    echo "Fix the UI build then re-run prepare-bundle.sh."
+    exit 1
+  }
 fi
 
-if [ ! -d "$WORKSPACE_DIR/docs/reference/templates" ]; then
-  echo "ERROR: $WORKSPACE_DIR/docs/reference/templates not found."
-  exit 1
-fi
-
-mkdir -p "$OPENCLAW_DIR"
-
-# Copy compiled dist (self-contained JS chunks, no TS needed)
-rsync -a --delete "$WORKSPACE_DIR/dist/" "$OPENCLAW_DIR/dist/"
-
-# Workspace templates required for agent boot (AGENTS.md, SOUL.md, etc.)
-mkdir -p "$OPENCLAW_DIR/docs/reference"
-rsync -a --delete "$WORKSPACE_DIR/docs/reference/templates/" "$OPENCLAW_DIR/docs/reference/templates/"
-
-# Bundled extensions (channel plugins: whatsapp, telegram, discord, etc.)
-if [ ! -d "$WORKSPACE_DIR/extensions" ]; then
-  echo "ERROR: $WORKSPACE_DIR/extensions not found."
-  exit 1
-fi
-rsync -a --delete --exclude='node_modules' "$WORKSPACE_DIR/extensions/" "$OPENCLAW_DIR/extensions/"
-log "Extensions copied ($(du -sh "$OPENCLAW_DIR/extensions" | cut -f1))"
-
-# Bundled skills (built-in agent skills)
-if [ ! -d "$WORKSPACE_DIR/skills" ]; then
-  echo "ERROR: $WORKSPACE_DIR/skills not found."
-  exit 1
-fi
-rsync -a --delete "$WORKSPACE_DIR/skills/" "$OPENCLAW_DIR/skills/"
-log "Skills copied ($(du -sh "$OPENCLAW_DIR/skills" | cut -f1))"
-
-# Entry point and dependency manifest
-cp "$WORKSPACE_DIR/openclaw.mjs"  "$OPENCLAW_DIR/openclaw.mjs"
-cp "$WORKSPACE_DIR/package.json"  "$OPENCLAW_DIR/package.json"
-
-log "OpenClaw dist copied ($(du -sh "$OPENCLAW_DIR/dist" | cut -f1))"
-log "Templates copied ($(du -sh "$OPENCLAW_DIR/docs/reference/templates" | cut -f1))"
+# ── OpenClaw payload (delegated to shared Node script) ───────────────────────
+OPENCLAW_BUNDLE_STAMP_BUN_VERSION="$BUN_VERSION" \
+  node "$SCRIPT_DIR/prepare-openclaw-bundle.mjs" "$WORKSPACE_DIR" "$OPENCLAW_DIR"
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo ""
