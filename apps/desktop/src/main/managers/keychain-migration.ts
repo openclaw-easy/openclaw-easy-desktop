@@ -2,8 +2,8 @@
  * One-shot keychain-rename migration.
  *
  * 2026-06-17 — the macOS entitlement `keychain-access-groups` was
- * renamed from `SNW9DN2FD5.com.moltbot-easy.app` (stale brand) to
- * `SNW9DN2FD5.com.openclaw-easy.app` (matches `electron-builder.yml`'s
+ * renamed from the previous brand's app id to
+ * `com.openclaw-easy.app` (matches `electron-builder.yml`'s
  * `appId`). The OS Keychain ties safeStorage ciphertext to the access
  * group that encrypted it; an existing install upgrading to a build
  * with the renamed entitlement CANNOT decrypt its old `authTokenEncrypted`
