@@ -906,19 +906,28 @@ export class ChannelManager {
   }
 
   private cleanupWhatsAppSession() {
-    if (whatsappLoginProcess && !whatsappLoginProcess.killed) {
-      this.addLog('🧹 Cleaning up WhatsApp login process')
-      whatsappLoginProcess.kill('SIGTERM')
-
-      setTimeout(() => {
-        if (whatsappLoginProcess && !whatsappLoginProcess.killed) {
-          whatsappLoginProcess.kill('SIGKILL')
-        }
-      }, 2000)
-    }
-
+    // Capture the process before nulling the module state: the SIGKILL
+    // escalation below must act on THIS child only. Re-reading the module
+    // var from the timer used to kill a retry's fresh login spawned within
+    // the 2s window ("QR Generation Failed" with empty logs on retry).
+    const proc = whatsappLoginProcess
     whatsappLoginProcess = null
     activeWhatsAppSession = null
+
+    // exitCode === null means still running; `.killed` only records that a
+    // signal was ever SENT, so it can neither detect a live process nor a
+    // dead one reliably.
+    if (proc && proc.exitCode === null) {
+      this.addLog('🧹 Cleaning up WhatsApp login process')
+      proc.kill('SIGTERM')
+      const killTimer = setTimeout(() => {
+        if (proc.exitCode === null) {
+          proc.kill('SIGKILL')
+        }
+      }, 2000)
+      killTimer.unref?.()
+      proc.once('exit', () => clearTimeout(killTimer))
+    }
   }
 
   private setupSessionCleanup() {

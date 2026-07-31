@@ -241,6 +241,15 @@ class OpenclawEasyApp {
     })
   }
 
+  /** Bring the existing window to front when a second launch is attempted. */
+  focusMainWindow() {
+    if (this.mainWindow && !this.mainWindow.isDestroyed()) {
+      if (this.mainWindow.isMinimized()) { this.mainWindow.restore() }
+      this.mainWindow.show()
+      this.mainWindow.focus()
+    }
+  }
+
   /**
    * Probe the configured gateway port on startup.
    * If a gateway is already listening, call start() which will detect it as
@@ -2204,10 +2213,25 @@ process.stderr.on('error', (err) => {
   console.error('[OpenclawApp] stderr error:', err)
 })
 
+// Single-instance gate. A second instance's bundled-mode start treats the
+// first instance's healthy gateway as a stale process and kills it by PID —
+// exit before constructing managers (ConfigManager's constructor already
+// runs config repairs).
+const gotSingleInstanceLock = app.requestSingleInstanceLock()
+if (!gotSingleInstanceLock) {
+  console.log('[OpenclawApp] Another OpenClaw Easy instance is already running — quitting')
+  app.exit(0)
+}
+
 // Initialize the app
 const openclawApp = new OpenclawEasyApp()
 
+app.on('second-instance', () => {
+  openclawApp.focusMainWindow()
+})
+
 app.whenReady().then(() => {
+  if (!gotSingleInstanceLock) { return }
   openclawApp.initialize()
 }).catch((error) => {
   console.error('[OpenclawApp] Error during app initialization:', error)

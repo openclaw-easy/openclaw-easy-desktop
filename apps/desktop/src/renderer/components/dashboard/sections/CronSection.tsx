@@ -188,9 +188,16 @@ export const CronSection: React.FC<CronSectionProps> = ({ colors }) => {
 
   const withActionLoading = async (id: string, fn: () => Promise<void>) => {
     setActionLoading(prev => new Set(prev).add(id))
+    setError(null)
     try {
       await fn()
       await loadJobs(true)
+    } catch (err: any) {
+      // Surface failures in the existing error banner — the handlers throw on
+      // {success:false}, and an uncaught rejection here means the toggle
+      // snaps back with zero feedback.
+      console.error('[CronSection] Action failed:', err)
+      setError(err?.message || t('cron.errorAction', 'Automation action failed'))
     } finally {
       setActionLoading(prev => {
         const s = new Set(prev)

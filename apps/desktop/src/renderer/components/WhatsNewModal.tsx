@@ -1,6 +1,6 @@
 import { useEffect } from 'react'
 import { useTranslation } from 'react-i18next'
-import { MessageCircle, Shield, Globe, Brain, type LucideIcon } from 'lucide-react'
+import { Wrench, Puzzle, MessageCircle, AlertCircle, type LucideIcon } from 'lucide-react'
 import { Modal } from './ui/modal'
 import { useWhatsNewStore } from '../stores/whatsNewStore'
 import { BrandLobster } from './ui/brand-lobster'
@@ -13,24 +13,24 @@ import { BrandLobster } from './ui/brand-lobster'
 // screen — no internals, no version plumbing.
 const RELEASE_HIGHLIGHTS: Array<{ icon: LucideIcon; title: string; body: string }> = [
   {
+    icon: Wrench,
+    title: 'Updates that fix themselves',
+    body: 'This release moves your saved sign-ins to a new format. The app now handles that for you on launch, so your assistant starts up as usual instead of stalling after an update.',
+  },
+  {
+    icon: Puzzle,
+    title: 'Your plugin choices stick',
+    body: 'Turn a plugin off and it stays off. Enabled and disabled plugins now survive restarts and updates instead of quietly switching back on.',
+  },
+  {
     icon: MessageCircle,
-    title: 'WeChat, working end to end',
-    body: 'Scan the QR, connect, and chat — WeChat setup, sign-in fixes, and self-repair keep it working across updates.',
+    title: 'WhatsApp sign-in survives a retry',
+    body: 'If the QR code times out, hitting retry now brings up a fresh one — it used to fail with an empty screen and no explanation.',
   },
   {
-    icon: Shield,
-    title: 'Decide who can talk to your assistant',
-    body: 'The new Access Control panel sets per-channel rules: open, approval-based pairing, or an allowlist — for DMs and groups.',
-  },
-  {
-    icon: Globe,
-    title: 'Your assistant can browse the web',
-    body: 'A dedicated browser your assistant drives — see its status, start or stop it, and snap a screenshot from the new Browser panel.',
-  },
-  {
-    icon: Brain,
-    title: 'See what it remembers',
-    body: 'The new Memory panel shows everything your assistant remembers, lets you search it, and delete anything you want forgotten.',
+    icon: AlertCircle,
+    title: 'No more buttons that do nothing',
+    body: 'Skills and Automations now tell you when something goes wrong, so a failed switch or delete says why instead of silently snapping back.',
   },
 ]
 

@@ -2,7 +2,7 @@ import { spawn, exec, execFile } from 'child_process'
 import * as path from 'path'
 import * as fs from 'fs'
 import { promisify } from 'util'
-import { ProcessManagerBase, ConfigManager } from './process-manager-base'
+import { ProcessManagerBase, ConfigManager, GATEWAY_STOP_ARGS, GATEWAY_RESTART_ARGS } from './process-manager-base'
 import { sanitizeConfigForBundled } from './utils/config-sanitizer'
 import { getOpenClawBundle } from './openclaw-bundle'
 import { getDevOpenClawSpawn } from './dev-openclaw-runtime'
@@ -67,16 +67,25 @@ export class ProcessManagerWindows extends ProcessManagerBase {
    * 3. Dev-mode Node + built dist (dev-openclaw-runtime.ts)
    */
   private async runGatewayStop(): Promise<void> {
+    await this.runGatewayCliAction(GATEWAY_STOP_ARGS, 'stop')
+  }
+
+  /** Restart a gateway we do not own as ONE operation — see GATEWAY_RESTART_ARGS. */
+  private async runGatewayRestart(): Promise<boolean> {
+    return await this.runGatewayCliAction(GATEWAY_RESTART_ARGS, 'restart')
+  }
+
+  private async runGatewayCliAction(args: readonly string[], label: string): Promise<boolean> {
     // 1. Try system binary
     const systemBinary = await this.detectSystemOpenClaw()
     if (systemBinary) {
       try {
-        console.log(`[ProcessManagerWindows] Running: ${systemBinary} gateway stop`)
-        await execFileAsync(systemBinary, ['gateway', 'stop'], { timeout: 15_000 })
-        console.log('[ProcessManagerWindows] openclaw gateway stop succeeded (system binary)')
-        return
+        console.log(`[ProcessManagerWindows] Running: ${systemBinary} gateway ${label}`)
+        await execFileAsync(systemBinary, [...args], { timeout: 30_000 })
+        console.log(`[ProcessManagerWindows] openclaw gateway ${label} succeeded (system binary)`)
+        return true
       } catch (err: any) {
-        console.warn('[ProcessManagerWindows] System openclaw gateway stop failed:', err.message)
+        console.warn(`[ProcessManagerWindows] System openclaw gateway ${label} failed:`, err.message)
       }
     }
 
@@ -90,28 +99,29 @@ export class ProcessManagerWindows extends ProcessManagerBase {
 
       if (fs.existsSync(bundledNode) && fs.existsSync(openclawMjs)) {
         try {
-          console.log(`[ProcessManagerWindows] Running: ${bundledNode} ${openclawMjs} gateway stop`)
-          await execFileAsync(bundledNode, [openclawMjs, 'gateway', 'stop'], { timeout: 15_000 })
-          console.log('[ProcessManagerWindows] openclaw gateway stop succeeded (bundled)')
-          return
+          console.log(`[ProcessManagerWindows] Running: ${bundledNode} ${openclawMjs} gateway ${label}`)
+          await execFileAsync(bundledNode, [openclawMjs, ...args], { timeout: 30_000 })
+          console.log(`[ProcessManagerWindows] openclaw gateway ${label} succeeded (bundled)`)
+          return true
         } catch (err: any) {
-          console.warn('[ProcessManagerWindows] Bundled openclaw gateway stop failed:', err.message)
+          console.warn(`[ProcessManagerWindows] Bundled openclaw gateway ${label} failed:`, err.message)
         }
       }
     } else {
       // Dev mode: built CLI under Node (see dev-openclaw-runtime.ts)
       try {
         const dev = getDevOpenClawSpawn()
-        console.log(`[ProcessManagerWindows] Running: ${dev.runtime} ${dev.entry} gateway stop`)
-        await execFileAsync(dev.runtime, [dev.entry, 'gateway', 'stop'], { timeout: 15_000 })
-        console.log('[ProcessManagerWindows] openclaw gateway stop succeeded (dev)')
-        return
+        console.log(`[ProcessManagerWindows] Running: ${dev.runtime} ${dev.entry} gateway ${label}`)
+        await execFileAsync(dev.runtime, [dev.entry, ...args], { timeout: 30_000 })
+        console.log(`[ProcessManagerWindows] openclaw gateway ${label} succeeded (dev)`)
+        return true
       } catch (err: any) {
-        console.warn('[ProcessManagerWindows] Dev openclaw gateway stop failed:', err.message)
+        console.warn(`[ProcessManagerWindows] Dev openclaw gateway ${label} failed:`, err.message)
       }
     }
 
-    console.error('[ProcessManagerWindows] All openclaw gateway stop attempts failed')
+    console.error(`[ProcessManagerWindows] All openclaw gateway ${label} attempts failed`)
+    return false
   }
 
   private async sanitizeConfigForBundled(installDir: string): Promise<void> {
@@ -164,11 +174,13 @@ export class ProcessManagerWindows extends ProcessManagerBase {
 
       // ── Mode 2: System — use system openclaw binary ────────────────────
       if (modeInfo.mode === 'system') {
-        return this.startSystem(modeInfo.systemBinaryPath!, modeInfo.port)
+        return this.startOwnedWithMigrationRetry(
+          () => this.startSystem(modeInfo.systemBinaryPath!, modeInfo.port)
+        )
       }
 
       // ── Mode 3: Bundled — use embedded openclaw (legacy behavior) ──────
-      return this.startBundled()
+      return this.startOwnedWithMigrationRetry(() => this.startBundled())
 
     } catch (error: any) {
       console.error('[ProcessManagerWindows] Start error:', error)
@@ -212,8 +224,12 @@ export class ProcessManagerWindows extends ProcessManagerBase {
 
     if (this.configManager) {
       await this.configManager.ensureGatewayConfigured(port)
-      await this.clearAllCooldowns()
     }
+
+    // Retired JSON credential files break model-runtime refresh even when the
+    // gateway boots — migrate them with the same binary before spawning.
+    this.lastSpawnRecipe = { cmd: binaryPath, argsPrefix: [] }
+    await this.repairLegacyAuthStoresIfNeeded(this.lastSpawnRecipe)
 
     const openclawEnv = this.openclawEnv.getEnvironmentVariables()
 
@@ -281,7 +297,6 @@ export class ProcessManagerWindows extends ProcessManagerBase {
 
     if (this.configManager) {
       await this.configManager.ensureGatewayConfigured(port)
-      await this.clearAllCooldowns()
     }
 
     const openclawEnv = this.openclawEnv.getEnvironmentVariables()
@@ -296,6 +311,8 @@ export class ProcessManagerWindows extends ProcessManagerBase {
     let spawnCmd: string
     let spawnArgs: string[]
     let spawnCwd: string
+
+    let spawnArgsPrefix: string[]
 
     if (app.isPackaged) {
       const bundle = getOpenClawBundle()
@@ -312,17 +329,23 @@ export class ProcessManagerWindows extends ProcessManagerBase {
       await this.sanitizeConfigForBundled(openclawInstallDir)
 
       spawnCmd = bundledNode
-      spawnArgs = [openclawMjs, 'gateway', 'run', '--port', String(this.activePort), '--bind', 'loopback']
+      spawnArgsPrefix = [openclawMjs]
       spawnCwd = openclawInstallDir
       console.log(`[ProcessManagerWindows] Production: ${bundledNode} ${openclawMjs}`)
       this.emitLog('Starting OpenClaw gateway (bundled runtime)...')
     } else {
       const dev = getDevOpenClawSpawn()
       spawnCmd = dev.runtime
-      spawnArgs = [dev.entry, 'gateway', 'run', '--port', String(this.activePort), '--bind', 'loopback']
+      spawnArgsPrefix = [dev.entry]
       spawnCwd = dev.cwd
       console.log(`[ProcessManagerWindows] Dev: ${dev.runtime} ${dev.entry}`)
     }
+    spawnArgs = [...spawnArgsPrefix, 'gateway', 'run', '--port', String(this.activePort), '--bind', 'loopback']
+
+    // Retired JSON credential files break model-runtime refresh even when the
+    // gateway boots — migrate them with the same runtime before spawning.
+    this.lastSpawnRecipe = { cmd: spawnCmd, argsPrefix: spawnArgsPrefix, cwd: spawnCwd, env: enhancedEnv }
+    await this.repairLegacyAuthStoresIfNeeded(this.lastSpawnRecipe)
 
     this.process = spawn(spawnCmd, spawnArgs, {
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -429,6 +452,24 @@ export class ProcessManagerWindows extends ProcessManagerBase {
   }
 
   async restart(): Promise<boolean> {
+    // Externally-supervised gateway: one CLI restart, same as mac. Going via
+    // stop() would unload the service and leave the operator with nothing
+    // running if the follow-up start lost the race.
+    if (this.gatewayMode === 'external') {
+      console.log('[ProcessManagerWindows] Restarting external gateway...')
+      this.emitLog('Restarting gateway...')
+      this.stopExternalMonitoring()
+
+      if (await this.runGatewayRestart()) {
+        this.activePort = this.readConfiguredGatewayPort()
+        this.setStatus('running')
+        this.startExternalMonitoring()
+        this.emitLog('Gateway restarted')
+        return true
+      }
+      this.emitLog('Gateway restart failed — retrying with a full stop/start')
+    }
+
     const portBeforeStop = this.activePort || this.readConfiguredGatewayPort()
     await this.stop()
     const deadline = Date.now() + 10000

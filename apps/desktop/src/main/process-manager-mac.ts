@@ -2,7 +2,7 @@ import { spawn, execFile } from 'child_process'
 import * as path from 'path'
 import * as fs from 'fs'
 import { promisify } from 'util'
-import { ProcessManagerBase, ConfigManager } from './process-manager-base'
+import { ProcessManagerBase, ConfigManager, GATEWAY_STOP_ARGS, GATEWAY_RESTART_ARGS } from './process-manager-base'
 import { sanitizeConfigForBundled } from './utils/config-sanitizer'
 import { getOpenClawBundle } from './openclaw-bundle'
 import { getDevOpenClawSpawn } from './dev-openclaw-runtime'
@@ -99,11 +99,13 @@ export class ProcessManagerMac extends ProcessManagerBase {
 
       // ── Mode 2: System — use system openclaw binary ────────────────────
       if (modeInfo.mode === 'system') {
-        return this.startSystem(modeInfo.systemBinaryPath!, modeInfo.port)
+        return this.startOwnedWithMigrationRetry(
+          () => this.startSystem(modeInfo.systemBinaryPath!, modeInfo.port)
+        )
       }
 
       // ── Mode 3: Bundled — use embedded openclaw (legacy behavior) ──────
-      return this.startBundled()
+      return this.startOwnedWithMigrationRetry(() => this.startBundled())
 
     } catch (error: any) {
       console.error('[ProcessManager] Start error:', error)
@@ -151,8 +153,12 @@ export class ProcessManagerMac extends ProcessManagerBase {
 
     if (this.configManager) {
       await this.configManager.ensureGatewayConfigured(port)
-      await this.clearAllCooldowns()
     }
+
+    // Retired JSON credential files hard-block `gateway start` preflight —
+    // migrate them with the same binary before trying to launch.
+    this.lastSpawnRecipe = { cmd: binaryPath, argsPrefix: [] }
+    await this.repairLegacyAuthStoresIfNeeded(this.lastSpawnRecipe)
 
     // Try `openclaw gateway start` first (uses launchd/systemd service management)
     try {
@@ -278,7 +284,6 @@ export class ProcessManagerMac extends ProcessManagerBase {
     if (this.configManager) {
       await this.configManager.ensureGatewayConfigured(port)
       console.log(`[ProcessManager] Updated config with gateway port ${port}`)
-      await this.clearAllCooldowns()
     }
 
     const openclawEnv = this.openclawEnv.getEnvironmentVariables()
@@ -310,6 +315,8 @@ export class ProcessManagerMac extends ProcessManagerBase {
     let spawnArgs: string[]
     let spawnCwd: string
 
+    let spawnArgsPrefix: string[]
+
     if (app.isPackaged) {
       const bundle = getOpenClawBundle()
       await bundle.ensureInstalled((msg) => {
@@ -325,17 +332,23 @@ export class ProcessManagerMac extends ProcessManagerBase {
       await this.sanitizeConfigForBundled(openclawInstallDir)
 
       spawnCmd = bundledNode
-      spawnArgs = [openclawMjs, 'gateway', 'run', '--port', String(this.activePort), '--bind', 'loopback']
+      spawnArgsPrefix = [openclawMjs]
       spawnCwd = openclawInstallDir
       console.log(`[ProcessManager] Production: ${bundledNode} ${openclawMjs}`)
       this.emitLog('🚀 Starting OpenClaw gateway (bundled runtime)...')
     } else {
       const dev = getDevOpenClawSpawn()
       spawnCmd = dev.runtime
-      spawnArgs = [dev.entry, 'gateway', 'run', '--port', String(this.activePort), '--bind', 'loopback']
+      spawnArgsPrefix = [dev.entry]
       spawnCwd = dev.cwd
       console.log(`[ProcessManager] Dev: ${dev.runtime} ${dev.entry}`)
     }
+    spawnArgs = [...spawnArgsPrefix, 'gateway', 'run', '--port', String(this.activePort), '--bind', 'loopback']
+
+    // Retired JSON credential files break model-runtime refresh even when the
+    // gateway boots — migrate them with the same runtime before spawning.
+    this.lastSpawnRecipe = { cmd: spawnCmd, argsPrefix: spawnArgsPrefix, cwd: spawnCwd, env: enhancedEnv }
+    await this.repairLegacyAuthStoresIfNeeded(this.lastSpawnRecipe)
 
     this.process = spawn(spawnCmd, spawnArgs, {
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -452,6 +465,31 @@ export class ProcessManagerMac extends ProcessManagerBase {
   }
 
   async restart(): Promise<boolean> {
+    // A gateway we do not own restarts as ONE CLI operation. Going through
+    // stop() would unload the LaunchAgent and leave bringing it back to a
+    // separate start() — if that start loses the race, the operator ends up
+    // with no gateway at all, which is how "Apply Changes" could take the
+    // assistant offline instead of restarting it.
+    if (this.gatewayMode === 'external') {
+      console.log('[ProcessManager] Restarting external gateway...')
+      this.emitLog('🔄 Restarting gateway...')
+      this.stopExternalMonitoring()
+
+      if (await this.runGatewayRestart()) {
+        // The service is back under its own supervisor; re-attach monitoring
+        // rather than spawning a child we would then own.
+        this.activePort = this.readConfiguredGatewayPort()
+        this.setStatus('running')
+        this.startExternalMonitoring()
+        this.emitLog('✅ Gateway restarted')
+        return true
+      }
+
+      // Restart failed — fall through to stop+start so a wedged service
+      // still gets a chance, and the user sees a real failure if it can't.
+      this.emitLog('⚠️ Gateway restart failed — retrying with a full stop/start')
+    }
+
     await this.stop()
 
     // Wait for the port to be fully released. Poll every 100ms (was
@@ -476,16 +514,35 @@ export class ProcessManagerMac extends ProcessManagerBase {
    * 3. Dev-mode Node + built dist (dev-openclaw-runtime.ts)
    */
   private async runGatewayStop(): Promise<void> {
+    await this.runGatewayCliAction(GATEWAY_STOP_ARGS, 'stop')
+  }
+
+  /**
+   * Restart a gateway we do not own, as ONE supervised operation.
+   * See GATEWAY_RESTART_ARGS for why this is not stop-then-start.
+   */
+  private async runGatewayRestart(): Promise<boolean> {
+    return await this.runGatewayCliAction(GATEWAY_RESTART_ARGS, 'restart')
+  }
+
+  /**
+   * Run an `openclaw gateway <action>` against the best available binary:
+   * 1. System openclaw binary (if installed)
+   * 2. Bundled Node + openclaw.mjs (production builds)
+   * 3. Dev-mode Node + built dist (dev-openclaw-runtime.ts)
+   * Returns true when one of them succeeded.
+   */
+  private async runGatewayCliAction(args: readonly string[], label: string): Promise<boolean> {
     // 1. Try system binary
     const systemBinary = await this.detectSystemOpenClaw()
     if (systemBinary) {
       try {
-        console.log(`[ProcessManager] Running: ${systemBinary} gateway stop`)
-        await execFileAsync(systemBinary, ['gateway', 'stop'], { timeout: 15_000 })
-        console.log('[ProcessManager] openclaw gateway stop succeeded (system binary)')
-        return
+        console.log(`[ProcessManager] Running: ${systemBinary} gateway ${label}`)
+        await execFileAsync(systemBinary, [...args], { timeout: 30_000 })
+        console.log(`[ProcessManager] openclaw gateway ${label} succeeded (system binary)`)
+        return true
       } catch (err: any) {
-        console.warn('[ProcessManager] System openclaw gateway stop failed:', err.message)
+        console.warn(`[ProcessManager] System openclaw gateway ${label} failed:`, err.message)
       }
     }
 
@@ -500,28 +557,29 @@ export class ProcessManagerMac extends ProcessManagerBase {
 
       if (fs.existsSync(bundledNode) && fs.existsSync(openclawMjs)) {
         try {
-          console.log(`[ProcessManager] Running: ${bundledNode} ${openclawMjs} gateway stop`)
-          await execFileAsync(bundledNode, [openclawMjs, 'gateway', 'stop'], { timeout: 15_000 })
-          console.log('[ProcessManager] openclaw gateway stop succeeded (bundled)')
-          return
+          console.log(`[ProcessManager] Running: ${bundledNode} ${openclawMjs} gateway ${label}`)
+          await execFileAsync(bundledNode, [openclawMjs, ...args], { timeout: 30_000 })
+          console.log(`[ProcessManager] openclaw gateway ${label} succeeded (bundled)`)
+          return true
         } catch (err: any) {
-          console.warn('[ProcessManager] Bundled openclaw gateway stop failed:', err.message)
+          console.warn(`[ProcessManager] Bundled openclaw gateway ${label} failed:`, err.message)
         }
       }
     } else {
       // Dev mode: built CLI under Node (see dev-openclaw-runtime.ts)
       try {
         const dev = getDevOpenClawSpawn()
-        console.log(`[ProcessManager] Running: ${dev.runtime} ${dev.entry} gateway stop`)
-        await execFileAsync(dev.runtime, [dev.entry, 'gateway', 'stop'], { timeout: 15_000 })
-        console.log('[ProcessManager] openclaw gateway stop succeeded (dev)')
-        return
+        console.log(`[ProcessManager] Running: ${dev.runtime} ${dev.entry} gateway ${label}`)
+        await execFileAsync(dev.runtime, [dev.entry, ...args], { timeout: 30_000 })
+        console.log(`[ProcessManager] openclaw gateway ${label} succeeded (dev)`)
+        return true
       } catch (err: any) {
-        console.warn('[ProcessManager] Dev openclaw gateway stop failed:', err.message)
+        console.warn(`[ProcessManager] Dev openclaw gateway ${label} failed:`, err.message)
       }
     }
 
-    console.error('[ProcessManager] All openclaw gateway stop attempts failed')
+    console.error(`[ProcessManager] All openclaw gateway ${label} attempts failed`)
+    return false
   }
 
   private async sanitizeConfigForBundled(installDir: string): Promise<void> {

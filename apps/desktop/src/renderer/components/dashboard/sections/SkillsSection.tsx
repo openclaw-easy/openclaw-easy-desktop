@@ -146,7 +146,10 @@ export const SkillsSection: React.FC<SkillsSectionProps> = ({ colors }) => {
   const [installingSkills, setInstallingSkills] = useState<Record<string, 'loading' | 'success' | 'error'>>({})
   const [installOutputs, setInstallOutputs] = useState<Record<string, string>>({})
   const [expandedOutputs, setExpandedOutputs] = useState<Set<string>>(new Set())
-  const [installBanner, setInstallBanner] = useState<string | null>(null)
+  // Outcome banner for skill actions (install/toggle/remove). Rendered above
+  // the tab panels: the Manage-tab actions write here too, so a banner only
+  // visible on Discover turns their failures into "button did nothing".
+  const [installBanner, setInstallBanner] = useState<{ text: string; isError?: boolean } | null>(null)
   const [workspaceSkills, setWorkspaceSkills] = useState<WorkspaceSkill[]>([])
   const discoverSearchTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
@@ -274,11 +277,11 @@ export const SkillsSection: React.FC<SkillsSectionProps> = ({ colors }) => {
       if (result.success) {
         await loadSkills(true)
       } else {
-        setInstallBanner(result.error || t('skills.errorUpdate'))
+        setInstallBanner({ text: result.error || t('skills.errorUpdate'), isError: true })
       }
     } catch (err: any) {
       console.error(`[SkillsSection] Error toggling skill ${skillName}:`, err)
-      setInstallBanner(err.message || t('skills.errorUpdate'))
+      setInstallBanner({ text: err.message || t('skills.errorUpdate'), isError: true })
     } finally {
       toggleBusy.finish(skillName)
     }
@@ -298,10 +301,10 @@ export const SkillsSection: React.FC<SkillsSectionProps> = ({ colors }) => {
         setSkillsStats(prev => ({ ...prev, total: prev.total - 1 }))
         setWorkspaceSkills(prev => prev.filter(ws => ws.dir !== skillName && ws.name !== skillName))
       } else {
-        setInstallBanner(result.error || t('skills.errorRemove'))
+        setInstallBanner({ text: result.error || t('skills.errorRemove'), isError: true })
       }
     } catch (err: any) {
-      setInstallBanner(err.message || t('skills.errorRemove'))
+      setInstallBanner({ text: err.message || t('skills.errorRemove'), isError: true })
     } finally {
       removeBusy.finish(skillName)
     }
@@ -316,14 +319,14 @@ export const SkillsSection: React.FC<SkillsSectionProps> = ({ colors }) => {
       if (result.success) {
         // Show the backend message if it contains manual instructions (credentials, etc.)
         // Otherwise show the generic restart banner
-        setInstallBanner(result.message || t('skills.installedRestartNeeded', 'Skill installed — restart the assistant to activate it'))
+        setInstallBanner({ text: result.message || t('skills.installedRestartNeeded', 'Skill installed — restart the assistant to activate it') })
         await loadSkills(true)
       } else {
-        setInstallBanner(result.error || t('skills.errorInstallRequirements'))
+        setInstallBanner({ text: result.error || t('skills.errorInstallRequirements'), isError: true })
       }
     } catch (err: any) {
       console.error(`[SkillsSection] Error installing requirements for ${skillName}:`, err)
-      setInstallBanner(err.message || t('skills.errorInstallRequirements'))
+      setInstallBanner({ text: err.message || t('skills.errorInstallRequirements'), isError: true })
     } finally {
       installBusy.finish(skillName)
     }
@@ -365,7 +368,7 @@ export const SkillsSection: React.FC<SkillsSectionProps> = ({ colors }) => {
         if (result.output) {
           setInstallOutputs(prev => ({ ...prev, [slug]: result.output }))
         }
-        setInstallBanner(t('skills.installedRestartNeeded', 'Skill installed — restart the assistant to activate it'))
+        setInstallBanner({ text: t('skills.installedRestartNeeded', 'Skill installed — restart the assistant to activate it') })
         // Refresh the skills list
         await loadSkills(true)
       } else {
@@ -560,6 +563,31 @@ export const SkillsSection: React.FC<SkillsSectionProps> = ({ colors }) => {
             </button>
           </div>
         </div>
+
+        {/* Action-outcome banner — above the tab panels so Manage-tab
+            failures/successes are visible no matter which tab is active. */}
+        {installBanner && (
+          <div className="px-6 pt-3 flex-shrink-0">
+            <div
+              className="flex items-center justify-between p-3 rounded-lg"
+              style={{
+                backgroundColor: `${installBanner.isError ? colors.accent.red : colors.accent.green}18`,
+                border: `1px solid ${installBanner.isError ? colors.accent.red : colors.accent.green}40`
+              }}
+            >
+              <span className="text-sm" style={{ color: installBanner.isError ? colors.accent.red : colors.accent.green }}>
+                {installBanner.isError ? '⚠' : '✓'} {installBanner.text}
+              </span>
+              <button
+                onClick={() => setInstallBanner(null)}
+                aria-label={t('skills.ariaCloseBanner')}
+                title={t('skills.ariaCloseBanner')}
+              >
+                <X className="h-4 w-4" style={{ color: installBanner.isError ? colors.accent.red : colors.accent.green }} />
+              </button>
+            </div>
+          </div>
+        )}
 
         {/* ── MANAGE TAB ── */}
         {activeTab === 'manage' && (
@@ -860,25 +888,6 @@ export const SkillsSection: React.FC<SkillsSectionProps> = ({ colors }) => {
                   <RefreshCw className={`h-3 w-3 ${discoverLoading ? 'animate-spin' : ''}`} />
                 </Button>
               </div>
-
-              {/* Restart-after-install banner */}
-              {installBanner && (
-                <div
-                  className="flex items-center justify-between p-3 mb-4 rounded-lg"
-                  style={{ backgroundColor: `${colors.accent.green}18`, border: `1px solid ${colors.accent.green}40` }}
-                >
-                  <span className="text-sm" style={{ color: colors.accent.green }}>
-                    ✓ {installBanner}
-                  </span>
-                  <button
-                    onClick={() => setInstallBanner(null)}
-                    aria-label={t('skills.ariaCloseBanner')}
-                    title={t('skills.ariaCloseBanner')}
-                  >
-                    <X className="h-4 w-4" style={{ color: colors.accent.green }} />
-                  </button>
-                </div>
-              )}
 
               {/* Search bar */}
               <div className="relative mb-4">

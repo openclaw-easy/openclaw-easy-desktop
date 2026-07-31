@@ -1072,15 +1072,16 @@ describe('ConfigManager', () => {
       expect(config.agents.defaults.timeoutSeconds).toBe(600)
     })
 
-    it('should remove plugins.entries to prevent duplicates', async () => {
+    it('preserves plugins.entries — the CLI persists enable/disable state there', async () => {
       writeConfig({
         plugins: {
-          entries: { telegram: { enabled: true } },
+          entries: { telegram: { enabled: true }, discord: { enabled: false } },
         },
       })
       await mgr.ensureToolsConfigured()
       const config = readConfig()
-      expect(config.plugins?.entries).toBeUndefined()
+      expect(config.plugins.entries.telegram).toEqual({ enabled: true })
+      expect(config.plugins.entries.discord).toEqual({ enabled: false })
     })
   })
 

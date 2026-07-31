@@ -1,11 +1,48 @@
 import { spawn, ChildProcess } from 'child_process'
 import { BrowserWindow } from 'electron'
+import * as os from 'os'
 import * as path from 'path'
 import * as net from 'net'
 import * as http from 'http'
 import { OpenClawEnvironment } from './openclaw-environment'
 import { DEFAULT_GATEWAY_PORT } from '../shared/constants'
 import { detectSystemOpenClaw as resolveSystemOpenClaw } from './managers/system-openclaw-resolver'
+import { findLegacyAuthCredentialFiles, isMigrationRequiredGatewayFailure } from './gateway-migration'
+
+/**
+ * How to invoke the OpenClaw CLI with the exact runtime a gateway spawn uses
+ * (system binary, bundled node+mjs, or dev node+dist). Doctor repairs must run
+ * with the same runtime so migrations match the CLI version being booted.
+ */
+/**
+ * Args for stopping a gateway we do not own (launchd/systemd service).
+ * `--force` is required: upstream refuses `gateway stop` whenever stdin/stdout
+ * are not a TTY (runDaemonStop in src/cli/daemon-cli/lifecycle.ts), which is
+ * always true for our piped spawns. That guard exists to stop scripts and
+ * agents from killing an operator's gateway — the desktop IS the operator's
+ * control surface and every stop here is a button they pressed. Without it,
+ * Stop Assistant and every restart-to-apply-settings silently fail.
+ */
+export const GATEWAY_STOP_ARGS: readonly string[] = ['gateway', 'stop', '--force']
+
+/**
+ * Args for restarting a gateway we do not own.
+ *
+ * `gateway restart` is one supervised operation that hands the service back
+ * running; stop-then-start is not equivalent. Stopping unloads the LaunchAgent
+ * and a follow-up `start` has to re-bootstrap it, which can outrun the
+ * caller's readiness window and leave the operator with no gateway at all —
+ * strictly worse than the restart they asked for. Unlike stop, restart carries
+ * no non-TTY guard upstream, so it needs no --force.
+ */
+export const GATEWAY_RESTART_ARGS: readonly string[] = ['gateway', 'restart']
+
+export interface OpenClawCliRecipe {
+  cmd: string
+  argsPrefix: string[]
+  cwd?: string
+  env?: NodeJS.ProcessEnv
+}
 
 // Forward declaration to avoid circular dependency
 export type ConfigManager = {
@@ -97,6 +134,12 @@ export abstract class ProcessManagerBase {
   protected restartAttempts: number = 0
   /** Pending auto-restart timer; cancelled on stop(). */
   protected restartTimer: NodeJS.Timeout | null = null
+  /** Rolling tail of the current child's raw stdout+stderr, kept for exit classification. */
+  protected outputTail: string = ''
+  /** Exit code of the most recently exited owned child (null = killed by signal / none yet). */
+  protected lastExitCode: number | null = null
+  /** CLI recipe of the most recent owned spawn — reused to run doctor repairs with the same runtime. */
+  protected lastSpawnRecipe: OpenClawCliRecipe | null = null
 
   constructor(configPath: string, configManager?: ConfigManager) {
     this.configPath = configPath
@@ -232,6 +275,16 @@ export abstract class ProcessManagerBase {
     this.cleanupProcessListeners(this.process)
     if (!this.process) { return }
     const proc = this.process
+    this.outputTail = ''
+    this.lastExitCode = null
+
+    // Raw (pre-filter) capture: exit classification must see markers the
+    // UI noise filters would drop, e.g. "run openclaw doctor --fix".
+    const captureTail = (data: Buffer | string) => {
+      this.outputTail = (this.outputTail + data.toString()).slice(-4000)
+    }
+    proc.stdout?.on('data', captureTail)
+    proc.stderr?.on('data', captureTail)
 
     proc.stdout?.on('data', (data) => {
       const text = data.toString().trim()
@@ -271,6 +324,7 @@ export abstract class ProcessManagerBase {
         console.log(`[ProcessManager] Ignoring exit from stale process (current pid=${this.process?.pid})`)
         return
       }
+      this.lastExitCode = code
       const wasRunning = this.status === 'running'
       const wasStarting = this.status === 'starting'
       if (wasRunning) {
@@ -278,7 +332,11 @@ export abstract class ProcessManagerBase {
         this.emitLog('❌ Gateway process stopped unexpectedly')
       } else if (wasStarting) {
         this.setStatus('stopped')
-        this.emitLog(`❌ Gateway process died during startup (signal=${signal})`)
+        if (isMigrationRequiredGatewayFailure(code, this.outputTail)) {
+          this.emitLog(`⚙️ Gateway refused to start: pending data migration (exit code ${code})`)
+        } else {
+          this.emitLog(`❌ Gateway process died during startup (code=${code}, signal=${signal})`)
+        }
       }
       this.process = null
       this.spawnedAt = 0
@@ -338,44 +396,90 @@ export abstract class ProcessManagerBase {
     }
   }
 
-  protected async clearAllCooldowns(): Promise<void> {
-    try {
-      const { readFile, writeFile } = await import('fs/promises')
-      const { existsSync } = await import('fs')
-      const home = process.env.HOME || process.env.USERPROFILE || ''
-      const authProfilesPaths = [
-        path.join(home, '.openclaw', 'auth-profiles.json'),
-        path.join(home, '.openclaw', 'agents', 'main', 'agent', 'auth-profiles.json')
-      ]
-
-      for (const authPath of authProfilesPaths) {
-        if (existsSync(authPath)) {
-          try {
-            const content = await readFile(authPath, 'utf8')
-            const authProfiles = JSON.parse(content)
-            if (authProfiles.usageStats) {
-              for (const profileId in authProfiles.usageStats) {
-                authProfiles.usageStats[profileId] = {
-                  ...authProfiles.usageStats[profileId],
-                  errorCount: 0,
-                  cooldownUntil: undefined,
-                  disabledUntil: undefined,
-                  disabledReason: undefined,
-                  failureCounts: undefined,
-                  lastFailureAt: undefined
-                }
-              }
-              await writeFile(authPath, JSON.stringify(authProfiles, null, 2))
-              console.log(`[ProcessManager] Cleared cooldown state from ${authPath}`)
-            }
-          } catch (error: any) {
-            console.error(`[ProcessManager] Failed to clear cooldowns from ${authPath}:`, error.message)
-          }
-        }
+  /**
+   * Run `doctor --fix --non-interactive` with the given CLI recipe. Doctor is
+   * upstream's single owner for state migrations (legacy auth JSON → SQLite,
+   * agent-DB schema cutovers); the desktop never migrates state itself.
+   * Returns true when doctor exits 0.
+   */
+  protected runDoctorFix(recipe: OpenClawCliRecipe): Promise<boolean> {
+    return new Promise((resolve) => {
+      this.emitLog('🩺 Running OpenClaw data migrations (doctor --fix)…')
+      const child = spawn(recipe.cmd, [...recipe.argsPrefix, 'doctor', '--fix', '--non-interactive'], {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        ...(recipe.cwd ? { cwd: recipe.cwd } : {}),
+        env: recipe.env ?? process.env
+      })
+      let output = ''
+      const capture = (data: Buffer | string) => {
+        output = (output + data.toString()).slice(-4000)
       }
+      child.stdout?.on('data', capture)
+      child.stderr?.on('data', capture)
+      // Media/DB migrations can be slow on large state dirs — allow minutes, not seconds.
+      const timer = setTimeout(() => child.kill('SIGKILL'), 180_000)
+      child.on('error', (error) => {
+        clearTimeout(timer)
+        console.error('[ProcessManager] doctor --fix failed to spawn:', error)
+        this.emitLog('⚠️ Automatic migration could not run — run `openclaw doctor --fix` in a terminal')
+        resolve(false)
+      })
+      child.on('exit', (code) => {
+        clearTimeout(timer)
+        if (code === 0) {
+          this.emitLog('✅ OpenClaw data migrations applied')
+          resolve(true)
+        } else {
+          console.error(`[ProcessManager] doctor --fix exited ${code}:`, output)
+          this.emitLog(`⚠️ Automatic migration failed (doctor exit ${code}) — run \`openclaw doctor --fix\` in a terminal`)
+          resolve(false)
+        }
+      })
+    })
+  }
+
+  /**
+   * Pre-spawn repair: retired JSON credential files hard-block `gateway
+   * start` preflight and break model-runtime refresh on a booted gateway,
+   * so they must be migrated BEFORE spawning — a boots-then-degrades gateway
+   * would otherwise look healthy to the startup port poll.
+   */
+  protected async repairLegacyAuthStoresIfNeeded(recipe: OpenClawCliRecipe): Promise<void> {
+    let legacy: string[]
+    try {
+      legacy = findLegacyAuthCredentialFiles(path.join(os.homedir(), '.openclaw'))
     } catch (error: any) {
-      console.error('[ProcessManager] Failed to clear cooldowns:', error.message)
+      console.error('[ProcessManager] Legacy credential scan failed:', error.message)
+      return
     }
+    if (legacy.length === 0) { return }
+    console.log('[ProcessManager] Legacy credential files require migration:', legacy)
+    this.emitLog(`🩺 Migrating ${legacy.length} legacy credential file(s) so the gateway can start…`)
+    // Failure is non-fatal by design: the gateway surfaces its own error and
+    // the exit-classification retry path gets a second chance.
+    await this.runDoctorFix(recipe)
+  }
+
+  /**
+   * Owned-mode start with one doctor-repair retry. When the gateway refuses
+   * to boot behind upstream's migration gate (exit 78 or a "run openclaw
+   * doctor --fix" marker), run the migration with the same runtime and retry
+   * once. Single retry per start() call; auto-restart's 3-attempt cap bounds
+   * the overall loop.
+   */
+  protected async startOwnedWithMigrationRetry(attempt: () => Promise<boolean>): Promise<boolean> {
+    const ok = await attempt()
+    if (ok) { return true }
+    if (!isMigrationRequiredGatewayFailure(this.lastExitCode, this.outputTail)) { return false }
+    const recipe = this.lastSpawnRecipe
+    if (!recipe) { return false }
+    this.emitLog('⚙️ Gateway needs a data migration — repairing and retrying…')
+    const repaired = await this.runDoctorFix(recipe)
+    if (!repaired) { return false }
+    // The exit handler flipped status to 'stopped'; the startup wait loops
+    // only keep polling while 'starting'.
+    this.setStatus('starting')
+    return await attempt()
   }
 
   /**

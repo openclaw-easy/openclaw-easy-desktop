@@ -1184,15 +1184,12 @@ export class ConfigManager {
           this.logger?.addLog('🔧 Enabled tools.elevated for sandbox/image support')
         }
 
-        // Remove ALL plugins.entries — bundled plugins are auto-discovered
-        // by the gateway from extensions/ (dev) or the bundled plugins dir
-        // (prod). Having them in plugins.entries causes "duplicate plugin
-        // id detected" warnings. Channel-specific operations re-add entries
-        // on demand via channel-manager.ensurePluginEnabled() when needed.
-        if (config.plugins?.entries && Object.keys(config.plugins.entries).length > 0) {
-          delete config.plugins.entries
-          hasChanges = true
-        }
+        // plugins.entries is the CLI's persisted enable/disable state
+        // (upstream `plugins enable/disable` writes entries.<id>.enabled) —
+        // never wipe it. The "duplicate plugin id detected" warning comes
+        // from two discovered MANIFESTS, which the installs cleanup below
+        // and removeDuplicateUserExtensionDirs() handle; dangling entries
+        // are pruned surgically by repairGatewayRejections().
 
         // Dev mode: drop config entries for plugins also present as bundled
         // sources, so the gateway loader doesn't see two manifests.
