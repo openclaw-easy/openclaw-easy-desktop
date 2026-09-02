@@ -27,6 +27,14 @@ describe('isMigrationRequiredGatewayFailure', () => {
 
   it('matches the daemon preflight hint with backticks', () => {
     expect(isMigrationRequiredGatewayFailure(1, 'Run `openclaw doctor --fix`, then retry this command.')).toBe(true)
+    // Upstream's config-validation gate double-quotes the command (observed
+    // 2026-08-31 on `gateway.tailscale.resetOnExit` after the Aug-31 sync).
+    expect(
+      isMigrationRequiredGatewayFailure(
+        1,
+        'openclaw.json:580 - gateway.tailscale: Unrecognized key: "resetOnExit"\nRun "openclaw doctor --fix" to repair, then retry.'
+      )
+    ).toBe(true)
   })
 
   it('does not match ordinary crashes', () => {

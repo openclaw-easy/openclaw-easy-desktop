@@ -1,7 +1,7 @@
 {
   "name": "moltbot-easy-desktop",
   "productName": "Openclaw Easy",
-  "version": "2026.8.1",
+  "version": "2026.9.1",
   "description": "User-friendly installer for OpenClaw AI assistant",
   "main": "out/main/index.js",
   "homepage": "https://openclaw-easy.com",

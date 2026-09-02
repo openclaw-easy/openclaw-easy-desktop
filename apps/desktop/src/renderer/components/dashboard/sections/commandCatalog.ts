@@ -267,7 +267,7 @@ export const COMMANDS: CommandDef[] = [
     title: 'Stop Gateway',
     description: 'Stop the running OpenClaw Gateway service cleanly',
     // --force: upstream refuses `gateway stop` on a non-TTY stdin/stdout, and
-    // the user already confirmed via dangerMessage. See GATEWAY_STOP_ARGS.
+    // the user already confirmed via dangerMessage. See GATEWAY_STOP_ACTION.
     args: ['gateway', 'stop', '--force'],
     danger: true,
     dangerMessage: 'This will disconnect all active channels and sessions until the gateway is started again.',

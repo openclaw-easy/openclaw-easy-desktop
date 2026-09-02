@@ -143,11 +143,13 @@ class OpenclawEasyApp {
 
   constructor() {
     this.openClawManager = new OpenClawManager()
-    this.configManager = new ConfigManager()
-    // This ConfigManager instance also syncs credentials into the SQLite
-    // auth store (the config:save path) — share the manager's
-    // platform executor so those writes go through the OpenClaw CLI.
-    this.configManager.setCommandExecutor(this.openClawManager.getCommandExecutor())
+    // Share the manager's ConfigManager rather than building a second one:
+    // both write ~/.openclaw/openclaw.json, and two instances mean two
+    // independent write locks, so an IPC config:save here could clobber a
+    // channel add or skill toggle made through the manager's half of the app.
+    // It arrives with the platform executor already set, so credential syncs
+    // (the config:save path) still reach the OpenClaw CLI.
+    this.configManager = this.openClawManager.getConfigManager()
     const executor = this.openClawManager.getCommandExecutor()
     this.accessControlManager = new AccessControlManager(this.configManager, executor)
     this.browserManager = new BrowserManager(this.configManager, executor)

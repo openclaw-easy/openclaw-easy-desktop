@@ -25,7 +25,11 @@ export function isMigrationRequiredGatewayFailure(
   outputTail: string
 ): boolean {
   if (exitCode === GATEWAY_EXIT_CONFIG_ERROR) return true
-  return /run\s+`?openclaw doctor --fix`?/i.test(outputTail)
+  // Upstream quotes the remediation command inconsistently across gates —
+  // backticks in the auth/schema messages, double quotes in the config-validation
+  // one (`Run "openclaw doctor --fix" to repair`). Accept either (or neither) so a
+  // future gate that exits with something other than 78 still self-repairs.
+  return /run\s+["'`]?openclaw doctor --fix["'`]?/i.test(outputTail)
 }
 
 /**

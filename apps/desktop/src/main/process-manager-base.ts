@@ -15,7 +15,17 @@ import { findLegacyAuthCredentialFiles, isMigrationRequiredGatewayFailure } from
  * with the same runtime so migrations match the CLI version being booted.
  */
 /**
- * Args for stopping a gateway we do not own (launchd/systemd service).
+ * One `openclaw gateway <action>` invocation. Args, log label, and deadline
+ * travel together so a caller cannot pair a fast timeout with a slow action.
+ */
+export interface GatewayCliAction {
+  readonly args: readonly string[]
+  readonly label: string
+  readonly timeoutMs: number
+}
+
+/**
+ * Stopping a gateway we do not own (launchd/systemd service).
  * `--force` is required: upstream refuses `gateway stop` whenever stdin/stdout
  * are not a TTY (runDaemonStop in src/cli/daemon-cli/lifecycle.ts), which is
  * always true for our piped spawns. That guard exists to stop scripts and
@@ -23,10 +33,15 @@ import { findLegacyAuthCredentialFiles, isMigrationRequiredGatewayFailure } from
  * control surface and every stop here is a button they pressed. Without it,
  * Stop Assistant and every restart-to-apply-settings silently fail.
  */
-export const GATEWAY_STOP_ARGS: readonly string[] = ['gateway', 'stop', '--force']
+export const GATEWAY_STOP_ACTION: GatewayCliAction = {
+  args: ['gateway', 'stop', '--force'],
+  label: 'stop',
+  // Stop is one service transition with no health proof; measured 11s on macOS.
+  timeoutMs: 30_000,
+}
 
 /**
- * Args for restarting a gateway we do not own.
+ * Restarting a gateway we do not own.
  *
  * `gateway restart` is one supervised operation that hands the service back
  * running; stop-then-start is not equivalent. Stopping unloads the LaunchAgent
@@ -34,8 +49,22 @@ export const GATEWAY_STOP_ARGS: readonly string[] = ['gateway', 'stop', '--force
  * caller's readiness window and leave the operator with no gateway at all —
  * strictly worse than the restart they asked for. Unlike stop, restart carries
  * no non-TTY guard upstream, so it needs no --force.
+ *
+ * The deadline must clear upstream's own health proof, not just the restart:
+ * `runDaemonRestart` polls until the gateway answers before it exits, and
+ * budgets that proof alone at 60s on POSIX / 180s on Windows
+ * (POST_RESTART_HEALTH_ATTEMPTS and WINDOWS_POST_RESTART_HEALTH_TIMEOUT_MS in
+ * src/cli/daemon-cli/lifecycle.ts). A deadline below that SIGTERMs a restart
+ * that is still working: a healthy `gateway restart` measures 31-33s on macOS,
+ * so the previous flat 30s killed every one of them mid-proof, reported a
+ * failure, and re-ran the whole restart on the next binary — two teardowns for
+ * one Apply Changes, with the success toast arriving after the UI gave up.
  */
-export const GATEWAY_RESTART_ARGS: readonly string[] = ['gateway', 'restart']
+export const GATEWAY_RESTART_ACTION: GatewayCliAction = {
+  args: ['gateway', 'restart'],
+  label: 'restart',
+  timeoutMs: process.platform === 'win32' ? 240_000 : 90_000,
+}
 
 export interface OpenClawCliRecipe {
   cmd: string

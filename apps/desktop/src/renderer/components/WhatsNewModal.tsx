@@ -1,6 +1,6 @@
 import { useEffect } from 'react'
 import { useTranslation } from 'react-i18next'
-import { Wrench, Puzzle, MessageCircle, AlertCircle, type LucideIcon } from 'lucide-react'
+import { RefreshCw, ShieldCheck, Sparkles, type LucideIcon } from 'lucide-react'
 import { Modal } from './ui/modal'
 import { useWhatsNewStore } from '../stores/whatsNewStore'
 import { BrandLobster } from './ui/brand-lobster'
@@ -13,24 +13,19 @@ import { BrandLobster } from './ui/brand-lobster'
 // screen — no internals, no version plumbing.
 const RELEASE_HIGHLIGHTS: Array<{ icon: LucideIcon; title: string; body: string }> = [
   {
-    icon: Wrench,
-    title: 'Updates that fix themselves',
-    body: 'This release moves your saved sign-ins to a new format. The app now handles that for you on launch, so your assistant starts up as usual instead of stalling after an update.',
+    icon: Sparkles,
+    title: 'Built on the newest OpenClaw',
+    body: 'Thousands of improvements to chat, channels and plugins from the OpenClaw project, covering everything through the end of August.',
   },
   {
-    icon: Puzzle,
-    title: 'Your plugin choices stick',
-    body: 'Turn a plugin off and it stays off. Enabled and disabled plugins now survive restarts and updates instead of quietly switching back on.',
+    icon: RefreshCw,
+    title: 'A smoother upgrade',
+    body: 'This version fixes an upgrade problem that could leave the assistant unable to start after updating. Your first launch may take a moment while it finishes tidying up how your chats are stored.',
   },
   {
-    icon: MessageCircle,
-    title: 'WhatsApp sign-in survives a retry',
-    body: 'If the QR code times out, hitting retry now brings up a fresh one — it used to fail with an empty screen and no explanation.',
-  },
-  {
-    icon: AlertCircle,
-    title: 'No more buttons that do nothing',
-    body: 'Skills and Automations now tell you when something goes wrong, so a failed switch or delete says why instead of silently snapping back.',
+    icon: ShieldCheck,
+    title: 'Staying on this version',
+    body: 'Once your data is upgraded, older versions of the app can no longer read it. Keep this version or newer.',
   },
 ]
 

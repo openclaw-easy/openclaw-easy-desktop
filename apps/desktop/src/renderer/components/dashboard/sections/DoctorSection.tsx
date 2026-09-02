@@ -350,8 +350,13 @@ export function DoctorSection({ colors }: DoctorSectionProps) {
       {/* Doctor Output Logs */}
       <Card className="flex-1 flex flex-col min-h-0 border-0 shadow-none" style={{ backgroundColor: colors.bg.secondary }}>
         <CardContent className="flex-1 flex flex-col min-h-0 p-0">
+          {/* Test seam: the Doctor report must be assertable on its own. The
+              dashboard renders chat alongside this pane, so scraping the whole
+              body sweeps in the persisted chat transcript and any historical
+              error text in it. */}
           <div
             ref={logContainerRef}
+            data-testid="doctor-output"
             className="flex-1 overflow-y-auto space-y-1"
             style={{
               backgroundColor: colors.bg.tertiary,

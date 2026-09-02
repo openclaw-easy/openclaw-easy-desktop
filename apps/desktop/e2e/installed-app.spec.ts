@@ -54,6 +54,12 @@ test.describe("Installed packaged app (production runtime)", () => {
     const { app, page, userDataDir } = await launchInstalled();
     try {
       await waitForDashboard(page);
+      // Precondition, not politeness: this test measures the BOOT, so the
+      // gateway has to be down before the click. In full-suite order an
+      // earlier spec leaves it running and only a Stop button is rendered.
+      // Accepting the already-running state instead would make the assertion
+      // below vacuous — it would pass without ever starting the bundled Node.
+      await stopAssistant(page).catch(() => {});
       // This spawns the bundled Node → openclaw.mjs gateway run. The WS coming
       // up proves node:sqlite + the gateway work in the packaged/signed app.
       await startAssistant(page);
@@ -77,13 +83,20 @@ test.describe("Installed packaged app (production runtime)", () => {
       const runBtn = page.getByRole("button", { name: /run diagnostics|run doctor|^run$/i }).first();
       await runBtn.waitFor({ state: "visible", timeout: 10_000 });
       await runBtn.click();
-      // Wait for the report to render and assert no plugin-load failure surfaced.
-      await page.waitForFunction(
-        () => /no issues|healthy|passed|✓|complete|ok/i.test(document.body.textContent || ""),
-        { timeout: 60_000 },
+      // Scope every read to the Doctor output pane. The dashboard renders chat
+      // next to it, so the old document.body reads swept in the persisted chat
+      // transcript: one historical "Cannot find module ..." message failed this
+      // test permanently, and the completion regex could match "ok" in any past
+      // chat line. Both signals now come from the report itself.
+      const report = page.getByTestId("doctor-output");
+      await expect(report).not.toBeEmpty({ timeout: 60_000 });
+      // Run button re-enables when the run ends (disabled={isRunning}) — a
+      // locale-independent completion signal, unlike matching report copy.
+      await expect(runBtn).toBeEnabled({ timeout: 60_000 });
+      const reportText = (await report.textContent()) ?? "";
+      expect(reportText, reportText).not.toMatch(
+        /plugin load failed|Cannot find module|SQLite support is unavailable/i,
       );
-      const body = (await page.locator("body").textContent()) ?? "";
-      expect(body).not.toMatch(/plugin load failed|Cannot find module|SQLite support is unavailable/i);
     } finally {
       await app.close().catch(() => {});
       await rm(userDataDir, { recursive: true, force: true }).catch(() => {});

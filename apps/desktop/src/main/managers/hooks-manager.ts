@@ -1,16 +1,16 @@
-import * as path from 'path'
-import * as os from 'os'
-import { readFile, writeFile } from 'fs/promises'
 import { OpenClawCommandExecutor } from './openclaw-command-executor'
+import type { ConfigManager } from './config-manager'
 
 /**
  * HooksManager - Manages OpenClaw hooks (event-driven automation)
  */
 export class HooksManager {
   private executor: OpenClawCommandExecutor
+  private configManager: ConfigManager
 
-  constructor(executor: OpenClawCommandExecutor) {
+  constructor(executor: OpenClawCommandExecutor, configManager: ConfigManager) {
     this.executor = executor
+    this.configManager = configManager
   }
 
   /**
@@ -131,25 +131,26 @@ export class HooksManager {
 
     // Enable: patch the config directly to remove the disabled flag.
     // The CLI blocks re-enabling a disabled hook because it marks it ineligible.
+    //
+    // Goes through ConfigManager.mutateConfig, not a raw read-modify-write:
+    // that path holds the desktop's config write lock (so a concurrent channel
+    // add or model change cannot lose either write) and writes atomically with
+    // a backup. Rewriting the whole openclaw.json by hand risked truncating it,
+    // and a structurally invalid config stops the gateway from booting at all.
     try {
       console.log(`[HooksManager] Enabling hook "${hookName}" via config patch`)
-      const configPath = path.join(os.homedir(), '.openclaw', 'openclaw.json')
-      const raw = await readFile(configPath, 'utf8')
-      let config: any
-      try { config = JSON.parse(raw) } catch { return { success: false, error: 'Config file contains invalid JSON' } }
-
-      const entries = config?.hooks?.internal?.entries
-      if (entries && entries[hookName]) {
-        // Remove the entry entirely — absence means "use default" (enabled)
+      await this.configManager.mutateConfig((config: any) => {
+        const entries = config?.hooks?.internal?.entries
+        // No entry at all means the hook is already enabled by default.
+        if (!entries || !entries[hookName]) return false
+        // Remove the entry entirely — absence means "use default" (enabled).
         delete entries[hookName]
         // If entries is now empty, clean up to keep config tidy
         if (Object.keys(entries).length === 0) {
           delete config.hooks.internal.entries
         }
-      }
-      // If no entry exists at all, the hook is already enabled by default — nothing to do
-
-      await writeFile(configPath, JSON.stringify(config, null, 2), 'utf8')
+        return true
+      })
       console.log(`[HooksManager] Hook "${hookName}" enabled via config patch`)
       return { success: true }
     } catch (error: any) {

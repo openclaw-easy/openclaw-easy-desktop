@@ -1,5 +1,10 @@
 import { describe, it, expect } from 'vitest'
-import { isCurlNoiseLine, isGatewayNoiseLine } from './process-manager-base'
+import {
+  isCurlNoiseLine,
+  isGatewayNoiseLine,
+  GATEWAY_STOP_ACTION,
+  GATEWAY_RESTART_ACTION,
+} from './process-manager-base'
 
 describe('isCurlNoiseLine', () => {
   it('should detect curl progress rows', () => {
@@ -94,5 +99,35 @@ describe('isGatewayNoiseLine', () => {
 
   it('should NOT filter actual error outputs that happen to contain numbers', () => {
     expect(isGatewayNoiseLine('Error: port 18800 is already in use')).toBe(false)
+  })
+})
+
+describe('gateway CLI actions', () => {
+  // Upstream's own post-restart health budget, from
+  // src/cli/daemon-cli/lifecycle.ts. `gateway restart` polls until the gateway
+  // answers before it exits, so our deadline has to clear these or we SIGTERM
+  // a restart that is still working.
+  const UPSTREAM_RESTART_HEALTH_BUDGET_MS = process.platform === 'win32' ? 180_000 : 60_000
+
+  it('gives restart more time than upstream spends proving health', () => {
+    expect(GATEWAY_RESTART_ACTION.timeoutMs).toBeGreaterThan(UPSTREAM_RESTART_HEALTH_BUDGET_MS)
+  })
+
+  it('gives restart more time than a healthy restart actually costs', () => {
+    // Measured on macOS: a healthy `openclaw gateway restart` is 31-33s
+    // (teardown + boot + health proof), which is why a flat 30s deadline killed
+    // every one of them and re-ran the whole restart on the next binary.
+    expect(GATEWAY_RESTART_ACTION.timeoutMs).toBeGreaterThan(33_000)
+  })
+
+  it('keeps stop cheaper than restart — stop has no health proof', () => {
+    expect(GATEWAY_STOP_ACTION.timeoutMs).toBeLessThan(GATEWAY_RESTART_ACTION.timeoutMs)
+  })
+
+  it('binds each label to the args it actually runs', () => {
+    expect(GATEWAY_STOP_ACTION.args).toEqual(['gateway', 'stop', '--force'])
+    expect(GATEWAY_STOP_ACTION.label).toBe('stop')
+    expect(GATEWAY_RESTART_ACTION.args).toEqual(['gateway', 'restart'])
+    expect(GATEWAY_RESTART_ACTION.label).toBe('restart')
   })
 })

@@ -233,6 +233,34 @@ log(
 fs.copyFileSync(OPENCLAW_MJS, path.join(DEST_DIR, "openclaw.mjs"));
 fs.copyFileSync(ROOT_PKG, path.join(DEST_DIR, "package.json"));
 
+// openclaw.mjs is shipped alone, so any repo-root sibling it imports has to come
+// with it. Upstream added `./node-version.mjs` in the 2026-08-31 sync and the
+// bundle shipped without it, so the runtime died at boot with
+// ERR_MODULE_NOT_FOUND — caught only by the pre-notarization DMG smoke test.
+// Derive the list from the entry point instead of maintaining it by hand, and
+// fail loudly here rather than in a DMG.
+const entrySource = fs.readFileSync(OPENCLAW_MJS, "utf8");
+const siblingSpecifiers = new Set(
+  [...entrySource.matchAll(/\bfrom\s*["'](\.\/[^"']+)["']|\bimport\s*\(\s*["'](\.\/[^"']+)["']/g)].map(
+    (match) => match[1] ?? match[2],
+  ),
+);
+for (const specifier of siblingSpecifiers) {
+  // Directory specifiers are bundle payloads copied by the steps above.
+  if (!/\.[cm]?js$/.test(specifier)) continue;
+  const source = path.join(WORKSPACE_DIR, specifier);
+  if (!fs.existsSync(source)) {
+    fatal(
+      `openclaw.mjs imports ${specifier}, which does not exist at ${source}.\n` +
+        `The bundled runtime would fail to boot with ERR_MODULE_NOT_FOUND.`,
+    );
+  }
+  const destination = path.join(DEST_DIR, specifier);
+  fs.mkdirSync(path.dirname(destination), { recursive: true });
+  fs.copyFileSync(source, destination);
+  console.log(`  entry sibling: ${specifier}`);
+}
+
 // ── 5b. Vendor workspace-protocol dependencies ───────────────────────────────
 // The root manifest declares `workspace:*` runtime deps (@openclaw/ai,
 // @openclaw/media-core) that the dist genuinely imports at runtime. Bun
@@ -306,7 +334,15 @@ function vendorWorkspaceDeps(destDir, workspaceDir) {
       count++;
     }
   }
-  if (count > 0) {
+  // Same hazard as the per-package delete above, one level up: the payload
+  // installs with `--production`, so devDependencies never install — but bun
+  // still PARSES them and aborts the entire install on a workspace: specifier
+  // it cannot resolve. An upstream sync only has to add one workspace devDep
+  // (2026-08-15: @openclaw/session-url-contract) and every fresh install dies
+  // with no node_modules. Drop them; a shipped runtime has no use for them.
+  const hadDevDependencies = rootManifest.devDependencies !== undefined;
+  delete rootManifest.devDependencies;
+  if (count > 0 || hadDevDependencies) {
     fs.writeFileSync(rootManifestPath, JSON.stringify(rootManifest, null, 2) + "\n");
   }
   return { count, vendored: [...vendored.keys()] };

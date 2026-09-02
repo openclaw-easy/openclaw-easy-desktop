@@ -2,7 +2,7 @@ import { spawn, execFile } from 'child_process'
 import * as path from 'path'
 import * as fs from 'fs'
 import { promisify } from 'util'
-import { ProcessManagerBase, ConfigManager, GATEWAY_STOP_ARGS, GATEWAY_RESTART_ARGS } from './process-manager-base'
+import { ProcessManagerBase, ConfigManager, GATEWAY_STOP_ACTION, GATEWAY_RESTART_ACTION, GatewayCliAction } from './process-manager-base'
 import { sanitizeConfigForBundled } from './utils/config-sanitizer'
 import { getOpenClawBundle } from './openclaw-bundle'
 import { getDevOpenClawSpawn } from './dev-openclaw-runtime'
@@ -514,15 +514,15 @@ export class ProcessManagerMac extends ProcessManagerBase {
    * 3. Dev-mode Node + built dist (dev-openclaw-runtime.ts)
    */
   private async runGatewayStop(): Promise<void> {
-    await this.runGatewayCliAction(GATEWAY_STOP_ARGS, 'stop')
+    await this.runGatewayCliAction(GATEWAY_STOP_ACTION)
   }
 
   /**
    * Restart a gateway we do not own, as ONE supervised operation.
-   * See GATEWAY_RESTART_ARGS for why this is not stop-then-start.
+   * See GATEWAY_RESTART_ACTION for why this is not stop-then-start.
    */
   private async runGatewayRestart(): Promise<boolean> {
-    return await this.runGatewayCliAction(GATEWAY_RESTART_ARGS, 'restart')
+    return await this.runGatewayCliAction(GATEWAY_RESTART_ACTION)
   }
 
   /**
@@ -532,13 +532,13 @@ export class ProcessManagerMac extends ProcessManagerBase {
    * 3. Dev-mode Node + built dist (dev-openclaw-runtime.ts)
    * Returns true when one of them succeeded.
    */
-  private async runGatewayCliAction(args: readonly string[], label: string): Promise<boolean> {
+  private async runGatewayCliAction({ args, label, timeoutMs }: GatewayCliAction): Promise<boolean> {
     // 1. Try system binary
     const systemBinary = await this.detectSystemOpenClaw()
     if (systemBinary) {
       try {
         console.log(`[ProcessManager] Running: ${systemBinary} gateway ${label}`)
-        await execFileAsync(systemBinary, [...args], { timeout: 30_000 })
+        await execFileAsync(systemBinary, [...args], { timeout: timeoutMs })
         console.log(`[ProcessManager] openclaw gateway ${label} succeeded (system binary)`)
         return true
       } catch (err: any) {
@@ -558,7 +558,7 @@ export class ProcessManagerMac extends ProcessManagerBase {
       if (fs.existsSync(bundledNode) && fs.existsSync(openclawMjs)) {
         try {
           console.log(`[ProcessManager] Running: ${bundledNode} ${openclawMjs} gateway ${label}`)
-          await execFileAsync(bundledNode, [openclawMjs, ...args], { timeout: 30_000 })
+          await execFileAsync(bundledNode, [openclawMjs, ...args], { timeout: timeoutMs })
           console.log(`[ProcessManager] openclaw gateway ${label} succeeded (bundled)`)
           return true
         } catch (err: any) {
@@ -570,7 +570,7 @@ export class ProcessManagerMac extends ProcessManagerBase {
       try {
         const dev = getDevOpenClawSpawn()
         console.log(`[ProcessManager] Running: ${dev.runtime} ${dev.entry} gateway ${label}`)
-        await execFileAsync(dev.runtime, [dev.entry, ...args], { timeout: 30_000 })
+        await execFileAsync(dev.runtime, [dev.entry, ...args], { timeout: timeoutMs })
         console.log(`[ProcessManager] openclaw gateway ${label} succeeded (dev)`)
         return true
       } catch (err: any) {

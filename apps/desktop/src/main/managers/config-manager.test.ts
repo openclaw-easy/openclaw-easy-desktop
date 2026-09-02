@@ -1263,4 +1263,51 @@ describe('ConfigManager', () => {
 
   // ── app-config auth persistence ────────────────────────────────────
 
+  describe('syncAgentModelsWithDefault', () => {
+    // Regression: this repair read `agents.list` directly, so once upstream
+    // renamed the roster to the keyed `agents.entries` it exited immediately
+    // and every agent stayed pinned to the previous provider's model after a
+    // provider switch — a silent no-op with no visible failure.
+    it('repoints a stale agent on the canonical keyed roster', async () => {
+      writeConfig({
+        agents: {
+          defaults: { model: { primary: 'google/gemini-3-pro' } },
+          entries: { main: { model: { primary: 'openai/gpt-5.5-pro' } } },
+        },
+      })
+
+      await mgr.syncAgentModelsWithDefault()
+
+      expect(readConfig().agents.entries.main.model.primary).toBe('google/gemini-3-pro')
+    })
+
+    it('still repairs an unmigrated legacy roster', async () => {
+      writeConfig({
+        agents: {
+          defaults: { model: { primary: 'google/gemini-3-pro' } },
+          list: [{ id: 'main', model: { primary: 'openai/gpt-5.5-pro' } }],
+        },
+      })
+
+      await mgr.syncAgentModelsWithDefault()
+
+      const roster = rosterEntries(readConfig())
+      expect(roster.find((a: any) => a.id === 'main').model.primary).toBe('google/gemini-3-pro')
+    })
+
+    it('leaves agents that already match the default provider alone', async () => {
+      writeConfig({
+        agents: {
+          defaults: { model: { primary: 'google/gemini-3-pro' } },
+          entries: { main: { model: { primary: 'google/gemini-3-flash' } } },
+        },
+      })
+
+      await mgr.syncAgentModelsWithDefault()
+
+      // Same provider — a different model on that provider is a deliberate
+      // per-agent choice, not drift.
+      expect(readConfig().agents.entries.main.model.primary).toBe('google/gemini-3-flash')
+    })
+  })
 })

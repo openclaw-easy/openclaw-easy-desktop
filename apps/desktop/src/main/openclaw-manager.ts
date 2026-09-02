@@ -83,7 +83,7 @@ export class OpenClawManager {
 
     this.agentBindingManager = new AgentBindingManager(this.configManager)
     this.skillsManager = new SkillsManager(this.executor as OpenClawCommandExecutor, this.configManager)
-    this.hooksManager = new HooksManager(this.executor as OpenClawCommandExecutor)
+    this.hooksManager = new HooksManager(this.executor as OpenClawCommandExecutor, this.configManager)
     this.pluginsManager = new PluginsManager(this.executor as OpenClawCommandExecutor, this.configManager)
     this.cronManager = new CronManager(this.executor as OpenClawCommandExecutor)
     this.doctorManager = new DoctorManager(this.executor as OpenClawCommandExecutor, this.logger, this.configManager)
@@ -398,6 +398,17 @@ export class OpenClawManager {
 
   getCommandExecutor(): CommandExecutor {
     return this.executor
+  }
+
+  /**
+   * The app's single ConfigManager. Its write lock is what serializes every
+   * openclaw.json read-modify-write, so a second instance elsewhere would be a
+   * second lock guarding the same file — i.e. no mutual exclusion at all, and
+   * a channel add racing a provider switch could silently drop one of them.
+   * Every caller that writes config must share this one.
+   */
+  getConfigManager(): ConfigManager {
+    return this.configManager
   }
 
   async getLogs(): Promise<string[]> {

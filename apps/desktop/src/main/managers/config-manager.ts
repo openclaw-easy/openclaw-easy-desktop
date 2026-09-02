@@ -1610,22 +1610,24 @@ export class ConfigManager {
     try {
       const changed = await this.mutateConfig((config) => {
         const defaultPrimary: string = config?.agents?.defaults?.model?.primary || ''
-        const agentsList: any[] = config?.agents?.list || []
-        if (!defaultPrimary || agentsList.length === 0) return false
+        if (!defaultPrimary) return false
 
-        // Extract the provider prefix from the global default
-        // (e.g. "google" from "google/gemini-2.5-pro")
+        // Roster access goes through agent-roster: reading `agents.list`
+        // directly made this repair a silent no-op once upstream renamed the
+        // roster to the keyed `agents.entries`, so a provider switch left every
+        // agent pinned to the old provider's model. listAgents reads both
+        // shapes; ensureAgent hands back the live entry so the write lands.
         const defaultProvider = defaultPrimary.split('/')[0]
         let hasChanges = false
 
-        for (const agent of agentsList) {
+        for (const agent of listAgents(config)) {
           const agentPrimary: string = agent.model?.primary || ''
           if (!agentPrimary) continue
           const agentProvider = agentPrimary.split('/')[0]
           // If the agent's provider doesn't match the global default, it's stale.
           if (agentProvider !== defaultProvider) {
             console.log(`[ConfigManager] Fixing stale agent "${agent.id}" model: ${agentPrimary} → ${defaultPrimary}`)
-            agent.model.primary = defaultPrimary
+            ensureAgent(config, agent.id).model.primary = defaultPrimary
             hasChanges = true
           }
         }
