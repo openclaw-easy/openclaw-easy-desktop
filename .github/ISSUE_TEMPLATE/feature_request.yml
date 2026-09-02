@@ -1,0 +1,39 @@
+name: Feature request
+description: Suggest something the app should do
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do?
+      description: |
+        Describe the situation, not the solution. Knowing what you are actually
+        trying to accomplish often leads somewhere better than the feature as
+        first imagined.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What would you like the app to do?
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What do you do today instead?
+      description: Workarounds, other tools, or editing the config by hand.
+
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Where does this belong?
+      description: |
+        The OpenClaw engine under `openclaw/` is upstream code. Requests about
+        agent behaviour, channels or tools usually belong at
+        [openclaw/openclaw](https://github.com/openclaw/openclaw/issues) — the
+        desktop app can only surface what the engine supports.
+      options:
+        - label: I think this is the desktop app, not the OpenClaw engine

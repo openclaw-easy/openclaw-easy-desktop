@@ -1,0 +1,92 @@
+name: Bug report
+description: Something in the app is broken or behaves unexpectedly
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time. The fields below are the ones that actually
+        let us reproduce a problem — especially the version and your OS, since
+        most bugs here are platform-specific.
+
+        **Security issue?** Please don't file it here — see [SECURITY.md](../blob/main/SECURITY.md).
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What you did, and what the app did instead of what you expected.
+      placeholder: I pressed Launch Assistant and the status stayed on "starting" forever.
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open the app
+        2. Go to AI Configuration
+        3. ...
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: App version
+      description: Settings → the version is shown at the bottom.
+      placeholder: 2026.9.1
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - macOS (Apple Silicon)
+        - macOS (Intel)
+        - Windows 11
+        - Windows 10
+        - Other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: model-mode
+    attributes:
+      label: Which AI mode were you using?
+      options:
+        - Local model (Ollama)
+        - Google
+        - OpenAI
+        - Venice AI
+        - OpenRouter
+        - Not relevant / not set up yet
+    validations:
+      required: true
+
+  - type: input
+    id: channel
+    attributes:
+      label: Which channel, if any?
+      placeholder: WhatsApp
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or error text
+      description: |
+        Anything the app printed. **Remove your API keys and tokens first** — they
+        can appear in log lines.
+      render: text
+
+  - type: dropdown
+    id: regression
+    attributes:
+      label: Did this work in an earlier version?
+      options:
+        - "Don't know"
+        - "Yes — it broke after an update"
+        - "No — it never worked for me"

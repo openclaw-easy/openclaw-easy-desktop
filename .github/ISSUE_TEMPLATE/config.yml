@@ -1,0 +1,14 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Download the app
+    url: https://openclaw-easy.com
+    about: Installers for macOS and Windows.
+  - name: OpenClaw engine docs
+    url: https://docs.openclaw.ai
+    about: Configuration, channels, agents and tools — the engine this app bundles.
+  - name: OpenClaw engine issues
+    url: https://github.com/openclaw/openclaw/issues
+    about: Bugs in agent behaviour, channels or tools belong upstream, not here.
+  - name: Report a security vulnerability
+    url: https://github.com/openclaw-easy/openclaw-easy-desktop/security/advisories/new
+    about: Please report privately rather than in a public issue.
