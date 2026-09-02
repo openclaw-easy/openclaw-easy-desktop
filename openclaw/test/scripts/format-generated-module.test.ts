@@ -7,7 +7,7 @@ import {
   formatGeneratedModule,
   GENERATED_MODULE_FORMAT_MAX_BUFFER_BYTES,
   GENERATED_MODULE_FORMAT_TIMEOUT_MS,
-} from "../../scripts/lib/format-generated-module.mjs";
+} from "../../scripts/lib/format-generated-module.mts";
 
 const tempDirs: string[] = [];
 
@@ -69,28 +69,7 @@ describe("formatGeneratedModule", () => {
       code: "ETIMEDOUT",
     });
 
-    expect(() =>
-      formatGeneratedModule(
-        "export const value=1;",
-        {
-          errorLabel: "test module",
-          outputPath: "generated.ts",
-          repoRoot,
-        },
-        {
-          spawnSync: () => ({
-            error: timeoutError,
-            signal: "SIGTERM",
-            status: null,
-            stderr: `DO_NOT_DUMP_OLD_STDERR${"x".repeat(20 * 1024)}\nrecent stderr tail`,
-            stdout: `DO_NOT_DUMP_OLD_STDOUT${"x".repeat(20 * 1024)}\nrecent stdout tail`,
-          }),
-        },
-      ),
-    ).toThrow(
-      /formatter timed out after 30000ms[\s\S]*recent stderr tail[\s\S]*recent stdout tail/u,
-    );
-
+    let message = "";
     try {
       formatGeneratedModule(
         "export const value=1;",
@@ -110,9 +89,40 @@ describe("formatGeneratedModule", () => {
         },
       );
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      expect(message).not.toContain("DO_NOT_DUMP_OLD_STDERR");
-      expect(message).not.toContain("DO_NOT_DUMP_OLD_STDOUT");
+      message = error instanceof Error ? error.message : String(error);
     }
+    expect(message).toMatch(
+      /formatter timed out after 30000ms[\s\S]*recent stderr tail[\s\S]*recent stdout tail/u,
+    );
+    expect(message).not.toContain("DO_NOT_DUMP_OLD_STDERR");
+    expect(message).not.toContain("DO_NOT_DUMP_OLD_STDOUT");
+  });
+
+  it("keeps truncated formatter diagnostics UTF-8 safe", () => {
+    const repoRoot = makeRepoRoot();
+    const splitBoundaryOutput = `你好${"x".repeat(16_380)}`;
+    let message = "";
+
+    try {
+      formatGeneratedModule(
+        "export const value=1;",
+        {
+          errorLabel: "test module",
+          outputPath: "generated.ts",
+          repoRoot,
+        },
+        {
+          spawnSync: () => ({
+            status: 1,
+            stderr: splitBoundaryOutput,
+            stdout: "",
+          }),
+        },
+      );
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+    expect(message).toMatch(/stderr tail:\n好x/u);
+    expect(message).not.toContain("�");
   });
 });

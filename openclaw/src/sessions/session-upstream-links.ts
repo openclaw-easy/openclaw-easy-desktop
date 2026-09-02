@@ -1,5 +1,6 @@
 /** Best-effort shared-state registry for adopted upstream sessions. */
 import type { DatabaseSync } from "node:sqlite";
+import { safeParseJson } from "@openclaw/normalization-core";
 import type { Selectable } from "kysely";
 import { executeSqliteQuerySync, getNodeSqliteKysely } from "../infra/kysely-sync.js";
 import { normalizeSqliteNumber } from "../infra/sqlite-number.js";
@@ -42,11 +43,7 @@ function parseJson(value: string | null): SessionUpstreamJsonValue | null {
   if (value === null) {
     return null;
   }
-  try {
-    return JSON.parse(value) as SessionUpstreamJsonValue;
-  } catch {
-    return null;
-  }
+  return (safeParseJson(value) as SessionUpstreamJsonValue | undefined) ?? null;
 }
 
 function rowToSessionUpstreamLink(row: SessionUpstreamLinkRow): SessionUpstreamLink {
@@ -229,11 +226,9 @@ export function listWatchedSessionUpstreamLinks(
   const grouped = new Map<string, SessionUpstreamLink[]>();
   try {
     const { db } = openOpenClawStateDatabase(options);
-    // Watch cursors own demand. Unwatched adopted sessions stay out of the polling hot path.
-    // The join matches on session_key only, which is unambiguous because adoption creates
-    // links under the single resolved store agent (one row per session_key). The seen-key
-    // guard below fails closed if a future multi-agent adoption ever breaks that invariant,
-    // so a cross-agent link can never be probed against another agent's watch cursor.
+    // Watch cursors own demand. Their key-only join relies on one owning agent per
+    // adopted session key, not one agent per native thread. Agent-qualified keys
+    // keep separate adoptions of the same thread distinct.
     const rows = executeSqliteQuerySync(
       db,
       getSessionUpstreamKysely(db)
@@ -250,8 +245,8 @@ export function listWatchedSessionUpstreamLinks(
     ).rows;
     const links = rows.map(rowToSessionUpstreamLink);
     // Fail closed on the single-agent-per-key invariant: the key-only cursor join
-    // cannot disambiguate two agents sharing a bare adopted key, so drop EVERY link
-    // for any duplicated key rather than probe an arbitrary agent's upstream.
+    // cannot disambiguate multiple agents sharing the exact same adopted key.
+    // Drop every link for that key rather than probe an arbitrary agent's upstream.
     const keyCounts = new Map<string, number>();
     for (const link of links) {
       keyCounts.set(link.sessionKey, (keyCounts.get(link.sessionKey) ?? 0) + 1);

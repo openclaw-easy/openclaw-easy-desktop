@@ -263,7 +263,7 @@ describe("command secret target ids", () => {
   });
 
   it("includes memorySearch remote targets for agent runtime commands", () => {
-    const ids = getAgentRuntimeCommandSecretTargetIds();
+    const ids = getAgentRuntimeCommandSecretTargetIds({ config: {} });
     expect(ids.has("memory.search.remote.apiKey")).toBe(true);
     expect(ids.has("agents.entries.*.memory.search.remote.apiKey")).toBe(true);
     expect(ids.has("plugins.entries.firecrawl.config.webFetch.apiKey")).toBe(true);
@@ -937,7 +937,7 @@ describe("command secret target ids", () => {
   });
 
   it("includes channel targets for agent runtime when delivery needs them", () => {
-    const ids = getAgentRuntimeCommandSecretTargetIds({ includeChannelTargets: true });
+    const ids = getAgentRuntimeCommandSecretTargetIds({ config: {}, includeChannelTargets: true });
     expect(ids.has("channels.discord.token")).toBe(true);
     expect(ids.has("channels.telegram.botToken")).toBe(true);
   });
@@ -1033,6 +1033,26 @@ describe("command secret target ids", () => {
     expect(scoped.allowedPaths).toEqual(
       new Set(["channels.discord.token", "channels.discord.accounts.ops.token"]),
     );
+  });
+
+  it("unions only the selected broadcast channel/account routes", () => {
+    const scoped = getScopedChannelsCommandSecretTargets({
+      config: {
+        channels: {
+          discord: {
+            token: "discord-default",
+            accounts: { ops: { token: "discord-ops" } },
+          },
+          telegram: { botToken: "telegram-default" },
+        },
+      } as never,
+      channels: ["discord", "telegram"],
+      accountId: "ops",
+    });
+
+    expect(scoped.allowedPaths?.has("channels.discord.token")).toBe(true);
+    expect(scoped.allowedPaths?.has("channels.discord.accounts.ops.token")).toBe(true);
+    expect(scoped.allowedPaths?.has("channels.telegram.botToken")).toBe(true);
   });
 
   it("keeps account-scoped allowedPaths as an empty set when scoped target paths are absent", () => {

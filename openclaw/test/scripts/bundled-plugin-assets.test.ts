@@ -3,18 +3,19 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { buildDiscordActivitySdk } from "../../scripts/build-discord-activity-sdk.mjs";
+import { buildDiscordActivitySdk } from "../../scripts/build-discord-activity-sdk.mts";
 import {
   listStaleGeneratedPluginAssets,
   parseBundledPluginAssetArgs,
   readBundledPluginAssetHooks,
-} from "../../scripts/bundled-plugin-assets.mjs";
-import { listGeneratedExtensionAssetSources } from "../../scripts/lib/static-extension-assets.mjs";
+  runBundledPluginAssetHooks,
+} from "../../scripts/bundled-plugin-assets.mts";
+import { listGeneratedExtensionAssetSources } from "../../scripts/lib/static-extension-assets.mts";
 import {
   createRunNodePathClassifier,
   isBuildRelevantRunNodePath,
   isRestartRelevantRunNodePath,
-} from "../../scripts/run-node-watch-paths.mjs";
+} from "../../scripts/run-node-watch-paths.mts";
 import { useAutoCleanupTempDirTracker } from "../helpers/temp-dir.js";
 
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
@@ -29,7 +30,7 @@ async function withPluginAssetFixture(run: (rootDir: string) => Promise<void>) {
         name: "@openclaw/canvas-plugin",
         openclaw: {
           assetScripts: {
-            build: "node scripts/bundle-a2ui.mjs",
+            build: "node --import tsx scripts/bundle-a2ui.mts",
             buildOutputs: ["assets/generated-runtime.js"],
             copy: "node scripts/copy-a2ui.mjs",
           },
@@ -80,7 +81,7 @@ describe("bundled plugin assets", () => {
 
     expect(hooks).toMatchObject([
       {
-        command: "node ../../scripts/build-discord-activity-sdk.mjs",
+        command: "node --import tsx ../../scripts/build-discord-activity-sdk.mts",
         packageName: "@openclaw/discord",
         phase: "build",
         pluginId: "discord",
@@ -101,9 +102,6 @@ describe("bundled plugin assets", () => {
       ).toBe(true);
     }
 
-    expect(generatedAssetSources).toContain(
-      "extensions/browser/chrome-extension/modules/copilot-runtime.js",
-    );
     expect(generatedAssetSources).toContain("extensions/canvas/src/host/a2ui/.bundle.hash");
     expect(generatedAssetSources).toContain("extensions/canvas/src/host/a2ui/a2ui.bundle.js");
     expect(generatedAssetSources).toContain("extensions/discord/assets/embedded-app-sdk.mjs");
@@ -111,11 +109,16 @@ describe("bundled plugin assets", () => {
       expect(isBuildRelevantRunNodePath(source), source).toBe(false);
       expect(isRestartRelevantRunNodePath(source), source).toBe(false);
     }
-    expect(
-      isRestartRelevantRunNodePath("extensions/browser/scripts/copilot-runtime-entry.ts"),
-    ).toBe(true);
     expect(isRestartRelevantRunNodePath("extensions/discord/src/activities/http.ts")).toBe(true);
   });
+
+  it.each(["packages/ai/src/host.ts", "packages/llm-core/src/types.ts"])(
+    "rebuilds the root runtime for %s",
+    (source) => {
+      expect(isBuildRelevantRunNodePath(source)).toBe(true);
+      expect(isRestartRelevantRunNodePath(source)).toBe(true);
+    },
+  );
 
   it("refreshes generated output metadata without recreating the watcher", async () => {
     await withPluginAssetFixture(async (rootDir) => {
@@ -151,7 +154,7 @@ describe("bundled plugin assets", () => {
       expect(hooks).toEqual([
         {
           aliases: ["@openclaw/canvas-plugin", "canvas", "canvas-plugin"],
-          command: "node scripts/bundle-a2ui.mjs",
+          command: "node --import tsx scripts/bundle-a2ui.mts",
           packageName: "@openclaw/canvas-plugin",
           phase: "build",
           pluginDir: path.join(rootDir, "extensions", "canvas"),
@@ -161,11 +164,86 @@ describe("bundled plugin assets", () => {
     });
   });
 
+  it("bounds stalled asset hooks and reports the affected plugin safely", async () => {
+    await withPluginAssetFixture(async (rootDir) => {
+      const pluginDir = path.join(rootDir, "extensions", "canvas");
+      const packagePath = path.join(pluginDir, "package.json");
+      const packageJson = JSON.parse(fs.readFileSync(packagePath, "utf8")) as {
+        openclaw: { assetScripts: { build: string } };
+      };
+      packageJson.openclaw.assetScripts.build = "node scripts/launch-stall.mjs";
+      fs.writeFileSync(packagePath, JSON.stringify(packageJson, null, 2));
+      fs.mkdirSync(path.join(pluginDir, "scripts"));
+      const pidFile = path.join(pluginDir, "stall.pid");
+      const readyFile = path.join(pluginDir, "stall.ready");
+      fs.writeFileSync(
+        path.join(pluginDir, "scripts", "stall.mjs"),
+        [
+          'import { writeFileSync } from "node:fs";',
+          'process.on("SIGTERM", () => {});',
+          `writeFileSync(${JSON.stringify(readyFile)}, String(process.pid));`,
+          "setInterval(() => {}, 100);",
+          "",
+        ].join("\n"),
+      );
+      fs.writeFileSync(
+        path.join(pluginDir, "scripts", "launch-stall.mjs"),
+        [
+          'import { spawn } from "node:child_process";',
+          'import { writeFileSync } from "node:fs";',
+          'process.on("SIGTERM", () => {});',
+          'const child = spawn(process.execPath, ["scripts/stall.mjs"], { stdio: "ignore" });',
+          `writeFileSync(${JSON.stringify(pidFile)}, String(child.pid));`,
+          "setInterval(() => {}, 100);",
+          "",
+        ].join("\n"),
+      );
+
+      let thrown: unknown;
+      let childPid = 0;
+      try {
+        await runBundledPluginAssetHooks({ phase: "build", rootDir, timeoutMs: 500 });
+      } catch (error) {
+        thrown = error;
+      }
+      try {
+        childPid = Number(fs.readFileSync(pidFile, "utf8"));
+        // Timeout rejection must join cleanup, not leave the caller to poll for it.
+        expect(isProcessAlive(childPid)).toBe(false);
+        expect(fs.readFileSync(readyFile, "utf8")).toBe(String(childPid));
+        expect(thrown).toMatchObject({
+          code: "ETIMEDOUT",
+          message: "Bundled plugin asset build hook timed out after 500ms: canvas",
+        });
+        expect((thrown as Error).message).not.toContain("launch-stall.mjs");
+      } finally {
+        if (childPid && isProcessAlive(childPid)) {
+          process.kill(childPid, "SIGKILL");
+        }
+      }
+    });
+  });
+
   it("skips cleanly when a requested plugin is absent", async () => {
     await withPluginAssetFixture(async (rootDir) => {
       await expect(
         readBundledPluginAssetHooks({ phase: "copy", plugins: ["missing"], rootDir }),
       ).resolves.toStrictEqual([]);
+    });
+  });
+
+  it("rejects a symlinked dist root before running copy hooks", async () => {
+    await withPluginAssetFixture(async (rootDir) => {
+      const targetDir = path.join(rootDir, "live-gateway-dist");
+      fs.mkdirSync(targetDir);
+      fs.writeFileSync(path.join(targetDir, "sentinel.js"), "keep\n");
+      fs.symlinkSync(targetDir, path.join(rootDir, "dist"), "dir");
+
+      await expect(runBundledPluginAssetHooks({ phase: "copy", rootDir })).rejects.toThrow(
+        /symbolic link/u,
+      );
+      expect(fs.readFileSync(path.join(targetDir, "sentinel.js"), "utf8")).toBe("keep\n");
+      expect(fs.readlinkSync(path.join(rootDir, "dist"))).toBe(targetDir);
     });
   });
 
@@ -217,3 +295,21 @@ describe("bundled plugin assets", () => {
     });
   });
 });
+
+function isProcessAlive(pid: number) {
+  try {
+    process.kill(pid, 0);
+  } catch {
+    return false;
+  }
+  if (process.platform !== "linux") {
+    return true;
+  }
+  try {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+    // kill(pid, 0) also succeeds for a terminated process awaiting reaping.
+    return stat.charAt(stat.lastIndexOf(")") + 2) !== "Z";
+  } catch {
+    return false;
+  }
+}

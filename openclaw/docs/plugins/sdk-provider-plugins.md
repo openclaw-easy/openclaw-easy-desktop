@@ -206,6 +206,32 @@ catalog, API-key auth, and dynamic model resolution.
     `openclaw onboard --acme-ai-api-key <key>` and select
     `acme-ai/acme-large` as their model.
 
+    A custom interactive auth method that mints a static token or API key can
+    request protected persistence on its returned profile:
+
+    ```typescript
+    return {
+      profiles: [
+        {
+          profileId: "acme-ai:device",
+          credential: { type: "token", provider: "acme-ai", token },
+          secretStorage: {
+            kind: "store",
+            namePrefix: "ACME_AI_TOKEN",
+          },
+        },
+      ],
+    };
+    ```
+
+    OpenClaw keeps the inline value only while staged validation runs. At the
+    final persistence boundary it writes the value to the protected local store
+    and saves a `tokenRef` or `keyRef` in the auth profile. `namePrefix` must be
+    an uppercase environment-style name. OpenClaw adds a stable suffix derived
+    from the provider and final profile id so multiple profiles remain separate.
+    Use this only for provider-minted static credentials, not rotating OAuth
+    credentials or values already supplied as SecretRefs.
+
     ### Live model discovery
 
     If your provider exposes an OpenAI-compatible `/models` API, opt the
@@ -369,6 +395,37 @@ catalog, API-key auth, and dynamic model resolution.
     upstream response is not an OpenAI-compatible `{ data: [{ id, object }] }`
     shape.
 
+    For a separate authoritative metadata feed, the same
+    `provider-catalog-live-runtime` subpath exposes `ProviderCatalogSnapshot`:
+    each entry pairs a runtime model with its lifecycle status.
+    `projectUpstreamProviderCatalogSnapshot` rebuilds that snapshot from a
+    trusted seed and accepted upstream rows, dropping withdrawn upstream-only
+    models. `projectProviderCatalogSnapshotRows` intersects advertised IDs with
+    active snapshot entries, deduplicating in endpoint order;
+    `listProviderCatalogSnapshotEntries` projects the same lifecycle facts for
+    catalog consumers. Keep seed lifecycle policy and model-specific decoration
+    in the owning plugin. Derive static fallback eligibility after refreshing
+    metadata so the first failed or fully filtered discovery uses current status.
+    Public metadata never establishes account entitlement or expands the
+    credential scope of discovery.
+
+    The same subpath exposes `normalizeOpenRouterModelPricing(pricing)` for
+    native OpenRouter pricing objects. It converts per-token rates and static
+    prompt-length overrides into a complete per-million cost schedule, without
+    network access or prices from another source. Overrides apply strictly above
+    `min_prompt_tokens`, counting uncached input, cache reads, and cache writes.
+    Matching entries apply in source order: later entries win per price key,
+    including at equal thresholds; omitted keys inherit the native base or an
+    earlier matching entry. Cache rates absent from the base default to zero.
+    Invalid effective token rates return `undefined`. Entries with time-based or
+    unknown conditions are skipped; other known charge dimensions are ignored.
+
+    When `ctx.providerIds` is present, it contains the normalized provider
+    identities selected for that catalog owner. Return `null` before resolving
+    credentials or making network requests when the hook serves none of them;
+    OpenClaw also filters returned identities to that scope. An absent scope
+    means the caller requested the full catalog.
+
     If the upstream provider uses different control tokens than OpenClaw, add a
     small bidirectional text transform instead of replacing the stream path:
 
@@ -485,8 +542,10 @@ catalog, API-key auth, and dynamic model resolution.
     });
     ```
 
-    If resolving requires a network call, use `prepareDynamicModel` for async
-    warm-up - `resolveDynamicModel` runs again after it completes.
+    If resolving requires a network call, return the requested model directly
+    from `prepareDynamicModel`. OpenClaw applies the same configured overrides
+    and normalization as synchronous dynamic resolution. Existing hooks that
+    return nothing still retry `resolveDynamicModel` after preparation.
 
   </Step>
 
@@ -604,14 +663,18 @@ catalog, API-key auth, and dynamic model resolution.
             session_id: ctx.sessionId ?? "",
             turn_id: ctx.turnId,
           },
-        }),
-        resolveWebSocketSessionPolicy: (ctx) => ({
-          headers: {
-            "x-session-id": ctx.sessionId ?? "",
+          websocket: {
+            headers: {
+              "x-session-id": ctx.sessionId ?? "",
+            },
+            degradeCooldownMs: 60_000,
           },
-          degradeCooldownMs: 60_000,
         }),
         ```
+
+        The older `resolveWebSocketSessionPolicy` hook remains supported but is
+        deprecated. Move its fields under `resolveTransportTurnState.websocket`;
+        fields from the new hook take precedence during migration.
       </Tab>
       <Tab title="Usage and billing">
         For providers that expose usage/billing data:
@@ -679,7 +742,7 @@ catalog, API-key auth, and dynamic model resolution.
       | `resolveExternalAuthProfiles` | Overlay provider-owned external auth profiles for CLI/app-managed credentials |
       | `shouldDeferSyntheticProfileAuth` | Lower synthetic stored-profile placeholders behind env/config auth |
       | `resolveDynamicModel` | Accept arbitrary upstream model IDs |
-      | `prepareDynamicModel` | Async metadata fetch before resolving |
+      | `prepareDynamicModel` | Return an asynchronously discovered model, or warm reusable metadata before sync resolution |
       | `normalizeResolvedModel` | Transport rewrites before the runner |
       | `normalizeToolSchemas` | Provider-owned tool-schema cleanup before registration |
       | `inspectToolSchemas` | Provider-owned tool-schema diagnostics |
@@ -687,9 +750,10 @@ catalog, API-key auth, and dynamic model resolution.
       | `prepareExtraParams` | Default request params |
       | `createStreamFn` | Fully custom StreamFn transport |
       | `wrapStreamFn` | Custom headers/body wrappers on the normal stream path |
-      | `resolveTransportTurnState` | Native per-turn headers/metadata |
-      | `resolveWebSocketSessionPolicy` | Native WS session headers/cool-down |
+      | `resolveTransportTurnState` | Native per-turn headers/metadata and WebSocket headers/cool-down |
+      | `resolveWebSocketSessionPolicy` | Deprecated WebSocket compatibility hook; use `resolveTransportTurnState` |
       | `formatApiKey` | Custom runtime token shape |
+      | `loginOAuth` | Callback-based OAuth login for the session SDK `AuthStorage` API |
       | `refreshOAuth` | Custom OAuth refresh |
       | `buildAuthDoctorHint` | Auth repair guidance |
       | `matchesContextOverflowError` | Provider-owned overflow detection |
@@ -713,6 +777,7 @@ catalog, API-key auth, and dynamic model resolution.
 
       Runtime fallback notes:
 
+      - Error classification uses the prepared provider owner or already loaded provider hooks. `matchesContextOverflowError` and `classifyFailoverReason` never trigger plugin discovery while handling an error; provider preparation owns loading those hooks.
       - `normalizeConfig` resolves one owning plugin per provider id (bundled providers first, then the matched runtime plugin) and calls only that hook - there is no scan across other providers. Google's own `normalizeConfig` hook is what normalizes `google` / `google-vertex` / `google-antigravity` config entries; it is not a separate core fallback.
       - `resolveConfigApiKey` uses the provider hook when exposed. Amazon Bedrock keeps AWS env-marker resolution in its provider plugin; runtime auth itself still uses the AWS SDK default chain when configured with `auth: "aws-sdk"`.
       - `resolveThinkingProfile(ctx)` receives the selected `provider`, `modelId`, optional merged `reasoning` catalog hint, and optional merged model `compat` facts. Use `compat` only to select the provider's thinking UI/profile.
@@ -774,9 +839,21 @@ catalog, API-key auth, and dynamic model resolution.
 
         Use `assertOkOrThrowProviderError(...)` for provider HTTP failures so
         plugins share capped error-body reads, JSON error parsing, and
-        request-id suffixes.
+        request-id suffixes. Pass `{ requestHeaders: headers }` as its third
+        argument when requests carry credentials: this redacts reflected header
+        values before error details and metadata are retained. Pass the same
+        option to `readProviderJsonResponse(...)` to omit unsafe parser excerpts.
+        For provider-specific failure payloads, use
+        `redactProviderResponseErrorText(text, headers)` or the bounded
+        `readProviderResponseErrorText(response, limitBytes, headers)` helper
+        from the same SDK entrypoint.
       </Tab>
       <Tab title="Realtime transcription">
+        Consumers can pass candidate provider IDs as the optional second argument
+        to `listRealtimeTranscriptionProviders(cfg, providerIds)`. This discovers
+        providers named in plugin-local config without broadening the active
+        registry or bypassing plugin enablement and allow/deny policy.
+
         Prefer `createRealtimeTranscriptionWebSocketSession(...)` - the shared
         helper handles proxy capture, reconnect backoff, close flushing, ready
         handshakes, audio queueing, and close-event diagnostics. Your plugin
@@ -825,6 +902,14 @@ catalog, API-key auth, and dynamic model resolution.
         compatible transcription APIs.
       </Tab>
       <Tab title="Realtime voice">
+        Consumers can pass candidate provider IDs as the optional second argument
+        to `listRealtimeVoiceProviders(cfg, providerIds)`. Omit the argument for
+        ordinary catalog discovery; per-call candidates do not change that catalog.
+        Automatic realtime voice and Voice Call transcription selection uses declared alias config as
+        defaults, with earlier aliases preferred and canonical values taking precedence.
+        An explicitly selected alias still overrides canonical config without inheriting
+        settings from other aliases.
+
         ```typescript
         api.registerRealtimeVoiceProvider({
           id: "acme-ai",
@@ -872,9 +957,20 @@ catalog, API-key auth, and dynamic model resolution.
         Consumers of `createRealtimeVoiceBridgeSession` may likewise return a
         promise from `onToolCall`; synchronous throws and rejections are routed
         to the session's `onError` callback.
+        The host may pass `sendUserMessage(text, { toolChoice })` while the
+        response state is idle to force one named function for that response;
+        later responses return to the session's configured tool choice.
         Set `handlesInputAudioBargeIn` only when provider VAD confirms an
         interruption by calling `onClearAudio("barge-in")`. Providers that omit
         the flag use OpenClaw's local input-audio fallback detection.
+
+        A browser-session request can include `gatewayControl` when the host has
+        explicitly negotiated server-owned provider control. The provider keeps
+        vendor authentication and signaling private, calls
+        `gatewayControl.bindBridge(bridge)` before connecting the attached
+        control transport, and forwards bridge events through the supplied
+        callbacks. The Gateway remains the owner of tool policy and run
+        lifecycle. Do not infer or enable this mode from a model name alone.
       </Tab>
       <Tab title="Media understanding">
         ```typescript
@@ -933,8 +1029,19 @@ catalog, API-key auth, and dynamic model resolution.
 
         Declare the same id in `contracts.embeddingProviders`. This is the
         general embedding contract for reusable vector generation, including
-        memory search. `registerMemoryEmbeddingProvider(...)` is deprecated
-        compatibility for existing memory-specific adapters.
+        memory search. The retired memory-specific registrar and manifest
+        contract are no longer accepted.
+
+        Providers that accept model aliases can expose
+        `normalizeModel(options): string`. Memory uses this synchronous hook for
+        both creation options and cold index identity checks. Keep it configuration-only:
+        do not authenticate or access the network. Make normalization idempotent and
+        reuse it in `create`, which may receive an already-normalized model or be
+        called outside memory. Return an empty string only when the
+        model remains unknown until discovery; do not turn an invalid explicit
+        model into an omitted selection. For an exact pre-initialization identity,
+        `resolveIndexIdentity(options)` additionally supplies the required
+        `cacheKeyData` and any equivalent persisted aliases.
       </Tab>
       <Tab title="Image and video generation">
         Image and video capabilities use a **mode-aware** shape. Image
@@ -953,7 +1060,15 @@ catalog, API-key auth, and dynamic model resolution.
             generate: { maxCount: 4, supportsSize: true },
             edit: { enabled: false },
           },
-          generateImage: async (req) => ({ images: [] }),
+          generateImage: async (req) => ({
+            images: [
+              {
+                buffer: await generateAcmeImageBytes(req),
+                mimeType: "image/png",
+                fileName: "acme-image.png",
+              },
+            ],
+          }),
         });
 
         api.registerVideoGenerationProvider({
@@ -987,9 +1102,23 @@ catalog, API-key auth, and dynamic model resolution.
               },
             },
           },
-          generateVideo: async (req) => ({ videos: [] }),
+          generateVideo: async (req) => ({
+            videos: [
+              {
+                url: await generateAcmeVideoUrl(req),
+                mimeType: "video/mp4",
+              },
+            ],
+          }),
         });
         ```
+
+        The illustrative helpers stand in for provider calls: the image helper
+        returns non-empty encoded bytes, while the video helper returns a hosted
+        media URL. Video providers may return non-empty encoded bytes instead,
+        or both when the URL is a delivery fallback. Empty result arrays and
+        empty buffers are candidate failures, except that a video asset with a
+        usable URL ignores an empty buffer and continues with the URL.
 
         `capabilities` is required on both provider types; `edit` and the
         video transform blocks (`imageToVideo`, `videoToVideo`) always need an
@@ -1049,6 +1178,21 @@ catalog, API-key auth, and dynamic model resolution.
         `hint`, `envVars`, `placeholder`, `signupUrl`, `credentialPath`,
         `getCredentialValue`, `setCredentialValue`, and `createTool` are all
         required.
+
+        Search providers using `openclaw/plugin-sdk/provider-web-search` should
+        resolve `resolveSearchCacheTtlMs(searchConfig)` once per execution and
+        pass that value to both `readCachedSearchPayload(cacheKey, ttlMs)` and
+        `writeCachedSearchPayload(cacheKey, payload, ttlMs)`. A zero TTL bypasses
+        reads and writes; a positive TTL bounds entry age without extending its
+        original expiry. Reads return a payload marked `cached: true`, or
+        `undefined` on a miss. The reader's `ttlMs` argument is optional:
+        existing one-argument calls continue to use the stored expiry alone.
+
+        Both tool definitions accept `execute(args, context?)`, where the optional
+        context carries `signal?: AbortSignal`. Forward that signal to network
+        requests and check cancellation after asynchronous work. Existing
+        one-argument implementations remain valid; OpenClaw rejects late fetch
+        results after cancellation before publishing them to its fetch cache.
       </Tab>
     </Tabs>
 

@@ -2,8 +2,9 @@ import type { SessionTranscriptUpdate } from "../../sessions/transcript-events.j
 import type { OpenClawConfig } from "../types.openclaw.js";
 import type {
   DeletedAgentSessionEntryPurgeParams,
+  DeleteSessionEntryLifecycleParams,
   DeleteSessionEntryLifecycleResult,
-  ResetSessionEntryLifecycleMutation,
+  ResetSessionEntryLifecycleParams,
   ResetSessionEntryLifecycleResult,
   SessionEntryLifecycleMutationResult,
   SessionEntryLifecycleRemoval,
@@ -13,8 +14,10 @@ import type {
   SessionLifecycleArtifactCleanupResult,
   SessionLifecycleStoreTarget,
 } from "./session-accessor.lifecycle-types.js";
+import type { TranscriptEvent } from "./session-accessor.types.js";
 import type { ResolvedSessionMaintenanceConfig } from "./store-maintenance.js";
-import type { SessionEntry } from "./types.js";
+import type { TranscriptEntryAnchor } from "./transcript-entry-anchor.js";
+import type { InternalSessionEntry as SessionEntry } from "./types.js";
 
 export type SessionAccessScope = {
   agentId?: string;
@@ -43,11 +46,13 @@ type SessionTranscriptRuntimeScope = SessionAccessScope & {
 
 export type SessionTranscriptReadScope = Omit<SessionTranscriptRuntimeScope, "sessionKey"> & {
   sessionKey?: string;
-  sessionEntry?: Pick<SessionEntry, "sessionFile"> & Partial<Pick<SessionEntry, "sessionId">>;
+  sessionEntry?: Partial<Pick<SessionEntry, "sessionId">>;
 };
 
 export type SessionTranscriptWriteScope = Omit<SessionTranscriptAccessScope, "sessionId"> & {
   sessionId?: string;
+  expectedLifecycleRevision?: string;
+  expectedWriterRunId?: string;
 };
 
 export type ExactSessionEntry = {
@@ -63,6 +68,7 @@ export type SessionEntrySummary = {
 export type SessionEntryStatus = NonNullable<SessionEntry["status"]>;
 
 export type SessionTranscriptInstance = SessionEntrySummary & {
+  agentId: string;
   /** Stable transcript identity, including rotated history for one logical session key. */
   sessionId: string;
   /** True when this transcript instance was owned by an ACP runtime. */
@@ -71,9 +77,42 @@ export type SessionTranscriptInstance = SessionEntrySummary & {
   provenanceKnown: boolean;
   /** Activity timestamp for this transcript instance, not the current logical session row. */
   updatedAtMs: number;
+  /** Recorded source facts; coarse historical trust classes cannot identify an exact hook source. */
+  sourceMetadata: {
+    createdAt: number;
+    channel: string | null;
+    accountId: string | null;
+    chatType: NonNullable<SessionEntry["chatType"]> | null;
+    hookExternalContentSource: NonNullable<SessionEntry["hookExternalContentSource"]> | null;
+  };
 };
 
-export type TranscriptEvent = unknown;
+export type SessionTranscriptInstanceListOptions = {
+  /** Include empty and internal windows when inspecting recorded source metadata. */
+  includeAllWindows?: boolean;
+  sessionId?: string;
+};
+
+export type TranscriptEventAppendOptions = {
+  appendIntent?: "active-branch";
+  /** Synchronous authority check run inside the append transaction. */
+  beforeCommitInTransaction?: () => void;
+};
+
+export type TranscriptAppendRefusal =
+  | {
+      actualSessionIdHash: string;
+      agentIdHash: string;
+      code: "session-rebound";
+      expectedSessionIdHash: string;
+      sessionKeyHash: string;
+    }
+  | {
+      agentIdHash: string;
+      code: "session-entry-missing";
+      expectedSessionIdHash: string;
+      sessionKeyHash: string;
+    };
 
 export type SessionTranscriptStats = {
   eventCount: number;
@@ -98,9 +137,11 @@ export type {
   SessionTranscriptRawDeltaResult,
   SessionTranscriptVisibleMessageDeltaLimits,
   SessionTranscriptVisibleMessageDeltaResult,
+  TranscriptEvent,
 } from "./session-accessor.types.js";
 
 export type TranscriptMessageAppendOptions<TMessage> = {
+  appendIntent?: "active-branch";
   config?: OpenClawConfig;
   cwd?: string;
   idempotencyLookup?: "scan" | "scan-assistant" | "caller-checked";
@@ -114,6 +155,8 @@ export type TranscriptMessageAppendOptions<TMessage> = {
 
 export type TranscriptMessageAppendResult<TMessage> = {
   appended: boolean;
+  anchor?: TranscriptEntryAnchor;
+  effectiveParentId?: string | null;
   message: TMessage;
   messageId: string;
 };
@@ -133,17 +176,22 @@ export type LatestTranscriptAssistantMessage = {
 
 export type SessionTranscriptTurnMessageAppend = TranscriptMessageAppendOptions<unknown> & {
   shouldAppend?: (context: SessionTranscriptTurnWriteContext) => Promise<boolean> | boolean;
+  /**
+   * Rechecks the newest assistant row after the write transaction begins.
+   * Direct synchronous writers bypass the process queue, so prepared facts can be stale.
+   */
+  shouldAppendInTransaction?: (latestAssistantMessage: unknown) => boolean;
 };
 
 export type SessionTranscriptTurnWriteContext = {
   agentId?: string;
-  sessionFile: string;
   sessionId?: string;
   sessionKey?: string;
   storePath?: string;
 };
 
 export type SessionEntryPatchOptions = {
+  assertCommitAllowed?: () => void;
   fallbackEntry?: SessionEntry;
   maintenanceConfig?: ResolvedSessionMaintenanceConfig;
   preserveActivity?: boolean;
@@ -178,34 +226,22 @@ export type SessionEntryReplacementUpdate<T> = {
   result: T;
 };
 
-export type ResetSessionEntryLifecycleParams = {
-  archivePreviousTranscript?: boolean;
-  afterEntryMutation?: (mutation: ResetSessionEntryLifecycleMutation) => Promise<void> | void;
-  agentId?: string;
-  buildNextEntry: (context: {
-    currentEntry?: SessionEntry;
-    primaryKey: string;
-  }) => Promise<SessionEntry> | SessionEntry;
-  resetBoundaryReason?: import("./session-reset-boundary-event.js").SessionResetBoundaryReason;
-  storePath: string;
-  target: SessionLifecycleStoreTarget;
+type SessionEntryBatchProjectionMutation = {
+  entry: SessionEntry;
+  previousSessionKeys?: readonly string[];
+  sessionKey: string;
 };
 
-export type DeleteSessionEntryLifecycleParams = {
-  agentId?: string;
-  archiveTranscript: boolean;
-  deleteTranscriptWithoutArchive?: boolean;
-  expectedEntry?: SessionEntry;
-  expectedSessionId?: string | null;
-  expectedLifecycleRevision?: string;
-  expectedUpdatedAt?: number;
-  storePath: string;
-  target: SessionLifecycleStoreTarget;
+export type SessionEntryBatchProjectionUpdate<T> = {
+  mutations?: Iterable<SessionEntryBatchProjectionMutation>;
+  result: T;
 };
 
 export type {
   DeletedAgentSessionEntryPurgeParams,
+  DeleteSessionEntryLifecycleParams,
   DeleteSessionEntryLifecycleResult,
+  ResetSessionEntryLifecycleParams,
   ResetSessionEntryLifecycleResult,
   SessionEntryLifecycleMutationResult,
   SessionEntryLifecycleRemoval,

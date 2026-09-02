@@ -1,17 +1,18 @@
 import { existsSync } from "node:fs";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
 import { replaceSessionEntrySync } from "../config/sessions/session-accessor.entry.js";
 import { deleteSessionEntryLifecycle } from "../config/sessions/session-accessor.js";
 import { requireNodeSqlite } from "../infra/node-sqlite.js";
-import { migrateLegacyMediaPersistence } from "../infra/state-migrations.js";
+import { migrateLegacyMediaPersistence } from "../infra/state-migrations.media-persistence.js";
 import {
   closeOpenClawAgentDatabasesForTest,
   openOpenClawAgentDatabase,
 } from "../state/openclaw-agent-db.js";
 import { closeOpenClawStateDatabaseForTest } from "../state/openclaw-state-db.js";
-import { InMemoryBoardStore, type BoardStore } from "./board-store.js";
+import type { BoardStore } from "./board-store.js";
+import { createTestBoardStore } from "./board-store.test-support.js";
 import { SqliteBoardStore } from "./sqlite-board-store.js";
 
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
@@ -27,16 +28,7 @@ function seedSession(env: NodeJS.ProcessEnv, agentId: string, sessionKey: string
 }
 
 function createSqliteStore(): BoardStore {
-  const stateDir = tempDirs.make("openclaw-board-parity-");
-  const env = { OPENCLAW_STATE_DIR: stateDir };
-  seedSession(env, "main", "agent:main:board");
-  return new SqliteBoardStore({
-    resolveSession: (sessionKey) => ({
-      agentId: sessionKey.split(":")[1] ?? "main",
-      sessionKey,
-    }),
-    env,
-  });
+  return createTestBoardStore();
 }
 
 afterEach(() => {
@@ -44,10 +36,37 @@ afterEach(() => {
   closeOpenClawStateDatabaseForTest();
 });
 
-describe.each([
-  ["memory", () => new InMemoryBoardStore()],
-  ["sqlite", createSqliteStore],
-] as const)("BoardStore parity: %s", (_kind, createStore) => {
+it("does not select the HTML BLOB when preparing board view metadata", () => {
+  const stateDir = tempDirs.make("openclaw-board-projection-");
+  const env = { OPENCLAW_STATE_DIR: stateDir };
+  const sessionKey = "agent:main:projection";
+  seedSession(env, "main", sessionKey);
+  const database = openOpenClawAgentDatabase({ agentId: "main", env });
+  const store = new SqliteBoardStore({
+    resolveSession: () => ({ agentId: "main", sessionKey }),
+    env,
+  });
+  store.putWidget({
+    sessionKey,
+    name: "status",
+    content: { kind: "html", html: "x".repeat(256 * 1024) },
+  });
+  const prepare = vi.spyOn(database.db, "prepare");
+
+  const prepared = store.getSnapshotWithHtmlViewMetadata(sessionKey);
+
+  const widgetSelects = prepare.mock.calls
+    .map(([sql]) => sql)
+    .filter((sql) => /select .* from "board_widgets"/iu.test(sql));
+  expect(widgetSelects).toHaveLength(1);
+  expect(widgetSelects[0]).toContain('"sha256"');
+  expect(widgetSelects[0]).not.toContain('"html"');
+  expect(prepared.htmlViewMetadata.get("status")).not.toHaveProperty("html");
+  prepare.mockRestore();
+});
+
+describe("SqliteBoardStore behavior", () => {
+  const createStore = createSqliteStore;
   it("persists revisions, layout, bytes, and declared summaries", () => {
     const store = createStore();
     const first = store.putWidget({
@@ -87,6 +106,20 @@ describe.each([
       revision: 1,
       sha256: expect.stringMatching(/^[a-f0-9]{64}$/u),
     });
+    const preparedView = store.getSnapshotWithHtmlViewMetadata("agent:main:board");
+    expect(preparedView).toMatchObject({
+      snapshot: { revision: 1 },
+      htmlViewMetadata: new Map([
+        [
+          "weather",
+          expect.objectContaining({
+            revision: 1,
+            sha256: expect.stringMatching(/^[a-f0-9]{64}$/u),
+          }),
+        ],
+      ]),
+    });
+    expect(preparedView.htmlViewMetadata.get("weather")).not.toHaveProperty("html");
 
     // Legacy clients omit heightMode on resize; explicit user sizing must pin.
     const resized = store.applyOps("agent:main:board", [
@@ -511,7 +544,7 @@ describe("SqliteBoardStore persistence", () => {
     expect(store.readWidgetMcpApp(sessionKey, "legacy-app")).toBeUndefined();
   });
 
-  it("migrates board tables into an existing v14 database", () => {
+  it("migrates board tables into an existing v14 database", async () => {
     const stateDir = tempDirs.make("openclaw-board-lazy-schema-");
     const env = { OPENCLAW_STATE_DIR: stateDir };
     const sessionKey = "agent:main:board";
@@ -526,12 +559,13 @@ describe("SqliteBoardStore persistence", () => {
     existingV14.exec(`
       DROP TABLE board_widgets;
       DROP TABLE board_tabs;
+      DROP TABLE session_participants;
       PRAGMA user_version = 14;
       UPDATE schema_meta SET schema_version = 14 WHERE meta_key = 'primary';
     `);
     existingV14.close();
 
-    expect(migrateLegacyMediaPersistence({ env }).warnings).toEqual([]);
+    expect((await migrateLegacyMediaPersistence({ env })).warnings).toEqual([]);
 
     const reopened = openOpenClawAgentDatabase({ agentId: "main", env });
     expect(
@@ -581,7 +615,7 @@ describe("SqliteBoardStore persistence", () => {
     ).toEqual({ name: "idx_agent_board_widgets_tab_position" });
   });
 
-  it("upgrades the v14 board constraint before storing plugin widgets", () => {
+  it("upgrades the v14 board constraint before storing plugin widgets", async () => {
     const stateDir = tempDirs.make("openclaw-board-plugin-kind-schema-");
     const env = { OPENCLAW_STATE_DIR: stateDir };
     const sessionKey = "agent:main:board";
@@ -624,12 +658,13 @@ describe("SqliteBoardStore persistence", () => {
         ON board_widgets(session_key, tab_id, position);
       COMMIT;
       PRAGMA foreign_keys = ON;
+      DROP TABLE session_participants;
       PRAGMA user_version = 14;
       UPDATE schema_meta SET schema_version = 14 WHERE meta_key = 'primary';
     `);
     closeOpenClawAgentDatabasesForTest();
 
-    expect(migrateLegacyMediaPersistence({ env }).warnings).toEqual([]);
+    expect((await migrateLegacyMediaPersistence({ env })).warnings).toEqual([]);
 
     const upgradedStore = new SqliteBoardStore({
       resolveSession: () => ({ agentId: "main", sessionKey }),
@@ -957,7 +992,7 @@ describe("SqliteBoardStore persistence", () => {
             .get(sessionKey) as { manifest: string }
         ).manifest,
       ),
-    ).toEqual({ tools: ["health"], grantSemanticsVersion: 2 });
+    ).toEqual({ contentOwner: "html", tools: ["health"], grantSemanticsVersion: 2 });
   });
 
   it("reopens durable boards and isolates owning agent databases", () => {

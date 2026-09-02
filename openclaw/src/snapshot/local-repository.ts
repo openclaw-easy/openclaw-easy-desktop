@@ -1,7 +1,6 @@
 import { randomUUID } from "node:crypto";
 import fsSync, { type Stats } from "node:fs";
 import fs from "node:fs/promises";
-import type { FileHandle } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
@@ -9,7 +8,9 @@ import { z } from "zod";
 import { loadSqliteVecExtension } from "../../packages/memory-host-sdk/src/engine-storage.js";
 import {
   ensureDurableDirectory,
+  getPublishFileExclusiveFailureDetails,
   pinDirectory,
+  publishFileNoClobber,
   requireDirectorySync,
   syncDirectory,
   syncDirectoryIfSupported,
@@ -30,28 +31,26 @@ import {
   createPrivateSqliteDirectory,
   createPrivateSqliteTempDirectory,
 } from "../infra/sqlite-private-directory.js";
-import {
-  createVerifiedSqliteSnapshot,
-  publishVerifiedSqliteFile,
-  type SqliteSnapshotValidator,
-} from "../infra/sqlite-snapshot.js";
+import { publishVerifiedSqliteFile } from "../infra/sqlite-snapshot.js";
 import { readSqliteUserVersion } from "../infra/sqlite-user-version.js";
+import {
+  buildEncodedPowerShellArgs,
+  buildPowerShellFailureCause,
+  WINDOWS_POWERSHELL_COLD_SPAWN_TIMEOUT_MS,
+} from "../infra/windows-powershell-spawn.js";
 import { runExec } from "../process/exec.js";
-import { isValidAgentId, normalizeAgentId } from "../routing/session-key.js";
-import { assertOpenClawAgentDatabaseForMaintenance } from "../state/openclaw-agent-db.js";
-import { assertOpenClawStateDatabaseForMaintenance } from "../state/openclaw-state-db.js";
 import {
-  sanitizeOpenClawGlobalStateSnapshot,
-  sanitizeOpenClawStateLeaseRows,
-} from "../state/openclaw-state-snapshot-sanitizer.js";
-import {
-  containsAsciiControlCharacter,
   copySnapshotArtifact,
   hashSnapshotArtifact,
   readSnapshotManifest,
   type SnapshotArtifactDigest,
   writeSnapshotManifest,
 } from "./manifest.js";
+import {
+  buildSnapshotValidator,
+  createOpenClawSnapshotCopy,
+  normalizeSnapshotIdentity,
+} from "./openclaw-snapshot-copy.js";
 import {
   SNAPSHOT_MANIFEST_FILENAME,
   SNAPSHOT_SQLITE_FILENAME,
@@ -285,17 +284,9 @@ class LocalSqliteSnapshotProvider implements SqliteSnapshotProvider {
       applyPrivateModeSync(stagingDir, SNAPSHOT_DIRECTORY_MODE);
       await assertPrivateStagingDirectory(stagingIdentity, stagingDir);
       await assertDirectoryIdentity(trustedRepositoryPath, repositoryIdentity);
-      const result = await createVerifiedSqliteSnapshot({
-        sourcePath,
+      const result = await createOpenClawSnapshotCopy({
+        database: { path: sourcePath, identity },
         targetPath: artifactPath,
-        requireNonEmptySource: identity.role !== "generic",
-        transform:
-          identity.role === "global"
-            ? sanitizeOpenClawGlobalStateSnapshot
-            : identity.role === "agent"
-              ? sanitizeOpenClawStateLeaseRows
-              : undefined,
-        validate: buildDatabaseValidator(identity),
       });
       applyPrivateModeSync(artifactPath, SNAPSHOT_FILE_MODE);
       const artifact = await hashSnapshotArtifact(stagingDir);
@@ -606,9 +597,19 @@ class LocalSqliteSnapshotProvider implements SqliteSnapshotProvider {
         `SQLite snapshot must be an immediate child of repository ${this.#repositoryPath}: ${snapshotDir}`,
       );
     }
-    const repositoryStat = await fs.lstat(this.#repositoryPath);
+    const repositoryStat = await lstatIfExists(this.#repositoryPath);
+    if (!repositoryStat) {
+      throw new Error(
+        `SQLite snapshot repository does not exist: ${this.#repositoryPath}. Check the snapshot path or create a snapshot with \`openclaw backup sqlite create\`.`,
+      );
+    }
     assertDirectory(repositoryStat, this.#repositoryPath, "SQLite snapshot repository");
-    const snapshotStat = await fs.lstat(snapshotDir);
+    const snapshotStat = await lstatIfExists(snapshotDir);
+    if (!snapshotStat) {
+      throw new Error(
+        `SQLite snapshot does not exist: ${snapshotDir}. Run \`openclaw backup sqlite list --repository ${this.#repositoryPath}\` to inspect available snapshots.`,
+      );
+    }
     assertDirectory(snapshotStat, snapshotDir, "SQLite snapshot");
     if (await lstatIfExists(path.join(snapshotDir, SNAPSHOT_PENDING_FILENAME))) {
       const snapshotState = await classifySnapshotDirectory(snapshotDir);
@@ -676,7 +677,12 @@ async function verifySnapshotDatabaseFile(
     throw new Error(`Snapshot artifact changed before SQLite verification: ${artifactPath}`);
   }
 
-  const validationRootIdentity = await fs.lstat(validationRootPath);
+  const validationRootIdentity = await lstatIfExists(validationRootPath);
+  if (!validationRootIdentity) {
+    throw new Error(
+      `SQLite validation root does not exist: ${validationRootPath}. Create a private directory there or pass an existing directory with \`--scratch\`.`,
+    );
+  }
   assertDirectory(validationRootIdentity, validationRootPath, "SQLite validation root");
   await withPrivateSqliteStagingDirectory({
     rootPath: validationRootPath,
@@ -725,24 +731,6 @@ async function verifySnapshotDatabaseFile(
   assertArtifactMatchesManifest(artifactPath, verifiedArtifact, manifest);
 }
 
-function normalizeSnapshotIdentity(identity: SnapshotDatabaseIdentity): SnapshotDatabaseIdentity {
-  if (identity.role === "global") {
-    return identity;
-  }
-  if (identity.role === "agent") {
-    const agentId = normalizeAgentId(identity.agentId);
-    if (!isValidAgentId(identity.agentId) || agentId !== identity.agentId) {
-      throw new Error(`SQLite snapshot agent id must be canonical: ${identity.agentId}`);
-    }
-    return { role: "agent", agentId };
-  }
-  const id = identity.id.trim();
-  if (!id || id !== identity.id || id.length > 256 || containsAsciiControlCharacter(id)) {
-    throw new Error("SQLite snapshot generic database id is invalid.");
-  }
-  return { role: "generic", id };
-}
-
 function buildDatabaseManifest(
   identity: SnapshotDatabaseIdentity,
   sourcePath: string,
@@ -758,27 +746,10 @@ function buildDatabaseManifest(
   return { role: "generic", id: identity.id, basename, userVersion };
 }
 
-function buildDatabaseValidator(
-  identity: SnapshotDatabaseIdentity | SnapshotDatabaseManifest,
-): SqliteSnapshotValidator {
-  if (identity.role === "global") {
-    return (database, pathname) =>
-      assertOpenClawStateDatabaseForMaintenance(database, { pathname });
-  }
-  if (identity.role === "agent") {
-    return (database, pathname) =>
-      assertOpenClawAgentDatabaseForMaintenance(database, {
-        agentId: identity.agentId,
-        pathname,
-      });
-  }
-  return () => undefined;
-}
-
 function buildManifestDatabaseValidator(
   manifest: SnapshotDatabaseManifest,
-): SqliteSnapshotValidator {
-  const validateOwner = buildDatabaseValidator(manifest);
+): import("../infra/sqlite-snapshot.js").SqliteSnapshotValidator {
+  const validateOwner = buildSnapshotValidator(manifest);
   return (database, pathname) => {
     validateOwner(database, pathname);
     const userVersion = readSqliteUserVersion(database);
@@ -902,110 +873,49 @@ function assertDirectoryIdentitySync(directoryPath: string, expectedIdentity: St
   }
 }
 
-function isSnapshotEntryLinkFallbackError(error: unknown): boolean {
-  const code = (error as NodeJS.ErrnoException).code;
-  return (
-    code === "EPERM" ||
-    code === "EXDEV" ||
-    code === "ENOTSUP" ||
-    code === "EOPNOTSUPP" ||
-    code === "ENOSYS"
-  );
-}
-
 async function publishSnapshotEntryNoOverwrite(
   sourcePath: string,
   targetPath: string,
   entryName: string,
   publishedEntries: Map<string, Stats>,
 ): Promise<void> {
-  let linked = false;
-  let linkedSourceIdentity: Stats | undefined;
+  let publication: Awaited<ReturnType<typeof publishFileNoClobber>>;
   try {
-    linkedSourceIdentity = await fs.lstat(sourcePath);
-    await fs.link(sourcePath, targetPath);
-    publishedEntries.set(entryName, linkedSourceIdentity);
-    linked = true;
+    publication = await publishFileNoClobber(sourcePath, targetPath, {
+      strategy: "link-or-copy",
+      moveSource: true,
+      durability: "fail-closed",
+    });
   } catch (error) {
-    if (!isSnapshotEntryLinkFallbackError(error)) {
-      throw error;
+    const details = getPublishFileExclusiveFailureDetails(error);
+    if (details?.targetCreated && details.cleanup !== "removed") {
+      const [currentSource, currentTarget] = await Promise.all([
+        fs.lstat(sourcePath).catch(() => undefined),
+        fs.lstat(targetPath).catch(() => undefined),
+      ]);
+      const matchesReceipt =
+        details.targetIdentity &&
+        currentTarget &&
+        sameFileIdentity(details.targetIdentity, currentTarget);
+      const matchesSource =
+        currentSource && currentTarget && sameFileIdentity(currentSource, currentTarget);
+      if (currentTarget && (matchesReceipt || matchesSource)) {
+        publishedEntries.set(entryName, currentTarget);
+      }
     }
-    const copiedIdentity = await copySnapshotEntryExclusive(sourcePath, targetPath);
-    publishedEntries.set(entryName, copiedIdentity);
+    throw error;
   }
-  const expectedTargetIdentity = publishedEntries.get(entryName);
+  const expectedTargetIdentity = publication.identity;
+  publishedEntries.set(entryName, expectedTargetIdentity);
   const initialTargetIdentity = await fs.lstat(targetPath);
-  if (!expectedTargetIdentity || !sameFileIdentity(expectedTargetIdentity, initialTargetIdentity)) {
+  if (!sameFileIdentity(expectedTargetIdentity, initialTargetIdentity)) {
     throw new Error(`SQLite snapshot entry changed during publication: ${targetPath}`);
   }
-  if (linked) {
-    if (!linkedSourceIdentity || !sameFileIdentity(linkedSourceIdentity, initialTargetIdentity)) {
-      throw new Error(`SQLite snapshot entry changed during publication: ${targetPath}`);
-    }
-    const sourceIdentity = await fs.lstat(sourcePath);
-    if (!sameFileIdentity(sourceIdentity, initialTargetIdentity)) {
-      throw new Error(`SQLite snapshot entry changed during publication: ${targetPath}`);
-    }
-  }
-  await fs.unlink(sourcePath);
   const finalTargetIdentity = await fs.lstat(targetPath);
   if (!sameFileIdentity(initialTargetIdentity, finalTargetIdentity)) {
     throw new Error(`SQLite snapshot entry changed after publication: ${targetPath}`);
   }
   publishedEntries.set(entryName, finalTargetIdentity);
-}
-
-async function copySnapshotEntryExclusive(sourcePath: string, targetPath: string): Promise<Stats> {
-  const source = await fs.open(sourcePath, "r");
-  let target: FileHandle | undefined;
-  let targetIdentity: Stats | undefined;
-  try {
-    target = await fs.open(targetPath, "wx+", SNAPSHOT_FILE_MODE);
-    targetIdentity = await target.stat();
-    const buffer = Buffer.allocUnsafe(1024 * 1024);
-    let offset = 0;
-    while (true) {
-      const { bytesRead } = await source.read(buffer, 0, buffer.length, offset);
-      if (bytesRead === 0) {
-        break;
-      }
-      let bytesWritten = 0;
-      while (bytesWritten < bytesRead) {
-        const result = await target.write(
-          buffer,
-          bytesWritten,
-          bytesRead - bytesWritten,
-          offset + bytesWritten,
-        );
-        if (result.bytesWritten === 0) {
-          throw new Error(`SQLite snapshot entry copy made no progress: ${targetPath}`);
-        }
-        bytesWritten += result.bytesWritten;
-      }
-      offset += bytesRead;
-    }
-    await target.sync();
-    const finalIdentity = await target.stat();
-    const currentIdentity = await fs.lstat(targetPath);
-    if (
-      !sameFileIdentity(targetIdentity, finalIdentity) ||
-      !sameFileIdentity(targetIdentity, currentIdentity)
-    ) {
-      throw new Error(`SQLite snapshot entry changed during copy: ${targetPath}`);
-    }
-    return finalIdentity;
-  } catch (error) {
-    if (targetIdentity) {
-      const currentIdentity = await fs.lstat(targetPath).catch(() => undefined);
-      if (currentIdentity && sameFileIdentity(currentIdentity, targetIdentity)) {
-        await fs.unlink(targetPath).catch(() => undefined);
-      }
-    }
-    throw error;
-  } finally {
-    await target?.close().catch(() => undefined);
-    await source.close().catch(() => undefined);
-  }
 }
 
 async function assertExactSnapshotContents(snapshotDir: string): Promise<void> {
@@ -1338,6 +1248,19 @@ async function assertTrustedStagingRoot(
   return trustedRootPath;
 }
 
+/** Create or strictly admit a Git repository through the local snapshot root trust policy. */
+export async function ensurePrivateSnapshotRepositoryRoot(rootPath: string): Promise<string> {
+  try {
+    return await assertTrustedStagingRoot(await fs.lstat(rootPath), rootPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      throw error;
+    }
+  }
+  const receipt = await ensurePrivateDirectory(rootPath, "Git backup repository");
+  return await assertTrustedStagingRoot(receipt.identity, rootPath);
+}
+
 async function assertPrivateStagingDirectory(
   expectedIdentity: Stats,
   directoryPath: string,
@@ -1512,8 +1435,10 @@ async function assertTrustedWindowsStagingPath(rootPath: string): Promise<void> 
   let security: z.infer<typeof WINDOWS_PATH_SECURITY_SCHEMA>;
   try {
     security = await inspectWindowsPathSecurity(paths);
-  } catch {
-    throw new Error(`Unable to verify private Windows ACL for SQLite staging: ${rootPath}`);
+  } catch (error) {
+    throw new Error(`Unable to verify private Windows ACL for SQLite staging: ${rootPath}`, {
+      cause: error,
+    });
   }
   if (security.paths.length !== paths.length) {
     throw new Error(`Unable to verify private Windows ACL for SQLite staging: ${rootPath}`);
@@ -1628,16 +1553,15 @@ async function runEncodedWindowsPowerShell(command: string, maxBuffer: number): 
   if (!powershell) {
     throw new Error("Unable to resolve PowerShell for Windows SQLite path security.");
   }
-  const encodedCommand = Buffer.from(command, "utf16le").toString("base64");
-  const { stdout } = await runExec(
-    powershell,
-    ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", encodedCommand],
-    {
-      timeoutMs: 10_000,
+  try {
+    const { stdout } = await runExec(powershell, buildEncodedPowerShellArgs(command), {
+      timeoutMs: WINDOWS_POWERSHELL_COLD_SPAWN_TIMEOUT_MS,
       maxBuffer,
-    },
-  );
-  return stdout;
+    });
+    return stdout;
+  } catch (error) {
+    throw buildPowerShellFailureCause(error);
+  }
 }
 
 async function removePublishedSnapshotDirectoryIfOwned(

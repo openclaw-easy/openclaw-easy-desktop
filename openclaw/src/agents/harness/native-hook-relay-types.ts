@@ -4,7 +4,19 @@ import type { PluginHookToolRequesterContext } from "../../plugins/hook-types.js
 import type {
   BeforeToolCallFailureDisposition,
   DeferredPluginToolApproval,
+  HookContext,
 } from "../agent-tools.before-tool-call.js";
+import type { AgentHarnessHostCapabilities } from "./host-capability-types.js";
+
+type NativeHookRelayApprovalContext = Pick<
+  HookContext,
+  | "approvalReviewerDeviceId"
+  | "trigger"
+  | "turnSourceAccountId"
+  | "turnSourceChannel"
+  | "turnSourceThreadId"
+  | "turnSourceTo"
+>;
 
 export type JsonValue =
   | null
@@ -14,7 +26,7 @@ export type JsonValue =
   | JsonValue[]
   | { [key: string]: JsonValue };
 
-const NATIVE_HOOK_RELAY_EVENTS = [
+export const NATIVE_HOOK_RELAY_EVENTS = [
   "pre_tool_use",
   "post_tool_use",
   "permission_request",
@@ -67,9 +79,14 @@ export type NativeHookRelayRegistration = {
   runId: string;
   channelId?: string;
   requester?: PluginHookToolRequesterContext;
+  approvalContext?: NativeHookRelayApprovalContext;
   allowedEvents: readonly NativeHookRelayEvent[];
   expiresAtMs: number;
   signal?: AbortSignal;
+  /** Exact host policy capability for authority-bearing native callbacks. */
+  runBeforeToolCall?: AgentHarnessHostCapabilities["runBeforeToolCall"];
+  /** Revalidates the exact admitted owner after authority-bearing awaits. */
+  assertActive?: AgentHarnessHostCapabilities["assertActive"];
   onPreToolUseFailure?: (failure: {
     toolName: string;
     toolCallId: string;
@@ -78,9 +95,10 @@ export type NativeHookRelayRegistration = {
   }) => void | Promise<void>;
 };
 
-type NativeHookRelayRegistrationHandle = NativeHookRelayRegistration & {
+export type NativeHookRelayRegistrationHandle = NativeHookRelayRegistration & {
   generation?: string;
   shouldRelayEvent: (event: NativeHookRelayEvent) => boolean;
+  toolMatcherForEvent: (event: NativeHookRelayEvent) => readonly string[] | undefined;
   commandForEvent: (
     event: NativeHookRelayEvent,
     options?: NativeHookRelayCommandForEventOptions,
@@ -101,12 +119,15 @@ export type RegisterNativeHookRelayParams = {
   runId: string;
   channelId?: string;
   requester?: PluginHookToolRequesterContext;
+  approvalContext?: NativeHookRelayApprovalContext;
   allowedEvents?: readonly NativeHookRelayEvent[];
   /** Whether this relay should run OpenClaw loop detection from native PreToolUse hooks. */
   preToolUseLoopDetection?: boolean;
   ttlMs?: number;
   command?: NativeHookRelayCommandOptions;
   signal?: AbortSignal;
+  runBeforeToolCall?: NativeHookRelayRegistration["runBeforeToolCall"];
+  assertActive?: NativeHookRelayRegistration["assertActive"];
   onPreToolUseFailure?: NativeHookRelayRegistration["onPreToolUseFailure"];
 };
 
@@ -117,7 +138,7 @@ type NativeHookRelayCommandOptions = {
   timeoutMs?: number;
 };
 
-export type NativeHookRelayCommandForEventOptions = {
+type NativeHookRelayCommandForEventOptions = {
   timeoutMs?: number;
 };
 
@@ -174,6 +195,7 @@ export type NativeHookRelayProviderAdapter = {
 export type NativeHookRelayPermissionApprovalResult =
   | NativeHookRelayPermissionDecision
   | "allow-always"
+  | "timed-out"
   | "defer";
 
 export type ActiveNativeHookRelayRegistration = NativeHookRelayRegistration & {

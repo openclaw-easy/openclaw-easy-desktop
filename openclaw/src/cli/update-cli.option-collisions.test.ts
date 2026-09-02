@@ -28,6 +28,9 @@ const {
 
 vi.mock("./update-cli/update-command.js", () => ({
   updateCommand: (opts: unknown) => mocks.updateCommand(opts),
+}));
+
+vi.mock("./update-cli/update-command-finalize.js", () => ({
   updateFinalizeCommand: (opts: unknown) => mocks.updateFinalizeCommand(opts),
 }));
 
@@ -48,10 +51,11 @@ function firstCallOptions(mock: { mock: { calls: unknown[][] } }) {
 }
 
 type UpdateFinalizeCommandOptions = {
-  acknowledgeClawHubRisk?: boolean;
+  channel?: string;
   json?: boolean;
   timeout?: string;
   restart?: boolean;
+  yes?: boolean;
 };
 
 describe("update cli option collisions", () => {
@@ -80,15 +84,7 @@ describe("update cli option collisions", () => {
     },
     {
       name: "forwards parent-captured options to hidden `update finalize`",
-      argv: [
-        "update",
-        "--acknowledge-clawhub-risk",
-        "finalize",
-        "--json",
-        "--timeout",
-        "17",
-        "--no-restart",
-      ],
+      argv: ["update", "finalize", "--json", "--timeout", "17", "--no-restart"],
       assert: () => {
         expect(updateFinalizeCommand).toHaveBeenCalledTimes(1);
         const opts = firstCallOptions(updateFinalizeCommand) as
@@ -97,7 +93,6 @@ describe("update cli option collisions", () => {
         expect(opts?.json).toBe(true);
         expect(opts?.timeout).toBe("17");
         expect(opts?.restart).toBe(false);
-        expect(opts?.acknowledgeClawHubRisk).toBe(true);
       },
     },
     {
@@ -154,5 +149,137 @@ describe("update cli option collisions", () => {
     });
 
     assert();
+  });
+
+  it.each([
+    { name: "repair", handler: updateFinalizeCommand },
+    { name: "finalize", handler: updateFinalizeCommand },
+    { name: "wizard", handler: updateWizardCommand },
+    { name: "status", handler: updateStatusCommand },
+  ])("rejects parent --dry-run before running update $name", async ({ name, handler }) => {
+    await runRegisteredCli({
+      register: registerUpdateCli as (program: Command) => void,
+      argv: ["update", "--dry-run", name],
+    });
+
+    expect(handler).not.toHaveBeenCalled();
+    expect(updateCommand).not.toHaveBeenCalled();
+    expect(defaultRuntime.error).toHaveBeenCalledWith(
+      `--dry-run is not supported for \`openclaw update ${name}\`. Run \`openclaw update --dry-run\` instead.`,
+    );
+    expect(defaultRuntime.exit).toHaveBeenCalledWith(1);
+  });
+
+  it.each(["repair", "finalize"])(
+    "forwards parent channel and confirmation to update %s",
+    async (name) => {
+      await runRegisteredCli({
+        register: registerUpdateCli as (program: Command) => void,
+        argv: ["update", "--channel", "beta", "--yes", name],
+      });
+
+      expect(updateFinalizeCommand).toHaveBeenCalledOnce();
+      expect(firstCallOptions(updateFinalizeCommand)).toMatchObject({
+        channel: "beta",
+        yes: true,
+      });
+    },
+  );
+
+  it.each(["repair", "finalize"])(
+    "lets the explicit update %s channel override its parent",
+    async (name) => {
+      await runRegisteredCli({
+        register: registerUpdateCli as (program: Command) => void,
+        argv: ["update", "--channel", "beta", "--yes", name, "--channel", "dev"],
+      });
+
+      expect(updateFinalizeCommand).toHaveBeenCalledOnce();
+      expect(firstCallOptions(updateFinalizeCommand)).toMatchObject({
+        channel: "dev",
+        yes: true,
+      });
+    },
+  );
+
+  it.each(["repair", "finalize"])(
+    "preserves an explicitly empty parent channel for update %s validation",
+    async (name) => {
+      await runRegisteredCli({
+        register: registerUpdateCli as (program: Command) => void,
+        argv: ["update", "--channel", "", name],
+      });
+
+      expect(updateFinalizeCommand).toHaveBeenCalledOnce();
+      expect(firstCallOptions(updateFinalizeCommand)).toMatchObject({ channel: "" });
+    },
+  );
+
+  it.each(["repair", "finalize"])(
+    "lets an explicitly empty update %s channel override its parent",
+    async (name) => {
+      await runRegisteredCli({
+        register: registerUpdateCli as (program: Command) => void,
+        argv: ["update", "--channel", "beta", name, "--channel", ""],
+      });
+
+      expect(updateFinalizeCommand).toHaveBeenCalledOnce();
+      expect(firstCallOptions(updateFinalizeCommand)).toMatchObject({ channel: "" });
+    },
+  );
+
+  it.each(["repair", "finalize"])(
+    "forwards all explicitly inherited options to update %s",
+    async (name) => {
+      await runRegisteredCli({
+        register: registerUpdateCli as (program: Command) => void,
+        argv: ["update", "--json", "--timeout", "31", "--channel", "beta", "--yes", name],
+      });
+
+      expect(updateFinalizeCommand).toHaveBeenCalledOnce();
+      expect(firstCallOptions(updateFinalizeCommand)).toMatchObject({
+        channel: "beta",
+        json: true,
+        restart: false,
+        timeout: "31",
+        yes: true,
+      } satisfies UpdateFinalizeCommandOptions);
+    },
+  );
+
+  it.each([
+    {
+      name: "status",
+      argv: ["update", "status", "--timeout", ""],
+      handler: updateStatusCommand,
+    },
+    {
+      name: "wizard",
+      argv: ["update", "wizard", "--timeout", ""],
+      handler: updateWizardCommand,
+    },
+    {
+      name: "repair",
+      argv: ["update", "repair", "--timeout", ""],
+      handler: updateFinalizeCommand,
+    },
+    {
+      name: "finalize",
+      argv: ["update", "finalize", "--timeout", ""],
+      handler: updateFinalizeCommand,
+    },
+    {
+      name: "status with a valid inherited parent timeout",
+      argv: ["update", "--timeout", "9", "status", "--timeout", ""],
+      handler: updateStatusCommand,
+    },
+  ])("preserves an explicitly empty $name timeout for validation", async ({ argv, handler }) => {
+    await runRegisteredCli({
+      register: registerUpdateCli as (program: Command) => void,
+      argv,
+    });
+
+    expect(handler).toHaveBeenCalledOnce();
+    expect(firstCallOptions(handler)).toMatchObject({ timeout: "" });
   });
 });

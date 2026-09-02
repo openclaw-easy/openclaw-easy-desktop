@@ -2,12 +2,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import {
-  clearCurrentPluginMetadataSnapshot,
+  makePluginMetadataIndex as makeIndex,
+  makePluginMetadataManifestRegistry,
   setCurrentPluginMetadataSnapshot,
-} from "./current-plugin-metadata-snapshot.js";
+} from "./current-plugin-metadata.test-support.js";
 import { resolveInstalledPluginIndexPolicyHash } from "./installed-plugin-index-policy.js";
-import type { InstalledPluginIndex } from "./installed-plugin-index.js";
-import type { PluginManifestRecord, PluginManifestRegistry } from "./manifest-registry.js";
+import type { PluginManifestRegistry } from "./manifest-registry.js";
 import { clearPluginMetadataLifecycleCaches } from "./plugin-metadata-lifecycle.js";
 import { loadPluginMetadataSnapshot } from "./plugin-metadata-snapshot.js";
 import { resetPluginRuntimeStateForTest } from "./runtime.js";
@@ -18,8 +18,8 @@ import { resetPluginRuntimeStateForTest } from "./runtime.js";
 const loadPluginRegistrySnapshotWithMetadata = vi.hoisted(() => vi.fn());
 const loadPluginManifestRegistryForInstalledIndex = vi.hoisted(() => vi.fn());
 
-vi.mock("./plugin-registry.js", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("./plugin-registry.js")>();
+vi.mock("./plugin-registry-snapshot.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./plugin-registry-snapshot.js")>();
   return {
     ...actual,
     loadPluginRegistrySnapshotWithMetadata: (params: unknown) =>
@@ -37,57 +37,17 @@ vi.mock("./manifest-registry-installed.js", async (importOriginal) => {
 });
 
 import { resolveExternalAuthProfilesWithPlugins } from "./provider-runtime.js";
-import { isPluginProvidersLoadInFlight, resolvePluginProviders } from "./providers.runtime.js";
+import { isPluginProvidersLoadInFlight, resolvePluginProvidersCore } from "./providers.runtime.js";
 
 const WORKSPACE = "/workspace/a";
 
-function makeIndex(pluginId = "demo"): InstalledPluginIndex {
-  const rootDir = `/plugins/${pluginId}`;
-  return {
-    version: 1,
-    hostContractVersion: "test",
-    compatRegistryVersion: "test",
-    migrationVersion: 1,
-    policyHash: "test",
-    generatedAtMs: 1,
-    installRecords: {},
-    diagnostics: [],
-    plugins: [
-      {
-        pluginId,
-        manifestPath: `${rootDir}/openclaw.plugin.json`,
-        manifestHash: `${pluginId}-manifest`,
-        rootDir,
-        origin: "global",
-        enabled: true,
-        startup: {
-          sidecar: false,
-          memory: false,
-          deferConfiguredChannelFullLoadUntilAfterListen: false,
-          agentHarnesses: [],
-        },
-        compat: [],
-      },
-    ],
-  };
-}
-
 function makeManifestRegistry(pluginId = "demo"): PluginManifestRegistry {
-  const plugin: PluginManifestRecord = {
-    id: pluginId,
-    name: pluginId,
-    channels: [],
-    providers: [pluginId],
-    cliBackends: [],
-    skills: [],
-    hooks: [],
-    commandAliases: [],
-    rootDir: `/plugins/${pluginId}`,
-    source: `/plugins/${pluginId}/index.js`,
-    manifestPath: `/plugins/${pluginId}/openclaw.plugin.json`,
-    origin: "global",
-  };
-  return { plugins: [plugin], diagnostics: [] };
+  const registry = makePluginMetadataManifestRegistry(pluginId);
+  // Provider fixtures intentionally declare no command aliases.
+  for (const plugin of registry.plugins) {
+    plugin.commandAliases = [];
+  }
+  return registry;
 }
 
 // Build a snapshot from a provided index (no disk) and register it as the
@@ -121,14 +81,12 @@ describe("provider runtime consults the current plugin metadata snapshot", () =>
   beforeEach(() => {
     resetPluginRuntimeStateForTest();
     clearPluginMetadataLifecycleCaches();
-    clearCurrentPluginMetadataSnapshot();
     loadPluginRegistrySnapshotWithMetadata.mockReset();
     loadPluginManifestRegistryForInstalledIndex.mockReset();
     loadPluginManifestRegistryForInstalledIndex.mockReturnValue(makeManifestRegistry());
   });
 
   afterEach(() => {
-    clearCurrentPluginMetadataSnapshot();
     clearPluginMetadataLifecycleCaches();
     resetPluginRuntimeStateForTest();
   });
@@ -179,14 +137,14 @@ describe("provider runtime consults the current plugin metadata snapshot", () =>
     });
   });
 
-  describe("resolvePluginProviders", () => {
+  describe("resolvePluginProvidersCore", () => {
     it("reuses a compatible current snapshot without a direct disk load", () => {
       const config: OpenClawConfig = {};
       registerCurrentSnapshot(config);
 
       // onlyPluginIds:[] short-circuits provider materialization after the
       // snapshot is resolved, isolating the consult-first routing.
-      const providers = resolvePluginProviders({
+      const providers = resolvePluginProvidersCore({
         config,
         env: {},
         workspaceDir: WORKSPACE,
@@ -202,7 +160,7 @@ describe("provider runtime consults the current plugin metadata snapshot", () =>
     it("falls back to a direct disk load when no current snapshot is registered", () => {
       armFallbackLoad();
 
-      resolvePluginProviders({
+      resolvePluginProvidersCore({
         config: {},
         env: {},
         workspaceDir: WORKSPACE,

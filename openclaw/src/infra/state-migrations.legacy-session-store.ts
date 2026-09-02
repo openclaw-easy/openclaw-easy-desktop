@@ -8,7 +8,10 @@ import {
   hydrateSessionStoreSkillPromptRefs,
   projectSessionStoreForPersistence,
 } from "../config/sessions/skill-prompt-blobs.js";
-import { normalizePersistedSessionEntryShape } from "../config/sessions/store-entry-shape.js";
+import {
+  normalizePersistedSessionEntryShape,
+  stripRuntimeOnlySessionSkillsFields,
+} from "../config/sessions/store-entry-shape.js";
 import {
   applyFileBackedSessionStoreMaintenance,
   type SessionMaintenanceApplyReport,
@@ -16,6 +19,7 @@ import {
 import { collectSessionMaintenancePreserveKeysForStore } from "../config/sessions/store-maintenance-preserve.js";
 import { resolveMaintenanceConfig } from "../config/sessions/store-maintenance-runtime.js";
 import {
+  archiveStaleDashboardEntries,
   capEntryCount,
   pruneStaleEntries,
   pruneStaleModelRunEntries,
@@ -41,6 +45,7 @@ import {
   resolveAgentHarnessSessionStoreTransitionError,
 } from "../sessions/agent-harness-session-key.js";
 import { createLazyRuntimeModule } from "../shared/lazy-runtime.js";
+import { migrateLegacySessionCreator } from "../state/creator-namespace-migration.js";
 import {
   deliveryContextFromChannelRoute,
   isCanonicalSessionDeliveryState,
@@ -57,7 +62,7 @@ import {
 import { writeTextAtomic } from "./json-files.js";
 import { readSessionStoreJson5 } from "./state-migrations.fs.js";
 
-export type LegacySessionStoreLoadOptions = {
+type LegacySessionStoreLoadOptions = {
   skipCache?: boolean;
   maintenanceConfig?: ResolvedSessionMaintenanceConfig;
   runMaintenance?: boolean;
@@ -67,7 +72,6 @@ export type LegacySessionStoreLoadOptions = {
 
 export type LegacySessionStoreSaveOptions = {
   skipMaintenance?: boolean;
-  skipSerializeForUnchangedStore?: boolean;
   takeCacheOwnership?: boolean;
   activeSessionKey?: string;
   onWarn?: (warning: SessionMaintenanceWarning) => void | Promise<void>;
@@ -94,26 +98,12 @@ const loadTrajectoryCleanupRuntime = createLazyRuntimeModule(
   () => import("../trajectory/cleanup.js"),
 );
 
-function normalizeOptionalFiniteNumber(value: unknown): number | undefined {
-  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
-}
-
-function normalizeOptionalAttemptCount(value: unknown): number | undefined {
-  return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : undefined;
-}
-
-function normalizeOptionalStringOrNull(value: unknown): string | null | undefined {
-  return value === null || typeof value === "string" ? value : undefined;
-}
-
 function normalizeRecordKey(value: string): string | undefined {
   const key = value.trim();
   return key.length > 0 ? key : undefined;
 }
 
-function normalizeOptionalDeliveryContext(
-  value: unknown,
-): SessionEntry["pendingFinalDeliveryContext"] {
+function normalizeOptionalDeliveryContext(value: unknown): DeliveryContext | undefined {
   if (!isRecord(value)) {
     return undefined;
   }
@@ -130,8 +120,8 @@ function normalizeOptionalDeliveryContext(
 }
 
 function sameDeliveryContext(
-  left: SessionEntry["pendingFinalDeliveryContext"],
-  right: SessionEntry["pendingFinalDeliveryContext"],
+  left: DeliveryContext | undefined,
+  right: DeliveryContext | undefined,
 ): boolean {
   return (
     (left?.channel ?? undefined) === (right?.channel ?? undefined) &&
@@ -141,7 +131,7 @@ function sameDeliveryContext(
   );
 }
 
-function normalizePendingFinalDeliveryFields(entry: SessionEntry): SessionEntry {
+function normalizeRestartRecoveryFields(entry: SessionEntry): SessionEntry {
   let next = entry;
   const assign = <K extends keyof SessionEntry>(key: K, value: SessionEntry[K] | undefined) => {
     if (entry[key] === value) {
@@ -157,32 +147,6 @@ function normalizePendingFinalDeliveryFields(entry: SessionEntry): SessionEntry 
     }
   };
 
-  assign("pendingFinalDelivery", entry.pendingFinalDelivery === true ? true : undefined);
-  assign("pendingFinalDeliveryText", normalizeOptionalStringOrNull(entry.pendingFinalDeliveryText));
-  assign(
-    "pendingFinalDeliveryCreatedAt",
-    normalizeOptionalFiniteNumber(entry.pendingFinalDeliveryCreatedAt),
-  );
-  assign(
-    "pendingFinalDeliveryLastAttemptAt",
-    normalizeOptionalFiniteNumber(entry.pendingFinalDeliveryLastAttemptAt),
-  );
-  assign(
-    "pendingFinalDeliveryAttemptCount",
-    normalizeOptionalAttemptCount(entry.pendingFinalDeliveryAttemptCount),
-  );
-  assign(
-    "pendingFinalDeliveryLastError",
-    normalizeOptionalStringOrNull(entry.pendingFinalDeliveryLastError),
-  );
-  const pendingContext = normalizeOptionalDeliveryContext(entry.pendingFinalDeliveryContext);
-  if (!sameDeliveryContext(entry.pendingFinalDeliveryContext, pendingContext)) {
-    assign("pendingFinalDeliveryContext", pendingContext);
-  }
-  assign(
-    "pendingFinalDeliveryIntentId",
-    normalizeOptionalStringOrNull(entry.pendingFinalDeliveryIntentId),
-  );
   const restartContext = normalizeOptionalDeliveryContext(entry.restartRecoveryDeliveryContext);
   if (!sameDeliveryContext(entry.restartRecoveryDeliveryContext, restartContext)) {
     assign("restartRecoveryDeliveryContext", restartContext);
@@ -191,18 +155,23 @@ function normalizePendingFinalDeliveryFields(entry: SessionEntry): SessionEntry 
   return next;
 }
 
-function normalizePluginExtensions(entry: SessionEntry): SessionEntry {
-  if (entry.pluginExtensions === undefined) {
+function normalizeLegacyPluginState(
+  entry: SessionEntry,
+  key: "pluginExtensions" | "pluginExtensionSlotKeys",
+  normalizeValue: (value: unknown) => PluginJsonValue | undefined,
+): SessionEntry {
+  const state = entry[key];
+  if (state === undefined) {
     return entry;
   }
-  if (!isRecord(entry.pluginExtensions)) {
+  if (!isRecord(state)) {
     const next = { ...entry };
-    delete next.pluginExtensions;
+    delete next[key];
     return next;
   }
   let changed = false;
-  const normalizedExtensions: Record<string, Record<string, PluginJsonValue>> = {};
-  for (const [rawPluginId, rawPluginState] of Object.entries(entry.pluginExtensions)) {
+  const normalizedState: Record<string, Record<string, PluginJsonValue>> = {};
+  for (const [rawPluginId, rawPluginState] of Object.entries(state)) {
     const pluginId = normalizeRecordKey(rawPluginId);
     if (!pluginId || !isRecord(rawPluginState)) {
       changed = true;
@@ -212,92 +181,50 @@ function normalizePluginExtensions(entry: SessionEntry): SessionEntry {
     const normalizedPluginState: Record<string, PluginJsonValue> = {};
     for (const [rawNamespace, rawValue] of Object.entries(rawPluginState)) {
       const namespace = normalizeRecordKey(rawNamespace);
-      if (!namespace || !isPluginJsonValue(rawValue)) {
+      const value = normalizeValue(rawValue);
+      if (!namespace || value === undefined) {
         changed = true;
         continue;
       }
-      changed ||= namespace !== rawNamespace;
-      normalizedPluginState[namespace] = rawValue;
+      changed ||= namespace !== rawNamespace || value !== rawValue;
+      normalizedPluginState[namespace] = value;
     }
     if (Object.keys(normalizedPluginState).length === 0) {
       changed = true;
       continue;
     }
-    normalizedExtensions[pluginId] = normalizedPluginState;
+    normalizedState[pluginId] = normalizedPluginState;
   }
   if (!changed) {
     return entry;
   }
   const next = { ...entry };
-  if (Object.keys(normalizedExtensions).length > 0) {
-    next.pluginExtensions = normalizedExtensions;
+  if (Object.keys(normalizedState).length > 0) {
+    Object.assign(next, { [key]: normalizedState });
   } else {
-    delete next.pluginExtensions;
+    delete next[key];
   }
   return next;
+}
+
+function normalizePluginExtensions(entry: SessionEntry): SessionEntry {
+  return normalizeLegacyPluginState(entry, "pluginExtensions", (value) =>
+    isPluginJsonValue(value) ? value : undefined,
+  );
 }
 
 function normalizePluginExtensionSlotKeys(entry: SessionEntry): SessionEntry {
-  if (entry.pluginExtensionSlotKeys === undefined) {
-    return entry;
-  }
-  if (!isRecord(entry.pluginExtensionSlotKeys)) {
-    const next = { ...entry };
-    delete next.pluginExtensionSlotKeys;
-    return next;
-  }
-  let changed = false;
-  const normalizedSlotKeys: Record<string, Record<string, string>> = {};
-  for (const [rawPluginId, rawPluginSlots] of Object.entries(entry.pluginExtensionSlotKeys)) {
-    const pluginId = normalizeRecordKey(rawPluginId);
-    if (!pluginId || !isRecord(rawPluginSlots)) {
-      changed = true;
-      continue;
-    }
-    changed ||= pluginId !== rawPluginId;
-    const normalizedPluginSlots: Record<string, string> = {};
-    for (const [rawNamespace, rawSlotKey] of Object.entries(rawPluginSlots)) {
-      const namespace = normalizeRecordKey(rawNamespace);
-      const slotKey = normalizeSessionEntrySlotKey(rawSlotKey);
-      if (!namespace || !slotKey.ok) {
-        changed = true;
-        continue;
-      }
-      changed ||= namespace !== rawNamespace || slotKey.key !== rawSlotKey;
-      normalizedPluginSlots[namespace] = slotKey.key;
-    }
-    if (Object.keys(normalizedPluginSlots).length === 0) {
-      changed = true;
-      continue;
-    }
-    normalizedSlotKeys[pluginId] = normalizedPluginSlots;
-  }
-  if (!changed) {
-    return entry;
-  }
-  const next = { ...entry };
-  if (Object.keys(normalizedSlotKeys).length > 0) {
-    next.pluginExtensionSlotKeys = normalizedSlotKeys;
-  } else {
-    delete next.pluginExtensionSlotKeys;
-  }
-  return next;
-}
-
-function stripPersistedSkillsCache(entry: SessionEntry): SessionEntry {
-  const snapshot = entry.skillsSnapshot;
-  if (!snapshot || snapshot.resolvedSkills === undefined) {
-    return entry;
-  }
-  const { resolvedSkills: _drop, ...rest } = snapshot;
-  return { ...entry, skillsSnapshot: rest };
+  return normalizeLegacyPluginState(entry, "pluginExtensionSlotKeys", (value) => {
+    const slotKey = normalizeSessionEntrySlotKey(value);
+    return slotKey.ok ? slotKey.key : undefined;
+  });
 }
 
 function normalizeLegacySessionStore(store: Record<string, SessionEntry>): void {
   applySessionStoreMigrations(store);
   for (const [key, entry] of Object.entries(store)) {
     const modelSelectionLocked = isRecord(entry) && entry.modelSelectionLocked === true;
-    const shaped = normalizePersistedSessionEntryShape(entry);
+    const shaped = normalizePersistedSessionEntryShape(entry, { sessionKey: key });
     if (!shaped) {
       if (modelSelectionLocked) {
         throw new Error(`Invalid model-selection-locked session entry: ${key}`);
@@ -309,11 +236,13 @@ function normalizeLegacySessionStore(store: Record<string, SessionEntry>): void 
     if (modelSelectionLocked && runtimeFields !== shaped) {
       throw new Error(`Invalid model-selection-locked session entry: ${key}`);
     }
-    store[key] = stripPersistedSkillsCache(
+    store[key] = stripRuntimeOnlySessionSkillsFields(
       normalizePluginExtensionSlotKeys(
         normalizePluginExtensions(
-          normalizePendingFinalDeliveryFields(
-            normalizeLegacySessionEntryDelivery(modelSelectionLocked ? shaped : runtimeFields),
+          normalizeRestartRecoveryFields(
+            normalizeLegacySessionEntryDelivery(
+              migrateLegacySessionCreator(modelSelectionLocked ? shaped : runtimeFields),
+            ),
           ),
         ),
       ),
@@ -343,16 +272,22 @@ export function loadLegacySessionStore(
         storePath,
         store: sessionStore,
       });
+      archiveStaleDashboardEntries(sessionStore, maintenance.archiveDashboardAfterMs, {
+        log: false,
+        preserveKeys: preserveSessionKeys,
+      });
       if (shouldRunModelRunPrune({ maintenance, entryCount: beforeCount })) {
         pruneStaleModelRunEntries(sessionStore, maintenance.modelRunPruneAfterMs, {
           log: false,
           preserveKeys: preserveSessionKeys,
+          preserveRecentMs: maintenance.preserveRecentMs,
         });
       }
       if (Object.keys(sessionStore).length > maintenance.maxEntries) {
         pruneStaleEntries(sessionStore, maintenance.pruneAfterMs, {
           log: false,
           preserveKeys: preserveSessionKeys,
+          preserveRecentMs: maintenance.preserveRecentMs,
         });
         if (
           shouldRunSessionEntryMaintenance({
@@ -363,6 +298,7 @@ export function loadLegacySessionStore(
           capEntryCount(sessionStore, maintenance.maxEntries, {
             log: false,
             preserveKeys: preserveSessionKeys,
+            preserveRecentMs: maintenance.preserveRecentMs,
           });
         }
       }
@@ -400,17 +336,6 @@ function assertLegacySessionStoreWriteIsValid(params: {
   }
 }
 
-function stripRuntimeOnlySkillState(
-  store: Record<string, SessionEntry>,
-): Record<string, SessionEntry> {
-  return Object.fromEntries(
-    Object.entries(store).map(([sessionKey, entry]) => [
-      sessionKey,
-      stripPersistedSkillsCache(entry),
-    ]),
-  );
-}
-
 async function archiveRemovedSessionTranscripts(params: {
   removedSessionFiles: Iterable<[string, string | undefined]>;
   referencedSessionIds: ReadonlySet<string>;
@@ -444,7 +369,7 @@ async function persistLegacySessionStore(
 ): Promise<void> {
   const persisted = projectSessionStoreForPersistence({
     storePath,
-    store: stripRuntimeOnlySkillState(store),
+    store,
   });
   await fs.promises.mkdir(path.dirname(storePath), { recursive: true });
   await writeTextAtomic(storePath, JSON.stringify(persisted.store, null, 2), {

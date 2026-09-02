@@ -3,25 +3,29 @@ import {
   normalizeOptionalString,
 } from "@openclaw/normalization-core/string-coerce";
 import type { resolveSessionModelRef } from "../agents/session-model-ref.js";
-import type { buildSubagentRunReadIndex } from "../agents/subagent-registry-read.js";
+import type { SubagentRunReadIndex } from "../agents/subagents/registry/subagent-registry-read.js";
+import type { SubagentRunReadRecord } from "../agents/subagents/registry/subagent-registry.types.js";
 import type { ThinkLevel, listThinkingLevelOptions } from "../auto-reply/thinking.js";
-import type { SessionEntry } from "../config/sessions.js";
+import type { SessionAcpMeta, SessionEntry } from "../config/sessions.js";
+import type { InternalSessionEntry } from "../config/sessions/types.js";
 import type { ModelCostConfig } from "../utils/usage-format.js";
+import type { CurrentUserProfileDisplay } from "./current-user-profile-display.js";
+
+export type GatewayModelThinkingProfile = {
+  thinkingLevels: ReturnType<typeof listThinkingLevelOptions>;
+  thinkingDefault: ThinkLevel;
+};
+
+export type SessionActorProfileIdentity = Extract<CurrentUserProfileDisplay, { kind: "resolved" }>;
 
 export type SessionListRowContext = {
-  subagentRuns: ReturnType<typeof buildSubagentRunReadIndex>;
-  storeChildSessionsByKey: Map<string, string[]>;
+  subagentRuns: SubagentRunReadIndex<SubagentRunReadRecord>;
   selectedModelByOverrideRef: Map<string, ReturnType<typeof resolveSessionModelRef>>;
-  thinkingMetadataByModelRef: Map<
-    string,
-    {
-      levels: ReturnType<typeof listThinkingLevelOptions>;
-      defaultLevel: ThinkLevel;
-    }
-  >;
+  thinkingMetadataByModelRef: Map<string, GatewayModelThinkingProfile>;
   displayModelIdentityByKey: Map<string, { provider?: string; model?: string }>;
   modelCostConfigByModelRef: Map<string, ModelCostConfig | undefined>;
-  userProfileLabelById: Map<string, string | undefined>;
+  userProfileIdentityById: Map<string, SessionActorProfileIdentity | undefined>;
+  acpSessionMetaByEntry: Map<SessionEntry, SessionAcpMeta | undefined>;
 };
 
 export type SessionListRowContextProvider = () => SessionListRowContext;
@@ -34,7 +38,8 @@ export type GatewaySessionStoreTarget = {
 };
 
 export type GatewaySessionStoreTargetWithStore = GatewaySessionStoreTarget & {
-  store: Record<string, SessionEntry>;
+  canonicalValidationError?: Error;
+  store: Record<string, InternalSessionEntry>;
 };
 
 export function createSessionRowModelCacheKey(

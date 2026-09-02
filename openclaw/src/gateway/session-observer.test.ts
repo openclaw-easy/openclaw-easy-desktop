@@ -1,18 +1,12 @@
-import { Value } from "typebox/value";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import {
-  SessionObserverDigestSchema,
-  type SessionObserverDigest,
-} from "../../packages/gateway-protocol/src/schema/sessions.js";
+import type { SessionObserverDigest } from "../../packages/gateway-protocol/src/schema/sessions.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
-import { normalizeSessionObserverModelOutput } from "./session-observer-model.js";
 import {
   createHarness,
   declareObserverVisibility,
   event,
   flushObserver,
   modelMessage,
-  preparedModel,
   persistedLiveDigest,
   resetSessionObserverEventSequence,
   startAndAddToolNotes,
@@ -97,9 +91,143 @@ describe("session observer", () => {
       "session.observer",
       expect.objectContaining({ headline: "Inspecting mobile rows", health: "on-track" }),
       new Set(["conn-1"]),
-      { dropIfSlow: true },
+      expect.objectContaining({ dropIfSlow: true }),
     );
     expect(harness.persistDigest).toHaveBeenCalledOnce();
+    harness.observer.dispose();
+  });
+
+  it("keeps global observer streams scoped to their owning agents", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000);
+    const harness = createHarness({ subscribe: false });
+    harness.subscribers.subscribe("conn-main", "agent:main:global")?.commit();
+    harness.subscribers.subscribe("conn-legacy", "global")?.commit();
+    harness.subscribers.subscribe("conn-work", "agent:work:global")?.commit();
+    harness.subscribers.subscribe("conn-work-raw", "global")?.commit();
+    declareObserverVisibility(harness.observer, "conn-main");
+    declareObserverVisibility(harness.observer, "conn-legacy");
+    declareObserverVisibility(harness.observer, "conn-work");
+    declareObserverVisibility(harness.observer, "conn-work-raw");
+
+    harness.observer.handleEvent(
+      event({
+        runId: "run-main",
+        sessionKey: "global",
+        agentId: "main",
+        stream: "item",
+        data: { kind: "preamble", phase: "update", progressText: "Main agent work" },
+      }),
+    );
+    harness.observer.handleEvent(
+      event({
+        runId: "run-work",
+        sessionKey: "global",
+        agentId: "work",
+        stream: "item",
+        data: { kind: "preamble", phase: "update", progressText: "Work agent task" },
+      }),
+    );
+    await flushObserver();
+
+    expect(harness.broadcastToConnIds.mock.calls).toEqual([
+      [
+        "session.observer",
+        expect.objectContaining({ agentId: "main", revision: 1, sessionKey: "global" }),
+        new Set(["conn-main", "conn-legacy", "conn-work-raw"]),
+        expect.objectContaining({ sessionKeys: ["agent:main:global", "global"] }),
+      ],
+      [
+        "session.observer",
+        expect.objectContaining({ agentId: "work", revision: 1, sessionKey: "global" }),
+        new Set(["conn-work"]),
+        expect.objectContaining({ sessionKeys: ["agent:work:global"] }),
+      ],
+    ]);
+    harness.observer.dispose();
+  });
+
+  it("keeps the persisted fixed-store owner on the bare global observer stream", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000);
+    const config = {
+      gateway: { controlUi: { sessionObserver: true } },
+      session: { scope: "global" as const, store: "/tmp/owned-shared.sqlite" },
+      agents: {
+        ownership: "explicit" as const,
+        defaults: {
+          utilityModel: "openai/gpt-test",
+          sessionStore: { agentId: "ops" },
+        },
+        entries: { ops: {}, research: {} },
+      },
+    } satisfies OpenClawConfig;
+    const harness = createHarness({ subscribe: false, config });
+    harness.subscribers.subscribe("conn-global", "global")?.commit();
+    harness.subscribers.subscribe("conn-scoped", "agent:ops:global")?.commit();
+    declareObserverVisibility(harness.observer, "conn-global");
+    declareObserverVisibility(harness.observer, "conn-scoped");
+
+    harness.observer.handleEvent(
+      event({
+        runId: "run-ops",
+        sessionKey: "global",
+        agentId: "ops",
+        stream: "item",
+        data: { kind: "preamble", phase: "update", progressText: "Ops agent work" },
+      }),
+    );
+    await flushObserver();
+
+    expect(harness.broadcastToConnIds).toHaveBeenCalledWith(
+      "session.observer",
+      expect.objectContaining({ agentId: "ops", sessionKey: "global" }),
+      new Set(["conn-scoped", "conn-global"]),
+      expect.objectContaining({
+        agentId: "ops",
+        dropIfSlow: true,
+        sessionKeys: ["agent:ops:global", "global"],
+      }),
+    );
+    harness.observer.dispose();
+  });
+
+  it("resolves an explicit global alias to its agent-scoped companion snapshot", () => {
+    const config = {
+      gateway: { controlUi: { sessionObserver: true } },
+      session: { scope: "global" as const },
+      agents: {
+        defaults: { utilityModel: "openai/gpt-test" },
+        list: [{ id: "main", default: true }, { id: "work" }],
+      },
+    } satisfies OpenClawConfig;
+    const harness = createHarness({ subscribe: false, config });
+    harness.subscribers.subscribe("conn-work", "agent:work:global")?.commit();
+    declareObserverVisibility(harness.observer, "conn-work");
+
+    harness.observer.handleEvent(
+      event({
+        runId: "run-work",
+        sessionKey: "global",
+        agentId: "work",
+        stream: "lifecycle",
+        data: { phase: "start" },
+      }),
+    );
+    harness.observer.handleEvent(
+      event({
+        runId: "run-work",
+        sessionKey: "global",
+        agentId: "work",
+        stream: "tool",
+        data: { phase: "start", name: "read", args: { path: "src/work.ts" } },
+      }),
+    );
+
+    const snapshot = harness.observer.getCompanionSnapshot("agent:work:main");
+    expect(snapshot.agentId).toBe("work");
+    expect(snapshot.runId).toBe("run-work");
+    expect(snapshot.notes).not.toHaveLength(0);
     harness.observer.dispose();
   });
 
@@ -420,49 +548,6 @@ describe("session observer", () => {
     await vi.advanceTimersByTimeAsync(3_000);
     await flushObserver();
     expect(completeModel).toHaveBeenCalledTimes(2);
-    harness.observer.dispose();
-  });
-
-  it("does not start completion after observation ends during model preparation", async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(0);
-    let resolvePreparation: ((value: ReturnType<typeof preparedModel>) => void) | undefined;
-    const prepareModel = vi.fn(
-      () =>
-        new Promise<ReturnType<typeof preparedModel>>((resolve) => {
-          resolvePreparation = resolve;
-        }),
-    );
-    const harness = createHarness({ prepareModel });
-    startAndAddToolNotes(harness.observer);
-    await vi.advanceTimersByTimeAsync(12_000);
-    expect(prepareModel).toHaveBeenCalledOnce();
-
-    harness.subscribers.unsubscribe("conn-1", "agent:main:session-1");
-    resolvePreparation?.(preparedModel());
-    await flushObserver();
-
-    expect(harness.completeModel).not.toHaveBeenCalled();
-    harness.observer.dispose();
-  });
-
-  it("times out stalled model preparation", async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(0);
-    const prepareModel = vi.fn(
-      () =>
-        new Promise<never>(() => {
-          // Intentionally unresolved: the observer timeout owns this test path.
-        }),
-    );
-    const harness = createHarness({ prepareModel });
-    startAndAddToolNotes(harness.observer);
-
-    await vi.advanceTimersByTimeAsync(34_000);
-    await flushObserver();
-
-    expect(prepareModel).toHaveBeenCalledOnce();
-    expect(harness.completeModel).not.toHaveBeenCalled();
     harness.observer.dispose();
   });
 
@@ -958,82 +1043,5 @@ describe("session observer", () => {
     expect(digest?.revision).toBe(storedDigest.revision + 1);
     expect(harness.persistDigest).not.toHaveBeenCalled();
     harness.observer.dispose();
-  });
-});
-
-describe("session observer schema", () => {
-  it("validates protocol digests", () => {
-    expect(
-      Value.Check(SessionObserverDigestSchema, {
-        sessionKey: "agent:main:session-1",
-        runId: "run-1",
-        revision: 1,
-        updatedAt: 1,
-        headline: "Checking the implementation",
-        health: "on-track",
-        planProgress: { completed: 2, total: 4 },
-      }),
-    ).toBe(true);
-    expect(
-      Value.Check(SessionObserverDigestSchema, {
-        sessionKey: "agent:main:session-1",
-        revision: 1,
-        updatedAt: 1,
-        headline: "x".repeat(121),
-        health: "on-track",
-      }),
-    ).toBe(false);
-  });
-
-  it("rejects loose JSON and truncates accepted strings to hard caps", () => {
-    expect(normalizeSessionObserverModelOutput("```json\n{}\n```")).toBeNull();
-    const normalized = normalizeSessionObserverModelOutput(
-      JSON.stringify({
-        headline: "h".repeat(140),
-        assessment: "a".repeat(400),
-        health: "grinding",
-      }),
-    );
-    expect(normalized?.headline).toHaveLength(120);
-    expect(normalized?.assessment).toHaveLength(320);
-  });
-});
-
-describe("session observer run bookkeeping", () => {
-  it("bounds dormant runs and preserves revision continuity for evicted entries", async () => {
-    const { rememberSessionObserverDormantRun } = await import("./session-observer-model.js");
-    const runs = new Map();
-    const floors = new Map();
-    for (let index = 0; index < 300; index += 1) {
-      rememberSessionObserverDormantRun(runs, floors, {
-        sessionKey: `agent:main:session-${index}`,
-        sessionId: `session-${index}`,
-        runId: `run-${index}`,
-        agentId: "main",
-        utilityModelRef: "openai/gpt-test",
-        startedAt: index,
-        lastPersistedAt: undefined,
-        revision: index + 1,
-        digestCount: 1,
-        consecutiveFailures: 0,
-        planProgress: undefined,
-        previousDigest: undefined,
-      });
-    }
-    expect(runs.size).toBe(256);
-    expect(runs.has("run-0")).toBe(false);
-    expect(runs.has("run-299")).toBe(true);
-    expect(floors.get("agent:main:session-0")?.revision).toBe(1);
-  });
-
-  it("bounds disabled-run bookkeeping", async () => {
-    const { rememberSessionObserverDisabledRun } = await import("./session-observer-model.js");
-    const runs = new Set<string>();
-    for (let index = 0; index < 600; index += 1) {
-      rememberSessionObserverDisabledRun(runs, `run-${index}`);
-    }
-    expect(runs.size).toBe(512);
-    expect(runs.has("run-0")).toBe(false);
-    expect(runs.has("run-599")).toBe(true);
   });
 });

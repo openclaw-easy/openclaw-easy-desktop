@@ -61,6 +61,55 @@ function selectSegmented(control: HTMLElement) {
 }
 
 describe("config form renderer", () => {
+  it("conceals core-classified encryption, private-key, and local service env values", () => {
+    const container = document.createElement("div");
+    const analysis = analyzeConfigSchema({
+      type: "object",
+      properties: {
+        encryptKey: { type: "string" },
+        privateKey: { type: "string" },
+        localService: {
+          type: "object",
+          properties: {
+            env: {
+              type: "object",
+              properties: { FOO: { type: "string" } },
+            },
+          },
+        },
+      },
+    });
+
+    render(
+      renderConfigForm({
+        schema: analysis.schema,
+        uiHints: {},
+        unsupportedPaths: analysis.unsupportedPaths,
+        value: {
+          encryptKey: "encrypt-value",
+          privateKey: "private-value",
+          localService: { env: { FOO: "env-value" } },
+        },
+        revealSensitive: false,
+        onPatch: vi.fn(),
+      }),
+      container,
+    );
+
+    for (const label of ["Encrypt Key", "Private Key", "FOO"]) {
+      const input = expectElement(
+        container.querySelector<HTMLInputElement>(`input[aria-label='${label}']`),
+        `${label} input`,
+      );
+      expect(input.readOnly).toBe(true);
+      expect(input.classList.contains("cfg-redacted")).toBe(true);
+      expect(input.value).toBe("");
+    }
+    expect(container.innerHTML).not.toContain("encrypt-value");
+    expect(container.innerHTML).not.toContain("private-value");
+    expect(container.innerHTML).not.toContain("env-value");
+  });
+
   it("renders inputs and patches values", () => {
     const onPatch = vi.fn();
     const container = document.createElement("div");
@@ -264,9 +313,11 @@ describe("config form renderer", () => {
       container,
     );
 
-    const headings = Array.from(container.querySelectorAll(".settings-section__heading")).map(
-      (node) => node.textContent?.trim(),
-    );
+    const headings = Array.from(
+      container.querySelectorAll(
+        ".settings-section > .settings-section__header .settings-section__heading",
+      ),
+    ).map((node) => node.textContent?.trim());
     expect(headings).toEqual(["Auth"]);
     // The subsection object emits its fields directly; no nested details block
     // repeats the subsection title inside the group.
@@ -717,5 +768,128 @@ describe("config form renderer", () => {
     );
     removeButton.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     expect(onPatch).toHaveBeenCalledWith(["accounts"], {});
+  });
+
+  it("shows field help once instead of repeating it on every array item", () => {
+    const container = document.createElement("div");
+    const analysis = analyzeConfigSchema({
+      type: "object",
+      properties: {
+        allowFrom: {
+          type: "array",
+          items: { type: "string" },
+          default: ["+15550000000"],
+        },
+      },
+    });
+    render(
+      renderConfigForm({
+        schema: analysis.schema,
+        // Item paths collapse their numeric segment, so the item rows resolve
+        // this same hint; only the array header should render it.
+        uiHints: { allowFrom: { help: "Sender ids allowed to reach the agent." } },
+        unsupportedPaths: analysis.unsupportedPaths,
+        value: { allowFrom: ["+15550001111", "+15550002222"] },
+        onPatch: vi.fn(),
+      }),
+      container,
+    );
+
+    const help = Array.from(container.querySelectorAll(".settings-row__desc")).filter(
+      (node) => node.textContent?.trim() === "Sender ids allowed to reach the agent.",
+    );
+    expect(help).toHaveLength(1);
+    expect(container.textContent).toContain('Default: ["+15550000000"]');
+  });
+
+  it("does not repeat array header metadata on nested array items", () => {
+    const container = document.createElement("div");
+    const analysis = analyzeConfigSchema({
+      type: "object",
+      properties: {
+        groups: {
+          type: "array",
+          default: [["root-default"]],
+          items: {
+            type: "array",
+            default: ["nested-default"],
+            items: { type: "string" },
+          },
+        },
+      },
+    });
+    render(
+      renderConfigForm({
+        schema: analysis.schema,
+        uiHints: { groups: { help: "Group sender ids." } },
+        unsupportedPaths: analysis.unsupportedPaths,
+        value: { groups: [["first"], ["second"]] },
+        onPatch: vi.fn(),
+      }),
+      container,
+    );
+
+    const descriptions = Array.from(container.querySelectorAll(".settings-row__desc")).map((node) =>
+      node.textContent?.trim(),
+    );
+    expect(descriptions.filter((description) => description === "Group sender ids.")).toHaveLength(
+      1,
+    );
+    expect(
+      descriptions.filter((description) => description === 'Default: [["root-default"]]'),
+    ).toHaveLength(1);
+    expect(descriptions.some((description) => description?.includes("nested-default"))).toBe(false);
+  });
+
+  it("renders section help when the top-level hint has a docs URL", () => {
+    const container = document.createElement("div");
+    render(
+      renderConfigForm({
+        schema: rootAnalysis.schema,
+        uiHints: { gateway: { docsUrl: "https://docs.openclaw.ai/gateway/configuration" } },
+        unsupportedPaths: rootAnalysis.unsupportedPaths,
+        value: {},
+        activeSection: "gateway",
+        onPatch: vi.fn(),
+      }),
+      container,
+    );
+
+    const button = expectElement(
+      container.querySelector<HTMLButtonElement>(".settings-section__help-button"),
+      "section help button",
+    );
+    expect(button.getAttribute("aria-label")).toBe("Help for Gateway");
+    expect(button.querySelector("svg")).not.toBeNull();
+    const tooltip = expectElement(button.closest("openclaw-tooltip"), "section help tooltip");
+    expect((tooltip as HTMLElement & { content: string }).content).toBe("Help for Gateway");
+    const link = expectElement(
+      container.querySelector<HTMLAnchorElement>(".settings-section__help-popover a"),
+      "section guide link",
+    );
+    expect(link.textContent?.trim()).toBe("Learn more");
+    expect(link.classList.contains("learn-more-link")).toBe(true);
+    const popover = expectElement(link.closest("wa-popover"), "section help popover");
+    expect(button.getAttribute("aria-controls")).toBe(popover.id);
+    expect(link.getAttribute("href")).toBe("https://docs.openclaw.ai/gateway/configuration");
+    expect(link.getAttribute("target")).toBe("_blank");
+    expect(link.getAttribute("rel")).toBe("noopener noreferrer");
+  });
+
+  it("omits section help when the top-level hint has no docs URL", () => {
+    const container = document.createElement("div");
+    render(
+      renderConfigForm({
+        schema: rootAnalysis.schema,
+        uiHints: {},
+        unsupportedPaths: rootAnalysis.unsupportedPaths,
+        value: {},
+        activeSection: "gateway",
+        onPatch: vi.fn(),
+      }),
+      container,
+    );
+
+    expect(container.querySelector(".settings-section__help-button")).toBeNull();
   });
 });

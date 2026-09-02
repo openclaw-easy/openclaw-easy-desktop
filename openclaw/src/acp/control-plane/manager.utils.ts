@@ -1,5 +1,3 @@
-/** Shared ACP manager normalization, resolution, and error helpers. */
-import { ACP_ERROR_CODES, AcpRuntimeError } from "@openclaw/acp-core/runtime/errors";
 import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
 import {
   canonicalizeMainSessionAlias,
@@ -13,6 +11,8 @@ import {
   normalizeMainKey,
   parseAgentSessionKey,
 } from "../../routing/session-key.js";
+/** Shared ACP manager normalization, resolution, and error helpers. */
+import { ACP_ERROR_CODES, AcpRuntimeError } from "../runtime/errors.js";
 import type { AcpSessionResolution } from "./manager.types.js";
 
 /** Resolves the agent id encoded in an ACP session key. */
@@ -113,8 +113,6 @@ export function createUnsupportedControlError(params: {
     `ACP backend "${params.backend}" does not support ${params.control}.`,
   );
 }
-
-export const DEFAULT_ACP_RUNTIME_IDLE_TTL_MS = 0;
 
 export function hasLegacyAcpIdentityProjection(meta: SessionAcpMeta): boolean {
   const raw = meta as Record<string, unknown>;

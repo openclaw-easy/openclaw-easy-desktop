@@ -105,7 +105,7 @@ describe("AppSidebar session catalog pagination", () => {
       });
       provider.setContext(createContext(currentGateway.gateway, sessions));
       await sidebar.updateComplete;
-      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(50);
 
       legacyFallback.resolve(catalogPage([]));
       await vi.advanceTimersByTimeAsync(0);
@@ -122,51 +122,13 @@ describe("AppSidebar session catalog pagination", () => {
     }
   });
 
-  it("opens a catalog-targeted draft from its new-session action", async () => {
-    const gateway = createGateway({} as GatewayBrowserClient);
-    const { sidebar } = await mountSidebar(
-      gateway,
-      createSessions("research", ["agent:research:main"]),
-      "panel",
-      {
-        defaultId: "main",
-        mainKey: "agent:main:main",
-        scope: "global",
-        agents: [
-          { id: "main", name: "Main" },
-          { id: "research", name: "Research" },
-        ],
-      },
-    );
-    const onOpenNewSession = vi.fn();
-    sidebar.connected = true;
-    sidebar.onOpenNewSession = onOpenNewSession;
-    sidebar.sessionData.sessionCatalogs = [
-      {
-        id: "claude",
-        label: "Claude Code",
-        capabilities: {
-          continueSession: true,
-          archive: false,
-          createSession: { model: "anthropic/claude-opus-4-8" },
-        },
-        hosts: [],
-      },
-    ];
-    sidebar.sessionData.requestSessionDataUpdate();
-    await sidebar.updateComplete;
-
-    const button = sidebar.querySelector<HTMLButtonElement>(".sidebar-session-catalog-new");
-    expect(button?.getAttribute("aria-label")).toBe("New thread — Claude Code");
-    button?.click();
-
-    expect(onOpenNewSession).toHaveBeenCalledWith("research", { catalogId: "claude" });
-  });
-
   it.each([
-    { id: "claude", label: "Claude Code" },
-    { id: "codex", label: "Codex" },
-  ])("groups $label catalog rows by their owning host", async ({ id, label }) => {
+    { id: "claude", label: "Claude Code", branded: true },
+    { id: "codex", label: "Codex", branded: true },
+    { id: "opencode", label: "OpenCode", branded: true },
+    { id: "pi", label: "Pi", branded: true },
+    { id: "custom", label: "Custom", branded: false },
+  ])("groups $label catalog rows by their owning host", async ({ id, label, branded }) => {
     const gateway = createGateway({} as GatewayBrowserClient);
     const { sidebar } = await mountSidebar(gateway, createSessions("main", ["agent:main:main"]));
     sidebar.sessionData.sessionCatalogs = [
@@ -225,6 +187,10 @@ describe("AppSidebar session catalog pagination", () => {
     await sidebar.updateComplete;
 
     const section = sidebar.querySelector(`[data-session-section="catalog:${id}"]`);
+    const lead = section?.querySelector(".sidebar-session-group-toggle__lead");
+    expect(lead?.querySelector(".sidebar-session-group-toggle__icon")).not.toBeNull();
+    const providerIcon = lead?.querySelector(".sidebar-session-catalog-provider-icon");
+    expect(providerIcon?.getAttribute("data-provider-icon")).toBe(branded ? id : undefined);
     const hostGroups = section?.querySelectorAll<HTMLElement>("[data-session-catalog-host]");
     expect(Array.from(hostGroups ?? []).map((host) => host.dataset.sessionCatalogHost)).toEqual([
       "gateway:local",
@@ -265,6 +231,7 @@ describe("AppSidebar session catalog pagination", () => {
         ],
       },
     );
+    sidebar.connected = true;
     sidebar.sessionData.sessionCatalogs = [
       {
         id: "claude",
@@ -295,11 +262,12 @@ describe("AppSidebar session catalog pagination", () => {
     const backingRows = (sidebar.sessionData.sessionsResult?.sessions ?? []).map((row) =>
       row.key === backingSessionKey ? Object.assign({}, row, { unread: true }) : row,
     );
-    sidebar.sessionData.sessionsResult = {
+    const backingResult = {
       ...sidebar.sessionData.sessionsResult!,
       sessions: backingRows,
     };
-    sidebar.sessionData.sessionRowsByAgent = { main: backingRows };
+    sidebar.sessionData.sessionsResult = backingResult;
+    sidebar.sessionData.sessionResultsByAgent = { main: backingResult };
     sidebar.sessionData.requestSessionDataUpdate();
     await sidebar.updateComplete;
 
@@ -347,11 +315,12 @@ describe("AppSidebar session catalog pagination", () => {
         ? Object.assign({}, row, { unread: false, hasActiveRun: true })
         : row,
     );
-    sidebar.sessionData.sessionsResult = {
+    const runningResult = {
       ...sidebar.sessionData.sessionsResult,
       sessions: runningRows,
     };
-    sidebar.sessionData.sessionRowsByAgent = { main: runningRows };
+    sidebar.sessionData.sessionsResult = runningResult;
+    sidebar.sessionData.sessionResultsByAgent = { main: runningResult };
     sidebar.sessionData.requestSessionDataUpdate();
     await sidebar.updateComplete;
 
@@ -692,7 +661,7 @@ describe("AppSidebar session catalog pagination", () => {
     }
   });
 
-  it("refreshes immediately when paired-node presence changes", async () => {
+  it("coalesces a presence and focus burst into one catalog refresh", async () => {
     vi.useFakeTimers();
     try {
       const request = vi.fn().mockResolvedValue(catalogPage([]));
@@ -713,13 +682,13 @@ describe("AppSidebar session catalog pagination", () => {
       gateway.publishEvent("presence", {
         presence: [{ deviceId: "node-1", mode: "node", reason: "connect" }],
       });
+      globalThis.dispatchEvent(new Event("focus"));
+      await vi.advanceTimersByTimeAsync(49);
+      expect(request).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(1);
       expect(request).toHaveBeenCalledTimes(2);
-
-      gateway.publishEvent("presence", {
-        presence: [{ deviceId: "node-1", mode: "node", reason: "disconnect" }],
-      });
       await vi.advanceTimersByTimeAsync(0);
-      expect(request).toHaveBeenCalledTimes(3);
+      expect(request).toHaveBeenCalledTimes(2);
     } finally {
       vi.useRealTimers();
     }

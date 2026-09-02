@@ -9,11 +9,12 @@ import type {
   LobsterRunOutcome,
 } from "./lobster-pet-contract.ts";
 import {
-  LOBSTER_PET_PALETTES,
+  canonicalLobsterLook,
   lobsterPetName,
   mulberry32,
   SPOT_ZONES,
 } from "./lobster-pet-look.ts";
+import { LOBSTER_PET_PALETTES } from "./lobster-pet-palettes.ts";
 
 export { SPOT_ZONES };
 
@@ -178,13 +179,13 @@ export const BAR_ZONE = [18, 50] as const;
 export const BAR_MAX_SCALE = 1.7;
 
 // Visit cadence: seeded per load, the pet is a guest, not a fixture. A share
-// of loads gets no visit at all; the rest get a first arrival within minutes,
+// of loads gets no visit at all; the rest get a delayed first arrival,
 // stays of a few minutes, and long gaps between returns. Disconnects summon
 // the pet regardless of schedule (unless dismissed or disabled).
-export const VISIT_SHY_CHANCE = 0.25;
-export const VISIT_FIRST_DELAY_MS = [15_000, 180_000] as const;
+export const VISIT_SHY_CHANCE = 0.5;
+export const VISIT_FIRST_DELAY_MS = [120_000, 600_000] as const;
 export const VISIT_STAY_MS = [90_000, 300_000] as const;
-export const VISIT_GAP_MS = [360_000, 1_080_000] as const;
+export const VISIT_GAP_MS = [1_800_000, 3_600_000] as const;
 
 // Rare-event loads, planned per seed so tests can probe them purely: a molt
 // load sheds its shell during the first idle act and sizes up one tier; a
@@ -260,8 +261,8 @@ export type LobsterLoadIdentity = {
 };
 
 // Rare per-load identities, resolved on top of the seeded look: the Elder
-// outranks an old-friend return, and retro looks (grail or anniversary dress
-// code) are never repainted. Lobsterdex completion is snapshotted here too,
+// outranks an old-friend return, and retro-geometry looks (grail or anniversary
+// dress code) are never repainted. Lobsterdex completion is snapshotted here too,
 // so the golden ledge trim appears between loads, never mid-visit.
 export function resolveLobsterLoadIdentity(
   seed: number,
@@ -291,7 +292,7 @@ export function resolveLobsterLoadIdentity(
       },
     };
   }
-  if (look.palette.id === "retro") {
+  if (look.palette.id === "retro" || look.palette.id === "goldenretro") {
     return base;
   }
   const known = [...seen]
@@ -308,7 +309,11 @@ export function resolveLobsterLoadIdentity(
     ...base,
     oldFriend: true,
     friendName: getLobsterdexEntries().get(palette.id)?.name ?? null,
-    look: { ...look, palette },
+    look: {
+      ...look,
+      palette,
+      chimeraParts: palette.id === "chimera" ? canonicalLobsterLook(palette).chimeraParts : null,
+    },
   };
 }
 
@@ -330,7 +335,7 @@ export const LOBSTER_BOTTLE_FORTUNES = [
   "somewhere, a test is green because of you",
   "swim sideways when forward fails",
   "the reef remembers kind commits",
-  "even the abyss keeps a night light",
+  "even the deep keeps a night light",
   "barnacles are only patient passengers",
   "no current lasts forever",
   "bury your treasure in version control",

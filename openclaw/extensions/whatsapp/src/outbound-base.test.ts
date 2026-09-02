@@ -30,25 +30,12 @@ function sendMessageOptionsAt(
 }
 
 describe("createWhatsAppOutboundBase", () => {
-  it("exposes the provided chunker", () => {
-    const outbound = createWhatsAppOutboundBase({
-      chunker: (text, limit) => [text.slice(0, limit)],
-      sendMessageWhatsApp: vi.fn(),
-      sendPollWhatsApp: vi.fn(),
-      shouldLogVerbose: () => false,
-      resolveTarget: ({ to }) => ({ ok: true as const, to: to ?? "" }),
-    });
-
-    expect(outbound.chunker?.("alpha beta", 5)).toEqual(["alpha"]);
-  });
-
   it("forwards mediaLocalRoots to sendMessageWhatsApp", async () => {
     const sendMessageWhatsApp = vi.fn(async () => ({
       messageId: "msg-1",
       toJid: "15551234567@s.whatsapp.net",
     }));
     const outbound = createWhatsAppOutboundBase({
-      chunker: (text) => [text],
       sendMessageWhatsApp,
       sendPollWhatsApp: vi.fn(),
       shouldLogVerbose: () => false,
@@ -83,7 +70,6 @@ describe("createWhatsAppOutboundBase", () => {
       toJid: "15551234567@s.whatsapp.net",
     }));
     const outbound = createWhatsAppOutboundBase({
-      chunker: (text) => [text],
       sendMessageWhatsApp,
       sendPollWhatsApp: vi.fn(),
       shouldLogVerbose: () => false,
@@ -118,7 +104,6 @@ describe("createWhatsAppOutboundBase", () => {
       };
     });
     const outbound = createWhatsAppOutboundBase({
-      chunker: (text) => [text],
       sendMessageWhatsApp,
       sendPollWhatsApp: vi.fn(),
       shouldLogVerbose: () => false,
@@ -151,7 +136,6 @@ describe("createWhatsAppOutboundBase", () => {
       toJid: "15551234567@s.whatsapp.net",
     }));
     const outbound = createWhatsAppOutboundBase({
-      chunker: (text) => [text],
       sendMessageWhatsApp,
       sendPollWhatsApp: vi.fn(),
       shouldLogVerbose: () => false,
@@ -196,7 +180,6 @@ describe("createWhatsAppOutboundBase", () => {
       toJid: "15551234567@s.whatsapp.net",
     }));
     const outbound = createWhatsAppOutboundBase({
-      chunker: (text) => [text],
       sendMessageWhatsApp,
       sendPollWhatsApp: vi.fn(),
       shouldLogVerbose: () => false,
@@ -240,7 +223,6 @@ describe("createWhatsAppOutboundBase", () => {
       toJid: "15551234567@s.whatsapp.net",
     }));
     const outbound = createWhatsAppOutboundBase({
-      chunker: (text) => [text],
       sendMessageWhatsApp,
       sendPollWhatsApp: vi.fn(),
       shouldLogVerbose: () => false,
@@ -285,7 +267,6 @@ describe("createWhatsAppOutboundBase", () => {
       toJid: "15551234567@s.whatsapp.net",
     }));
     const outbound = createWhatsAppOutboundBase({
-      chunker: (text) => [text],
       sendMessageWhatsApp,
       sendPollWhatsApp: vi.fn(),
       shouldLogVerbose: () => false,
@@ -330,7 +311,6 @@ describe("createWhatsAppOutboundBase", () => {
       toJid: "5511976136970@s.whatsapp.net",
     }));
     const outbound = createWhatsAppOutboundBase({
-      chunker: (text) => [text],
       sendMessageWhatsApp,
       sendPollWhatsApp: vi.fn(),
       shouldLogVerbose: () => false,
@@ -365,6 +345,7 @@ describe("createWhatsAppOutboundBase", () => {
       remoteJid: "277038292303944@lid",
       fromMe: true,
       participant: "5511976136970@s.whatsapp.net",
+      lookupTargetJid: "5511976136970@s.whatsapp.net",
       messageText: "quoted from lid chat",
     });
   });
@@ -379,7 +360,6 @@ describe("createWhatsAppOutboundBase", () => {
       toJid: "15551234567@s.whatsapp.net",
     }));
     const outbound = createWhatsAppOutboundBase({
-      chunker: (text) => [text],
       sendMessageWhatsApp,
       sendPollWhatsApp: vi.fn(),
       shouldLogVerbose: () => false,
@@ -426,7 +406,6 @@ describe("createWhatsAppOutboundBase", () => {
       toJid: "5511976136970@s.whatsapp.net",
     }));
     const outbound = createWhatsAppOutboundBase({
-      chunker: (text) => [text],
       sendMessageWhatsApp,
       sendPollWhatsApp: vi.fn(),
       shouldLogVerbose: () => false,
@@ -482,7 +461,6 @@ describe("createWhatsAppOutboundBase", () => {
       toJid: to,
     }));
     const outbound = createWhatsAppOutboundBase({
-      chunker: (text) => [text],
       sendMessageWhatsApp,
       sendPollWhatsApp: vi.fn(),
       shouldLogVerbose: () => false,
@@ -544,7 +522,6 @@ describe("createWhatsAppOutboundBase", () => {
       toJid: "15551234567@s.whatsapp.net",
     }));
     const outbound = createWhatsAppOutboundBase({
-      chunker: (text) => [text],
       sendMessageWhatsApp,
       sendPollWhatsApp: vi.fn(),
       shouldLogVerbose: () => false,
@@ -579,7 +556,6 @@ describe("createWhatsAppOutboundBase", () => {
       toJid: "15551234567@s.whatsapp.net",
     }));
     const outbound = createWhatsAppOutboundBase({
-      chunker: (text) => [text],
       sendMessageWhatsApp,
       sendPollWhatsApp: vi.fn(),
       shouldLogVerbose: () => false,
@@ -620,7 +596,6 @@ describe("createWhatsAppOutboundBase", () => {
       toJid: "15551234567@s.whatsapp.net",
     }));
     const outbound = createWhatsAppOutboundBase({
-      chunker: (text) => [text],
       sendMessageWhatsApp,
       sendPollWhatsApp: vi.fn(),
       shouldLogVerbose: () => false,
@@ -655,7 +630,6 @@ describe("createWhatsAppOutboundBase", () => {
       toJid: "15551234567@s.whatsapp.net",
     }));
     const outbound = createWhatsAppOutboundBase({
-      chunker: (text) => [text],
       sendMessageWhatsApp,
       sendPollWhatsApp: vi.fn(),
       shouldLogVerbose: () => false,
@@ -688,7 +662,6 @@ describe("createWhatsAppOutboundBase", () => {
       toJid: "15551234567@s.whatsapp.net",
     }));
     const outbound = createWhatsAppOutboundBase({
-      chunker: (text) => [text],
       sendMessageWhatsApp,
       sendPollWhatsApp: vi.fn(),
       shouldLogVerbose: () => false,
@@ -717,7 +690,6 @@ describe("createWhatsAppOutboundBase", () => {
       toJid: "1555@s.whatsapp.net",
     }));
     const outbound = createWhatsAppOutboundBase({
-      chunker: (text) => [text],
       sendMessageWhatsApp: vi.fn(),
       sendPollWhatsApp,
       shouldLogVerbose: () => false,

@@ -5,30 +5,22 @@ import { resetConfiguredBindingTargetInPlace } from "../../channels/plugins/bind
 import { updateSessionEntry } from "../../config/sessions/session-accessor.js";
 import { logVerbose } from "../../globals.js";
 import { isAcpSessionKey } from "../../routing/session-key.js";
+import { isResetAuthorizedForContext } from "../command-auth.js";
+import { applyCommandTextToContext } from "./command-context-rewrite.js";
 import { resolveBoundAcpThreadSessionKey } from "./commands-acp/targets.js";
 import { emitResetCommandHooks, type ResetCommandAction } from "./commands-reset-hooks.js";
 import { parseSoftResetCommand } from "./commands-reset-mode.js";
 import type { CommandHandlerResult, HandleCommandsParams } from "./commands-types.js";
 import type { ReplySessionBinding } from "./get-reply.types.js";
-import { isResetAuthorizedForContext } from "./reset-authorization.js";
 
 type InternalResetCommandOptions = NonNullable<HandleCommandsParams["opts"]> & {
   onSessionPrepared?: (binding: ReplySessionBinding) => void;
 };
 
 function applyAcpResetTailContext(ctx: HandleCommandsParams["ctx"], resetTail: string): void {
-  const mutableCtx = ctx as Record<string, unknown>;
-  mutableCtx.commandText = resetTail;
-  mutableCtx.agentText = resetTail;
-  mutableCtx.rawText = resetTail;
-  mutableCtx.Body = resetTail;
-  mutableCtx.RawBody = resetTail;
-  mutableCtx.CommandBody = resetTail;
-  mutableCtx.BodyForCommands = resetTail;
-  mutableCtx.BodyForAgent = resetTail;
-  mutableCtx.BodyStripped = resetTail;
+  applyCommandTextToContext(ctx, resetTail);
   // Mark the context so ACP dispatch continues with the post-reset tail, not the reset command.
-  mutableCtx.AcpDispatchTailAfterReset = true;
+  ctx.AcpDispatchTailAfterReset = true;
 }
 
 function isResetAuthorized(params: HandleCommandsParams): boolean {
@@ -106,6 +98,7 @@ export async function maybeHandleResetCommand(
 
     await emitResetCommandHooks({
       action: "reset",
+      agentId: params.agentId,
       ctx: params.ctx,
       cfg: params.cfg,
       command: params.command,
@@ -113,6 +106,9 @@ export async function maybeHandleResetCommand(
       storePath: params.storePath,
       sessionEntry: targetSessionEntry,
       previousSessionEntry,
+      previousSessionMemory: params.previousSessionMemory,
+      previousSessionResetMessages: params.previousSessionResetMessages,
+      onObservedReplyDelivery: params.opts?.onObservedReplyDelivery,
       workspaceDir: params.workspaceDir,
     });
     params.command.softResetTriggered = true;
@@ -180,6 +176,7 @@ export async function maybeHandleResetCommand(
 
   const hookResult = await emitResetCommandHooks({
     action: commandAction,
+    agentId: params.agentId,
     ctx: params.ctx,
     cfg: params.cfg,
     command: params.command,
@@ -187,6 +184,9 @@ export async function maybeHandleResetCommand(
     storePath: params.storePath,
     sessionEntry: targetSessionEntry,
     previousSessionEntry: params.previousSessionEntry,
+    previousSessionMemory: params.previousSessionMemory,
+    previousSessionResetMessages: params.previousSessionResetMessages,
+    onObservedReplyDelivery: params.opts?.onObservedReplyDelivery,
     workspaceDir: params.workspaceDir,
   });
   if (!resetTail) {

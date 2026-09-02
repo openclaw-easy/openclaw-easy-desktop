@@ -1,4 +1,6 @@
+import type { CompactionAccountingFact } from "../../agents/embedded-agent-runner/run/internal-params.js";
 import type { runEmbeddedAgent } from "../../agents/embedded-agent.js";
+import type { FailoverReason } from "../../agents/failover/signal.js";
 import type { SessionEntry } from "../../config/sessions.js";
 import type { TemplateContext } from "../templating.js";
 import type { VerboseLevel } from "../thinking.js";
@@ -15,17 +17,29 @@ export type RuntimeFallbackAttempt = {
   provider: string;
   model: string;
   error: string;
-  reason?: string;
+  reason: FailoverReason;
   status?: number;
   code?: string;
 };
 
-/** Result of running an agent turn through fallback/retry handling. */
-export type AgentRunLoopResult =
+/** Presentation counts include target-less events; only captured durable facts may be persisted. */
+export type AgentTurnCompaction = {
+  count: number;
+  durable: Array<Extract<CompactionAccountingFact, { kind: "durable" }>>;
+};
+
+type AbortedAgentTurn = {
+  kind: "aborted";
+  reason: "user" | "restart" | "superseded";
+  compaction?: AgentTurnCompaction;
+};
+
+/** Internal fallback-cycle result before caller-facing settlement projection. */
+export type AgentTurnInternalResult =
+  | AbortedAgentTurn
   | {
-      kind: "success";
-      runId: string;
-      runResult: Awaited<ReturnType<typeof runEmbeddedAgent>>;
+      kind: "completed";
+      result: Awaited<ReturnType<typeof runEmbeddedAgent>>;
       fallbackProvider?: string;
       fallbackModel?: string;
       fallbackExhausted?: true;
@@ -38,8 +52,55 @@ export type AgentRunLoopResult =
       directlySentBlockPayloads?: ReplyPayload[];
       /** Prepared terminal failure, appended only after delivery evidence settles. */
       terminalFailurePayload?: ReplyPayload;
+      postCompactionModelFailure?: true;
     }
-  | { kind: "final"; payload: ReplyPayload };
+  | {
+      kind: "final";
+      payload: ReplyPayload;
+      resolved?: { provider: string; model: string };
+      postCompactionModelFailure?: true;
+    };
+
+type SettledAgentTurnBase = {
+  kind: "settled";
+  result: Awaited<ReturnType<typeof runEmbeddedAgent>>;
+  resolved: { provider: string; model: string };
+  fallback: { exhausted: boolean; attempts: RuntimeFallbackAttempt[] };
+  autoCompactionCount: number;
+  compaction?: AgentTurnCompaction;
+  didLogHeartbeatStrip: boolean;
+  directlySentBlockKeys?: Set<string>;
+  directlySentBlockPayloads?: ReplyPayload[];
+};
+
+export type SettledAgentTurn = SettledAgentTurnBase &
+  (
+    | {
+        status: "ok";
+        terminalFailurePayload?: never;
+        postCompactionModelFailure?: never;
+      }
+    | {
+        status: "failed";
+        terminalFailurePayload: ReplyPayload;
+        postCompactionModelFailure?: true;
+      }
+  );
+
+/** Closed result shared by foreground and queued agent-turn callers. */
+export type AgentTurnExecutionResult = {
+  runId: string;
+  outcome:
+    | SettledAgentTurn
+    | AbortedAgentTurn
+    | {
+        kind: "rejected";
+        compaction?: AgentTurnCompaction;
+        payload: ReplyPayload;
+        resolved?: { provider: string; model: string };
+        postCompactionModelFailure?: true;
+      };
+};
 
 /** Inputs shared by direct and queued agent-turn execution. */
 export type AgentTurnParams = {
@@ -50,6 +111,7 @@ export type AgentTurnParams = {
   replyThreading?: TemplateContext["ReplyThreading"];
   replyOperation?: ReplyOperation;
   opts?: InternalGetReplyOptions;
+  resolveVisibleReplyDelivery?: () => Promise<boolean>;
   typingSignals: TypingSignaler;
   blockReplyPipeline: BlockReplyPipeline | null;
   blockStreamingEnabled: boolean;

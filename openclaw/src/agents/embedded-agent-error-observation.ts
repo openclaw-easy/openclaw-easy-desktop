@@ -1,3 +1,4 @@
+import { stableStringify } from "@openclaw/normalization-core";
 /**
  * Builds structured observations for embedded-agent API/text failures.
  */
@@ -12,7 +13,6 @@ import {
   parseApiErrorInfo,
   type ProviderRuntimeFailureKind,
 } from "./embedded-agent-helpers.js";
-import { stableStringify } from "./stable-stringify.js";
 
 const MAX_OBSERVATION_INPUT_CHARS = 64_000;
 const MAX_FINGERPRINT_MESSAGE_CHARS = 8_000;
@@ -162,11 +162,14 @@ export function buildApiErrorObservationFields(
         ? redactIdentifier(rawFingerprint, { len: 12 })
         : undefined,
       httpCode: parsed?.httpCode,
-      providerRuntimeFailureKind: classifyProviderRuntimeFailureKind({
-        status: parsed?.httpCode ? Number(parsed.httpCode) : undefined,
-        message: trimmed,
-        provider: opts?.provider,
-      }),
+      providerRuntimeFailureKind: classifyProviderRuntimeFailureKind(
+        {
+          status: parsed?.httpCode ? Number(parsed.httpCode) : undefined,
+          message: trimmed,
+          provider: opts?.provider,
+        },
+        { providerPlugin: null },
+      ),
       providerErrorType: parsed?.type,
       providerErrorMessagePreview: truncateForObservation(
         redactedProviderMessage,

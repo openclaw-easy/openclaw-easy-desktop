@@ -10,29 +10,55 @@ import {
 } from "./doctor-health-contribution-utils.js";
 import type { HealthCheckContext, HealthFinding } from "./health-checks.js";
 
-function isTruthyEnvValue(value: string | undefined): boolean {
+function isExplicitOptOutEnvValue(value: string | undefined): boolean {
   if (!value) {
     return false;
   }
+  // Update handoff predates canonical opt-in flags: every non-false value means the
+  // parent opted in, so preserve its broad acceptance until that protocol is retired.
   const normalized = value.trim().toLowerCase();
   return normalized !== "" && normalized !== "0" && normalized !== "false" && normalized !== "no";
 }
 
 function shouldSkipLegacyUpdateDoctorConfigWrite(env: NodeJS.ProcessEnv): boolean {
   return (
-    isTruthyEnvValue(env.OPENCLAW_UPDATE_IN_PROGRESS) &&
-    !isTruthyEnvValue(env[UPDATE_PARENT_SUPPORTS_DOCTOR_CONFIG_WRITE_ENV])
+    isExplicitOptOutEnvValue(env.OPENCLAW_UPDATE_IN_PROGRESS) &&
+    !isExplicitOptOutEnvValue(env[UPDATE_PARENT_SUPPORTS_DOCTOR_CONFIG_WRITE_ENV])
   );
 }
 
-export async function runWriteConfigHealth(ctx: DoctorHealthFlowContext): Promise<void> {
+/** Removes queued retired profiles after any config references have been durably repaired. */
+export async function runRetiredAuthProfileCleanup(ctx: DoctorHealthFlowContext): Promise<void> {
+  const retiredAuthProfileCleanupPlans = ctx.configResult.retiredAuthProfileCleanupPlans;
+  if (!retiredAuthProfileCleanupPlans?.length) {
+    return;
+  }
+  const { removeAuthProfilesAcrossOwnerStores } = await import("../agents/auth-profiles.js");
+  for (const plan of retiredAuthProfileCleanupPlans) {
+    if (!(await removeAuthProfilesAcrossOwnerStores(plan))) {
+      throw new Error(`Failed to remove retired auth profile "${plan.profileIds.join(", ")}".`);
+    }
+  }
+  delete ctx.configResult.retiredAuthProfileCleanupPlans;
+}
+
+export async function runWriteConfigHealth(
+  ctx: DoctorHealthFlowContext,
+  options: { runPostWriteRepairs?: boolean } = {},
+): Promise<void> {
+  if (ctx.configWriteRefusal) {
+    // The initial write already reported the refusal; retrying the
+    // same candidate would fail identically and duplicate the warning.
+    return;
+  }
   const { applyWizardMetadata } = await import("../commands/onboard-helpers.js");
   const { replaceConfigFile } = await import("../config/config.js");
   const { logConfigUpdated } = await import("../config/logging.js");
   const { shortenHomePath } = await import("../utils.js");
+  const configResultWritePending =
+    ctx.configResult.shouldWriteConfig === true && ctx.configResultWriteCommitted !== true;
   const shouldWriteConfig =
-    ctx.configResult.shouldWriteConfig ||
-    JSON.stringify(ctx.cfg) !== JSON.stringify(ctx.cfgForPersistence);
+    configResultWritePending || JSON.stringify(ctx.cfg) !== JSON.stringify(ctx.cfgForPersistence);
   if (shouldWriteConfig) {
     const updateDoctorRun = isUpdateDoctorRun(ctx.env ?? process.env);
     if (ctx.configResult.skipWizardMetadataForIncludeWrite !== true) {
@@ -47,20 +73,83 @@ export async function runWriteConfigHealth(ctx: DoctorHealthFlowContext): Promis
     }
     const legacyParentVersionOverride =
       resolveLegacyParentVersionOverride(ctx).lastTouchedVersionOverride;
-    await replaceConfigFile({
-      nextConfig: ctx.cfg,
-      afterWrite: { mode: "auto" },
-      writeOptions: {
-        auditOrigin: "doctor",
-        allowConfigSizeDrop: ctx.configResult.shouldWriteConfig === true || updateDoctorRun,
-        skipPluginValidation:
-          ctx.configResult.skipPluginValidationOnWrite === true || updateDoctorRun,
-        preservedLegacyRootKeys: ctx.configResult.preservedLegacyRootKeys,
-        ...(legacyParentVersionOverride
-          ? { lastTouchedVersionOverride: legacyParentVersionOverride }
-          : {}),
-      },
-    });
+    try {
+      await replaceConfigFile({
+        nextConfig: ctx.cfg,
+        afterWrite: { mode: "auto" },
+        writeOptions: {
+          auditOrigin: "doctor",
+          allowConfigSizeDrop: ctx.configResult.shouldWriteConfig === true || updateDoctorRun,
+          skipPluginValidation:
+            ctx.configResult.skipPluginValidationOnWrite === true || updateDoctorRun,
+          ...(ctx.configResult.explicitSetPaths
+            ? { explicitSetPaths: ctx.configResult.explicitSetPaths }
+            : {}),
+          preservedLegacyRootKeys: ctx.configResult.preservedLegacyRootKeys,
+          ...(legacyParentVersionOverride
+            ? { lastTouchedVersionOverride: legacyParentVersionOverride }
+            : {}),
+        },
+      });
+    } catch (error) {
+      const { isConfigValidationFailedError } = await import("../config/io.write-errors.js");
+      if (isConfigValidationFailedError(error)) {
+        // This refused write persisted nothing. Queued "Doctor changes" panels stay
+        // unprinted: reporting them would claim repairs that never reached disk.
+        // An earlier pass through this shared runner may have already committed, so
+        // describe only the pending write as unpersisted, never the whole run.
+        const { note } = await import("../../packages/terminal-core/src/note.js");
+        const { formatConfigIssueLines } = await import("../config/issue-format.js");
+        const issueLines = Array.isArray(error.issues)
+          ? formatConfigIssueLines(error.issues, "-", { normalizeRoot: true })
+          : [error.message];
+        const unpersistedLine =
+          ctx.configResultWriteCommitted === true
+            ? "Earlier config fixes were already saved; the remaining changes were not written."
+            : "No config changes were written.";
+        note(
+          [
+            "Doctor could not apply config fixes: the repaired config still fails validation.",
+            ...issueLines,
+            `${unpersistedLine} Fix the value(s) above in ${shortenHomePath(ctx.configPath)} by hand, then rerun "openclaw doctor --fix".`,
+          ].join("\n"),
+          "Doctor warnings",
+        );
+        ctx.configWriteRefusal = "validation";
+        return;
+      }
+      const { isCronOwnerWriteRefusalError } = await import("../config/io.cron-owner-refusal.js");
+      if (!isCronOwnerWriteRefusalError(error)) {
+        throw error;
+      }
+      const { note } = await import("../../packages/terminal-core/src/note.js");
+      note(
+        [
+          error.message,
+          "Doctor left the config unchanged, preserving any retained legacy owner for a later repair.",
+          'Resolve the reported Gateway or cron-store condition, then rerun "openclaw doctor --fix".',
+        ].join("\n"),
+        "Doctor warnings",
+      );
+      ctx.configWriteRefusal = "cron-owner-safety";
+      return;
+    }
+    // The atomic write committed: repair panels queued by the config flow are now
+    // true statements about disk state, so print them exactly once.
+    const pendingChangePanels = ctx.configResult.pendingChangePanels;
+    if (pendingChangePanels?.length) {
+      const { note } = await import("../../packages/terminal-core/src/note.js");
+      for (const panel of pendingChangePanels) {
+        note(panel, "Doctor changes");
+      }
+      delete ctx.configResult.pendingChangePanels;
+    }
+    // The final writer runs again after health repairs. Advance its baseline only
+    // after the atomic write succeeds so later failures cannot mark volatile state durable.
+    ctx.cfgForPersistence = structuredClone(ctx.cfg);
+    if (ctx.configResult.shouldWriteConfig === true) {
+      ctx.configResultWriteCommitted = true;
+    }
     // logConfigUpdated already prints the `.bak` backup line when it exists.
     logConfigUpdated(ctx.runtime);
     const preUpdateSnapshotPath = `${ctx.configPath}.pre-update`;
@@ -70,7 +159,26 @@ export async function runWriteConfigHealth(ctx: DoctorHealthFlowContext): Promis
       );
     }
   }
-  if (ctx.configResult.shouldRepairCronCodexModelRefsAfterConfigWrite !== true) {
+  if (options.runPostWriteRepairs === false) {
+    return;
+  }
+  await runRetiredAuthProfileCleanup(ctx);
+  if (ctx.configResult.retiredPhoneControlStateCleanupPending === true) {
+    const { finalizeRetiredPhoneControlCleanup } =
+      await import("../commands/doctor-retired-phone-control.js");
+    const { note } = await import("../../packages/terminal-core/src/note.js");
+    const cleanup = await finalizeRetiredPhoneControlCleanup({ env: ctx.env ?? process.env });
+    if (cleanup.changes.length > 0) {
+      note(cleanup.changes.join("\n"), "Doctor changes");
+    }
+    if (cleanup.warnings.length > 0) {
+      note(cleanup.warnings.join("\n"), "Doctor warnings");
+    }
+  }
+  if (
+    ctx.configResult.shouldRepairCronCodexModelRefsAfterConfigWrite !== true ||
+    ctx.postConfigWriteRepairsCommitted === true
+  ) {
     return;
   }
   // The config write above must finish before cron rows are rewritten against
@@ -83,6 +191,7 @@ export async function runWriteConfigHealth(ctx: DoctorHealthFlowContext): Promis
       ? { blockedModelIdentities: new Set(ctx.configResult.blockedCodexModelIdentities) }
       : {}),
   });
+  ctx.postConfigWriteRepairsCommitted = true;
   const { note } = await import("../../packages/terminal-core/src/note.js");
   if (result.changes.length > 0) {
     note(result.changes.join("\n"), "Doctor changes");
@@ -90,6 +199,14 @@ export async function runWriteConfigHealth(ctx: DoctorHealthFlowContext): Promis
   if (result.warnings.length > 0) {
     note(result.warnings.join("\n"), "Doctor warnings");
   }
+}
+
+/** Commits the finalized config-flow candidate before fallible health diagnostics start. */
+export async function runInitialConfigWriteHealth(ctx: DoctorHealthFlowContext): Promise<void> {
+  if (ctx.configResult.shouldWriteConfig !== true) {
+    return;
+  }
+  await runWriteConfigHealth(ctx, { runPostWriteRepairs: false });
 }
 
 export async function collectWriteConfigHealthFindings(

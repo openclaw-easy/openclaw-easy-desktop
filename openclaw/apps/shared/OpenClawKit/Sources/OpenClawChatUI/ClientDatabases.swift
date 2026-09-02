@@ -198,6 +198,12 @@ public final class OpenClawClientDatabases: @unchecked Sendable {
                 arguments: [gatewayID])
         }
         try self.cacheQueue.write { db in
+            try db.execute(
+                sql: "DELETE FROM cached_agent_sessions WHERE gateway_id = ?",
+                arguments: [gatewayID])
+            try db.execute(
+                sql: "DELETE FROM cached_session_rosters WHERE gateway_id = ?",
+                arguments: [gatewayID])
             try db.execute(sql: "DELETE FROM cached_sessions WHERE gateway_id = ?", arguments: [gatewayID])
             try db.execute(sql: "DELETE FROM cached_transcripts WHERE gateway_id = ?", arguments: [gatewayID])
         }
@@ -483,6 +489,7 @@ extension OpenClawClientDatabases {
                 FOREIGN KEY(gateway_id, command_id)
                     REFERENCES outbox_commands(gateway_id, client_uuid)
                     ON DELETE CASCADE
+                    ON UPDATE CASCADE
             );
             """)
         }
@@ -532,6 +539,32 @@ extension OpenClawClientDatabases {
                 gateway_id, session_key, agent_id, branch_epoch, needs_reconciliation
             )
             SELECT gateway_id, session_key, agent_id, 0, 1 FROM outbox_commands
+            """)
+        }
+        migrator.registerMigration("client-state-outbox-attachment-rekey-v6") { db in
+            try db.execute(sql: """
+            CREATE TABLE outbox_attachments_v6(
+                gateway_id TEXT NOT NULL,
+                command_id TEXT NOT NULL,
+                position INTEGER NOT NULL,
+                type TEXT NOT NULL,
+                mime_type TEXT NOT NULL,
+                file_name TEXT NOT NULL,
+                payload BLOB NOT NULL,
+                duration_seconds REAL,
+                PRIMARY KEY(gateway_id, command_id, position),
+                FOREIGN KEY(gateway_id, command_id)
+                    REFERENCES outbox_commands(gateway_id, client_uuid)
+                    ON DELETE CASCADE
+                    ON UPDATE CASCADE
+            );
+            INSERT INTO outbox_attachments_v6(
+                gateway_id, command_id, position, type, mime_type, file_name, payload, duration_seconds
+            )
+            SELECT gateway_id, command_id, position, type, mime_type, file_name, payload, duration_seconds
+            FROM outbox_attachments;
+            DROP TABLE outbox_attachments;
+            ALTER TABLE outbox_attachments_v6 RENAME TO outbox_attachments;
             """)
         }
         try migrator.migrate(queue)
@@ -614,7 +647,35 @@ extension OpenClawClientDatabases {
             INSERT OR REPLACE INTO cache_metadata(id, format_version)
                 VALUES (1, \(self.gatewayCacheFormatVersion));
             """)
+            try self.ensureAgentSessionCacheSchema(db)
         }
+    }
+
+    /// Session rosters are disposable cache state, so this additive surface is
+    /// lazily ensured without advancing the cache format or erasing transcripts.
+    static func ensureAgentSessionCacheSchema(_ db: Database) throws {
+        try db.execute(sql: """
+        CREATE TABLE IF NOT EXISTS cached_session_rosters(
+            gateway_id TEXT NOT NULL,
+            agent_id TEXT NOT NULL,
+            last_used_at REAL NOT NULL,
+            PRIMARY KEY(gateway_id, agent_id)
+        );
+        CREATE TABLE IF NOT EXISTS cached_agent_sessions(
+            gateway_id TEXT NOT NULL,
+            agent_id TEXT NOT NULL,
+            session_key TEXT NOT NULL,
+            position INTEGER NOT NULL,
+            updated_at REAL NOT NULL,
+            payload_json TEXT NOT NULL,
+            PRIMARY KEY(gateway_id, agent_id, session_key),
+            FOREIGN KEY(gateway_id, agent_id)
+                REFERENCES cached_session_rosters(gateway_id, agent_id)
+                ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS cached_agent_sessions_order
+            ON cached_agent_sessions(gateway_id, agent_id, position);
+        """)
     }
 }
 

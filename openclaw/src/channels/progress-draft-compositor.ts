@@ -1,3 +1,11 @@
+import {
+  createProgressDraftDiffStatTracker,
+  type ChannelProgressDraftDiffStat,
+} from "./progress-draft-diffstat.js";
+import {
+  createChannelProgressDraftEventHandlers,
+  type ChannelProgressDraftEventLineBuilder,
+} from "./progress-draft-events.js";
 // Stateful progress-draft compositor for channel streaming previews.
 // It merges status, tool, reasoning, and commentary updates until the final reply replaces them.
 import { removeChannelProgressDraftLine } from "./progress-draft-lines.js";
@@ -8,11 +16,13 @@ import {
   normalizeReasoningProgressLine,
   sanitizeProgressStatusText,
 } from "./progress-draft-status-text.js";
+import { settleProgressVisibilityCallbackResult } from "./progress-visibility.js";
 import {
   createChannelProgressDraftGate,
   type AgentPlanStep,
   type ChannelProgressDraftLine,
   formatChannelProgressDraftText,
+  isChannelProgressAttentionLine,
   isChannelProgressDraftWorkToolName,
   mergeChannelProgressDraftLine,
   normalizeChannelProgressDraftLineIdentity,
@@ -24,6 +34,8 @@ import {
   type StreamingCompatEntry,
   type StreamingMode,
 } from "./streaming.js";
+
+export { createChannelProgressWorkCounter } from "./progress-work-counter.js";
 
 // A recent model preamble remains the primary status; utility narration fills
 // the slot only after the model has been quiet for this interval. Exported for
@@ -39,82 +51,8 @@ export type ChannelProgressDraftCompositorSnapshot = Readonly<{
   statusHeadline?: string;
   plan?: readonly AgentPlanStep[];
   planExplanation?: string;
+  diffStat?: ChannelProgressDraftDiffStat;
 }>;
-
-/** Tracks per-turn activity for compact progress receipts. */
-export function createChannelProgressReceiptTracker(params?: { now?: () => number }) {
-  const now = params?.now ?? Date.now;
-  let startedAt = now();
-  let reasoningSteps = 0;
-  let toolCalls = 0;
-  let commentaryNotes = 0;
-  let reasoningOpen = false;
-  const seenCommentaryIds = new Set<string>();
-  let lastCommentaryText = "";
-
-  const closeReasoning = () => {
-    if (!reasoningOpen) {
-      return;
-    }
-    reasoningOpen = false;
-    reasoningSteps += 1;
-  };
-
-  const reset = () => {
-    startedAt = now();
-    reasoningSteps = 0;
-    toolCalls = 0;
-    commentaryNotes = 0;
-    reasoningOpen = false;
-    seenCommentaryIds.clear();
-    lastCommentaryText = "";
-  };
-
-  return {
-    noteReasoning() {
-      reasoningOpen = true;
-    },
-    closeReasoning,
-    noteToolCall(toolName?: string) {
-      closeReasoning();
-      if (isChannelProgressDraftWorkToolName(toolName)) {
-        toolCalls += 1;
-      }
-    },
-    noteCommentary(itemId?: string, text?: string) {
-      const trimmed = text?.trim();
-      if (!trimmed) {
-        return;
-      }
-      if (itemId) {
-        if (!seenCommentaryIds.has(itemId)) {
-          seenCommentaryIds.add(itemId);
-          commentaryNotes += 1;
-        }
-        return;
-      }
-      if (trimmed !== lastCommentaryText) {
-        lastCommentaryText = trimmed;
-        commentaryNotes += 1;
-      }
-    },
-    reset,
-    buildSummaryLine() {
-      closeReasoning();
-      const seconds = Math.max(1, Math.round((now() - startedAt) / 1000));
-      return [
-        ...(reasoningSteps > 0
-          ? [`🧠 ${reasoningSteps} thought${reasoningSteps === 1 ? "" : "s"}`]
-          : []),
-        ...(commentaryNotes > 0
-          ? [`💬 ${commentaryNotes} note${commentaryNotes === 1 ? "" : "s"}`]
-          : []),
-        ...(toolCalls > 0 ? [`🛠️ ${toolCalls} tool call${toolCalls === 1 ? "" : "s"}`] : []),
-        `⏱️ ${seconds}s`,
-      ].join(" · ");
-    },
-  };
-}
 
 type ChannelProgressDraftUpdateOptions = {
   flush?: boolean;
@@ -123,15 +61,25 @@ type ChannelProgressDraftUpdateOptions = {
 
 /** Creates a stateful compositor for one streaming channel reply. */
 export function createChannelProgressDraftCompositor(params: {
+  /** Show authored milestones and attention instead of a rolling tool log. */
+  presentation?: "summary";
   entry: StreamingCompatEntry | null | undefined;
   mode: ChannelProgressDraftMode;
   active: boolean;
   seed: string;
-  update: (text: string, options?: ChannelProgressDraftUpdateOptions) => Promise<void> | void;
+  update: (
+    text: string,
+    options?: ChannelProgressDraftUpdateOptions,
+  ) => Promise<boolean | void> | boolean | void;
   deleteCurrent?: () => Promise<void> | void;
   tryNativeUpdate?: (text: string) => Promise<boolean> | boolean;
   /** Publish when structured lines change even if the rendered text does not. */
   updateOnLineChange?: boolean;
+  /**
+   * Set when the channel renders `update`'s structured `lines` itself, so the
+   * composed text carries only the status block (label, headline, checklist).
+   */
+  rendersRollingLinesNatively?: boolean;
   formatLine?: (line: string) => string;
   isEmptyLine?: (line: ChannelProgressDraftCompositorLine | undefined) => boolean;
   shouldStartNow?: (line: ChannelProgressDraftCompositorLine | undefined) => boolean;
@@ -142,6 +90,8 @@ export function createChannelProgressDraftCompositor(params: {
   now?: () => number;
   setTimeoutFn?: typeof setTimeout;
   clearTimeoutFn?: typeof clearTimeout;
+  /** Channel-specific formatter policy; event/lifecycle ownership remains in the compositor. */
+  buildProgressEventLine?: ChannelProgressDraftEventLineBuilder;
 }) {
   const now = params.now ?? Date.now;
   const setTimeoutFn = params.setTimeoutFn ?? setTimeout;
@@ -155,23 +105,30 @@ export function createChannelProgressDraftCompositor(params: {
       .map((line) => line.replace(/^_(.*)_$/su, "$1"))
       .join("\n");
   const previewToolProgressEnabled =
-    params.active && resolveChannelStreamingPreviewToolProgress(params.entry);
+    params.active && resolveChannelStreamingPreviewToolProgress(params.entry, true, params.mode);
   const commentaryProgressEnabled =
-    params.active && resolveChannelStreamingProgressCommentary(params.entry);
+    params.active && resolveChannelStreamingProgressCommentary(params.entry, false, params.mode);
   const thinkingProgressEnabled =
     params.active && (params.reasoningGate ?? previewToolProgressEnabled);
   const suppressDefaultToolProgressMessages =
     params.active &&
     resolveChannelStreamingSuppressDefaultToolProgressMessages(params.entry, {
       draftStreamActive: true,
+      mode: params.mode,
       previewToolProgressEnabled,
     });
   let progressSuppressed = false;
   let lines: ChannelProgressDraftCompositorLine[] = [];
   let lastRenderedText = "";
   let lastRenderedLines = lines;
+  let lastRenderedDiffStatKey = "";
   let reasoningRawText = "";
   let lastReasoningLine: string | undefined;
+  // Id-less commentary streams as cumulative snapshots ("Checking" → "Checking
+  // the workspace"). Remember the open line so successive snapshots replace in
+  // place instead of appending one line per growing prefix.
+  let lastIdLessCommentaryId: string | undefined;
+  let lastIdLessCommentaryBare = "";
   // Model preambles and narration share the status slot while tool lines keep
   // accumulating underneath for turns where neither source is available.
   let preambleText = "";
@@ -182,7 +139,16 @@ export function createChannelProgressDraftCompositor(params: {
   let planExplanation = "";
   let finalReplyStarted = false;
   let finalReplyDelivered = false;
+  const diffStatTracker = createProgressDraftDiffStatTracker({
+    canStage: () =>
+      params.active &&
+      params.mode === "progress" &&
+      !progressSuppressed &&
+      !finalReplyStarted &&
+      !finalReplyDelivered,
+  });
   let preambleExpiryTimer: ReturnType<typeof setTimeout> | undefined;
+  let lastStartRendered = false;
 
   const mergeReasoningProgress = (text?: string, options?: { snapshot?: boolean }): string => {
     if (!text) {
@@ -210,23 +176,34 @@ export function createChannelProgressDraftCompositor(params: {
       : effectiveNarration;
   };
 
-  const formatDraftText = (draftLines = lines, options?: { formatted?: boolean }) =>
-    formatChannelProgressDraftText({
+  const formatDraftText = (draftLines = lines, options?: { formatted?: boolean }) => {
+    const narration = resolveStatusText() || undefined;
+    // Channels that render the rolling lines themselves (from `update`'s
+    // `lines`) would print them twice if they also appeared in this text.
+    const linesRenderedByChannel =
+      params.rendersRollingLinesNatively === true && Boolean(narration || planSteps?.length);
+    return formatChannelProgressDraftText({
+      presentation: params.presentation,
       entry: params.entry,
-      lines: draftLines,
+      lines: linesRenderedByChannel ? [] : draftLines,
       seed: params.seed,
       formatLine: options?.formatted === false ? undefined : params.formatLine,
-      narration: resolveStatusText() || undefined,
+      narration,
       plan: planSteps,
     });
+  };
+
+  const resolveDiffStat = diffStatTracker.resolve;
 
   const getSnapshot = (): ChannelProgressDraftCompositorSnapshot => {
     const statusHeadline = resolveStatusText();
+    const diffStat = resolveDiffStat();
     return {
       lines: lines.map((line) => (typeof line === "string" ? line : { ...line })),
       ...(statusHeadline ? { statusHeadline } : {}),
       ...(planSteps ? { plan: planSteps.map((entry) => ({ ...entry })) } : {}),
       ...(planExplanation ? { planExplanation } : {}),
+      ...(diffStat ? { diffStat } : {}),
     };
   };
 
@@ -236,29 +213,48 @@ export function createChannelProgressDraftCompositor(params: {
     lines = [];
     lastRenderedText = "";
     lastRenderedLines = lines;
+    lastRenderedDiffStatKey = "";
     reasoningRawText = "";
     lastReasoningLine = undefined;
+    lastIdLessCommentaryId = undefined;
+    lastIdLessCommentaryBare = "";
     preambleText = "";
     preambleItemId = undefined;
     preambleAt = undefined;
     narrationText = "";
     planSteps = undefined;
     planExplanation = "";
+    diffStatTracker.reset();
+    lastStartRendered = false;
+  };
+
+  const publish = async (options?: { flush?: boolean }): Promise<boolean> => {
+    const text = formatDraftText();
+    const diffStatKey = JSON.stringify(resolveDiffStat() ?? null);
+    const structuredStateChanged =
+      params.updateOnLineChange === true &&
+      (lines !== lastRenderedLines || diffStatKey !== lastRenderedDiffStatKey);
+    if (!text || (text === lastRenderedText && !structuredStateChanged)) {
+      return false;
+    }
+    const observed = await settleProgressVisibilityCallbackResult(
+      params.update(text, { ...options, lines: [...lines] }),
+    );
+    if (!observed.visible) {
+      return false;
+    }
+    // Only accepted renders become the dedupe baseline; pending sends remain retryable.
+    lastRenderedText = text;
+    lastRenderedLines = lines;
+    lastRenderedDiffStatKey = diffStatKey;
+    return true;
   };
 
   const render = async (options?: { flush?: boolean }): Promise<boolean> => {
     if (!params.active || params.mode !== "progress" || finalReplyStarted || finalReplyDelivered) {
       return false;
     }
-    const text = formatDraftText();
-    const linesChanged = params.updateOnLineChange === true && lines !== lastRenderedLines;
-    if (!text || (text === lastRenderedText && !linesChanged)) {
-      return false;
-    }
-    lastRenderedText = text;
-    lastRenderedLines = lines;
-    await params.update(text, { ...options, lines: [...lines] });
-    return true;
+    return await publish(options);
   };
 
   const schedulePreambleExpiryRefresh = () => {
@@ -287,29 +283,84 @@ export function createChannelProgressDraftCompositor(params: {
 
   const gate = createChannelProgressDraftGate({
     onStart: async () => {
-      await render({ flush: true });
+      lastStartRendered = await render({ flush: true });
       schedulePreambleExpiryRefresh();
     },
     setTimeoutFn,
     clearTimeoutFn,
   });
 
-  const clearLine = async (lineId: string) => {
-    const nextLines = removeChannelProgressDraftLine(lines, lineId);
-    if (nextLines === lines) {
-      return;
+  const startAndRender = async (options?: { flush?: boolean }): Promise<boolean> => {
+    const alreadyStarted = gate.hasStarted;
+    if (!alreadyStarted) {
+      lastStartRendered = false;
     }
-    lines = nextLines;
+    await gate.startNow();
     if (!gate.hasStarted) {
-      return;
+      return false;
     }
-    const text = formatDraftText();
-    if (text) {
-      await render();
-      return;
+    // Startup already rendered; preserve its acceptance without publishing twice.
+    return alreadyStarted ? await render(options) : lastStartRendered;
+  };
+
+  const renderAfterRetraction = async (): Promise<boolean> => {
+    if (!gate.hasStarted) {
+      return false;
+    }
+    const rendered = await render();
+    if (rendered || formatDraftText()) {
+      return rendered;
     }
     lastRenderedText = "";
     await params.deleteCurrent?.();
+    return true;
+  };
+
+  /**
+   * Commentary line identity. An explicit item id owns its line. Without one,
+   * providers stream cumulative snapshots ("Checking" → "Checking the
+   * workspace"), so a snapshot that continues the open line reuses its id and
+   * updates in place; anything else starts a new line.
+   */
+  const resolveCommentaryLineId = (commentary: {
+    itemId?: string;
+    normalized: string;
+    bareNormalized: string;
+  }): string => {
+    if (commentary.itemId) {
+      return `commentary:${commentary.itemId}`;
+    }
+    if (!commentary.normalized) {
+      // Sanitized to nothing (directive-only / NO_REPLY): no line to address, so
+      // it cannot retract the open one. Only an explicit itemId clears a line.
+      return "";
+    }
+    const continuesOpenLine =
+      Boolean(lastIdLessCommentaryBare) &&
+      (commentary.bareNormalized.startsWith(lastIdLessCommentaryBare) ||
+        lastIdLessCommentaryBare.startsWith(commentary.bareNormalized));
+    if (continuesOpenLine && lastIdLessCommentaryId) {
+      return lastIdLessCommentaryId;
+    }
+    return `commentary:${commentary.normalized}`;
+  };
+
+  const clearLine = async (lineId: string) => {
+    const nextLines = removeChannelProgressDraftLine(lines, lineId);
+    if (nextLines === lines) {
+      return false;
+    }
+    lines = nextLines;
+    if (!gate.hasStarted) {
+      return false;
+    }
+    const text = formatDraftText();
+    if (text) {
+      return await render();
+    }
+    lastRenderedText = "";
+    await params.deleteCurrent?.();
+    return true;
   };
 
   const noteProgress = async (
@@ -333,19 +384,28 @@ export function createChannelProgressDraftCompositor(params: {
       return false;
     }
     const progressLine = typeof line === "object" && line !== undefined ? line : normalized;
-    const shouldStoreLine = previewToolProgressEnabled;
+    const summary = params.presentation === "summary";
+    const needsAttention = isChannelProgressAttentionLine(progressLine);
+    if (summary && !needsAttention && typeof line === "object" && line.id) {
+      lines = removeChannelProgressDraftLine(lines, line.id);
+    }
+    const shouldStoreLine = summary ? needsAttention : previewToolProgressEnabled;
     const nextLines = shouldStoreLine
       ? mergeChannelProgressDraftLine(lines, progressLine, {
           maxLines: resolveChannelProgressDraftMaxLines(params.entry),
         })
       : lines;
-    if (shouldStoreLine && nextLines === lines) {
+    const lineChanged = nextLines !== lines;
+    const hasUnconfirmedRender = formatDraftText(nextLines) !== lastRenderedText;
+    const diffStatChanged =
+      params.updateOnLineChange === true &&
+      JSON.stringify(resolveDiffStat() ?? null) !== lastRenderedDiffStatKey;
+    if (shouldStoreLine && !lineChanged && !hasUnconfirmedRender && !diffStatChanged) {
       return false;
     }
-    // A work line lands between reasoning bursts: commit the current thinking
-    // line so the next thought appends as its own line, interleaved with tools
-    // in arrival order, instead of replacing the prior thought.
-    if (shouldStoreLine) {
+    // Work delimits reasoning bursts even when summary presentation hides its
+    // row; otherwise unrelated thoughts are concatenated as one streamed delta.
+    if (summary || (shouldStoreLine && lineChanged)) {
       reasoningRawText = "";
       lastReasoningLine = undefined;
     }
@@ -362,25 +422,10 @@ export function createChannelProgressDraftCompositor(params: {
     }
     lines = nextLines;
     if (params.mode !== "progress") {
-      if (!shouldStoreLine) {
-        return false;
-      }
-      const text = formatDraftText();
-      if (!text || text === lastRenderedText) {
-        return false;
-      }
-      lastRenderedText = text;
-      lastRenderedLines = lines;
-      await params.update(text, { lines: [...lines] });
-      return true;
+      return shouldStoreLine ? await publish() : false;
     }
-    if (options?.startImmediately || params.shouldStartNow?.(line)) {
-      const alreadyStarted = gate.hasStarted;
-      await gate.startNow();
-      if (!gate.hasStarted) {
-        return false;
-      }
-      return alreadyStarted ? await render() : true;
+    if (options?.startImmediately || params.shouldStartNow?.(line) || (summary && needsAttention)) {
+      return await startAndRender(summary && needsAttention ? { flush: true } : undefined);
     }
     const alreadyStarted = gate.hasStarted;
     const progressActive = await gate.noteWork();
@@ -389,6 +434,14 @@ export function createChannelProgressDraftCompositor(params: {
     }
     return false;
   };
+
+  const progressEventHandlers = createChannelProgressDraftEventHandlers({
+    entry: params.entry,
+    pushLine: noteProgress,
+    onTool: diffStatTracker.stageToolEvent,
+    onItem: diffStatTracker.commitItemEvent,
+    ...(params.buildProgressEventLine ? { buildLine: params.buildProgressEventLine } : {}),
+  });
 
   return {
     get previewToolProgressEnabled() {
@@ -404,7 +457,7 @@ export function createChannelProgressDraftCompositor(params: {
       return gate.hasStarted;
     },
     get isVisible() {
-      return gate.hasStarted && !finalReplyStarted && !finalReplyDelivered;
+      return Boolean(lastRenderedText) && !finalReplyStarted && !finalReplyDelivered;
     },
     get hasStatusHeadline() {
       return Boolean(resolveStatusText());
@@ -464,8 +517,8 @@ export function createChannelProgressDraftCompositor(params: {
         return false;
       }
       if (options?.startImmediately) {
-        await gate.startNow();
-        return gate.hasStarted ? await render({ flush: true }) : false;
+        // Explicit activity flushes even after startup; other updates can batch.
+        return await startAndRender({ flush: true });
       }
       const alreadyStarted = gate.hasStarted;
       const progressActive = await gate.noteWork();
@@ -475,6 +528,15 @@ export function createChannelProgressDraftCompositor(params: {
       return false;
     },
     pushToolProgress: noteProgress,
+    ...progressEventHandlers,
+    async pushApprovalEvent(
+      payload: Parameters<typeof progressEventHandlers.pushApprovalEvent>[0],
+    ) {
+      if (params.presentation === "summary" && payload.phase === "resolved" && payload.approvalId) {
+        return await clearLine(`approval:${payload.approvalId}`);
+      }
+      return await progressEventHandlers.pushApprovalEvent(payload);
+    },
     async pushPlanProgress(
       steps?: AgentPlanStep[],
       options?: { explanation?: string },
@@ -491,26 +553,9 @@ export function createChannelProgressDraftCompositor(params: {
       planSteps = steps && steps.length > 0 ? steps.map((entry) => ({ ...entry })) : undefined;
       planExplanation = options?.explanation?.replace(/\s+/g, " ").trim() ?? "";
       if (!planSteps && !planExplanation) {
-        if (!gate.hasStarted) {
-          return false;
-        }
-        const rendered = await render();
-        if (rendered || formatDraftText()) {
-          return rendered;
-        }
-        lastRenderedText = "";
-        await params.deleteCurrent?.();
-        return true;
+        return await renderAfterRetraction();
       }
-      const alreadyStarted = gate.hasStarted;
-      await gate.startNow();
-      if (!gate.hasStarted) {
-        return false;
-      }
-      if (alreadyStarted) {
-        await render();
-      }
-      return true;
+      return await startAndRender();
     },
     async pushPreambleHeadline(text?: string, options?: { itemId?: string }) {
       if (!params.active || params.mode !== "progress" || progressSuppressed) {
@@ -542,16 +587,7 @@ export function createChannelProgressDraftCompositor(params: {
         preambleItemId = undefined;
         preambleAt = undefined;
         clearPreambleExpiryTimer();
-        if (!gate.hasStarted) {
-          return false;
-        }
-        const rendered = await render();
-        if (rendered || formatDraftText()) {
-          return rendered;
-        }
-        lastRenderedText = "";
-        await params.deleteCurrent?.();
-        return true;
+        return await renderAfterRetraction();
       }
       const isNewPreambleItem = Boolean(itemId && itemId !== preambleItemId);
       if (isNewPreambleItem) {
@@ -600,6 +636,7 @@ export function createChannelProgressDraftCompositor(params: {
         params.mode !== "progress" ||
         !text ||
         progressSuppressed ||
+        finalReplyStarted ||
         finalReplyDelivered ||
         !thinkingProgressEnabled
       ) {
@@ -619,13 +656,27 @@ export function createChannelProgressDraftCompositor(params: {
       const displayLine = `${reasoningLinePrefix}${compactLine}`;
       // Reasoning streams usually arrive as deltas. Replace the previous
       // reasoning line so the draft stays compact instead of appending noise.
-      const priorIndex =
-        lastReasoningLine === undefined ? -1 : lines.lastIndexOf(lastReasoningLine);
-      if (priorIndex >= 0) {
-        lines = [...lines];
-        lines[priorIndex] = displayLine;
+      if (params.presentation === "summary") {
+        lines = mergeChannelProgressDraftLine(
+          lines,
+          {
+            id: "reasoning",
+            kind: "item",
+            text: stripLaneItalics(compactLine),
+            label: "Reasoning",
+            prefix: false,
+          },
+          { maxLines: resolveChannelProgressDraftMaxLines(params.entry) },
+        );
       } else {
-        lines = [...lines, displayLine].slice(-resolveChannelProgressDraftMaxLines(params.entry));
+        const priorIndex =
+          lastReasoningLine === undefined ? -1 : lines.lastIndexOf(lastReasoningLine);
+        if (priorIndex >= 0) {
+          lines = [...lines];
+          lines[priorIndex] = displayLine;
+        } else {
+          lines = [...lines, displayLine].slice(-resolveChannelProgressDraftMaxLines(params.entry));
+        }
       }
       lastReasoningLine = displayLine;
       const progressActive = await gate.noteWork();
@@ -646,7 +697,10 @@ export function createChannelProgressDraftCompositor(params: {
         return false;
       }
       const normalized = normalizeCommentaryProgressText(text ?? "");
-      const lineId = itemId ? `commentary:${itemId}` : normalized ? `commentary:${normalized}` : "";
+      // Compare bare (de-italicized) text so cumulative snapshots still match
+      // after normalizeCommentaryProgressText wraps each line in _…_.
+      const bareNormalized = stripLaneItalics(normalized);
+      const lineId = resolveCommentaryLineId({ itemId, normalized, bareNormalized });
       if (!normalized) {
         // Empty commentary with an item id means the producer retracted that
         // item; remove its draft line if it was already rendered.
@@ -659,7 +713,7 @@ export function createChannelProgressDraftCompositor(params: {
         id: lineId,
         // The lane marker (💬, matching 🧠 thinking / 🛠️ tools) is a per-channel
         // presentation choice supplied via commentaryLinePrefix; default none.
-        text: `${commentaryLinePrefix}${commentaryItalics ? normalized : stripLaneItalics(normalized)}`,
+        text: `${commentaryLinePrefix}${commentaryItalics ? normalized : bareNormalized}`,
         kind: "item",
         label: "Commentary",
         prefix: false,
@@ -667,17 +721,11 @@ export function createChannelProgressDraftCompositor(params: {
       lines = mergeChannelProgressDraftLine(lines, line, {
         maxLines: resolveChannelProgressDraftMaxLines(params.entry),
       });
-      const alreadyStarted = gate.hasStarted;
-      await gate.startNow();
-      if (!gate.hasStarted) {
-        return false;
+      if (!itemId) {
+        lastIdLessCommentaryId = lineId;
+        lastIdLessCommentaryBare = bareNormalized;
       }
-      if (alreadyStarted) {
-        await render();
-      }
-      // True means the sanitized commentary was accepted into the visible
-      // lane. A first item renders inside gate.onStart, not this call site.
-      return true;
+      return await startAndRender();
     },
   };
 }

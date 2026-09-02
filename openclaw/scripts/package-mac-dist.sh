@@ -20,6 +20,7 @@ APP_VERSION_INPUT="${APP_VERSION:-}"
 # Default to universal binary for distribution builds (supports both Apple Silicon and Intel Macs)
 export BUILD_ARCHS="${BUILD_ARCHS:-all}"
 export BUILD_CONFIG
+export OPENCLAW_CONTROL_UI_RELEASE_BUILD=1
 DSYM_ARCHS_VALUE="$BUILD_ARCHS"
 if [[ "$DSYM_ARCHS_VALUE" == "all" ]]; then
   DSYM_ARCHS_VALUE="arm64 x86_64"
@@ -242,12 +243,10 @@ if [[ "$SKIP_DSYM" != "1" ]]; then
   DSYM_PATHS=()
   MISSING_DSYM_ARCHS=()
   for arch in "${DSYM_ARCHS[@]}"; do
-    if [[ ! -d "$BUILD_ROOT/$arch" ]]; then
-      MISSING_DSYM_ARCHS+=("$arch")
-      continue
-    fi
-    DSYM_FOR_ARCH="$(find "$BUILD_ROOT/$arch" -type d -path "*/$BUILD_CONFIG/$PRODUCT.dSYM" -print -quit)"
-    if [[ -n "$DSYM_FOR_ARCH" ]]; then
+    # Use the same SwiftPM output link as package-mac-app.sh; Xcode builds
+    # place products under out/Products/Release rather than a lowercase directory.
+    DSYM_FOR_ARCH="$BUILD_ROOT/$arch/$BUILD_CONFIG/$PRODUCT.dSYM"
+    if [[ -d "$DSYM_FOR_ARCH" ]]; then
       DSYM_PATHS+=("$DSYM_FOR_ARCH")
     else
       MISSING_DSYM_ARCHS+=("$arch")

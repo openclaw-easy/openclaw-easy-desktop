@@ -99,6 +99,7 @@ export async function deliverPrivateCommandReply(params: {
         accountId: target.accountId ?? undefined,
         threadId: target.threadId ?? undefined,
         cfg: params.commandParams.cfg,
+        agentId: params.commandParams.agentId,
         sessionKey: params.commandParams.sessionKey,
         policyConversationType: "direct",
         mirror: false,
@@ -107,7 +108,10 @@ export async function deliverPrivateCommandReply(params: {
       }),
     ),
   );
-  return results.some((result) => result.status === "fulfilled" && result.value.ok);
+  return results.some(
+    (result) =>
+      result.status === "fulfilled" && (result.value.delivered || result.value.suppressed === true),
+  );
 }
 
 /** Reads the command message thread id from command context. */

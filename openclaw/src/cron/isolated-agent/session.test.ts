@@ -1,16 +1,15 @@
 // Isolated agent session tests cover session creation and metadata for cron runs.
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../../config/config.js";
-import type { SessionEntry } from "../../config/sessions/types.js";
-import type { SessionOrigin } from "../../config/sessions/types.js";
+import type { SessionEntry, SessionOrigin } from "../../config/sessions/types.js";
 import { normalizeLegacySessionEntryDelivery } from "../../infra/state-migrations.legacy-session-store.js";
 import { projectSessionDeliveryFields } from "../../utils/delivery-context.shared.js";
 import type { DeliveryContext } from "../../utils/delivery-context.types.js";
 
 vi.mock("../../config/sessions/paths.js", () => ({
-  resolveStorePath: vi.fn().mockReturnValue("/tmp/test-store.json"),
+  resolveSessionStorePathCore: vi.fn().mockReturnValue("/tmp/test-store.json"),
   resolveSessionFilePathOptions: vi.fn().mockReturnValue({ sessionsDir: "/tmp" }),
-  resolveSessionFilePath: vi.fn((sessionId: string) => `/tmp/${sessionId}.jsonl`),
+  resolveSessionFilePathCore: vi.fn((sessionId: string) => `/tmp/${sessionId}.jsonl`),
 }));
 
 vi.mock("../../config/sessions/reset-policy.js", () => ({
@@ -41,7 +40,6 @@ vi.mock("../../agents/sessions/reset-boundary.js", () => ({
 
 import { clearBootstrapSnapshot } from "../../agents/bootstrap-cache.js";
 import { evaluateSessionFreshness } from "../../config/sessions/reset-policy.js";
-import { formatSqliteSessionFileMarker } from "../../config/sessions/sqlite-marker.js";
 import { resolveCronSession } from "./session.js";
 
 const NOW_MS = 1_737_600_000_000;
@@ -168,6 +166,60 @@ describe("resolveCronSession", () => {
     expect(clearBootstrapSnapshot).not.toHaveBeenCalled();
   });
 
+  it("rolls an archived isolated heartbeat session into a fresh run", () => {
+    const result = resolveWithStoredEntry({
+      sessionKey: "agent:main:main:heartbeat",
+      entry: {
+        sessionId: "archived-heartbeat-session-id",
+        updatedAt: NOW_MS - 1000,
+        archivedAt: NOW_MS,
+        heartbeatIsolatedBaseSessionKey: "agent:main:main",
+      },
+      forceNew: true,
+    });
+
+    expect(result.isNewSession).toBe(true);
+    expect(result.previousSessionId).toBe("archived-heartbeat-session-id");
+    expect(result.sessionEntry.sessionId).not.toBe("archived-heartbeat-session-id");
+    expect(result.sessionEntry.archivedAt).toBeUndefined();
+    expect(result.sessionEntry.heartbeatIsolatedBaseSessionKey).toBeUndefined();
+  });
+
+  it("keeps an initializing isolated heartbeat blocked during forced rollover", () => {
+    expect(() =>
+      resolveWithStoredEntry({
+        sessionKey: "agent:main:main:heartbeat",
+        entry: {
+          sessionId: "initializing-heartbeat-session-id",
+          updatedAt: NOW_MS - 1000,
+          archivedAt: NOW_MS,
+          initializationPending: true,
+          heartbeatIsolatedBaseSessionKey: "agent:main:main",
+        },
+        forceNew: true,
+      }),
+    ).toThrow(
+      'Session "agent:main:main:heartbeat" is still initializing. Retry after initialization completes.',
+    );
+    expect(clearBootstrapSnapshot).not.toHaveBeenCalled();
+  });
+
+  it("keeps an archived isolated heartbeat read-only without forceNew", () => {
+    expect(() =>
+      resolveWithStoredEntry({
+        sessionKey: "agent:main:main:heartbeat",
+        entry: {
+          sessionId: "archived-heartbeat-session-id",
+          updatedAt: NOW_MS - 1000,
+          archivedAt: NOW_MS,
+          heartbeatIsolatedBaseSessionKey: "agent:main:main",
+        },
+      }),
+    ).toThrow(
+      'Session "agent:main:main:heartbeat" is archived. Restore it before starting new work.',
+    );
+  });
+
   // New tests for session reuse behavior (#18027)
   describe("session reuse for webhooks/cron", () => {
     it("reuses existing sessionId when session is fresh", () => {
@@ -217,15 +269,33 @@ describe("resolveCronSession", () => {
       expect(result.sessionEntry.claudeCliSessionId).toBeUndefined();
       expect(result.sessionEntry.compactionCount).toBe(0);
       expect(result.sessionEntry.sendPolicy).toBe("allow");
-      expect(result.sessionEntry.sessionFile).toBe(
-        formatSqliteSessionFileMarker({
-          agentId: "main",
-          sessionId: "old-session-id",
-          storePath: "/tmp/test-store.json",
-        }),
-      );
+      expect(result.sessionEntry).not.toHaveProperty("sessionFile");
       expect(result.resetBoundaryPending).toMatchObject({ reason: "cron-stale" });
       expect(clearBootstrapSnapshot).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      { name: "stale reset", fresh: false, forceNew: false },
+      { name: "forced rollover", fresh: true, forceNew: true },
+    ])("preserves required creation provenance across $name", ({ fresh, forceNew }) => {
+      const provenance = {
+        createdAt: NOW_MS - 86_400_000,
+        createdVia: "cron" as const,
+        createdActor: {
+          type: "human" as const,
+          source: "profile" as const,
+          id: "profile-cron-creator",
+        },
+        sandbox: "required" as const,
+      };
+      const result = resolveWithStoredEntry({
+        sessionKey: "agent:main:cron:required",
+        entry: { sessionId: "required-session", updatedAt: NOW_MS - 1_000, ...provenance },
+        fresh,
+        forceNew,
+      });
+      expect(result.isNewSession).toBe(true);
+      expect(result.sessionEntry).toMatchObject(provenance);
     });
 
     it("creates new sessionId when forceNew is true", () => {
@@ -359,23 +429,25 @@ describe("resolveCronSession", () => {
           cliSessionBindings: {},
           claudeCliSessionId: "old-claude-session",
           liveModelSwitchPending: true,
-          fallbackNoticeSelectedModel: "anthropic/claude-opus-4-6",
-          fallbackNoticeActiveModel: "anthropic/claude-sonnet-4-6",
-          fallbackNoticeReason: "rate limit",
+          fallbackNotice: {
+            kind: "active",
+            selectedModel: "anthropic/claude-opus-4-6",
+            activeModel: "anthropic/claude-sonnet-4-6",
+            reason: "rate limit",
+          },
           inputTokens: 1,
           outputTokens: 2,
           totalTokens: 3,
           totalTokensFresh: true,
           estimatedCostUsd: 0.01,
-          execAsk: "always",
           execHost: "gateway",
           execNode: "node-1",
-          execSecurity: "allowlist",
           cacheRead: 4,
           cacheWrite: 5,
           contextTokens: 200_000,
+          contextTokensSource: "runtime",
           compactionCount: 9,
-          memoryFlushAt: NOW_MS - 500,
+          memoryFlush: { kind: "succeeded", compactionCount: 9 },
           abortCutoffMessageSid: "old-message",
           spawnedBy: "agent:main:session:parent",
           skillsSnapshot: {
@@ -421,7 +493,6 @@ describe("resolveCronSession", () => {
             lastActivityAt: NOW_MS - 1_000,
           },
           authProfileOverride: "auto-auth",
-          authProfileOverrideSource: "auto",
           authProfileOverrideCompactionCount: 2,
           modelOverride: "auto-model",
           providerOverride: "anthropic",
@@ -447,23 +518,20 @@ describe("resolveCronSession", () => {
       expect(result.sessionEntry.cliSessionBindings).toBeUndefined();
       expect(result.sessionEntry.claudeCliSessionId).toBeUndefined();
       expect(result.sessionEntry.liveModelSwitchPending).toBeUndefined();
-      expect(result.sessionEntry.fallbackNoticeSelectedModel).toBeUndefined();
-      expect(result.sessionEntry.fallbackNoticeActiveModel).toBeUndefined();
-      expect(result.sessionEntry.fallbackNoticeReason).toBeUndefined();
+      expect(result.sessionEntry.fallbackNotice).toBeUndefined();
       expect(result.sessionEntry.inputTokens).toBeUndefined();
       expect(result.sessionEntry.outputTokens).toBeUndefined();
       expect(result.sessionEntry.totalTokens).toBeUndefined();
       expect(result.sessionEntry.totalTokensFresh).toBeUndefined();
       expect(result.sessionEntry.estimatedCostUsd).toBeUndefined();
-      expect(result.sessionEntry.execAsk).toBeUndefined();
       expect(result.sessionEntry.execHost).toBeUndefined();
       expect(result.sessionEntry.execNode).toBeUndefined();
-      expect(result.sessionEntry.execSecurity).toBeUndefined();
       expect(result.sessionEntry.cacheRead).toBeUndefined();
       expect(result.sessionEntry.cacheWrite).toBeUndefined();
       expect(result.sessionEntry.contextTokens).toBeUndefined();
+      expect(result.sessionEntry.contextTokensSource).toBeUndefined();
       expect(result.sessionEntry.compactionCount).toBeUndefined();
-      expect(result.sessionEntry.memoryFlushAt).toBeUndefined();
+      expect(result.sessionEntry.memoryFlush).toBeUndefined();
       expect(result.sessionEntry.abortCutoffMessageSid).toBeUndefined();
       expect(result.sessionEntry.spawnedBy).toBeUndefined();
       expect(result.sessionEntry.skillsSnapshot).toBeUndefined();
@@ -517,6 +585,22 @@ describe("resolveCronSession", () => {
       expect(result.sessionEntry.authProfileOverride).toBe("work-profile");
       expect(result.sessionEntry.authProfileOverrideSource).toBe("user");
       expect(result.sessionEntry.authProfileOverrideCompactionCount).toBe(3);
+    });
+
+    it("stamps a legacy source-less user auth override on fresh sessions", () => {
+      const result = resolveWithStoredEntry({
+        entry: {
+          sessionId: "existing-session-id-legacy-auth",
+          updatedAt: NOW_MS - 1_000,
+          authProfileOverride: "work-profile",
+        },
+        fresh: true,
+        forceNew: true,
+      });
+
+      expect(result.sessionEntry.authProfileOverride).toBe("work-profile");
+      expect(result.sessionEntry.authProfileOverrideSource).toBe("user");
+      expect(result.sessionEntry.authProfileOverrideCompactionCount).toBeUndefined();
     });
 
     it("preserves non-delivery ambient session context for non-isolated expiration rollovers", () => {

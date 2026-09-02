@@ -8,7 +8,8 @@ import os from "node:os";
 import path from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
-import { resetProviderAuthAliasMapCacheForTest } from "../provider-auth-aliases.test-support.js";
+import { clearPluginMetadataLifecycleCaches } from "../../plugins/plugin-metadata-lifecycle.js";
+import { isAmbientCredentialAllowedByProviderAuthPin } from "./ambient-auth.js";
 import { saveAuthProfileStore } from "./store.js";
 import type { AuthProfileStore } from "./types.js";
 
@@ -30,7 +31,8 @@ const pluginMetadataMocks = vi.hoisted(() => {
   };
 });
 
-vi.mock("../../plugins/current-plugin-metadata-snapshot.js", () => ({
+vi.mock("../../plugins/current-plugin-metadata-snapshot.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../plugins/current-plugin-metadata-snapshot.js")>()),
   getCurrentPluginMetadataSnapshot: pluginMetadataMocks.getCurrentPluginMetadataSnapshot,
 }));
 
@@ -45,6 +47,7 @@ vi.mock("./external-auth.js", () => ({
 
 import {
   isStoredCredentialCompatibleWithAuthProvider,
+  resolveAuthProfileEligibility,
   resolveAuthProfileOrder,
   resolveAuthProfileOrderWithMetadata,
 } from "./order.js";
@@ -52,7 +55,7 @@ import { markAuthProfileSuccess } from "./profiles.js";
 
 describe("resolveAuthProfileOrder", () => {
   beforeEach(() => {
-    resetProviderAuthAliasMapCacheForTest();
+    clearPluginMetadataLifecycleCaches();
     pluginMetadataMocks.getCurrentPluginMetadataSnapshot.mockClear();
     pluginMetadataMocks.loadPluginMetadataSnapshot.mockClear();
   });
@@ -75,6 +78,96 @@ describe("resolveAuthProfileOrder", () => {
     });
 
     expect(order).toEqual(["fixture-provider:default"]);
+  });
+
+  it("does not apply the provider auth pin to stored profiles", () => {
+    const cfg = {
+      models: {
+        providers: {
+          "fixture-provider": {
+            auth: "api-key",
+            baseUrl: "https://example.invalid",
+            models: [],
+          },
+        },
+      },
+    } satisfies OpenClawConfig;
+    const store: AuthProfileStore = {
+      version: 1,
+      profiles: {
+        "fixture-provider:oauth": {
+          type: "oauth",
+          provider: "fixture-provider",
+          access: "oauth-access",
+          refresh: "oauth-refresh",
+          expires: Date.now() + 60_000,
+        },
+        "fixture-provider:api-key": {
+          type: "api_key",
+          provider: "fixture-provider",
+          key: "api-key",
+        },
+      },
+    };
+
+    expect(
+      resolveAuthProfileOrder({
+        cfg,
+        store,
+        provider: "fixture-provider",
+      }),
+    ).toEqual(["fixture-provider:oauth", "fixture-provider:api-key"]);
+  });
+
+  it("applies provider auth pins to ambient credentials through auth aliases", () => {
+    const cfg = {
+      models: {
+        providers: {
+          "fixture-provider": { auth: "oauth", baseUrl: "https://example.invalid", models: [] },
+          "fixture-provider-plan": { baseUrl: "https://example.invalid", models: [] },
+        },
+      },
+    } satisfies OpenClawConfig;
+
+    expect(
+      isAmbientCredentialAllowedByProviderAuthPin({
+        config: cfg,
+        provider: "fixture-provider-plan",
+        type: "api_key",
+      }),
+    ).toBe(false);
+  });
+
+  it("keeps configured AWS SDK profiles eligible without stored credentials", () => {
+    const cfg = {
+      auth: {
+        profiles: {
+          "amazon-bedrock:default": { provider: "amazon-bedrock", mode: "aws-sdk" },
+        },
+      },
+      models: {
+        providers: {
+          "amazon-bedrock": {
+            auth: "aws-sdk",
+            baseUrl: "https://bedrock-runtime.us-east-1.amazonaws.com",
+            models: [],
+          },
+        },
+      },
+    } satisfies OpenClawConfig;
+    const store: AuthProfileStore = { version: 1, profiles: {} };
+
+    expect(
+      resolveAuthProfileEligibility({
+        cfg,
+        store,
+        provider: "amazon-bedrock",
+        profileId: "amazon-bedrock:default",
+      }),
+    ).toEqual({ eligible: true, reasonCode: "ok" });
+    expect(resolveAuthProfileOrder({ cfg, store, provider: "amazon-bedrock" })).toEqual([
+      "amazon-bedrock:default",
+    ]);
   });
 
   it("uses canonical provider auth order for alias providers", async () => {
@@ -841,4 +934,59 @@ describe("resolveAuthProfileOrder", () => {
       }),
     ).toBe(false);
   });
+
+  it.each([
+    [{ type: "api_key", provider: "openai", key: "test-key" }, "oauth", "mode_mismatch"],
+    [{ type: "token", provider: "openai", token: "test-token" }, "oauth", "ok"],
+    [
+      {
+        type: "oauth",
+        provider: "openai",
+        access: "test-access",
+        refresh: "test-refresh",
+        expires: 2_000_000_000_000,
+      },
+      "api_key",
+      "mode_mismatch",
+    ],
+  ] as const)(
+    "keeps provider identity and configured mode distinct for %j",
+    (credential, configuredMode, expectedModeReason) => {
+      const authAliasLookupParams = { metadataSnapshot: { plugins: [] } };
+      const store: AuthProfileStore = { version: 1, profiles: { fixture: credential } };
+      const params = {
+        store,
+        profileId: "fixture",
+        provider: "openai",
+        authAliasLookupParams,
+        now: 1_700_000_000_000,
+      };
+
+      expect(
+        isStoredCredentialCompatibleWithAuthProvider({
+          provider: "other-provider",
+          credential,
+          authAliasLookupParams,
+        }),
+      ).toBe(false);
+      expect(
+        resolveAuthProfileEligibility({
+          ...params,
+          cfg: {
+            auth: {
+              profiles: { fixture: { provider: "other-provider", mode: credential.type } },
+            },
+          },
+        }),
+      ).toEqual({ eligible: false, reasonCode: "provider_mismatch" });
+      expect(
+        resolveAuthProfileEligibility({
+          ...params,
+          cfg: {
+            auth: { profiles: { fixture: { provider: "openai", mode: configuredMode } } },
+          },
+        }),
+      ).toEqual({ eligible: expectedModeReason === "ok", reasonCode: expectedModeReason });
+    },
+  );
 });

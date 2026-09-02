@@ -1,6 +1,7 @@
 ---
 summary: "Inbound event helpers for channel plugins: context building, shared runner orchestration, session record, and prepared reply dispatch"
 title: "Channel inbound API"
+doc-schema-version: 1
 read_when:
   - You are building or refactoring a messaging channel plugin receive path
   - You need shared inbound context construction, session recording, or prepared reply dispatch
@@ -32,7 +33,15 @@ import {
   into the prompt/session context. Pass channel-owned sender/chat metadata
   through `channelContext`, which plugin hooks see as `ctx.channelContext`.
   Augment `PluginHookChannelSenderContext` or `PluginHookChannelChatContext`
-  from this subpath for channel-specific fields.
+  from this subpath for channel-specific fields. This public standalone builder
+  is non-authoritative and cannot mint participant evidence. Bundled production
+  receive paths use the host-injected registered
+  `runtime.channel.inbound.buildContext` and pass the exact resolver result as
+  `channelIngress`. Resolve that result with `contextBinding` after final route
+  selection. Core accepts it once only when the same active plugin record,
+  lifecycle epoch, agent, session, message, event, and admission scope still
+  match; receive paths must not rebuild participant provenance from context fields. Only a named,
+  source-proven unsupported path passes `channelIngress: "unsupported"`.
 - `runChannelInboundEvent(...)`: runs ingest, classify, preflight, resolve,
   record, dispatch, and finalize for one inbound platform event.
 - `dispatchChannelInboundReply(...)`: records and dispatches an already
@@ -84,6 +93,40 @@ Assemble `dispatchChannelInboundReply(...)` inputs for compatibility
 dispatchers that keep platform delivery in the delivery adapter. New send
 paths should use message adapters and durable message helpers from
 `channel-outbound` instead.
+
+## Internal turn sources
+
+`MsgContext.InternalTurnSource` identifies an internal wake: `"heartbeat"`,
+`"cron"`, or `"exec"`. Leave it unset for ordinary channel messages. It keeps
+internal turns from resetting sessions or replacing the conversation binding;
+it does not grant execution authority or replace `InputProvenance`.
+
+Keep `Provider` and `Surface` for transport identity, and keep the reply route in
+`OriginatingChannel` and `OriginatingTo`. An internal wake may have no transport
+or explicit reply target. Do not put a wake label in those channel fields.
+
+For existing SDK callers, inbound finalization and session-recording entrypoints
+translate legacy `Provider` values `"heartbeat"`, `"cron-event"`, and
+`"exec-event"` into `InternalTurnSource`. They remove those labels from channel
+fields while preserving a real reply route. New callers should set the typed
+source directly.
+
+## Receive acknowledgment policy
+
+`createMessageReceiveContext(...)`, exported from
+`openclaw/plugin-sdk/channel-outbound`, tracks acknowledgment state for one
+inbound event. Its `ackPolicy` selects the stage accepted by `shouldAckAfter(...)`:
+
+| Policy                 | Acknowledgment boundary                                                   |
+| ---------------------- | ------------------------------------------------------------------------- |
+| `after_receive_record` | After durable inbound metadata is recorded for deduplication and routing. |
+| `after_agent_dispatch` | After the agent run is dispatched.                                        |
+| `after_durable_send`   | After durable outbound delivery commits.                                  |
+| `manual`               | No stage qualifies automatically; the caller decides when to acknowledge. |
+
+The helper defaults to `after_receive_record`, not `manual`. Callers still
+perform the work and invoke `ack()` or `nack(error)`; selecting a policy does
+not itself persist, dispatch, or send a message.
 
 ## Delivery settlement contract
 
@@ -143,6 +186,14 @@ receives the settled result after that observation.
 has `visibleReplySent: false`, does not emit `message_sent`, and does not count
 as a visible queued reply. This lets plugins distinguish hook cancellation
 from provider failure without inventing a native message identity.
+
+By default, routed turns record inbound metadata against
+`ctxPayload.SessionKey ?? route.sessionKey`. Set `record.sessionKey` only when a
+native command intentionally executes in one command session while updating a
+different provider-routed target session. The override affects inbound metadata,
+transcript-context merge, and record-stage diagnostics; it does not change dispatch
+routing or hook correlation. An explicit override must be non-empty and contain no
+surrounding whitespace.
 
 Reject `deliver` or `finalization` when native delivery fails. If no provider
 send was attempted, throw `PlatformMessageNotDispatchedError` from

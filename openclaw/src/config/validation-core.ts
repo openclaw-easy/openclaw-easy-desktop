@@ -1,13 +1,16 @@
 import path from "node:path";
 import { isCanonicalDottedDecimalIPv4, isLoopbackIpAddress } from "@openclaw/net-policy/ip";
-import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
 import { sanitizeForLog } from "../../packages/terminal-core/src/ansi.js";
 import {
   listAgentEntries,
   listAgentEntriesWithSource,
+  listAgentIds,
   resolveAgentWorkspaceDir,
-  resolveDefaultAgentId,
+  resolveAmbientOwnerAgentId,
+  tryResolveAmbientOwnerAgentId,
 } from "../agents/agent-scope.js";
+import { resolveSandboxDockerEnv, resolveSandboxScope } from "../agents/sandbox/config-contract.js";
+import { getContainerEnvFileEntryIssue } from "../infra/container-env-file.js";
 import type { PluginMetadataSnapshot } from "../plugins/plugin-metadata-snapshot.js";
 import {
   hasAvatarUriScheme,
@@ -22,13 +25,14 @@ import {
 } from "../shared/gateway-tailscale-auth-policy.js";
 import { isRecord } from "../utils.js";
 import { findDuplicateAgentDirs, formatDuplicateAgentDirError } from "./agent-dirs.js";
+import { attachAgentListProjection } from "./agent-list-projection.js";
+import {
+  inheritLegacyDefaultAgentId,
+  tryGetLegacyDefaultAgentId,
+} from "./legacy.default-agent-owner.js";
 import { migratePersistedImplicitMainRoster } from "./legacy.roster.js";
 import { materializeRuntimeConfig } from "./materialize.js";
-import {
-  isModelPolicyCompatSelector,
-  isValidExactModelPolicyRef,
-  parseModelPolicyWildcardRef,
-} from "./model-policy-ref.js";
+import { createModelPolicyRefValidator } from "./model-policy-ref.js";
 import type { ConfigValidationIssue, OpenClawConfig } from "./types.js";
 import { collectRawBundledChannelConfigIssues } from "./validation-channel-rules.js";
 import {
@@ -39,6 +43,26 @@ import {
 } from "./validation-issues.js";
 import { isBuiltInModelProviderOverlayId } from "./zod-schema.core.js";
 import { OpenClawSchema } from "./zod-schema.js";
+import { McpServerNameSchema, NodeHostMcpServerNameSchema } from "./zod-schema.root-support.js";
+
+export function collectHeartbeatOwnerWarnings(config: OpenClawConfig): ConfigValidationIssue[] {
+  const agentEntries = listAgentEntries(config);
+  // Match heartbeat enrollment so validation never warns for an owner the runner can use.
+  const unresolved =
+    listAgentIds(config).length > 1 &&
+    !agentEntries.some((entry) => Boolean(entry.heartbeat)) &&
+    !config.agents?.defaults?.heartbeat &&
+    tryResolveAmbientOwnerAgentId(config) === undefined;
+  return unresolved
+    ? [
+        {
+          path: "agents.defaults.heartbeat.agentId",
+          message:
+            "Multi-agent config has no ambient heartbeat owner; heartbeats stay disabled until agents.defaults.heartbeat.agentId or agents.defaults.systemAgent.agentId is set.",
+        },
+      ]
+    : [];
+}
 
 function materializeBundledModelProviderOverlays(config: OpenClawConfig): OpenClawConfig {
   const providers = config.models?.providers;
@@ -77,6 +101,46 @@ function stripPreservedLegacyRootKeysForValidation(
     delete next[key];
   }
   return next;
+}
+
+function collectMcpServerNameIssues(raw: unknown): ConfigValidationIssue[] {
+  if (!isRecord(raw)) {
+    return [];
+  }
+  const mcp = isRecord(raw.mcp) ? raw.mcp : undefined;
+  const nodeHost = isRecord(raw.nodeHost) ? raw.nodeHost : undefined;
+  const nodeHostMcp = isRecord(nodeHost?.mcp) ? nodeHost.mcp : undefined;
+  const locations = [
+    {
+      path: ["mcp", "servers"] as const,
+      servers: isRecord(mcp?.servers) ? mcp.servers : undefined,
+      schema: McpServerNameSchema,
+    },
+    {
+      path: ["nodeHost", "mcp", "servers"] as const,
+      servers: isRecord(nodeHostMcp?.servers) ? nodeHostMcp.servers : undefined,
+      schema: NodeHostMcpServerNameSchema,
+    },
+  ];
+  const issues: ConfigValidationIssue[] = [];
+  for (const location of locations) {
+    for (const serverName of Object.keys(location.servers ?? {})) {
+      const result = location.schema.safeParse(serverName);
+      if (result.success) {
+        continue;
+      }
+      const pathSegments = [...location.path, serverName];
+      for (const issue of result.error.issues) {
+        issues.push(
+          withConfigIssuePath(
+            { path: pathSegments.join("."), message: issue.message },
+            pathSegments,
+          ),
+        );
+      }
+    }
+  }
+  return issues;
 }
 
 function isWorkspaceAvatarPath(value: string, workspaceDir: string): boolean {
@@ -134,7 +198,7 @@ function validateIdentityAvatar(
     }
     const workspaceDir = resolveAgentWorkspaceDir(
       config,
-      entry.id ?? resolveDefaultAgentId(config),
+      entry.id ?? resolveAmbientOwnerAgentId(config),
       env,
     );
     if (!isWorkspaceAvatarPath(avatar, workspaceDir)) {
@@ -189,31 +253,13 @@ function validateGatewayTailscaleAuth(config: OpenClawConfig): ConfigValidationI
 function collectModelPolicyAllowIssues(config: OpenClawConfig): ConfigValidationIssue[] {
   const issues: ConfigValidationIssue[] = [];
   const defaultModels = config.agents?.defaults?.models;
-  const collectAliases = (...modelMaps: Array<typeof defaultModels | undefined>): Set<string> => {
-    const aliases = new Set<string>();
-    for (const models of modelMaps) {
-      for (const entry of Object.values(models ?? {})) {
-        const alias = normalizeLowercaseStringOrEmpty(entry?.alias);
-        if (alias) {
-          aliases.add(alias);
-        }
-      }
-    }
-    return aliases;
-  };
   const validateRefs = (
     refs: readonly string[] | undefined,
     configPath: string,
-    aliases: Set<string>,
+    isValidRef: (raw: string) => boolean,
   ) => {
     for (const [index, raw] of (refs ?? []).entries()) {
-      const trimmed = raw.trim();
-      if (
-        aliases.has(normalizeLowercaseStringOrEmpty(trimmed)) ||
-        isModelPolicyCompatSelector(trimmed) ||
-        isValidExactModelPolicyRef(trimmed) ||
-        parseModelPolicyWildcardRef(trimmed)
-      ) {
+      if (isValidRef(raw)) {
         continue;
       }
       issues.push({
@@ -225,11 +271,10 @@ function collectModelPolicyAllowIssues(config: OpenClawConfig): ConfigValidation
     }
   };
 
-  const defaultAliases = collectAliases(defaultModels);
   validateRefs(
     config.agents?.defaults?.modelPolicy?.allow,
     "agents.defaults.modelPolicy.allow",
-    defaultAliases,
+    createModelPolicyRefValidator(defaultModels),
   );
   for (const { entry: agent, source } of listAgentEntriesWithSource(config)) {
     const pathPrefix =
@@ -237,23 +282,83 @@ function collectModelPolicyAllowIssues(config: OpenClawConfig): ConfigValidation
     validateRefs(
       agent.modelPolicy?.allow,
       `${pathPrefix}.modelPolicy.allow`,
-      collectAliases(defaultModels, agent.models),
+      createModelPolicyRefValidator(defaultModels, agent.models),
     );
   }
   return issues;
 }
 
-function attachAgentListProjection(config: OpenClawConfig): OpenClawConfig {
-  if (!config.agents) {
-    return config;
+function collectSandboxContainerEnvIssues(
+  config: OpenClawConfig,
+  sourceRaw?: unknown,
+): ConfigValidationIssue[] {
+  const agents = listAgentEntriesWithSource(config);
+  if (
+    !config.agents?.defaults?.sandbox?.docker?.env &&
+    !agents.some(({ entry }) => entry.sandbox?.docker?.env)
+  ) {
+    return [];
   }
-  Object.defineProperty(config.agents, "list", {
-    configurable: true,
-    enumerable: false,
-    value: listAgentEntries(config),
-    writable: false,
-  });
-  return config;
+  const issues: ConfigValidationIssue[] = [];
+  const seen = new Set<string>();
+  const authoredAgents = isRecord(sourceRaw) ? listAgentEntriesWithSource(sourceRaw) : agents;
+  const authoredById = new Map(authoredAgents.map((agent) => [agent.entry.id, agent]));
+
+  const defaultSandbox = config.agents?.defaults?.sandbox;
+  const effectiveAgents = agents.length > 0 ? agents : [undefined];
+  for (const agent of effectiveAgents) {
+    const agentSandbox = agent?.entry.sandbox;
+    const scope = resolveSandboxScope({ scope: agentSandbox?.scope ?? defaultSandbox?.scope });
+    const backend = agentSandbox?.backend?.trim() || defaultSandbox?.backend?.trim() || "docker";
+    if (backend !== "docker" && backend !== "podman") {
+      continue;
+    }
+    const env = resolveSandboxDockerEnv({
+      scope,
+      globalEnv: defaultSandbox?.docker?.env,
+      agentEnv: agentSandbox?.docker?.env,
+    });
+    const authoredAgent = agent ? (authoredById.get(agent.entry.id) ?? agent) : undefined;
+    for (const [key, value] of Object.entries(env)) {
+      const reason = getContainerEnvFileEntryIssue(key, value);
+      if (!reason) {
+        continue;
+      }
+      const agentOwnsValue =
+        scope !== "shared" &&
+        authoredAgent !== undefined &&
+        Object.hasOwn(authoredAgent.entry.sandbox?.docker?.env ?? {}, key);
+      const pathSegments =
+        agentOwnsValue && authoredAgent
+          ? authoredAgent.source.kind === "entries"
+            ? ["agents", "entries", authoredAgent.source.key, "sandbox", "docker", "env", key]
+            : ["agents", "list", authoredAgent.source.index, "sandbox", "docker", "env", key]
+          : ["agents", "defaults", "sandbox", "docker", "env", key];
+      const issuePath = pathSegments.join(".");
+      const issueIdentity = JSON.stringify([issuePath, reason]);
+      if (seen.has(issueIdentity)) {
+        continue;
+      }
+      seen.add(issueIdentity);
+      const backendName = backend === "podman" ? "Podman" : "Docker";
+      const remediation =
+        reason === "invalid-name"
+          ? `Rename key ${JSON.stringify(key)} to use letters, digits, and underscores without a leading digit.`
+          : `Use a single-line, non-NUL value for key ${JSON.stringify(key)}, or deliver multiline material through a mounted file or custom image.`;
+      issues.push(
+        withConfigIssuePath(
+          {
+            path: issuePath,
+            message:
+              `${backendName} sandbox backend requires portable environment names and single-line, non-NUL values because the secure env-file transport is line-delimited. ` +
+              `${remediation} SSH/OpenShell backends may keep multiline values. Run openclaw doctor to report the invalid path; manual remediation is required.`,
+          },
+          pathSegments,
+        ),
+      );
+    }
+  }
+  return issues;
 }
 
 /**
@@ -270,21 +375,55 @@ export function validateConfigObjectRaw(
     env?: NodeJS.ProcessEnv;
   },
 ): { ok: true; config: OpenClawConfig } | { ok: false; issues: ConfigValidationIssue[] } {
-  const normalizedRaw = stripPreservedLegacyRootKeysForValidation(
-    raw,
-    opts?.preservedLegacyRootKeys,
+  const legacyDefaultAgentId = isRecord(raw)
+    ? tryGetLegacyDefaultAgentId(raw as OpenClawConfig)
+    : undefined;
+  let normalizedRaw = stripPreservedLegacyRootKeysForValidation(raw, opts?.preservedLegacyRootKeys);
+  let syntheticLegacyOwnership = false;
+  if (legacyDefaultAgentId && isRecord(normalizedRaw) && isRecord(normalizedRaw.agents)) {
+    const entries = normalizedRaw.agents.entries;
+    if (
+      isRecord(entries) &&
+      Object.keys(entries).length > 1 &&
+      normalizedRaw.agents.ownership === undefined
+    ) {
+      normalizedRaw = {
+        ...normalizedRaw,
+        agents: { ...normalizedRaw.agents, ownership: "explicit" },
+      };
+      syntheticLegacyOwnership = true;
+    }
+  }
+  // Generic config transforms can rebuild records before schema validation, so
+  // validate authored MCP names from the parsed source when it is available.
+  const normalizedMcpServerNameIssueKeys = new Set(
+    collectMcpServerNameIssues(normalizedRaw).map((issue) =>
+      JSON.stringify([issue.path, issue.message]),
+    ),
+  );
+  const mcpServerNameIssues = collectMcpServerNameIssues(opts?.sourceRaw).filter(
+    (issue) => !normalizedMcpServerNameIssueKeys.has(JSON.stringify([issue.path, issue.message])),
   );
   const policyIssues = collectUnsupportedSecretRefPolicyIssues(normalizedRaw);
   const validated = OpenClawSchema.safeParse(normalizedRaw);
-  if (!validated.success) {
-    const schemaIssues = validated.error.issues.map(mapZodIssueToConfigIssue);
+  if (!validated.success || mcpServerNameIssues.length > 0) {
+    const schemaIssues = validated.success
+      ? mcpServerNameIssues
+      : [...mcpServerNameIssues, ...validated.error.issues.map(mapZodIssueToConfigIssue)];
     return {
       ok: false,
       issues: mergeUnsupportedMutableSecretRefIssues(policyIssues, schemaIssues),
     };
   }
-  const validatedConfig = attachAgentListProjection(
-    materializeBundledModelProviderOverlays(validated.data as OpenClawConfig),
+  let parsedConfig = validated.data as OpenClawConfig;
+  if (syntheticLegacyOwnership && parsedConfig.agents) {
+    const agents = { ...parsedConfig.agents };
+    delete agents.ownership;
+    parsedConfig = { ...parsedConfig, agents };
+  }
+  const validatedConfig = inheritLegacyDefaultAgentId(
+    raw as OpenClawConfig,
+    attachAgentListProjection(materializeBundledModelProviderOverlays(parsedConfig)),
   );
   const channelIssues =
     policyIssues.length > 0 || opts?.validateBundledChannels
@@ -298,6 +437,13 @@ export function validateConfigObjectRaw(
   }
   if (policyIssues.length > 0) {
     return { ok: false, issues: policyIssues };
+  }
+  const sandboxContainerEnvIssues = collectSandboxContainerEnvIssues(
+    validatedConfig,
+    opts?.sourceRaw,
+  );
+  if (sandboxContainerEnvIssues.length > 0) {
+    return { ok: false, issues: sandboxContainerEnvIssues };
   }
   const duplicates = findDuplicateAgentDirs(validatedConfig);
   if (duplicates.length > 0) {
@@ -339,7 +485,7 @@ export function validateConfigObject(
   return {
     ok: true,
     config: attachAgentListProjection(
-      materializeRuntimeConfig(result.config, "snapshot", {
+      materializeRuntimeConfig(result.config, {
         manifestRegistry: opts?.manifestRegistry,
       }),
     ),

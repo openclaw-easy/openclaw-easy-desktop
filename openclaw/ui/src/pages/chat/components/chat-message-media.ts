@@ -1,35 +1,45 @@
+import { asFiniteNumber } from "@openclaw/normalization-core/number-coercion";
+import { asNonArrayRecord, asOptionalRecord } from "@openclaw/normalization-core/record-coerce";
 import type { ImageLightboxItem } from "../../../components/image-lightbox.ts";
 import { t } from "../../../i18n/index.ts";
 import type { MessageContentItem } from "../../../lib/chat/chat-types.ts";
 import { readTranscriptMediaEntries } from "../../../lib/chat/message-extract.ts";
-import { getMediaFileExtension } from "../../../lib/media-file-extension.ts";
+import {
+  getMediaFileExtension,
+  getMediaFileName,
+  hasVideoMediaFileExtension,
+} from "../../../lib/media-file-extension.ts";
 
 export type PairingQrExpiryNotice = {
   title: string;
   reason: string;
 };
-type PairingQrExpiryRefreshTimer = {
-  expiresAtMs: number;
-  onRequestUpdate: () => void;
-  timer: ReturnType<typeof setTimeout>;
-};
-const pairingQrExpiryRefreshTimers = new Map<string, PairingQrExpiryRefreshTimer>();
 
 export type ImageBlock = {
   url: string;
+  artifactId?: string;
+  fileName?: string;
   openUrl?: string;
   alt?: string;
+  sizeBytes?: number;
   width?: number;
   height?: number;
 };
 
+export type ArtifactDownloadResolver = (params: {
+  sessionKey: string;
+  artifactId: string;
+}) => Promise<{ url: string; expiresAt?: string } | null>;
+
 export type ImageRenderOptions = {
+  connectionEpoch?: number;
   localMediaPreviewRoots?: readonly string[];
-  basePath?: string;
+  resourceBasePath?: string;
   authToken?: string | null;
   onRequestUpdate?: () => void;
   onRequestOpenImage?: () => number;
   onOpenImage?: (item: ImageLightboxItem, requestVersion?: number) => void;
+  resolveArtifactDownload?: ArtifactDownloadResolver;
 };
 
 export type RenderableImageBlock = ImageBlock & {
@@ -37,101 +47,284 @@ export type RenderableImageBlock = ImageBlock & {
 };
 
 export type AttachmentItem = Extract<MessageContentItem, { type: "attachment" }>;
+type AttachmentFailureItem = Extract<MessageContentItem, { type: "attachment_error" }>;
+export type AssistantAttachmentItem = AttachmentItem | AttachmentFailureItem;
 
-const managedImageBlobUrlResolvedCache = new Map<string, string>();
-const managedImageBlobUrlMissCache = new Map<string, number>();
-const managedImageBlobUrlRetainCounts = new Map<string, number>();
+type ChatMediaResourceKind =
+  | "assistant-attachment"
+  | "managed-image"
+  | "managed-media"
+  | "pairing-qr";
+
+export type ChatMediaResource<Value> = {
+  kind: ChatMediaResourceKind;
+  cacheKey: string;
+  value: Value | undefined;
+  pending: Promise<Value | null> | undefined;
+  subscribers: Set<() => void>;
+  retryAttempted: boolean;
+  unavailableAt: number | undefined;
+  abortController: AbortController | undefined;
+  refresh: { at: number; timer: ReturnType<typeof setTimeout> } | undefined;
+};
+
+type ChatMediaSubscriber = {
+  resources: Map<string, ChatMediaResource<unknown>>;
+  children: Set<() => void>;
+  owner?: () => void;
+};
+
+type ManagedImageBlobUrl = {
+  url: string;
+  retainCount: number;
+};
+
+const chatMediaResources = new Map<string, ChatMediaResource<unknown>>();
+const chatMediaSubscribers = new Map<() => void, ChatMediaSubscriber>();
+const managedImageBlobUrls = new Map<string, ManagedImageBlobUrl>();
 const MANAGED_IMAGE_BLOB_URL_CACHE_MAX_ENTRIES = 64;
-const MANAGED_IMAGE_BLOB_URL_MISS_RETRY_MS = 5_000;
+let chatMediaRenderVersion = 0;
+
+function chatMediaResourceKey(kind: ChatMediaResourceKind, cacheKey: string): string {
+  return `${kind}\0${cacheKey}`;
+}
+
+function getChatMediaSubscriber(subscriber: () => void): ChatMediaSubscriber {
+  let state = chatMediaSubscribers.get(subscriber);
+  if (!state) {
+    state = { resources: new Map(), children: new Set() };
+    chatMediaSubscribers.set(subscriber, state);
+  }
+  return state;
+}
+
+function pruneChatMediaSubscriber(subscriber: () => void, state: ChatMediaSubscriber): void {
+  if (!state.owner && state.children.size === 0 && state.resources.size === 0) {
+    chatMediaSubscribers.delete(subscriber);
+  }
+}
+
+function detachChatMediaResourceSubscriber(
+  resource: ChatMediaResource<unknown>,
+  subscriber: () => void,
+) {
+  resource.subscribers.delete(subscriber);
+  if (resource.subscribers.size > 0) {
+    return;
+  }
+  if (resource.refresh) {
+    clearTimeout(resource.refresh.timer);
+    resource.refresh = undefined;
+  }
+  const resourceKey = chatMediaResourceKey(resource.kind, resource.cacheKey);
+  if (chatMediaResources.get(resourceKey) === resource) {
+    chatMediaResources.delete(resourceKey);
+  }
+  resource.abortController?.abort();
+  resource.abortController = undefined;
+}
+
+export function observeChatMediaResource<Value>(
+  kind: ChatMediaResourceKind,
+  cacheKey: string,
+  subscriber?: () => void,
+  subscriberScope = cacheKey,
+): ChatMediaResource<Value> {
+  const resourceKey = chatMediaResourceKey(kind, cacheKey);
+  let resource = chatMediaResources.get(resourceKey) as ChatMediaResource<Value> | undefined;
+  if (!resource) {
+    resource = {
+      kind,
+      cacheKey,
+      value: undefined,
+      pending: undefined,
+      subscribers: new Set(),
+      retryAttempted: false,
+      unavailableAt: undefined,
+      abortController: undefined,
+      refresh: undefined,
+    };
+    chatMediaResources.set(resourceKey, resource as ChatMediaResource<unknown>);
+  }
+  if (subscriber) {
+    const subscriptions = getChatMediaSubscriber(subscriber).resources;
+    const subscriptionKey = chatMediaResourceKey(kind, subscriberScope);
+    const previous = subscriptions.get(subscriptionKey);
+    if (previous && previous !== resource) {
+      detachChatMediaResourceSubscriber(previous, subscriber);
+    }
+    subscriptions.set(subscriptionKey, resource as ChatMediaResource<unknown>);
+    resource.subscribers.add(subscriber);
+  }
+  return resource;
+}
+
+export function isChatMediaResourceCurrent<Value>(resource: ChatMediaResource<Value>): boolean {
+  return (
+    chatMediaResources.get(chatMediaResourceKey(resource.kind, resource.cacheKey)) === resource
+  );
+}
+
+export function getChatMediaRenderVersion(): number {
+  return chatMediaRenderVersion;
+}
+
+export function notifyChatMediaResourceSubscribers<Value>(resource: ChatMediaResource<Value>) {
+  if (!isChatMediaResourceCurrent(resource)) {
+    return;
+  }
+  chatMediaRenderVersion = (chatMediaRenderVersion + 1) % Number.MAX_SAFE_INTEGER;
+  // A pane can change its subscription while another pane is being notified.
+  // Snapshot the current generation so a replacement never receives stale work.
+  for (const subscriber of Array.from(resource.subscribers)) {
+    if (resource.subscribers.has(subscriber)) {
+      subscriber();
+    }
+  }
+}
+
+export function scheduleChatMediaResourceRefresh<Value>(
+  resource: ChatMediaResource<Value>,
+  refreshAt: number | undefined,
+  onRefresh: () => void,
+) {
+  if (resource.refresh?.at === refreshAt) {
+    return;
+  }
+  if (resource.refresh) {
+    clearTimeout(resource.refresh.timer);
+    resource.refresh = undefined;
+  }
+  if (refreshAt === undefined || resource.subscribers.size === 0) {
+    return;
+  }
+  const refresh = {
+    at: refreshAt,
+    timer: setTimeout(
+      () => {
+        if (!isChatMediaResourceCurrent(resource) || resource.refresh !== refresh) {
+          return;
+        }
+        resource.refresh = undefined;
+        onRefresh();
+      },
+      Math.max(0, refreshAt - Date.now()),
+    ),
+  };
+  resource.refresh = refresh;
+}
+
+export function observeChatMediaResourceSubscriber(owner: () => void, subscriber: () => void) {
+  const state = getChatMediaSubscriber(subscriber);
+  if (state.owner === owner) {
+    return;
+  }
+  if (state.owner) {
+    const previousOwner = state.owner;
+    const previous = chatMediaSubscribers.get(previousOwner);
+    if (previous) {
+      previous.children.delete(subscriber);
+      pruneChatMediaSubscriber(previousOwner, previous);
+    }
+  }
+  getChatMediaSubscriber(owner).children.add(subscriber);
+  state.owner = owner;
+}
+
+export function releaseChatMediaResourceSubscriber(subscriber: (() => void) | undefined) {
+  const state = subscriber && chatMediaSubscribers.get(subscriber);
+  if (!subscriber || !state) {
+    return;
+  }
+  chatMediaSubscribers.delete(subscriber);
+  for (const child of state.children) {
+    releaseChatMediaResourceSubscriber(child);
+  }
+  if (state.owner) {
+    const owner = chatMediaSubscribers.get(state.owner);
+    if (owner) {
+      owner.children.delete(subscriber);
+      pruneChatMediaSubscriber(state.owner, owner);
+    }
+  }
+  for (const resource of new Set(state.resources.values())) {
+    detachChatMediaResourceSubscriber(resource, subscriber);
+  }
+}
+
+export function trimManagedImageMissResources() {
+  const misses = [...chatMediaResources.entries()].filter(
+    ([, resource]) =>
+      resource.kind === "managed-image" &&
+      resource.value === null &&
+      resource.subscribers.size === 0 &&
+      !resource.pending,
+  );
+  for (const [resourceKey] of misses.slice(0, -MANAGED_IMAGE_BLOB_URL_CACHE_MAX_ENTRIES)) {
+    chatMediaResources.delete(resourceKey);
+  }
+}
 
 export function readManagedImageBlobUrl(cacheKey: string): string | undefined {
-  const cached = managedImageBlobUrlResolvedCache.get(cacheKey);
+  const cached = managedImageBlobUrls.get(cacheKey);
   if (!cached) {
     return undefined;
   }
-  managedImageBlobUrlResolvedCache.delete(cacheKey);
-  managedImageBlobUrlResolvedCache.set(cacheKey, cached);
-  return cached;
+  managedImageBlobUrls.delete(cacheKey);
+  managedImageBlobUrls.set(cacheKey, cached);
+  return cached.url;
 }
 
 function trimManagedImageBlobUrlCache() {
-  while (managedImageBlobUrlResolvedCache.size > MANAGED_IMAGE_BLOB_URL_CACHE_MAX_ENTRIES) {
-    const evictable = [...managedImageBlobUrlResolvedCache.keys()].find(
-      (cacheKey) => (managedImageBlobUrlRetainCounts.get(cacheKey) ?? 0) === 0,
-    );
+  while (managedImageBlobUrls.size > MANAGED_IMAGE_BLOB_URL_CACHE_MAX_ENTRIES) {
+    const evictable = [...managedImageBlobUrls].find(([, cached]) => cached.retainCount === 0);
     if (!evictable) {
       return;
     }
-    const evicted = managedImageBlobUrlResolvedCache.get(evictable);
-    managedImageBlobUrlResolvedCache.delete(evictable);
-    if (evicted) {
-      URL.revokeObjectURL(evicted);
+    const [cacheKey, cached] = evictable;
+    managedImageBlobUrls.delete(cacheKey);
+    const resourceKey = chatMediaResourceKey("managed-image", cacheKey);
+    const resource = chatMediaResources.get(resourceKey);
+    // Subscriber-free successful resources share their blob's LRU lifetime.
+    // The promise finalizer may still be queued, but a matching value is settled.
+    if (resource?.value === cached.url && resource.subscribers.size === 0) {
+      chatMediaResources.delete(resourceKey);
     }
+    URL.revokeObjectURL(cached.url);
   }
 }
 
 export function retainManagedImageBlobUrl(cacheKey: string): (() => void) | undefined {
-  if (!managedImageBlobUrlResolvedCache.has(cacheKey)) {
+  const cached = managedImageBlobUrls.get(cacheKey);
+  if (!cached) {
     return undefined;
   }
-  managedImageBlobUrlRetainCounts.set(
-    cacheKey,
-    (managedImageBlobUrlRetainCounts.get(cacheKey) ?? 0) + 1,
-  );
+  cached.retainCount += 1;
   let released = false;
   return () => {
     if (released) {
       return;
     }
     released = true;
-    const remaining = (managedImageBlobUrlRetainCounts.get(cacheKey) ?? 1) - 1;
-    if (remaining <= 0) {
-      managedImageBlobUrlRetainCounts.delete(cacheKey);
-    } else {
-      managedImageBlobUrlRetainCounts.set(cacheKey, remaining);
+    const current = managedImageBlobUrls.get(cacheKey);
+    if (current && current.retainCount > 0) {
+      current.retainCount -= 1;
     }
     trimManagedImageBlobUrlCache();
   };
 }
 
 export function cacheManagedImageBlobUrl(cacheKey: string, blobUrl: string) {
-  const previous = managedImageBlobUrlResolvedCache.get(cacheKey);
-  managedImageBlobUrlResolvedCache.delete(cacheKey);
-  managedImageBlobUrlResolvedCache.set(cacheKey, blobUrl);
-  managedImageBlobUrlMissCache.delete(cacheKey);
-  if (previous && previous !== blobUrl) {
-    URL.revokeObjectURL(previous);
+  const previous = managedImageBlobUrls.get(cacheKey);
+  managedImageBlobUrls.delete(cacheKey);
+  managedImageBlobUrls.set(cacheKey, { url: blobUrl, retainCount: previous?.retainCount ?? 0 });
+  if (previous && previous.url !== blobUrl) {
+    URL.revokeObjectURL(previous.url);
   }
 
   // Blob URLs retain browser-managed image data. Keep recent previews reusable,
   // but protect an image while its lightbox still uses that object URL.
   trimManagedImageBlobUrlCache();
-}
-
-export function hasRecentManagedImageBlobUrlMiss(cacheKey: string): boolean {
-  const missAt = managedImageBlobUrlMissCache.get(cacheKey);
-  if (missAt === undefined) {
-    return false;
-  }
-  if (Date.now() - missAt >= MANAGED_IMAGE_BLOB_URL_MISS_RETRY_MS) {
-    managedImageBlobUrlMissCache.delete(cacheKey);
-    return false;
-  }
-  managedImageBlobUrlMissCache.delete(cacheKey);
-  managedImageBlobUrlMissCache.set(cacheKey, missAt);
-  return true;
-}
-
-export function cacheManagedImageBlobUrlMiss(cacheKey: string) {
-  managedImageBlobUrlMissCache.delete(cacheKey);
-  managedImageBlobUrlMissCache.set(cacheKey, Date.now());
-  while (managedImageBlobUrlMissCache.size > MANAGED_IMAGE_BLOB_URL_CACHE_MAX_ENTRIES) {
-    const oldest = managedImageBlobUrlMissCache.keys().next();
-    if (oldest.done) {
-      break;
-    }
-    managedImageBlobUrlMissCache.delete(oldest.value);
-  }
 }
 
 function appendImageBlock(images: ImageBlock[], block: ImageBlock) {
@@ -146,7 +339,7 @@ function buildBase64ImageUrl(params: { data: string; mediaType?: string }): stri
     : `data:${params.mediaType ?? "image/png"};base64,${params.data}`;
 }
 
-function isImageTranscriptMediaPath(path: string, mediaType: unknown): boolean {
+export function isImageMediaPath(path: string, mediaType: unknown): boolean {
   if (typeof mediaType === "string" && mediaType.trim()) {
     const normalized = mediaType.trim().toLowerCase();
     if (normalized.startsWith("image/")) {
@@ -161,6 +354,12 @@ function isImageTranscriptMediaPath(path: string, mediaType: unknown): boolean {
     ext !== undefined &&
     ["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "heic", "heif", "avif"].includes(ext)
   );
+}
+
+export function isSvgImageMediaPath(path: string, mediaType: unknown): boolean {
+  const normalizedMediaType =
+    typeof mediaType === "string" ? mediaType.split(";", 1)[0]?.trim().toLowerCase() : "";
+  return normalizedMediaType === "image/svg+xml" || getMediaFileExtension(path) === "svg";
 }
 
 function isAudioTranscriptMediaPath(path: string, mediaType: unknown): boolean {
@@ -178,19 +377,109 @@ function isVideoTranscriptMediaPath(path: string, mediaType: unknown): boolean {
   if (typeof mediaType === "string" && mediaType.trim().toLowerCase().startsWith("video/")) {
     return true;
   }
-  const ext = getMediaFileExtension(path);
-  return ext !== undefined && ["m4v", "mov", "mp4", "webm"].includes(ext);
+  return hasVideoMediaFileExtension(path);
 }
+
+// Collision-safe managed inbound URIs store the original filename plus a
+// terminal "---<uuid>" storage suffix in the basename
+// (e.g. media://inbound/report---<uuid>.pdf). Restore the original filename by
+// removing only that final generated segment, so an original name that itself
+// contains a "---<uuid>"-shaped part is preserved; the stored URI is unchanged.
+const MANAGED_INBOUND_MEDIA_PREFIX = "media://inbound/";
+const MANAGED_INBOUND_UUID_SUFFIX_PATTERN =
+  /---[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?=\.[^./]*$|$)/i;
 
 function labelForMediaPath(mediaPath: string): string {
   const trimmed = mediaPath.trim();
+  if (trimmed.startsWith(MANAGED_INBOUND_MEDIA_PREFIX)) {
+    const basename = trimmed.split("/").pop()?.trim() || trimmed;
+    return basename.replace(MANAGED_INBOUND_UUID_SUFFIX_PATTERN, "") || basename;
+  }
   try {
     if (/^https?:\/\//i.test(trimmed)) {
       const parsed = new URL(trimmed);
-      return parsed.pathname.split("/").pop()?.trim() || parsed.hostname || trimmed;
+      return getMediaFileName(trimmed)?.trim() || parsed.hostname || trimmed;
     }
   } catch {}
   return trimmed.split(/[\\/]/).pop()?.trim() || trimmed;
+}
+
+function crossOriginStructuredSvgAttachment(
+  source: unknown,
+  mediaType: unknown,
+  metadata: Record<string, unknown> = {},
+): AttachmentItem | null {
+  if (typeof source !== "string" || !isSvgImageMediaPath(source, mediaType)) {
+    return null;
+  }
+  try {
+    const url = new URL(source, window.location.href);
+    if (
+      (url.protocol !== "http:" && url.protocol !== "https:") ||
+      url.origin === window.location.origin
+    ) {
+      return null;
+    }
+  } catch {
+    return null;
+  }
+  const sizeBytes = asFiniteNumber(metadata.sizeBytes);
+  return {
+    type: "attachment",
+    attachment: {
+      url: source,
+      kind: "image",
+      label:
+        (typeof metadata.fileName === "string" && metadata.fileName.trim()) ||
+        (typeof metadata.alt === "string" && metadata.alt.trim()) ||
+        labelForMediaPath(source),
+      mimeType: typeof mediaType === "string" ? mediaType : "image/svg+xml",
+      ...(typeof metadata.artifactId === "string" ? { artifactId: metadata.artifactId } : {}),
+      ...(sizeBytes !== undefined ? { sizeBytes } : {}),
+    },
+  };
+}
+
+export function extractStructuredSvgAttachments(message: unknown): AttachmentItem[] {
+  const content = asNonArrayRecord(message).content;
+  if (!Array.isArray(content)) {
+    return [];
+  }
+  const attachments: AttachmentItem[] = [];
+  const append = (attachment: AttachmentItem | null) => {
+    if (
+      attachment &&
+      !attachments.some((item) => item.attachment.url === attachment.attachment.url)
+    ) {
+      attachments.push(attachment);
+    }
+  };
+  for (const block of content) {
+    if (!block || typeof block !== "object") {
+      continue;
+    }
+    const entry = asNonArrayRecord(block);
+    if (entry.type === "image") {
+      const source = asOptionalRecord(entry.source);
+      append(
+        crossOriginStructuredSvgAttachment(entry.url, entry.mimeType ?? source?.media_type, entry),
+      );
+    } else if (entry.type === "image_url") {
+      const imageUrl = asOptionalRecord(entry.image_url);
+      append(crossOriginStructuredSvgAttachment(imageUrl?.url, undefined));
+    } else if (entry.type === "input_image") {
+      const imageUrl = entry.image_url;
+      const source = asOptionalRecord(entry.source);
+      append(
+        crossOriginStructuredSvgAttachment(
+          typeof imageUrl === "string" ? imageUrl : asOptionalRecord(imageUrl)?.url,
+          undefined,
+        ),
+      );
+      append(crossOriginStructuredSvgAttachment(source?.url, source?.media_type));
+    }
+  }
+  return attachments;
 }
 
 export function extractImages(message: unknown): ImageBlock[] {
@@ -209,8 +498,11 @@ export function extractImages(message: unknown): ImageBlock[] {
         // Handle source object format from optimistic user sends.
         const source = b.source as Record<string, unknown> | undefined;
         const imageMeta = {
+          artifactId: typeof b.artifactId === "string" ? b.artifactId : undefined,
           alt: typeof b.alt === "string" ? b.alt : undefined,
+          fileName: typeof b.fileName === "string" ? b.fileName : undefined,
           openUrl: typeof b.openUrl === "string" ? b.openUrl : undefined,
+          sizeBytes: asFiniteNumber(b.sizeBytes),
           width: typeof b.width === "number" ? b.width : undefined,
           height: typeof b.height === "number" ? b.height : undefined,
         };
@@ -231,27 +523,39 @@ export function extractImages(message: unknown): ImageBlock[] {
             }),
             ...imageMeta,
           });
-        } else if (typeof b.url === "string") {
+        } else if (
+          typeof b.url === "string" &&
+          !crossOriginStructuredSvgAttachment(b.url, b.mimeType ?? source?.media_type, b)
+        ) {
           appendImageBlock(images, { url: b.url, ...imageMeta });
         }
       } else if (b.type === "image_url") {
         // OpenAI format
         const imageUrl = b.image_url as Record<string, unknown> | undefined;
-        if (typeof imageUrl?.url === "string") {
+        if (
+          typeof imageUrl?.url === "string" &&
+          !crossOriginStructuredSvgAttachment(imageUrl.url, undefined)
+        ) {
           appendImageBlock(images, { url: imageUrl.url });
         }
       } else if (b.type === "input_image") {
         const imageUrl = b.image_url;
-        if (typeof imageUrl === "string") {
+        if (
+          typeof imageUrl === "string" &&
+          !crossOriginStructuredSvgAttachment(imageUrl, undefined)
+        ) {
           appendImageBlock(images, { url: imageUrl });
         } else if (imageUrl && typeof imageUrl === "object") {
           const url = (imageUrl as Record<string, unknown>).url;
-          if (typeof url === "string") {
+          if (typeof url === "string" && !crossOriginStructuredSvgAttachment(url, undefined)) {
             appendImageBlock(images, { url });
           }
         }
         const source = b.source as Record<string, unknown> | undefined;
-        if (typeof source?.url === "string") {
+        if (
+          typeof source?.url === "string" &&
+          !crossOriginStructuredSvgAttachment(source.url, source.media_type)
+        ) {
           appendImageBlock(images, { url: source.url });
         } else if (typeof source?.data === "string") {
           appendImageBlock(images, {
@@ -276,19 +580,20 @@ export function extractImages(message: unknown): ImageBlock[] {
     }
   }
 
-  for (const { path: mediaPath, mediaType } of readTranscriptMediaEntries(message)) {
-    if (!isImageTranscriptMediaPath(mediaPath, mediaType)) {
+  for (const { path: mediaPath, mediaType, fileName, sizeBytes } of readTranscriptMediaEntries(
+    message,
+  )) {
+    if (!isImageMediaPath(mediaPath, mediaType) || isSvgImageMediaPath(mediaPath, mediaType)) {
       continue;
     }
-    appendImageBlock(images, { url: mediaPath });
+    appendImageBlock(images, { url: mediaPath, fileName, sizeBytes });
   }
 
   return images;
 }
 
 function readPairingQrExpiresAtMs(block: Record<string, unknown>): number | undefined {
-  const expiresAtMs = block.expiresAtMs;
-  return typeof expiresAtMs === "number" && Number.isFinite(expiresAtMs) ? expiresAtMs : undefined;
+  return asFiniteNumber(block.expiresAtMs);
 }
 
 function isExpiredPairingQrBlock(block: Record<string, unknown>, nowMs = Date.now()): boolean {
@@ -349,61 +654,66 @@ function resolveNearestFuturePairingQrExpiresAtMs(
   return nearestExpiresAtMs;
 }
 
-function clearPairingQrExpiryRefreshTimer(messageKey: string) {
-  const existing = pairingQrExpiryRefreshTimers.get(messageKey);
-  if (!existing) {
-    return;
-  }
-  clearTimeout(existing.timer);
-  pairingQrExpiryRefreshTimers.delete(messageKey);
-}
-
 export function schedulePairingQrExpiryRefresh(
   messageKey: string,
   message: unknown,
   onRequestUpdate: (() => void) | undefined,
 ) {
-  const nowMs = Date.now();
-  const expiresAtMs = resolveNearestFuturePairingQrExpiresAtMs(message, nowMs);
-  const existing = pairingQrExpiryRefreshTimers.get(messageKey);
-  if (!expiresAtMs || !onRequestUpdate) {
-    if (existing) {
-      clearPairingQrExpiryRefreshTimer(messageKey);
+  if (!onRequestUpdate) {
+    return;
+  }
+  const refreshAt = resolveNearestFuturePairingQrExpiresAtMs(message);
+  if (refreshAt === undefined) {
+    const subscriber = chatMediaSubscribers.get(onRequestUpdate);
+    const resourceKey = chatMediaResourceKey("pairing-qr", messageKey);
+    const resource = subscriber?.resources.get(resourceKey);
+    if (subscriber && resource) {
+      subscriber.resources.delete(resourceKey);
+      detachChatMediaResourceSubscriber(resource, onRequestUpdate);
+      pruneChatMediaSubscriber(onRequestUpdate, subscriber);
     }
     return;
   }
-  if (existing?.expiresAtMs === expiresAtMs && existing.onRequestUpdate === onRequestUpdate) {
-    return;
-  }
-  clearPairingQrExpiryRefreshTimer(messageKey);
-  const timer = setTimeout(
-    () => {
-      pairingQrExpiryRefreshTimers.delete(messageKey);
-      onRequestUpdate();
-    },
-    Math.max(0, expiresAtMs - nowMs),
+  const resource = observeChatMediaResource<void>("pairing-qr", messageKey, onRequestUpdate);
+  scheduleChatMediaResourceRefresh(resource, refreshAt, () =>
+    notifyChatMediaResourceSubscribers(resource),
   );
-  pairingQrExpiryRefreshTimers.set(messageKey, { expiresAtMs, onRequestUpdate, timer });
 }
 
 export function extractTranscriptAttachments(message: unknown): AttachmentItem[] {
   const attachments: AttachmentItem[] = [];
-  for (const { path: mediaPath, mediaType } of readTranscriptMediaEntries(message)) {
-    if (isImageTranscriptMediaPath(mediaPath, mediaType)) {
+  for (const {
+    path: mediaPath,
+    mediaType,
+    fileName,
+    sizeBytes,
+    durationMs,
+    width,
+    height,
+  } of readTranscriptMediaEntries(message)) {
+    const image = isImageMediaPath(mediaPath, mediaType);
+    const svg = image && isSvgImageMediaPath(mediaPath, mediaType);
+    if (image && !svg) {
       continue;
     }
-    const kind = isAudioTranscriptMediaPath(mediaPath, mediaType)
-      ? "audio"
-      : isVideoTranscriptMediaPath(mediaPath, mediaType)
-        ? "video"
-        : "document";
+    const kind = svg
+      ? "image"
+      : isAudioTranscriptMediaPath(mediaPath, mediaType)
+        ? "audio"
+        : isVideoTranscriptMediaPath(mediaPath, mediaType)
+          ? "video"
+          : "document";
     attachments.push({
       type: "attachment",
       attachment: {
         url: mediaPath,
         kind,
-        label: labelForMediaPath(mediaPath),
+        label: fileName?.trim() || labelForMediaPath(mediaPath),
         ...(typeof mediaType === "string" ? { mimeType: mediaType } : {}),
+        ...(sizeBytes !== undefined ? { sizeBytes } : {}),
+        ...(durationMs !== undefined ? { durationMs } : {}),
+        ...(width !== undefined ? { width } : {}),
+        ...(height !== undefined ? { height } : {}),
       },
     });
   }

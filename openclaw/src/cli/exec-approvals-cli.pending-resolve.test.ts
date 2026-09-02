@@ -1,5 +1,6 @@
-// Pending and resolve CLI tests stay separate from policy-management coverage.
 import { Command } from "commander";
+// Pending and resolve CLI tests stay separate from policy-management coverage.
+import { createRequireRecord } from "openclaw/plugin-sdk/test-fixtures";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { registerExecApprovalsCli } from "./exec-approvals-cli.js";
 
@@ -30,12 +31,7 @@ const mocks = vi.hoisted(() => {
 
 const { callGatewayFromCli, defaultRuntime, runtimeErrors } = mocks;
 
-function requireRecord(value: unknown, label: string): Record<string, unknown> {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new Error(`Expected ${label}`);
-  }
-  return value as Record<string, unknown>;
-}
+const requireRecord = createRequireRecord("record", "expected-label-capitalized");
 
 function firstMockArg(mock: { mock: { calls: ReadonlyArray<ReadonlyArray<unknown>> } }): unknown {
   const call = mock.mock.calls[0];
@@ -145,6 +141,27 @@ describe("exec approvals pending and resolve CLI", () => {
     defaultRuntime.writeStdout.mockClear();
     defaultRuntime.writeJson.mockClear();
     defaultRuntime.exit.mockClear();
+  });
+
+  it.each(["10junk", "1.5", "0"])(
+    "rejects a malformed grants list limit before the Gateway request (%s)",
+    async (limit) => {
+      await expect(
+        runApprovalsCommand(["approvals", "grants", "list", "--limit", limit, "--json"]),
+      ).rejects.toThrow("--limit must be a positive integer.");
+
+      expect(callGatewayFromCli).not.toHaveBeenCalled();
+    },
+  );
+
+  it("forwards a valid grants list limit as a number", async () => {
+    callGatewayFromCli.mockResolvedValueOnce({ grants: [] });
+
+    await runApprovalsCommand(["approvals", "grants", "list", "--limit", "25", "--json"]);
+
+    const call = callGatewayFromCli.mock.calls[0];
+    expect(call?.[0]).toBe("exec.approval.grants.list");
+    expect(call?.[2]).toEqual({ limit: 25 });
   });
 
   it("renders pending approvals from all three approval kinds", async () => {
@@ -275,6 +292,18 @@ describe("exec approvals pending and resolve CLI", () => {
         },
       ],
     });
+  });
+
+  it("bubbles pending approval failures to the JSON owner", async () => {
+    callGatewayFromCli.mockRejectedValue(new Error("gateway unavailable"));
+
+    await expect(runApprovalsCommand(["approvals", "pending", "--json"])).rejects.toThrow(
+      "gateway unavailable",
+    );
+
+    expect(defaultRuntime.writeJson).not.toHaveBeenCalled();
+    expect(defaultRuntime.error).not.toHaveBeenCalled();
+    expect(defaultRuntime.exit).not.toHaveBeenCalled();
   });
 
   it("preserves whitespace-bearing ids verbatim and keeps them distinct", async () => {
@@ -518,5 +547,34 @@ describe("exec approvals pending and resolve CLI", () => {
       "allow-always is not allowed for system-agent approvals; allowed decisions: allow-once, deny",
     );
     expect(callGatewayFromCli).toHaveBeenCalledTimes(1);
+  });
+
+  it("escapes hostile grant fields visibly in the standing-grant ledger", async () => {
+    const now = Date.now();
+    callGatewayFromCli.mockResolvedValueOnce({
+      grants: [
+        {
+          grantId: "grant-1",
+          cronJobId: "job-1",
+          cronJobName: "night\u001B[2Jly",
+          command: "echo hi \u001B]52;c;steal\u0007",
+          cwd: null,
+          createdAtMs: now - 60_000,
+          expiresAtMs: null,
+          revokedAtMs: now - 1_000,
+          revokedBy: "ops\u001B[1;31madmin",
+          lastUsedAtMs: null,
+          useCount: 3,
+        },
+      ],
+    });
+
+    await runApprovalsCommand(["approvals", "grants", "list"]);
+
+    const output = runtimeOutput();
+    expect(output).not.toContain("\u001B");
+    expect(output).toContain("revoked by ops\\u{1B}");
+    expect(output).toContain("night\\u{1B}");
+    expect(output).toContain("\\u{1B}]52;c;steal");
   });
 });

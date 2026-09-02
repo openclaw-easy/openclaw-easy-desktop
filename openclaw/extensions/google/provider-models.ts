@@ -49,7 +49,10 @@ function normalizeGeminiProRequestId(id: string): string {
 }
 
 function googleFamilyModelId(id: string): string {
-  return id.startsWith(GOOGLE_PROVIDER_PREFIX) ? id.slice(GOOGLE_PROVIDER_PREFIX.length) : id;
+  const unqualified = id.startsWith(GOOGLE_PROVIDER_PREFIX)
+    ? id.slice(GOOGLE_PROVIDER_PREFIX.length)
+    : id;
+  return unqualified.startsWith("models/") ? unqualified.slice("models/".length) : unqualified;
 }
 
 export function isGoogleTextGenerationModelId(id: string): boolean {
@@ -69,6 +72,11 @@ export function isGoogleTextGenerationModelId(id: string): boolean {
     lower === GEMINI_FLASH_LITE_LATEST_ID ||
     lower.startsWith(GEMMA_PREFIX)
   );
+}
+
+export function isGoogleNativeVideoModelId(id: string): boolean {
+  const normalized = normalizeOptionalLowercaseString(googleFamilyModelId(id)) ?? "";
+  return normalized.startsWith("gemini-") && isGoogleTextGenerationModelId(normalized);
 }
 
 type GoogleForwardCompatFamily = readonly [
@@ -196,6 +204,42 @@ const GOOGLE_FORWARD_COMPAT_CASES: readonly GoogleForwardCompatCase[] = [
       normalizedModelId.startsWith("gemma-4") ? { reasoning: true } : undefined,
   },
 ];
+
+// Live discovery copies per-model `compat` from the bundled static catalog.
+// Resolve a discovered id to the static entry carrying the same weights:
+// alias normalization, dated preview releases, and the -latest family aliases.
+// Fail closed: an id that does not canonically resolve keeps no compat, so
+// flags like codeMode are never enabled for unevaluated configurations.
+export function resolveGoogleStaticModelId(
+  id: string,
+  staticIds: ReadonlySet<string>,
+): string | undefined {
+  const canonical = normalizeGoogleModelId(id);
+  if (staticIds.has(canonical)) {
+    return canonical;
+  }
+  // Dated releases publish the same weights under `<id>[-preview]-MM-DD`.
+  const dateless = canonical.replace(/(?:-preview)?-\d{2}-\d{2}$/, "");
+  if (dateless !== canonical) {
+    const canonicalDateless = normalizeGoogleModelId(dateless);
+    if (staticIds.has(canonicalDateless)) {
+      return canonicalDateless;
+    }
+  }
+  const isLatestAlias =
+    canonical === GEMINI_PRO_LATEST_ID ||
+    canonical === GEMINI_FLASH_LATEST_ID ||
+    canonical === GEMINI_FLASH_LITE_LATEST_ID;
+  if (!isLatestAlias) {
+    return undefined;
+  }
+  // -latest aliases track the newest family member; reuse the family template
+  // ordering instead of maintaining a parallel alias map.
+  const familyCase = GOOGLE_FORWARD_COMPAT_CASES.find((entry) =>
+    typeof entry.match === "function" ? entry.match(canonical) : entry.match.includes(canonical),
+  );
+  return familyCase?.family[0].find((templateId) => staticIds.has(templateId));
+}
 
 export function resolveGoogleGeminiForwardCompatModel(params: {
   providerId: string;

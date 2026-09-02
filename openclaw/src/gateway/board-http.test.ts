@@ -1,24 +1,48 @@
+import { mkdtempSync, rmSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { InMemoryBoardStore } from "../boards/board-store.js";
+import { createTestBoardStore } from "../boards/board-store.test-support.js";
+import { closeOpenClawAgentDatabasesForTest } from "../state/openclaw-agent-db.js";
+import { closeOpenClawStateDatabaseForTest } from "../state/openclaw-state-db.js";
 import { handleBoardHttpRequest } from "./board-http.js";
 import {
   BOARD_VIEW_TICKET_TTL_MS,
   createBoardViewTicket,
   verifyBoardViewTicket,
 } from "./board-view-ticket.js";
+import type { GatewayRequestContext } from "./server-methods/types.js";
 
-const store = new InMemoryBoardStore();
+const stateDir = mkdtempSync(path.join(tmpdir(), "openclaw-board-http-"));
+const store = createTestBoardStore({ stateDir });
 const nowMs = 1_800_000_000_000;
+const statusHtml = "<!doctype html><p>Status 界</p>";
+const gatewayA = {} as GatewayRequestContext;
+const gatewayB = {} as GatewayRequestContext;
+let gatewayAActive = true;
+let requestGatewayContext: GatewayRequestContext | undefined = gatewayA;
 let server: Server;
 let baseUrl: string;
+const resolveGatewayA = () => (gatewayAActive ? gatewayA : undefined);
+const resolveGatewayB = () => gatewayB;
+gatewayA.resolveGatewayContext = resolveGatewayA;
+gatewayB.resolveGatewayContext = resolveGatewayB;
+const gatewayAAuthority = {
+  gatewayContext: gatewayA,
+  resolveGatewayContext: resolveGatewayA,
+};
+const gatewayBAuthority = {
+  gatewayContext: gatewayB,
+  resolveGatewayContext: resolveGatewayB,
+};
 
 beforeAll(async () => {
   store.putWidget({
     sessionKey: "agent:main:main",
     name: "status",
-    content: { kind: "html", html: "<!doctype html><p>Status</p>" },
+    content: { kind: "html", html: statusHtml },
   });
   store.putWidget({
     sessionKey: "agent:main:main",
@@ -68,6 +92,9 @@ beforeAll(async () => {
     const handled = handleBoardHttpRequest(req, res, {
       store,
       nowMs,
+      resolveGatewayContext: () => requestGatewayContext,
+    } as Parameters<typeof handleBoardHttpRequest>[2] & {
+      resolveGatewayContext: () => GatewayRequestContext | undefined;
     });
     if (!handled) {
       res.statusCode = 404;
@@ -91,6 +118,9 @@ afterAll(async () => {
       resolve();
     });
   });
+  closeOpenClawAgentDatabasesForTest();
+  closeOpenClawStateDatabaseForTest();
+  rmSync(stateDir, { recursive: true, force: true });
 });
 
 function ticketFor(name: string, revision = 1, issuedAtMs = nowMs): string {
@@ -98,13 +128,23 @@ function ticketFor(name: string, revision = 1, issuedAtMs = nowMs): string {
   if (!document) {
     throw new Error(`missing HTML widget: ${name}`);
   }
-  return createBoardViewTicket({
+  return issueTicket({
     sessionKey: "agent:main:main",
     name,
     revision,
     viewGeneration: document.viewGeneration,
     nowMs: issuedAtMs,
   }).ticket;
+}
+
+function issueTicket(
+  params: Omit<Parameters<typeof createBoardViewTicket>[0], "authority">,
+  authority: Parameters<typeof createBoardViewTicket>[0]["authority"] = gatewayAAuthority,
+): ReturnType<typeof createBoardViewTicket> {
+  return createBoardViewTicket({
+    ...params,
+    authority,
+  });
 }
 
 function request(
@@ -119,12 +159,42 @@ function request(
 }
 
 describe("board widget HTTP", () => {
+  it("serves a ticket only through its issuing live Gateway", async () => {
+    gatewayAActive = true;
+    requestGatewayContext = gatewayA;
+    const ticket = ticketFor("status");
+    expect((await request("status", { ticket })).status).toBe(200);
+
+    requestGatewayContext = gatewayB;
+    expect((await request("status", { ticket })).status).toBe(503);
+    const document = store.readWidgetHtml("agent:main:main", "status");
+    if (!document) {
+      throw new Error("missing status widget");
+    }
+    const replacementTicket = issueTicket(
+      {
+        sessionKey: "agent:main:main",
+        name: "status",
+        revision: document.revision,
+        viewGeneration: document.viewGeneration,
+        nowMs,
+      },
+      gatewayBAuthority,
+    ).ticket;
+    expect((await request("status", { ticket: replacementTicket })).status).toBe(200);
+
+    requestGatewayContext = gatewayA;
+    gatewayAActive = false;
+    expect((await request("status", { ticket })).status).toBe(503);
+    gatewayAActive = true;
+  });
+
   it("round-trips self-contained claims covered by a two-minute HMAC ticket", () => {
     const document = store.readWidgetHtml("agent:main:main", "status");
     if (!document || !("html" in document)) {
       throw new Error("missing status widget");
     }
-    const issued = createBoardViewTicket({
+    const issued = issueTicket({
       sessionKey: "agent:main:main",
       name: "status",
       revision: 1,
@@ -139,22 +209,57 @@ describe("board widget HTTP", () => {
       name: "status",
       revision: 1,
       viewGeneration: document.viewGeneration,
+      authorityGeneration: expect.stringMatching(/^[A-Za-z0-9_-]{32}$/u),
       expiresAtMs: issued.expiresAtMs,
       nonce: expect.stringMatching(/^[A-Za-z0-9_-]{32}$/u),
     });
   });
 
-  it("serves HTML bytes with a valid ticket and no gateway auth", async () => {
-    const response = await request("status", { ticket: ticketFor("status") });
-    expect(response.status).toBe(200);
-    expect(response.headers.get("content-type")).toBe("text/html; charset=utf-8");
-    expect(response.headers.get("content-security-policy")).toContain("default-src 'none'");
-    expect(response.headers.get("content-security-policy")).toContain("connect-src 'none'");
-    expect(response.headers.get("content-security-policy")).toContain("webrtc 'block'");
-    expect(response.headers.get("content-security-policy")).toContain("sandbox allow-scripts");
-    expect(response.headers.get("access-control-allow-origin")).toBe("*");
-    expect(response.headers.get("cache-control")).toBe("no-cache");
-    await expect(response.text()).resolves.toBe("<!doctype html><p>Status</p>");
+  it.each([
+    {
+      label: "authorized multibyte HTML",
+      name: "status",
+      ticket: () => ticketFor("status"),
+      status: 200,
+      body: statusHtml,
+      contentType: "text/html; charset=utf-8",
+    },
+    {
+      label: "malformed encoded path",
+      name: "%E0%A4%A",
+      status: 404,
+      body: "Not Found",
+      contentType: "text/plain; charset=utf-8",
+    },
+    {
+      label: "missing ticket",
+      name: "status",
+      status: 401,
+      body: "Unauthorized",
+      contentType: "text/plain; charset=utf-8",
+    },
+  ])("preserves GET metadata while suppressing the HEAD body for $label", async (testCase) => {
+    for (const method of ["GET", "HEAD"] as const) {
+      const response = await request(testCase.name, {
+        method,
+        ticket: testCase.ticket?.(),
+      });
+      const body = Buffer.from(await response.arrayBuffer());
+
+      expect(response.status).toBe(testCase.status);
+      expect(response.headers.get("content-type")).toBe(testCase.contentType);
+      expect(response.headers.get("content-length")).toBe(String(Buffer.byteLength(testCase.body)));
+      expect(response.headers.get("access-control-allow-origin")).toBe("*");
+      expect(body).toEqual(method === "GET" ? Buffer.from(testCase.body) : Buffer.alloc(0));
+
+      if (testCase.status === 200) {
+        expect(response.headers.get("content-security-policy")).toContain("default-src 'none'");
+        expect(response.headers.get("content-security-policy")).toContain("connect-src 'none'");
+        expect(response.headers.get("content-security-policy")).toContain("webrtc 'block'");
+        expect(response.headers.get("content-security-policy")).toContain("sandbox allow-scripts");
+        expect(response.headers.get("cache-control")).toBe("no-cache");
+      }
+    }
   });
 
   it("does not require or inspect an operator token", async () => {
@@ -231,7 +336,7 @@ describe("board widget HTTP", () => {
   });
 
   it("rejects a ticket with a stale view generation", async () => {
-    const ticket = createBoardViewTicket({
+    const ticket = issueTicket({
       sessionKey: "agent:main:main",
       name: "status",
       revision: 1,
@@ -256,7 +361,7 @@ describe("board widget HTTP", () => {
     if (!document || !("html" in document)) {
       throw new Error("missing slash-key widget");
     }
-    const ticket = createBoardViewTicket({
+    const ticket = issueTicket({
       sessionKey: "session/with/slash",
       name: "slash-key",
       revision: 1,
@@ -271,7 +376,7 @@ describe("board widget HTTP", () => {
   });
 
   it("returns 401 when valid claims have no matching HTML document", async () => {
-    const ticket = createBoardViewTicket({
+    const ticket = issueTicket({
       sessionKey: "agent:main:main",
       name: "missing",
       revision: 1,
@@ -279,7 +384,7 @@ describe("board widget HTTP", () => {
       nowMs,
     }).ticket;
     expect((await request("missing", { ticket })).status).toBe(401);
-    const mcpTicket = createBoardViewTicket({
+    const mcpTicket = issueTicket({
       sessionKey: "agent:main:main",
       name: "mcp",
       revision: 1,
@@ -289,9 +394,9 @@ describe("board widget HTTP", () => {
     expect((await request("mcp", { ticket: mcpTicket })).status).toBe(401);
   });
 
-  it("allows GET only", async () => {
+  it("allows GET and HEAD only", async () => {
     const response = await request("status", { method: "POST", ticket: ticketFor("status") });
     expect(response.status).toBe(405);
-    expect(response.headers.get("allow")).toBe("GET");
+    expect(response.headers.get("allow")).toBe("GET, HEAD");
   });
 });

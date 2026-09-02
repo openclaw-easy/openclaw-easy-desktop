@@ -28,6 +28,12 @@ const POLICY_FIX_METADATA = [
   m(CHECK_IDS.policyMissingFile, "manual", "Restore or author the approved policy artifact."),
   m(CHECK_IDS.policyInvalidFile, "manual", "Repair the policy JSONC syntax or schema."),
   m(
+    CHECK_IDS.policyUnmigratedToolsFile,
+    "manual",
+    "Run openclaw doctor --fix to migrate governed tool declarations into AGENTS.md.",
+    { policyPath: ["tools", "requireMetadata"] },
+  ),
+  m(
     CHECK_IDS.policyHashMismatch,
     "manual",
     "Restore the approved artifact or update the expected hash after review.",
@@ -254,7 +260,7 @@ const POLICY_FIX_METADATA = [
     "Merge required built-in deny tool classes.",
     {
       policyPath: ["tools", "denyTools"],
-      configTargets: ["tools.deny", "agents.list[].tools.deny"],
+      configTargets: ["tools.deny", "agents.entries.<id>.tools.deny"],
     },
   ),
   m(

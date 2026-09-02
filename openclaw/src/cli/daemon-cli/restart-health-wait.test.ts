@@ -35,7 +35,7 @@ describe("restart health", () => {
 
     const { waitForGatewayHealthyRestart } = await import("./restart-health.js");
     const snapshot = await waitForGatewayHealthyRestart({
-      service: { readRuntime } as unknown as GatewayService,
+      service: { readRuntime, readCommand: vi.fn(async () => null) } as unknown as GatewayService,
       port: 18789,
       expectedVersion: "2026.4.24",
       requireRunningService: true,
@@ -284,6 +284,7 @@ describe("restart health", () => {
       readRuntime: vi.fn(async () =>
         ++runtimeReads >= 27 ? { status: "running", pid: 8000 } : { status: "stopped" },
       ),
+      readCommand: vi.fn(async () => null),
     } as unknown as GatewayService;
     inspectPortUsage.mockImplementation(async () =>
       ++portInspections >= 27
@@ -361,6 +362,131 @@ describe("restart health", () => {
     expect(snapshot.elapsedMs).toBe(1_000);
     expect(snapshot.versionMismatch).toBeUndefined();
     expect(sleep).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps waiting when the expected gateway build identity is not available yet", async () => {
+    const service = makeGatewayService({ status: "running", pid: 8000 });
+    inspectPortUsage
+      .mockResolvedValueOnce({
+        port: 18789,
+        status: "free",
+        listeners: [],
+        hints: [],
+      })
+      .mockResolvedValueOnce({
+        port: 18789,
+        status: "busy",
+        listeners: [{ pid: 8000, commandLine: "openclaw-gateway" }],
+        hints: [],
+      });
+    probeGateway.mockResolvedValue({
+      ok: true,
+      close: null,
+      server: { version: "2026.4.26", buildId: "new-build", connId: "new" },
+    });
+
+    const { waitForGatewayHealthyRestart } = await import("./restart-health.js");
+    const snapshot = await waitForGatewayHealthyRestart({
+      service,
+      port: 18789,
+      expectedBuildId: "new-build",
+      attempts: 4,
+      delayMs: 1_000,
+    });
+
+    expect(snapshot.healthy).toBe(true);
+    expect(snapshot.gatewayBuildId).toBe("new-build");
+    expect(snapshot.expectedBuildId).toBe("new-build");
+    expect(snapshot.waitOutcome).toBe("healthy");
+    expect(snapshot.buildIdMismatch).toBeUndefined();
+    expect(sleep).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps waiting when the gateway probe cannot report build identity yet", async () => {
+    const service = makeGatewayService({ status: "running", pid: 8000 });
+    inspectPortUsage.mockResolvedValue({
+      port: 18789,
+      status: "busy",
+      listeners: [{ pid: 8000, commandLine: "openclaw-gateway" }],
+      hints: [],
+    });
+    probeGateway
+      .mockResolvedValueOnce({ ok: false, close: null, error: "connect ECONNREFUSED" })
+      .mockResolvedValueOnce({
+        ok: true,
+        close: null,
+        server: { version: "2026.4.26", buildId: "new-build", connId: "new" },
+      });
+
+    const { waitForGatewayHealthyRestart } = await import("./restart-health.js");
+    const snapshot = await waitForGatewayHealthyRestart({
+      service,
+      port: 18789,
+      expectedBuildId: "new-build",
+      attempts: 4,
+      delayMs: 1_000,
+    });
+
+    expect(snapshot.healthy).toBe(true);
+    expect(snapshot.gatewayBuildId).toBe("new-build");
+    expect(snapshot.waitOutcome).toBe("healthy");
+    expect(snapshot.buildIdMismatch).toBeUndefined();
+    expect(sleep).toHaveBeenCalledTimes(1);
+  });
+
+  it("fails closed when build identity remains unavailable through the wait deadline", async () => {
+    const service = makeGatewayService({ status: "running", pid: 8000 });
+    inspectPortUsage.mockResolvedValue({
+      port: 18789,
+      status: "free",
+      listeners: [],
+      hints: [],
+    });
+
+    const { waitForGatewayHealthyRestart } = await import("./restart-health.js");
+    const snapshot = await waitForGatewayHealthyRestart({
+      service,
+      port: 18789,
+      expectedBuildId: "new-build",
+      attempts: 4,
+      delayMs: 1_000,
+    });
+
+    expect(snapshot.healthy).toBe(false);
+    expect(snapshot.waitOutcome).toBe("timeout");
+    expect(snapshot.elapsedMs).toBe(4_000);
+    expect(snapshot.buildIdMismatch).toBeUndefined();
+    expect(sleep).toHaveBeenCalledTimes(4);
+  });
+
+  it("fails immediately when a reachable gateway omits build identity", async () => {
+    const service = makeGatewayService({ status: "running", pid: 8000 });
+    inspectPortUsage.mockResolvedValue({
+      port: 18789,
+      status: "busy",
+      listeners: [{ pid: 8000, commandLine: "openclaw-gateway" }],
+      hints: [],
+    });
+    probeGateway.mockResolvedValue({
+      ok: true,
+      close: null,
+      server: { version: "2026.4.26", connId: "legacy" },
+    });
+
+    const { waitForGatewayHealthyRestart } = await import("./restart-health.js");
+    const snapshot = await waitForGatewayHealthyRestart({
+      service,
+      port: 18789,
+      expectedBuildId: "new-build",
+      attempts: 4,
+      delayMs: 1_000,
+    });
+
+    expect(snapshot.healthy).toBe(false);
+    expect(snapshot.waitOutcome).toBe("build-id-mismatch");
+    expect(snapshot.elapsedMs).toBe(0);
+    expect(snapshot.buildIdMismatch).toEqual({ expected: "new-build", actual: null });
+    expect(sleep).not.toHaveBeenCalled();
   });
 
   it("annotates timeout waits when the health loop exhausts all attempts", async () => {

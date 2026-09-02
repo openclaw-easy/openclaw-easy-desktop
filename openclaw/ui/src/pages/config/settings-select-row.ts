@@ -8,9 +8,11 @@ export function renderSettingsSelectRow<T extends string>(params: {
   setting: "send-shortcut" | "follow-up-mode" | "catalog-open-target";
   options: ReadonlyArray<{ value: T; label: string }>;
   onChange: (value: string) => void;
+  description?: unknown;
 }) {
   return renderSettingsRow({
     title: params.title,
+    description: params.description,
     control: html`
       <select
         class="settings-select"

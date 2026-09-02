@@ -1,29 +1,16 @@
 // Plugin synchronization and convergence after the core update.
-import path from "node:path";
-import { confirm, isCancel, text } from "@clack/prompts";
-import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import { stripAnsi } from "../../../packages/terminal-core/src/ansi.js";
-import { stylePromptMessage } from "../../../packages/terminal-core/src/prompt-style.js";
-import { sanitizeTerminalText } from "../../../packages/terminal-core/src/safe-text.js";
 import { theme } from "../../../packages/terminal-core/src/theme.js";
 import { readConfigFileSnapshot } from "../../config/config.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import type { PluginInstallRecord } from "../../config/types.plugins.js";
-import type { ClawHubRiskAcknowledgementRequest } from "../../infra/clawhub-install-trust.js";
-import { pathExists } from "../../infra/fs-safe.js";
-import type { UpdateChannel } from "../../infra/update-channels.js";
-import type { UpdateRunResult } from "../../infra/update-runner.js";
-import { normalizePluginsConfig, resolveEffectiveEnableState } from "../../plugins/config-state.js";
+import { resolveRegistryUpdateChannel, type UpdateChannel } from "../../infra/update-channels.js";
 import { commitPluginInstallRecordsWithConfig } from "../../plugins/install-record-commit.js";
 import {
   loadInstalledPluginIndexInstallRecords,
   withoutPluginInstallRecords,
   withPluginInstallRecords,
 } from "../../plugins/installed-plugin-index-records.js";
-import {
-  resolveTrustedSourceLinkedOfficialClawHubSpec,
-  resolveTrustedSourceLinkedOfficialNpmSpec,
-} from "../../plugins/official-external-install-records.js";
 import { refreshPluginRegistryAfterConfigMutation } from "../../plugins/registry-refresh.js";
 import {
   isClawHubTrustSkippedOutcome,
@@ -33,183 +20,39 @@ import {
   type PluginUpdateOutcome,
 } from "../../plugins/update.js";
 import { defaultRuntime } from "../../runtime.js";
-import { resolveUserPath } from "../../utils.js";
+import { resolvePluginCapabilityConsentCliOptions } from "../plugin-capability-consent.js";
 import { listPersistedBundledPluginLocationBridges } from "../plugins-location-bridges.js";
-import {
-  hasNativePackageInstallPayload,
-  resolveBundleInstallRecordPayload,
-  validateBundleInstallRecordPayload,
-} from "./plugin-payload-validation.js";
 import {
   convergenceWarningsToOutcomes,
   runPostCorePluginConvergence,
 } from "./post-core-plugin-convergence.js";
 import { readPackageVersion, type UpdateCommandOptions } from "./shared.js";
+import {
+  buildInvalidConfigPostCoreUpdateResult,
+  collectMissingPluginInstallPayloads,
+  resolvePostSyncPluginUpdateSkipIds,
+  type MissingPluginInstallPayload,
+  type PostCorePluginUpdateResult,
+} from "./update-command-plugins-internals.js";
+
+export type { PostCorePluginUpdateResult } from "./update-command-plugins-internals.js";
 
 const POST_UPDATE_PLUGIN_REPAIR_GUIDANCE =
   "Run openclaw update repair to retry post-update plugin repair.";
 
-export type PostCorePluginUpdateResult = NonNullable<
-  NonNullable<UpdateRunResult["postUpdate"]>["plugins"]
->;
-
-type MissingPluginInstallPayload = {
-  pluginId: string;
-  installPath?: string;
-  reason: "missing-install-path" | "missing-package-dir" | "missing-package-json";
-};
-
 type PostUpdatePluginWarning = NonNullable<PostCorePluginUpdateResult["warnings"]>[number];
 
-function resolvePostSyncPluginUpdateSkipIds(params: {
-  switchedToClawHub: readonly string[];
-  switchedToNpm: readonly string[];
-  repairedMissingPayloadIds: ReadonlySet<string>;
-}): Set<string> {
-  return new Set([
-    ...params.switchedToClawHub,
-    ...params.switchedToNpm,
-    ...params.repairedMissingPayloadIds,
-  ]);
-}
-
 function isClawHubTrustNotice(message: string): boolean {
-  const trimmed = stripAnsi(message).trimStart();
-  return (
-    trimmed.startsWith("ClawHub trust warning ") ||
-    trimmed.startsWith("╭─ REVIEW RECOMMENDED - ClawHub ") ||
-    trimmed.startsWith("╭─ WARNING - ClawHub found security risks ") ||
-    trimmed.startsWith("╭─ BLOCKED - ClawHub ")
-  );
+  return stripAnsi(message).includes("ClawHub Security Audit");
 }
 
 function isNonBlockingClawHubTrustNotice(message: string): boolean {
-  const trimmed = stripAnsi(message).trimStart();
-  return (
-    trimmed.startsWith("ClawHub trust warning ") ||
-    trimmed.startsWith("╭─ REVIEW RECOMMENDED - ClawHub ")
-  );
+  const audit = stripAnsi(message);
+  return audit.includes("ClawHub Security Audit") && audit.includes("Outcome: Review");
 }
 
 function formatPluginUpdateWarning(message: string): string {
   return message.includes("╭─") ? message : theme.warn(message);
-}
-
-function resolveUpdateClawHubRiskAcknowledgementOptions(
-  opts: UpdateCommandOptions,
-  params: {
-    renderWarningBeforePrompt?: (warning: string) => void;
-  } = {},
-): {
-  acknowledgeClawHubRisk?: boolean;
-  onClawHubRisk?: (request: ClawHubRiskAcknowledgementRequest) => Promise<boolean>;
-} {
-  if (opts.acknowledgeClawHubRisk) {
-    return { acknowledgeClawHubRisk: true };
-  }
-  if (opts.dryRun || opts.yes || opts.json || !process.stdin.isTTY || !process.stdout.isTTY) {
-    return {};
-  }
-  return {
-    onClawHubRisk: async (request) => {
-      params.renderWarningBeforePrompt?.(request.warning);
-      const packageName = sanitizeTerminalText(request.packageName);
-      const releaseLabel = `${packageName}@${sanitizeTerminalText(request.version)}`;
-      if (request.acknowledgementKind === "type-package") {
-        const answer = await text({
-          message: stylePromptMessage(`type: '${packageName}' to update anyway`),
-          placeholder: packageName,
-        });
-        return !isCancel(answer) && answer.trim() === packageName;
-      }
-      const ok = await confirm({
-        message: stylePromptMessage(
-          `Update ClawHub package "${releaseLabel}" after reviewing the warning above?`,
-        ),
-        initialValue: false,
-      });
-      return !isCancel(ok) && ok;
-    },
-  };
-}
-
-function isTrackedPackageInstallRecord(record: PluginInstallRecord): boolean {
-  return (
-    record.source === "npm" ||
-    record.source === "clawhub" ||
-    record.source === "git" ||
-    record.source === "marketplace"
-  );
-}
-
-async function collectMissingPluginInstallPayloads(params: {
-  records: Record<string, PluginInstallRecord>;
-  config?: OpenClawConfig;
-  skipDisabledPlugins?: boolean;
-  syncOfficialPluginInstalls?: boolean;
-  env?: NodeJS.ProcessEnv;
-}): Promise<MissingPluginInstallPayload[]> {
-  const env = params.env ?? process.env;
-  const normalizedPluginConfig =
-    params.skipDisabledPlugins && params.config
-      ? normalizePluginsConfig(params.config.plugins)
-      : undefined;
-  const missing: MissingPluginInstallPayload[] = [];
-  for (const [pluginId, record] of Object.entries(params.records).toSorted(([left], [right]) =>
-    left.localeCompare(right),
-  )) {
-    if (!isTrackedPackageInstallRecord(record)) {
-      continue;
-    }
-    const officialNpmSpec = params.syncOfficialPluginInstalls
-      ? resolveTrustedSourceLinkedOfficialNpmSpec({ pluginId, record })
-      : undefined;
-    const officialClawHubSpec = params.syncOfficialPluginInstalls
-      ? resolveTrustedSourceLinkedOfficialClawHubSpec({ pluginId, record })
-      : undefined;
-    if (normalizedPluginConfig && params.config) {
-      const enableState = resolveEffectiveEnableState({
-        id: pluginId,
-        origin: "global",
-        config: normalizedPluginConfig,
-        rootConfig: params.config,
-      });
-      if (!enableState.enabled && !officialNpmSpec && !officialClawHubSpec) {
-        continue;
-      }
-    }
-    const rawInstallPath = normalizeOptionalString(record.installPath);
-    if (!rawInstallPath) {
-      missing.push({ pluginId, reason: "missing-install-path" });
-      continue;
-    }
-    const installPath = resolveUserPath(rawInstallPath, env);
-    if (!(await pathExists(installPath))) {
-      missing.push({ pluginId, installPath, reason: "missing-package-dir" });
-      continue;
-    }
-    const bundlePayload = resolveBundleInstallRecordPayload({ record, installPath });
-    if (bundlePayload.isBundlePayload) {
-      if (await hasNativePackageInstallPayload(installPath)) {
-        continue;
-      }
-      const bundleFailure = validateBundleInstallRecordPayload({
-        pluginId,
-        installPath,
-        record,
-        bundleFormat: bundlePayload.bundleFormat,
-      });
-      if (bundleFailure) {
-        missing.push({ pluginId, installPath, reason: "missing-package-json" });
-      }
-      continue;
-    }
-    const packageJsonPath = path.join(installPath, "package.json");
-    if (!(await pathExists(packageJsonPath))) {
-      missing.push({ pluginId, installPath, reason: "missing-package-json" });
-    }
-  }
-  return missing;
 }
 
 function formatMissingPluginPayloadReason(entry: MissingPluginInstallPayload): string {
@@ -295,58 +138,6 @@ function isActionableSkippedPostUpdateOutcome(outcome: PluginUpdateOutcome): boo
   return isDisabledAfterFailureOutcome(outcome) || isClawHubTrustSkippedOutcome(outcome);
 }
 
-/**
- * Build the post-core-update result we return when the active config cannot
- * even be parsed. Mandatory post-core convergence requires a parseable
- * config to know which plugins are configured; if one isn't available, we
- * refuse to restart the gateway and surface this as a hard error so the
- * existing `status === "error"` ⇒ `exit 1` pre-restart gate fires.
- *
- */
-function buildInvalidConfigPostCoreUpdateResult(): {
-  message: string;
-  guidance: string[];
-  result: PostCorePluginUpdateResult;
-} {
-  const guidance = [
-    "Run `openclaw doctor` to inspect the config validation errors.",
-    "Once the config parses, rerun `openclaw update repair`.",
-  ];
-  const message =
-    "Plugin post-update convergence skipped because the config is invalid; refusing to restart the gateway with an unverified plugin set.";
-  return {
-    message,
-    guidance,
-    result: {
-      status: "error",
-      reason: "invalid-config",
-      changed: false,
-      sync: {
-        changed: false,
-        switchedToBundled: [],
-        switchedToNpm: [],
-        warnings: [],
-        errors: [],
-      },
-      npm: {
-        changed: false,
-        outcomes: [],
-      },
-      integrityDrifts: [],
-      warnings: [{ reason: "invalid-config", message, guidance }],
-    },
-  };
-}
-
-if (process.env.VITEST || process.env.NODE_ENV === "test") {
-  (globalThis as Record<PropertyKey, unknown>)[Symbol.for("openclaw.updateCommandPluginsTestApi")] =
-    {
-      buildInvalidConfigPostCoreUpdateResult,
-      collectMissingPluginInstallPayloads,
-      resolvePostSyncPluginUpdateSkipIds,
-    };
-}
-
 export async function updatePluginsAfterCoreUpdate(params: {
   root: string;
   channel: UpdateChannel;
@@ -410,25 +201,18 @@ export async function updatePluginsAfterCoreUpdate(params: {
   }
 
   const warnings: PostUpdatePluginWarning[] = [];
-  const clawHubRiskAcknowledgementOptions = resolveUpdateClawHubRiskAcknowledgementOptions(
-    params.opts,
-    {
-      renderWarningBeforePrompt: (warning) => {
-        if (hasLoggedPluginWarning(warning)) {
-          return;
-        }
-        recordLoggedPluginWarning(warning);
-        recordClawHubTrustNotice(warning);
-        if (!params.opts.json) {
-          defaultRuntime.log(formatPluginUpdateWarning(warning));
-        }
-      },
-    },
-  );
+  const capabilityConsent = resolvePluginCapabilityConsentCliOptions({
+    acceptCapabilities: params.opts.acceptCapabilities,
+    action: "update",
+    allowPrompt: !params.opts.json,
+  });
   const pluginInstallRecords =
     params.pluginInstallRecords ?? (await loadInstalledPluginIndexInstallRecords());
-  const pluginUpdateChannel = params.channel;
   const coreVersion = await readPackageVersion(params.root);
+  const pluginUpdateChannel = resolveRegistryUpdateChannel({
+    configChannel: params.channel,
+    currentVersion: coreVersion,
+  });
   const syncConfig = withPluginInstallRecords(
     params.configSnapshot.sourceConfig,
     pluginInstallRecords,
@@ -441,8 +225,8 @@ export async function updatePluginsAfterCoreUpdate(params: {
     externalizedBundledPluginBridges: await listPersistedBundledPluginLocationBridges({
       workspaceDir: params.root,
     }),
-    ...clawHubRiskAcknowledgementOptions,
     logger: pluginLogger,
+    ...capabilityConsent,
   });
   for (const error of syncResult.summary.errors) {
     warnings.push(createPostUpdatePluginWarning({ reason: error }));
@@ -516,7 +300,7 @@ export async function updatePluginsAfterCoreUpdate(params: {
       disableOnFailure: true,
       logger: pluginLogger,
       onIntegrityDrift: onPluginIntegrityDrift,
-      ...clawHubRiskAcknowledgementOptions,
+      ...capabilityConsent,
     });
     pluginConfig = repairResult.config;
     pluginsChanged ||= repairResult.changed;
@@ -542,7 +326,7 @@ export async function updatePluginsAfterCoreUpdate(params: {
     disableOnFailure: true,
     logger: pluginLogger,
     onIntegrityDrift: onPluginIntegrityDrift,
-    ...clawHubRiskAcknowledgementOptions,
+    ...capabilityConsent,
   });
   pluginConfig = npmResult.config;
   pluginsChanged ||= npmResult.changed;
@@ -595,8 +379,9 @@ export async function updatePluginsAfterCoreUpdate(params: {
   const convergence = await runPostCorePluginConvergence({
     cfg: pluginConfig,
     env: process.env,
+    compatibilityHostVersion: coreVersion ?? undefined,
     baselineInstallRecords: convergenceBaselineRecords,
-    ...clawHubRiskAcknowledgementOptions,
+    ...capabilityConsent,
   });
   for (const change of convergence.changes) {
     if (!params.opts.json) {
@@ -635,11 +420,14 @@ export async function updatePluginsAfterCoreUpdate(params: {
         channels: structuredClone(params.restoredAuthoredChannels) as OpenClawConfig["channels"],
       };
     }
+    // Installed plugin metadata can own migrations that this process has not loaded yet.
+    // Finalization runs fresh doctor plus strict validation before the update can complete.
     await commitPluginInstallRecordsWithConfig({
       previousInstallRecords: pluginInstallRecords,
       nextInstallRecords,
       nextConfig,
       baseHash: params.configSnapshot.hash,
+      writeOptions: { skipPluginValidation: true },
     });
     await refreshPluginRegistryAfterConfigMutation({
       config: nextConfig,

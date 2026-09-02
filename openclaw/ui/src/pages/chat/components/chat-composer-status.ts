@@ -1,9 +1,8 @@
 import { html, nothing } from "lit";
 import { icons } from "../../../components/icons.ts";
 import { t } from "../../../i18n/index.ts";
-import type { ChatRunUiStatus } from "../run-lifecycle.ts";
-import { CHAT_RUN_STATUS_TOAST_DURATION_MS } from "../run-lifecycle.ts";
-import type { CompactionStatus, FallbackStatus } from "../tool-stream.ts";
+import { CHAT_RUN_STATUS_TOAST_DURATION_MS, type ChatRunUiStatus } from "../run-lifecycle.ts";
+import type { CompactionStatus, FallbackStatus } from "../tool-stream-contract.ts";
 
 const COMPACTION_TOAST_DURATION_MS = 5000;
 const FALLBACK_TOAST_DURATION_MS = 8000;
@@ -15,17 +14,11 @@ export type ComposerRunStatus =
       occurredAt?: number | null;
     };
 
-// Working and Done need no composer chrome: the thread's working spark,
-// content arriving, and Stop reverting to Send already show them (screen
-// readers get the composer's persistent sr-only run-status region).
-// Interrupted keeps a visible toast: the transcript shows nothing when a run
-// is killed, so silence would read as "finished".
 export function renderChatRunStatusIndicator(status: ComposerRunStatus | null | undefined) {
-  if (status?.phase !== "interrupted") {
-    return nothing;
-  }
-  const elapsed = Date.now() - status.occurredAt;
-  if (elapsed >= CHAT_RUN_STATUS_TOAST_DURATION_MS) {
+  if (
+    status?.phase !== "interrupted" ||
+    Date.now() - status.occurredAt >= CHAT_RUN_STATUS_TOAST_DURATION_MS
+  ) {
     return nothing;
   }
   const interrupted = t("chat.composer.runInterrupted");
@@ -34,7 +27,7 @@ export function renderChatRunStatusIndicator(status: ComposerRunStatus | null | 
       class="agent-chat__run-status agent-chat__run-status--interrupted"
       aria-label=${t("chat.composer.runStatus", { status: interrupted })}
     >
-      ${icons.stop}<span class="agent-chat__run-status-label">${interrupted}</span>
+      ${icons.square}<span class="agent-chat__run-status-label">${interrupted}</span>
     </span>
   `;
 }
@@ -50,7 +43,7 @@ export function renderCompactionIndicator(status: CompactionStatus | null | unde
         role="status"
         aria-live="polite"
       >
-        ${icons.loader} Compacting context...
+        ${icons.loader} ${t("chat.composer.compactingContext")}
       </div>
     `;
   }
@@ -63,7 +56,7 @@ export function renderCompactionIndicator(status: CompactionStatus | null | unde
           role="status"
           aria-live="polite"
         >
-          ${icons.check} Context compacted
+          ${icons.check} ${t("chat.composer.contextCompacted")}
         </div>
       `;
     }
@@ -81,18 +74,26 @@ export function renderFallbackIndicator(status: FallbackStatus | null | undefine
     return nothing;
   }
   const details = [
-    `Selected: ${status.selected}`,
-    phase === "cleared" ? `Active: ${status.selected}` : `Active: ${status.active}`,
-    phase === "cleared" && status.previous ? `Previous fallback: ${status.previous}` : null,
-    status.reason ? `Reason: ${status.reason}` : null,
-    status.attempts.length > 0 ? `Attempts: ${status.attempts.slice(0, 3).join(" | ")}` : null,
+    t("chat.composer.fallbackSelected", { model: status.selected }),
+    t("chat.composer.fallbackCurrent", {
+      model: phase === "cleared" ? status.selected : status.active,
+    }),
+    phase === "cleared" && status.previous
+      ? t("chat.composer.fallbackPrevious", { model: status.previous })
+      : null,
+    status.reason ? t("chat.composer.fallbackReason", { reason: status.reason }) : null,
+    status.attempts.length > 0
+      ? t("chat.composer.fallbackAttempts", {
+          attempts: status.attempts.slice(0, 3).join(" | "),
+        })
+      : null,
   ]
     .filter(Boolean)
     .join(" • ");
   const message =
     phase === "cleared"
-      ? `Fallback cleared: ${status.selected}`
-      : `Fallback active: ${status.active}`;
+      ? t("chat.composer.fallbackCleared", { model: status.selected })
+      : t("chat.composer.fallbackActive", { model: status.active });
   const className =
     phase === "cleared"
       ? "compaction-indicator compaction-indicator--fallback-cleared"

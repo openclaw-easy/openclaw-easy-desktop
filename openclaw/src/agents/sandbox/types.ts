@@ -35,6 +35,11 @@ export type SandboxToolPolicyResolved = {
 
 export type SandboxWorkspaceAccess = "none" | "ro" | "rw";
 
+/** Prepared resource ownership; only proven profiles retain cross-session workspaces. */
+export type SandboxIsolationSubject =
+  | { kind: "profile"; profileId: string }
+  | { kind: "session"; sessionKey: string };
+
 export type SandboxBrowserConfig = {
   enabled: boolean;
   image: string;
@@ -79,6 +84,8 @@ export type SandboxConfig = {
   scope: SandboxScope;
   workspaceAccess: SandboxWorkspaceAccess;
   workspaceRoot: string;
+  // Podman must omit only the inherited bare /run tmpfs default; explicit /run is rejected.
+  dockerTmpfsSource: "default" | "configured";
   docker: SandboxDockerConfig;
   ssh: SandboxSshConfig;
   browser: SandboxBrowserConfig;
@@ -94,6 +101,8 @@ export type SandboxBrowserContext = {
 
 export type SandboxContext = {
   enabled: boolean;
+  /** Immutable creator policy: this session may never escape to a host execution target. */
+  required?: true;
   backendId: SandboxBackendId;
   sessionKey: string;
   workspaceDir: string;

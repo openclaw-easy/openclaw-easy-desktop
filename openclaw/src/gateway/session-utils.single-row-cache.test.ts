@@ -1,17 +1,17 @@
 /**
- * Tests single-row session cache behavior in gateway session utilities.
+ * Tests fresh child state in exact session-row Gateway projections.
  */
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { resetConfigRuntimeState, setRuntimeConfigSnapshot } from "../config/config.js";
 import type { OpenClawConfig } from "../config/config.js";
-import { resolveStorePath, type SessionEntry } from "../config/sessions.js";
+import { resolveSessionStorePathCore, type SessionEntry } from "../config/sessions.js";
 import { replaceSessionEntry, updateSessionEntry } from "../config/sessions/session-accessor.js";
 import { resetPluginRuntimeStateForTest } from "../plugins/runtime.js";
 import { withStateDirEnv } from "../test-helpers/state-dir-env.js";
 
 const subagentRegistryReadMock = vi.hoisted(() => {
   let runsByChildSessionKey = new Map<string, Record<string, unknown>>();
-  const buildSubagentRunReadIndex = vi.fn(() => {
+  const buildSubagentSessionListReadIndex = vi.fn(() => {
     const runsByControllerSessionKey = new Map<string, Record<string, unknown>[]>();
     for (const entry of runsByChildSessionKey.values()) {
       const controllerSessionKey =
@@ -36,7 +36,7 @@ const subagentRegistryReadMock = vi.hoisted(() => {
     };
   });
   return {
-    buildSubagentRunReadIndex,
+    buildSubagentSessionListReadIndex,
     countActiveDescendantRuns: vi.fn(() => 0),
     getSessionDisplaySubagentRunByChildSessionKey: vi.fn(
       (childSessionKey: string) => runsByChildSessionKey.get(childSessionKey) ?? null,
@@ -44,6 +44,7 @@ const subagentRegistryReadMock = vi.hoisted(() => {
     getSubagentSessionRuntimeMs: vi.fn(() => undefined),
     getSubagentSessionStartedAt: vi.fn(() => undefined),
     isSubagentRunLive: vi.fn(() => false),
+    isSubagentRunQueued: vi.fn(() => false),
     listSubagentRunsForController: vi.fn((controllerSessionKey: string) =>
       [...runsByChildSessionKey.values()].filter((entry) => {
         const controller =
@@ -66,11 +67,12 @@ const subagentRegistryReadMock = vi.hoisted(() => {
   };
 });
 
-vi.mock("../agents/subagent-registry-read.js", () => subagentRegistryReadMock);
+vi.mock("../agents/subagents/registry/subagent-registry-read.js", () => subagentRegistryReadMock);
 
 import {
-  listSessionsFromStore,
+  buildGatewaySessionInfo,
   listSessionsFromStoreAsync,
+  loadGatewaySessionEntryReadOnly,
   loadGatewaySessionRow,
 } from "./session-utils.js";
 
@@ -110,7 +112,7 @@ async function withSingleRowCacheStore(
     setRuntimeConfigSnapshot(cfg, cfg);
     await run({
       now: Math.floor(Date.now() / 1_000) * 1_000 + 100,
-      storePath: resolveStorePath(cfg.session?.store, { agentId: MAIN_AGENT_ID }),
+      storePath: resolveSessionStorePathCore(cfg.session?.store, { agentId: MAIN_AGENT_ID }),
     });
   });
 }
@@ -130,6 +132,21 @@ function runningChildSession(
   return {
     sessionId,
     parentSessionKey,
+    updatedAt: now,
+    status: "running",
+  };
+}
+
+function runningControlledChildSession(
+  sessionId: string,
+  spawnedBy: string,
+  now: number,
+  parentSessionKey?: string,
+): SessionEntry {
+  return {
+    sessionId,
+    spawnedBy,
+    ...(parentSessionKey ? { parentSessionKey } : {}),
     updatedAt: now,
     status: "running",
   };
@@ -155,6 +172,7 @@ function setSubagentControllerRun(
       controllerSessionKey,
       requesterSessionKey: controllerSessionKey,
       createdAt,
+      execution: { status: "running", startedAt: createdAt },
     },
   ]);
 }
@@ -182,10 +200,10 @@ function expectChildMovedToNewParent(fixture: MovingChildFixture, now: number): 
   expect(loadGatewaySessionRow(fixture.newParent, { now: now + 50 })?.childSessions).toEqual([
     fixture.child,
   ]);
-  expect(subagentRegistryReadMock.buildSubagentRunReadIndex).not.toHaveBeenCalled();
+  expect(subagentRegistryReadMock.buildSubagentSessionListReadIndex).not.toHaveBeenCalled();
 }
 
-describe("single gateway session row child-session cache", () => {
+describe("single gateway session row child projections", () => {
   afterEach(() => {
     resetConfigRuntimeState();
     resetPluginRuntimeStateForTest();
@@ -193,7 +211,7 @@ describe("single gateway session row child-session cache", () => {
     vi.clearAllMocks();
   });
 
-  test("shares the child-session index across repeated single-row loads for the same store", async () => {
+  test("keeps direct children visible with at most one candidate scan per exact snapshot", async () => {
     await withSingleRowCacheStore(
       "openclaw-single-row-cache-",
       "/tmp/openclaw-single-row-cache",
@@ -223,17 +241,40 @@ describe("single gateway session row child-session cache", () => {
         expect(rowA?.childSessions).toEqual(["agent:main:subagent:child-a"]);
         expect(rowB?.childSessions).toEqual(["agent:main:subagent:child-b"]);
         expect(rowAAfterWindow?.childSessions).toEqual(["agent:main:subagent:child-a"]);
-        expect(subagentRegistryReadMock.buildSubagentRunReadIndex).not.toHaveBeenCalled();
+        for (let index = 0; index < 2; index += 1) {
+          const loaded = loadGatewaySessionEntryReadOnly("agent:main:subagent:parent-a", {
+            clone: false,
+            includeStoreChildEntries: true,
+          });
+          const entriesSpy = vi.spyOn(Object, "entries");
+          try {
+            const row = buildGatewaySessionInfo({ ...loaded, key: loaded.canonicalKey, now });
+            expect(row.childSessions).toEqual(["agent:main:subagent:child-a"]);
+            expect(
+              entriesSpy.mock.calls.filter(([value]) => value === loaded.store).length,
+            ).toBeLessThanOrEqual(1);
+          } finally {
+            entriesSpy.mockRestore();
+          }
+        }
+        expect(subagentRegistryReadMock.buildSubagentSessionListReadIndex).not.toHaveBeenCalled();
       },
     );
   });
 
-  test("refreshes subagent registry state while reusing store child candidates", async () => {
+  test("refreshes subagent registry control on each projection", async () => {
     await withSingleRowCacheStore(
       "openclaw-single-row-cache-fresh-registry-",
       "/tmp/openclaw-single-row-cache-fresh-registry",
       async ({ now, storePath }) => {
         const fixture = createMovingChildFixture(now);
+        // This fixture moves runtime control only; an explicit parent would
+        // instead declare durable navigation lineage that must remain linked.
+        fixture.store[fixture.child] = runningControlledChildSession(
+          "child",
+          fixture.oldParent,
+          now,
+        );
         await seedSessionEntries(storePath, fixture.store);
 
         setSubagentControllerRun(fixture.child, fixture.oldParent, now);
@@ -242,6 +283,36 @@ describe("single gateway session row child-session cache", () => {
         ]);
 
         setSubagentControllerRun(fixture.child, fixture.newParent, now + 25);
+        expectChildMovedToNewParent(fixture, now);
+      },
+    );
+  });
+
+  test("keeps independent navigation lineage while runtime control moves", async () => {
+    await withSingleRowCacheStore(
+      "openclaw-single-row-cache-navigation-owner-",
+      "/tmp/openclaw-single-row-cache-navigation-owner",
+      async ({ now, storePath }) => {
+        const fixture = createMovingChildFixture(now);
+        const navigationParent = "agent:main:dashboard:navigation-parent";
+        fixture.store[navigationParent] = parentSession("navigation-parent", now);
+        fixture.store[fixture.child] = runningControlledChildSession(
+          "child",
+          fixture.oldParent,
+          now,
+          navigationParent,
+        );
+        await seedSessionEntries(storePath, fixture.store);
+
+        setSubagentControllerRun(fixture.child, fixture.oldParent, now);
+        expect(loadGatewaySessionRow(navigationParent, { now })?.childSessions).toEqual([
+          fixture.child,
+        ]);
+
+        setSubagentControllerRun(fixture.child, fixture.newParent, now + 25);
+        expect(loadGatewaySessionRow(navigationParent, { now: now + 50 })?.childSessions).toEqual([
+          fixture.child,
+        ]);
         expectChildMovedToNewParent(fixture, now);
       },
     );
@@ -268,21 +339,6 @@ describe("single gateway session row child-session cache", () => {
           },
         } as OpenClawConfig;
 
-        const syncListed = listSessionsFromStore({
-          cfg,
-          storePath,
-          store,
-          opts: { agentId: MAIN_AGENT_ID, limit: 1 },
-        });
-
-        expect(syncListed.sessions).toHaveLength(1);
-        expect(subagentRegistryReadMock.buildSubagentRunReadIndex).toHaveBeenCalledTimes(1);
-        expect(
-          subagentRegistryReadMock.getSessionDisplaySubagentRunByChildSessionKey,
-        ).not.toHaveBeenCalled();
-
-        vi.clearAllMocks();
-
         const asyncListed = await listSessionsFromStoreAsync({
           cfg,
           storePath,
@@ -291,7 +347,7 @@ describe("single gateway session row child-session cache", () => {
         });
 
         expect(asyncListed.sessions).toHaveLength(1);
-        expect(subagentRegistryReadMock.buildSubagentRunReadIndex).toHaveBeenCalledTimes(1);
+        expect(subagentRegistryReadMock.buildSubagentSessionListReadIndex).toHaveBeenCalledTimes(1);
         expect(
           subagentRegistryReadMock.getSessionDisplaySubagentRunByChildSessionKey,
         ).not.toHaveBeenCalled();
@@ -299,7 +355,7 @@ describe("single gateway session row child-session cache", () => {
     );
   });
 
-  test("rebuilds store child candidates after same-object session store writes", async () => {
+  test("refreshes store child candidates after session writes", async () => {
     await withSingleRowCacheStore(
       "openclaw-single-row-cache-write-version-",
       "/tmp/openclaw-single-row-cache-write-version",

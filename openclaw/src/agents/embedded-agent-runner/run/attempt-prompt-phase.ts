@@ -4,58 +4,106 @@ import {
   buildHeartbeatOutcomeContext,
   claimHeartbeatOutcomeForRun,
 } from "../../../infra/heartbeat-outcome-store.js";
-import { releasePendingAgentSteeringItems } from "../../subagent-registry.js";
+import { releasePendingAgentSteeringItems } from "../../subagents/registry/subagent-registry.js";
 import { prepareGooglePromptCacheStreamFn } from "../google-prompt-cache.js";
 import { log } from "../logger.js";
 import { resolveEmbeddedAgentApiKey } from "../stream-resolution.js";
 import { runEmbeddedAttemptBeforeAgentRun } from "./attempt-before-agent-run.js";
-import { prepareEmbeddedAttemptPromptAssembly } from "./attempt-prompt-assembly.js";
-import { prepareEmbeddedAttemptPromptContext } from "./attempt-prompt-context.js";
-import { dispatchEmbeddedAttemptPrompt } from "./attempt-prompt-dispatch.js";
-import { handleEmbeddedAttemptPromptError } from "./attempt-prompt-error.js";
-import { handleEmbeddedAttemptMidTurnPrecheck } from "./attempt-prompt-preflight.js";
+import {
+  prepareEmbeddedAttemptPromptAssembly,
+  prepareEmbeddedAttemptPromptContext,
+} from "./attempt-prompt-build.js";
+import {
+  handleEmbeddedAttemptMidTurnPrecheck,
+  prepareEmbeddedAttemptPromptPreflight,
+} from "./attempt-prompt-preflight.js";
+import {
+  handleEmbeddedAttemptPromptError,
+  submitEmbeddedAttemptPrompt,
+} from "./attempt-prompt-submit.js";
+import {
+  type createPromptBuildToolPolicy,
+  observeEmbeddedAttemptPrompt,
+} from "./attempt-prompt-support.js";
 import { removeTrailingMidTurnPrecheckAssistantError } from "./attempt-transcript-helpers.js";
 import type { MidTurnPrecheckRequest } from "./midturn-precheck.js";
+import { prepareEmbeddedAttemptPromptExecution } from "./prompt-image-preparation.js";
 
 type PromptAssemblyInput = Parameters<typeof prepareEmbeddedAttemptPromptAssembly>[0];
 type PromptAssemblyResult = Awaited<ReturnType<typeof prepareEmbeddedAttemptPromptAssembly>>;
 type PromptContextInput = Parameters<typeof prepareEmbeddedAttemptPromptContext>[0];
 type PromptContextResult = ReturnType<typeof prepareEmbeddedAttemptPromptContext>;
-type PromptDispatchInput = Parameters<typeof dispatchEmbeddedAttemptPrompt>[0];
 type PromptErrorInput = Parameters<typeof handleEmbeddedAttemptPromptError>[0];
+type PromptExecutionInput = Parameters<typeof prepareEmbeddedAttemptPromptExecution>[0];
+type PromptObservationInput = Parameters<typeof observeEmbeddedAttemptPrompt>[0];
+type PromptPreflightInput = Parameters<typeof prepareEmbeddedAttemptPromptPreflight>[0];
+type PromptSubmissionInput = Parameters<typeof submitEmbeddedAttemptPrompt>[0];
 type BeforeAgentRunOutcome = NonNullable<
   Awaited<ReturnType<typeof runEmbeddedAttemptBeforeAgentRun>>
 >;
-type PromptPhaseState = Omit<PromptDispatchInput["state"], "skipPromptSubmission">;
+type PromptPhaseState = Omit<PromptPreflightInput["state"], "skipPromptSubmission">;
 
 type PromptAssemblyPhaseInput = Omit<
   PromptAssemblyInput,
-  "attempt" | "activeSession" | "sessionManager" | "setLeasedSteering"
+  | "attempt"
+  | "activeSession"
+  | "sessionManager"
+  | "applyPromptBuildToolsAllow"
+  | "setLeasedSteering"
 >;
 type PromptContextPhaseInput = Omit<
   PromptContextInput,
   "attempt" | "messages" | "prompt" | "replaceSessionMessages"
 >;
-type PromptExecutionPhaseInput = Omit<PromptDispatchInput["execution"], "sessionLockController">;
-type PromptObservationPhaseInput = Omit<PromptDispatchInput["observation"], "transcriptLeafId">;
-type PromptPreflightPhaseInput = PromptDispatchInput["preflight"] & {
-  activeContextEngine?: PromptDispatchInput["activeContextEngine"];
+type PromptExecutionPhaseInput = Omit<
+  PromptExecutionInput,
+  "attempt" | "prompt" | "skipPromptSubmission"
+>;
+type PromptObservationPhaseInput = Omit<
+  PromptObservationInput,
+  | "attempt"
+  | "contextTokenBudget"
+  | "effectivePrompt"
+  | "hookMessagesForCurrentPrompt"
+  | "imageCount"
+  | "llmBoundaryPromptForPrecheck"
+  | "promptForModel"
+  | "promptSubmissionRuntimeOnly"
+  | "reserveTokens"
+  | "sessionMessages"
+  | "skipPromptSubmission"
+  | "systemPromptForHook"
+  | "transcriptLeafId"
+>;
+type PromptPreflightPhaseInput = Omit<
+  PromptPreflightInput,
+  | "attempt"
+  | "activeContextEngine"
+  | "contextTokenBudget"
+  | "hookMessagesForCurrentPrompt"
+  | "promptForPrecheck"
+  | "reserveTokens"
+  | "sessionMessageCount"
+  | "state"
+  | "systemPrompt"
+  | "toolResultMaxChars"
+> & {
+  activeContextEngine?: PromptPreflightInput["activeContextEngine"];
 };
 type PromptSubmissionPhaseInput = Pick<
-  PromptDispatchInput["submission"],
+  PromptSubmissionInput,
   | "promptActiveSession"
   | "sessionPromptState"
   | "toolResultPromptProjectionState"
   | "trajectoryRecorder"
 >;
-type WithOwnedSessionWriteLock = <T>(operation: () => Promise<T> | T) => Promise<T>;
+type WithOwnedTranscriptWrite = <T>(operation: () => Promise<T> | T) => Promise<T>;
 
 export async function runEmbeddedAttemptPromptPhase(input: {
   attempt: PromptAssemblyInput["attempt"];
   activeSession: PromptAssemblyInput["activeSession"];
   sessionManager: PromptAssemblyInput["sessionManager"];
-  sessionLockController: PromptDispatchInput["execution"]["sessionLockController"];
-  withOwnedSessionWriteLock: WithOwnedSessionWriteLock;
+  withOwnedTranscriptWrite: WithOwnedTranscriptWrite;
   getCompactionReserveTokens: () => number;
   emptyExplicitToolAllowlistError?: Error;
   assembly: PromptAssemblyPhaseInput;
@@ -66,6 +114,7 @@ export async function runEmbeddedAttemptPromptPhase(input: {
     signal: AbortSignal;
   };
   observation: PromptObservationPhaseInput;
+  toolPolicy: ReturnType<typeof createPromptBuildToolPolicy>;
   preflight: PromptPreflightPhaseInput;
   submission: PromptSubmissionPhaseInput;
   lifecycle: {
@@ -79,9 +128,11 @@ export async function runEmbeddedAttemptPromptPhase(input: {
     setPromptCacheChangesForTurn: (
       changes: PromptAssemblyResult["promptCacheChangesForTurn"],
     ) => void;
+    setCodeModeReconciliationReadAuthorized: (value: boolean) => void;
     setFinalPromptText: (prompt: string) => void;
     markBeforeAgentRunBlocked: (outcome: BeforeAgentRunOutcome) => void;
     markYieldAborted: () => void;
+    isRunBudgetTimeoutAbort: (error: unknown) => boolean;
     readYieldState: () => Pick<
       PromptErrorInput,
       "yieldAbortSettled" | "yieldDetected" | "yieldMessage"
@@ -97,7 +148,7 @@ export async function runEmbeddedAttemptPromptPhase(input: {
   const patchState = (patch: Partial<PromptPhaseState>) => {
     input.lifecycle.writeState({ ...input.lifecycle.readState(), ...patch });
   };
-  const publishDispatchState = (state: PromptDispatchInput["state"]) => {
+  const publishDispatchState = (state: PromptPreflightInput["state"]) => {
     const { skipPromptSubmission: nextSkipPromptSubmission, ...phaseState } = state;
     skipPromptSubmission = nextSkipPromptSubmission;
     input.lifecycle.writeState(phaseState);
@@ -133,6 +184,21 @@ export async function runEmbeddedAttemptPromptPhase(input: {
   };
 
   const promptStartedAt = Date.now();
+
+  const promptAssembly = await prepareEmbeddedAttemptPromptAssembly({
+    attempt,
+    activeSession,
+    sessionManager,
+    ...input.assembly,
+    applyPromptBuildToolsAllow: (toolsAllow) => {
+      const promptToolSurface = input.toolPolicy.apply(toolsAllow);
+      input.lifecycle.setCodeModeReconciliationReadAuthorized(promptToolSurface.coreReadAuthorized);
+      return promptToolSurface.activeToolNames;
+    },
+    setLeasedSteering: (lease) => {
+      leasedSteering = lease;
+    },
+  });
   if (input.emptyExplicitToolAllowlistError) {
     patchState({
       promptError: input.emptyExplicitToolAllowlistError,
@@ -141,24 +207,16 @@ export async function runEmbeddedAttemptPromptPhase(input: {
     skipPromptSubmission = true;
     log.warn(`[tools] ${input.emptyExplicitToolAllowlistError.message}`);
   }
-
-  const promptAssembly = await prepareEmbeddedAttemptPromptAssembly({
-    attempt,
-    activeSession,
-    sessionManager,
-    ...input.assembly,
-    setLeasedSteering: (lease) => {
-      leasedSteering = lease;
-    },
-  });
   const { hookCtx, promptBuildPrependContext, promptBuildAppendContext, transcriptLeafId } =
     promptAssembly;
   leasedSteering = promptAssembly.leasedSteering ?? leasedSteering;
   input.lifecycle.setPromptCacheChangesForTurn(promptAssembly.promptCacheChangesForTurn);
 
   try {
+    const canClaimHeartbeatOutcome =
+      attempt.trigger === "user" && attempt.sessionPersistence !== "detached";
     const heartbeatOutcomeContext =
-      attempt.trigger === "user" && attempt.sessionKey
+      canClaimHeartbeatOutcome && attempt.sessionKey
         ? buildHeartbeatOutcomeContext(
             claimHeartbeatOutcomeForRun({
               agentId: input.context.sessionAgentId,
@@ -193,7 +251,7 @@ export async function runEmbeddedAttemptPromptPhase(input: {
             modelPrompt: promptForModel,
             sessionManager,
             systemPrompt: systemPromptForHook,
-            withOwnedSessionWriteLock: input.withOwnedSessionWriteLock,
+            withOwnedTranscriptWrite: input.withOwnedTranscriptWrite,
           });
     if (beforeAgentRunOutcome) {
       input.lifecycle.markBeforeAgentRunBlocked(beforeAgentRunOutcome);
@@ -218,7 +276,7 @@ export async function runEmbeddedAttemptPromptPhase(input: {
         provider: attempt.provider,
         sessionManager: {
           appendCustomEntry: async (customType, data) => {
-            await input.withOwnedSessionWriteLock(() => {
+            await input.withOwnedTranscriptWrite(() => {
               sessionManager.appendCustomEntry(customType, data);
             });
           },
@@ -233,41 +291,83 @@ export async function runEmbeddedAttemptPromptPhase(input: {
       }
     }
 
+    const imageResult = await prepareEmbeddedAttemptPromptExecution({
+      ...input.execution,
+      attempt,
+      prompt: promptContext.promptSubmission.prompt,
+      skipPromptSubmission,
+    });
+    const reserveTokens = input.getCompactionReserveTokens();
+    let state: PromptPreflightInput["state"] = {
+      ...input.lifecycle.readState(),
+      skipPromptSubmission: observeEmbeddedAttemptPrompt({
+        ...input.observation,
+        effectiveTools: input.toolPolicy.current.effectiveTools,
+        tools: input.toolPolicy.current.tools,
+        uncompactedEffectiveTools: input.toolPolicy.current.uncompactedEffectiveTools,
+        attempt,
+        contextTokenBudget: promptContext.contextTokenBudget,
+        effectivePrompt: promptContext.effectivePrompt,
+        hookMessagesForCurrentPrompt: promptContext.hookMessagesForCurrentPrompt,
+        imageCount: imageResult.images.length,
+        llmBoundaryPromptForPrecheck: promptContext.llmBoundaryPromptForPrecheck,
+        promptForModel: promptContext.promptForModel,
+        promptSubmissionRuntimeOnly: promptContext.promptSubmission.runtimeOnly,
+        reserveTokens,
+        sessionMessages: activeSession.messages,
+        skipPromptSubmission,
+        systemPromptForHook: promptContext.systemPromptForHook,
+        transcriptLeafId,
+      }).skipPromptSubmission,
+    };
+    // Publish each admission transition before the next fallible phase so outer cleanup sees it.
+    publishDispatchState(state);
+
     const { activeContextEngine, ...preflight } = input.preflight;
-    const dispatchState = await dispatchEmbeddedAttemptPrompt({
+    state = await prepareEmbeddedAttemptPromptPreflight({
+      ...preflight,
       attempt,
       ...(activeContextEngine ? { activeContextEngine } : {}),
-      activeSession,
-      promptContext,
-      getCompactionReserveTokens: input.getCompactionReserveTokens,
-      publishState: publishDispatchState,
-      releaseLeasedSteering,
-      state: {
-        ...input.lifecycle.readState(),
-        skipPromptSubmission,
-      },
-      execution: {
-        ...input.execution,
-        sessionLockController: input.sessionLockController,
-      },
-      observation: {
-        ...input.observation,
-        transcriptLeafId,
-      },
-      preflight,
-      submission: {
+      contextTokenBudget: promptContext.contextTokenBudget,
+      hookMessagesForCurrentPrompt: promptContext.hookMessagesForCurrentPrompt,
+      promptForPrecheck: promptContext.llmBoundaryPromptForPrecheck,
+      reserveTokens,
+      sessionMessageCount: activeSession.messages.length,
+      state,
+      systemPrompt: promptContext.systemPromptForHook,
+      toolResultMaxChars: promptContext.promptToolResultMaxChars,
+    });
+    publishDispatchState(state);
+
+    if (!state.skipPromptSubmission) {
+      await submitEmbeddedAttemptPrompt({
         ...(promptBuildAppendContext ? { appendContext: promptBuildAppendContext } : {}),
+        attempt,
+        activeSession,
+        contextTokenBudget: promptContext.contextTokenBudget,
+        images: imageResult.images,
         ...(leasedSteering ? { leasedSteering } : {}),
+        modelPrompt: promptContext.promptForModel,
         onFinalPromptText: input.lifecycle.setFinalPromptText,
         onSteeringAcknowledged: () => {
           leasedSteering = undefined;
         },
         ...(promptBuildPrependContext ? { prependContext: promptBuildPrependContext } : {}),
+        ...(promptContext.runtimeContextMessageForCurrentTurn
+          ? { runtimeContextMessage: promptContext.runtimeContextMessageForCurrentTurn }
+          : {}),
+        runtimeOnly: promptContext.promptSubmission.runtimeOnly === true,
+        systemPrompt: promptContext.systemPromptForHook,
+        toolResultAggregateMaxChars: promptContext.promptToolResultAggregateMaxChars,
+        toolResultMaxChars: promptContext.promptToolResultMaxChars,
         transcriptLeafId,
+        transcriptPrompt: promptContext.promptForSession,
         ...input.submission,
-      },
-    });
-    publishDispatchState(dispatchState);
+      });
+    } else {
+      releaseLeasedSteering(state.promptError ?? "prompt submission skipped");
+    }
+    publishDispatchState(state);
   } catch (error) {
     const promptErrorOutcome = await handleEmbeddedAttemptPromptError({
       activeSession,
@@ -276,11 +376,15 @@ export async function runEmbeddedAttemptPromptPhase(input: {
       handleMidTurnPrecheckRequest,
       markYieldAborted: input.lifecycle.markYieldAborted,
       releaseLeasedSteering,
-      sessionLockController: input.sessionLockController,
-      withOwnedSessionWriteLock: input.withOwnedSessionWriteLock,
+      withOwnedTranscriptWrite: input.withOwnedTranscriptWrite,
       ...input.lifecycle.readYieldState(),
     });
-    if (promptErrorOutcome.promptFailure) {
+    // The timeout owner records its terminal before aborting the prompt. That
+    // abort is not a provider failure and must leave timeout salvage eligible.
+    if (
+      promptErrorOutcome.promptFailure &&
+      !input.lifecycle.isRunBudgetTimeoutAbort(promptErrorOutcome.promptFailure.error)
+    ) {
       patchState({
         promptError: promptErrorOutcome.promptFailure.error,
         promptErrorSource: promptErrorOutcome.promptFailure.source,
@@ -295,8 +399,7 @@ export async function runEmbeddedAttemptPromptPhase(input: {
 
   const pendingMidTurnPrecheckRequest = input.lifecycle.takePendingMidTurnPrecheckRequest();
   if (pendingMidTurnPrecheckRequest) {
-    await input.sessionLockController.waitForSessionEvents(activeSession);
-    await input.withOwnedSessionWriteLock(() => {
+    await input.withOwnedTranscriptWrite(() => {
       removeTrailingMidTurnPrecheckAssistantError({ activeSession, sessionManager });
       const state = input.lifecycle.readState();
       if (!state.preflightRecovery && state.promptErrorSource !== "precheck") {

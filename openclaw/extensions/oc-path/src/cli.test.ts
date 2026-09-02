@@ -4,14 +4,46 @@
  * Tests invoke each subcommand through the retained Commander registration.
  * Assertions inspect captured process output and the resulting exit code.
  */
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import {
+  closeSync,
+  constants as fsConstants,
+  mkdtempSync,
+  openSync,
+  promises as fs,
+  readFileSync,
+  writeFileSync,
+  writeSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Command, CommanderError } from "commander";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { registerOcPathCli } from "../cli-registration.js";
 import { registerPathCli } from "./cli.js";
 
 const JSONC_INPUT_LIMIT_BYTES = 16 * 1024 * 1024;
+type RegisterCli = Parameters<typeof registerOcPathCli>[0]["registerCli"];
+type CliRegistrar = Parameters<RegisterCli>[0];
+type CliRegistrationOptions = Parameters<RegisterCli>[1];
+
+function resolvePathMachineOutput() {
+  let resolver:
+    | ((params: { argv: readonly string[]; stdoutIsTTY: boolean }) => boolean)
+    | undefined;
+  registerOcPathCli({
+    registerCli(_registrar: CliRegistrar, options?: CliRegistrationOptions) {
+      const descriptor = options?.descriptors?.[0];
+      resolver = descriptor && "machineOutput" in descriptor ? descriptor.machineOutput : undefined;
+    },
+  } as unknown as Parameters<typeof registerOcPathCli>[0]);
+  if (!resolver) {
+    throw new Error("oc-path CLI descriptor is missing its machine-output resolver");
+  }
+  return resolver;
+}
+
+const isPathMachineOutput = resolvePathMachineOutput();
 
 type PathCommandOptions = {
   readonly json?: boolean;
@@ -176,6 +208,14 @@ async function pathEmitCommand(
 }
 
 describe("openclaw path CLI", () => {
+  it("reports its TTY-aware machine-output mode to the CLI", () => {
+    const argv = ["node", "openclaw", "path", "validate", "oc://AGENTS.md"];
+    expect(isPathMachineOutput({ argv, stdoutIsTTY: false })).toBe(true);
+    expect(isPathMachineOutput({ argv, stdoutIsTTY: true })).toBe(false);
+    expect(isPathMachineOutput({ argv: [...argv, "--json"], stdoutIsTTY: true })).toBe(true);
+    expect(isPathMachineOutput({ argv: [...argv, "--human"], stdoutIsTTY: false })).toBe(false);
+  });
+
   let workspaceDir: string;
 
   beforeEach(() => {
@@ -259,20 +299,92 @@ describe("openclaw path CLI", () => {
       expect(stderrText(rt)).toContain("missing required argument");
     });
 
-    it("rejects oversized multibyte JSONC with the typed diagnostic", async () => {
+    it("bounds every file-loading verb before parsing oversized input", async () => {
       const filePath = join(workspaceDir, "oversized.json");
       const content = `"${"界".repeat(Math.floor(JSONC_INPUT_LIMIT_BYTES / 3) + 1)}"`;
       writeFileSync(filePath, content, "utf-8");
-      const rt = createTestRuntime();
+      const unboundedRead = vi
+        .spyOn(fs, "readFile")
+        .mockRejectedValue(new Error("unbounded file read"));
+      const cases: ReadonlyArray<{
+        code: string;
+        run: (runtime: TestRuntime) => Promise<void>;
+      }> = [
+        {
+          code: "OC_JSONC_INPUT_TOO_LARGE",
+          run: (runtime) =>
+            pathResolveCommand(
+              "oc://oversized.json/value",
+              { file: filePath, json: true },
+              runtime,
+            ),
+        },
+        {
+          code: "OC_JSONC_INPUT_TOO_LARGE",
+          run: (runtime) =>
+            pathFindCommand("oc://oversized.json/*", { file: filePath, json: true }, runtime),
+        },
+        {
+          code: "OC_JSONC_INPUT_TOO_LARGE",
+          run: (runtime) =>
+            pathSetCommand(
+              "oc://oversized.json/value",
+              "next",
+              { file: filePath, json: true, dryRun: true },
+              runtime,
+            ),
+        },
+        {
+          code: "OC_JSONC_INPUT_TOO_LARGE",
+          run: (runtime) => pathEmitCommand(filePath, { json: true }, runtime),
+        },
+        {
+          code: "OC_PATH_INPUT_TOO_LARGE",
+          run: (runtime) =>
+            pathResolveCommand("oc://oversized.md/value", { file: filePath, json: true }, runtime),
+        },
+      ];
 
-      await pathResolveCommand("oc://oversized.json/value", { cwd: workspaceDir, json: true }, rt);
-
-      expect(rt.exitCode).toBe(2);
-      expect(stdoutText(rt)).toBe("");
-      expect(JSON.parse(stderrText(rt))).toMatchObject({
-        error: { code: "OC_JSONC_INPUT_TOO_LARGE" },
-      });
+      try {
+        for (const testCase of cases) {
+          const rt = createTestRuntime();
+          await testCase.run(rt);
+          expect(rt.exitCode).toBe(2);
+          expect(stdoutText(rt)).toBe("");
+          expect(JSON.parse(stderrText(rt))).toMatchObject({
+            error: { code: testCase.code },
+          });
+        }
+        expect(unboundedRead).not.toHaveBeenCalled();
+      } finally {
+        unboundedRead.mockRestore();
+      }
     });
+
+    it.runIf(process.platform !== "win32")(
+      "rejects a FIFO without waiting for a writer",
+      async () => {
+        const fifoPath = join(workspaceDir, "input.json");
+        execFileSync("mkfifo", [fifoPath]);
+        const releaseBlockedReader = setTimeout(() => {
+          const fd = openSync(fifoPath, fsConstants.O_WRONLY | fsConstants.O_NONBLOCK);
+          writeSync(fd, '{"ok":true}');
+          closeSync(fd);
+        }, 250);
+        const rt = createTestRuntime();
+
+        try {
+          await pathResolveCommand("oc://input.json/ok", { file: fifoPath, json: true }, rt);
+        } finally {
+          clearTimeout(releaseBlockedReader);
+        }
+
+        expect(rt.exitCode).toBe(2);
+        expect(JSON.parse(stderrText(rt))).toMatchObject({
+          error: { code: "OC_PATH_FILE_NOT_REGULAR" },
+        });
+      },
+    );
   });
 
   describe("set", () => {

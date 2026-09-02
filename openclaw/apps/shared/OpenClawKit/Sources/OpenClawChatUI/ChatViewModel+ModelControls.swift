@@ -3,6 +3,35 @@ import Foundation
 extension OpenClawChatViewModel {
     public static let verboseLevelOptions = ["off", "on", "full"]
 
+    public var modelPickerSections: ChatModelPickerSections {
+        let defaultProvider = ChatModelPickerStore.resolvedDefaultProvider(
+            provider: self.sessionDefaults?.modelProvider,
+            model: self.sessionDefaults?.model)
+        return ChatModelPickerStore.sections(
+            choices: self.modelChoices,
+            favorites: self.modelPickerFavorites,
+            recents: self.modelPickerRecents,
+            defaultProvider: defaultProvider)
+    }
+
+    public func isDefaultModel(_ model: OpenClawChatModelChoice) -> Bool {
+        ChatModelPickerStore.isDefaultModel(
+            model,
+            defaultProvider: self.sessionDefaults?.modelProvider,
+            defaultModel: self.sessionDefaults?.model)
+    }
+
+    public var isSelectedModelPinned: Bool {
+        self.modelSelectionID != Self.defaultModelSelectionID &&
+            self.modelPickerFavorites.contains(self.modelSelectionID)
+    }
+
+    public func toggleSelectedModelPinned() {
+        guard self.modelSelectionID != Self.defaultModelSelectionID else { return }
+        self.modelPickerStore.toggleFavorite(self.modelSelectionID)
+        self.modelPickerFavorites = self.modelPickerStore.favorites
+    }
+
     public var thinkingSelectionID: String {
         self.thinkingOverrideIsInherited ? Self.inheritedThinkingSelectionID : self.thinkingLevel
     }
@@ -31,6 +60,11 @@ extension OpenClawChatViewModel {
         return (session.effectiveFastMode ?? session.fastMode)?.isEnabled == true ? "on" : "off"
     }
 
+    public var fastModeIsEnabled: Bool {
+        guard let session = self.currentSessionEntry() else { return false }
+        return (session.effectiveFastMode ?? session.fastMode)?.isEnabled == true
+    }
+
     /// `models.list` currently has no fast-support capability field. Keep the
     /// control available and let the gateway validate the session patch.
     public var selectedModelSupportsFastMode: Bool {
@@ -56,6 +90,7 @@ extension OpenClawChatViewModel {
         guard clearsOverride ? baselineSessionLevel != nil : Self.normalizedVerboseLevel(baselineSessionLevel) != next
         else { return }
 
+        self.errorText = nil
         if self.acceptedVerboseLevelsByTarget[target] == nil {
             self.acceptedVerboseLevelsByTarget[target] = baselineSessionLevel.map(VerboseLevelState.value)
                 ?? VerboseLevelState.none
@@ -104,6 +139,7 @@ extension OpenClawChatViewModel {
                         self.acceptedVerboseLevelsByTarget[target]?.level,
                         sessionKey: state.key,
                         exactMatchOnly: state.exactMatchOnly)
+                    if !state.exactMatchOnly { self.errorText = error.localizedDescription }
                 }
             }
         }
@@ -148,6 +184,7 @@ extension OpenClawChatViewModel {
         let baselineEffectiveFastMode = self.currentSessionEntry()?.effectiveFastMode
         guard baselineFastMode != next else { return }
 
+        self.errorText = nil
         if self.acceptedFastModesByTarget[target] == nil {
             self.acceptedFastModesByTarget[target] = FastModeState(
                 override: baselineFastMode,
@@ -196,6 +233,7 @@ extension OpenClawChatViewModel {
                         effective: accepted?.effective,
                         sessionKey: state.key,
                         exactMatchOnly: state.exactMatchOnly)
+                    if !state.exactMatchOnly { self.errorText = error.localizedDescription }
                 }
             }
         }

@@ -1,6 +1,7 @@
 // Openrouter provider module implements model/runtime integration.
 import { toImageDataUrl } from "openclaw/plugin-sdk/image-generation";
 import { resolveGeneratedMediaMaxBytes } from "openclaw/plugin-sdk/media-generation-runtime";
+import { canonicalizeBase64, estimateBase64DecodedBytes } from "openclaw/plugin-sdk/media-runtime";
 import type {
   MusicGenerationProvider,
   MusicGenerationRequest,
@@ -8,18 +9,15 @@ import type {
 } from "openclaw/plugin-sdk/music-generation";
 import { resolvePositiveTimerTimeoutMs } from "openclaw/plugin-sdk/number-runtime";
 import { isProviderApiKeyConfigured } from "openclaw/plugin-sdk/provider-auth";
-import { resolveApiKeyForProvider } from "openclaw/plugin-sdk/provider-auth-runtime";
 import {
   assertOkOrThrowHttpError,
   createProviderOperationDeadline,
   postJsonRequest,
-  resolveProviderHttpRequestConfig,
   resolveProviderOperationTimeoutMs,
-  sanitizeConfiguredModelProviderRequest,
   type ProviderOperationDeadline,
 } from "openclaw/plugin-sdk/provider-http";
 import { isRecord, normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
-import { OPENROUTER_BASE_URL } from "./provider-catalog.js";
+import { resolveOpenRouterGenerationRequestContext } from "./generation-request-context.js";
 
 const DEFAULT_OPENROUTER_MUSIC_MODEL = "google/lyria-3-pro-preview";
 const OPENROUTER_CLIP_MUSIC_MODEL = "google/lyria-3-clip-preview";
@@ -140,11 +138,19 @@ function appendDecodedOpenRouterMusicAudio(
   if (!base64) {
     return;
   }
-  const decodedBytes = Buffer.byteLength(base64, "base64");
-  if (decodedBytes > result.maxBytes - result.audioBytes) {
+  const remainingBytes = result.maxBytes - result.audioBytes;
+  if (estimateBase64DecodedBytes(base64) > remainingBytes) {
     throw createOpenRouterMusicTooLargeError("audio", result.maxBytes);
   }
-  const buffer = Buffer.from(base64, "base64");
+  const canonicalAudio = canonicalizeBase64(base64);
+  if (!canonicalAudio) {
+    throw new Error("OpenRouter music generation returned malformed base64 audio data");
+  }
+  const decodedBytes = Buffer.byteLength(canonicalAudio, "base64");
+  if (decodedBytes > remainingBytes) {
+    throw createOpenRouterMusicTooLargeError("audio", result.maxBytes);
+  }
+  const buffer = Buffer.from(canonicalAudio, "base64");
   const nextBytes = result.audioBytes + buffer.byteLength;
   if (nextBytes > result.maxBytes) {
     throw createOpenRouterMusicTooLargeError("audio", result.maxBytes);
@@ -335,11 +341,7 @@ export function buildOpenRouterMusicGenerationProvider(): MusicGenerationProvide
     label: "OpenRouter",
     defaultModel: DEFAULT_OPENROUTER_MUSIC_MODEL,
     models: [...OPENROUTER_MUSIC_MODELS],
-    isConfigured: ({ agentDir }) =>
-      isProviderApiKeyConfigured({
-        provider: "openrouter",
-        agentDir,
-      }),
+    isConfigured: (ctx) => isProviderApiKeyConfigured({ provider: "openrouter", ...ctx }),
     capabilities: {
       generate: {
         maxTracks: 1,
@@ -366,33 +368,13 @@ export function buildOpenRouterMusicGenerationProvider(): MusicGenerationProvide
       if ((req.inputImages?.length ?? 0) > 1) {
         throw new Error("OpenRouter music generation supports at most one reference image.");
       }
-      const auth = await resolveApiKeyForProvider({
-        provider: "openrouter",
-        cfg: req.cfg,
-        agentDir: req.agentDir,
-        store: req.authStore,
-      });
-      if (!auth.apiKey) {
-        throw new Error("OpenRouter API key missing");
-      }
-
       const { baseUrl, allowPrivateNetwork, headers, dispatcherPolicy } =
-        resolveProviderHttpRequestConfig({
-          baseUrl: req.cfg?.models?.providers?.openrouter?.baseUrl,
-          defaultBaseUrl: OPENROUTER_BASE_URL,
-          allowPrivateNetwork: false,
-          defaultHeaders: {
-            Authorization: `Bearer ${auth.apiKey}`,
-            "Content-Type": "application/json",
-            "HTTP-Referer": "https://openclaw.ai",
-            "X-OpenRouter-Title": "OpenClaw",
-          },
-          request: sanitizeConfiguredModelProviderRequest(
-            req.cfg?.models?.providers?.openrouter?.request,
-          ),
-          provider: "openrouter",
+        await resolveOpenRouterGenerationRequestContext({
+          cfg: req.cfg,
+          agentDir: req.agentDir,
+          authStore: req.authStore,
           capability: "audio",
-          transport: "http",
+          jsonContentType: true,
         });
       const model = resolveOpenRouterMusicModel(req.model);
       const format = req.format ?? "wav";

@@ -1,5 +1,5 @@
 import { getActiveBackgroundExecSessionCount } from "../agents/bash-process-registry.js";
-import { getActiveEmbeddedRunCount } from "../agents/embedded-agent-runner/run-state.js";
+import { getActiveEmbeddedRunCount } from "../agents/embedded-agent-runner/active-run-projections.js";
 import { getTotalPendingReplies } from "../auto-reply/reply/dispatcher-registry.js";
 import { resolveGatewayRestartDeferralTimeoutMs } from "../infra/restart.js";
 import { getTotalQueueSize } from "../process/command-queue.js";
@@ -74,6 +74,11 @@ export function createGatewayActiveWorkTracker(options: {
     const omitted = blockers.length - shown.length;
     return omitted > 0 ? `${shown.join("; ")}; +${omitted} more` : shown.join("; ");
   };
+  const formatDeferredWorkStatus = (status: "active" | "still active") => {
+    const details = formatActiveDetails(getActiveCounts()).join(", ");
+    const taskBlockers = formatTaskBlockers();
+    return `${details} ${status}${taskBlockers ? ` (${taskBlockers})` : ""}`;
+  };
   const waitForActiveWorkBeforeChannelReload = async (
     channels: Iterable<ChannelKind>,
     isTransactionCurrent: () => boolean,
@@ -134,6 +139,7 @@ export function createGatewayActiveWorkTracker(options: {
 
   return {
     formatActiveDetails,
+    formatDeferredWorkStatus,
     formatTaskBlockers,
     getActiveCounts,
     waitForActiveWorkBeforeChannelReload,

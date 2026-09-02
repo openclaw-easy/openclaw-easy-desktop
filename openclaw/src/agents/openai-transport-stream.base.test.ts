@@ -5,17 +5,13 @@ import {
   prepareTransportAwareSimpleModel,
   resolveTransportAwareSimpleApi,
 } from "@openclaw/ai/transports";
-import type { ChatCompletionChunk } from "openai/resources/chat/completions.js";
 import type { Api, Model } from "openclaw/plugin-sdk/llm";
 import { describe, expect, it, vi } from "vitest";
 import {
   resolveAzureOpenAIApiVersion,
   type OpenAIResponsesOutput,
   type CapturedStreamEvent,
-  makeCompletionsModel,
   makeResponsesModel,
-  createDeepSeekCompletionsModel,
-  createAssistantOutput,
   createResponsesAssistantOutput,
   createAzureResponsesModel,
   neverYieldsStream,
@@ -47,33 +43,6 @@ describe("openai transport stream", () => {
         createResponsesAssistantOutput(model),
         { push: vi.fn() },
         model,
-        { firstEventTimeoutMs: 5, abortFirstEventStream, onFirstEventTimeout },
-      );
-      const rejection = expect(resultPromise).rejects.toThrow(
-        /did not deliver a first SSE event within 5ms after streaming headers/,
-      );
-
-      await vi.advanceTimersByTimeAsync(5);
-      await rejection;
-      expect(abortFirstEventStream).toHaveBeenCalledTimes(1);
-      expect(abortFirstEventStream.mock.calls[0]?.[0]).toBeInstanceOf(Error);
-      expect(onFirstEventTimeout).toHaveBeenCalledWith(abortFirstEventStream.mock.calls[0]?.[0]);
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it("fails OpenAI completions streams when headers arrive but no first event follows", async () => {
-    vi.useFakeTimers();
-    try {
-      const model = createDeepSeekCompletionsModel();
-      const abortFirstEventStream = vi.fn();
-      const onFirstEventTimeout = vi.fn();
-      const resultPromise = testing.processOpenAICompletionsStream(
-        neverYieldsStream() as AsyncIterable<ChatCompletionChunk>,
-        createAssistantOutput(model),
-        model,
-        { push: vi.fn() },
         { firstEventTimeoutMs: 5, abortFirstEventStream, onFirstEventTimeout },
       );
       const rejection = expect(resultPromise).rejects.toThrow(
@@ -228,6 +197,43 @@ describe("openai transport stream", () => {
     expect(output.responseId).toBe("resp_failed_empty_error");
   });
 
+  it("preserves the structured error code on a thrown Responses failure (#117609)", async () => {
+    // A real response.failed SSE event carries error.code. The transport must
+    // preserve that code on the thrown ResponsesStreamFailure so the failover
+    // classifier can hand it to the provider hook. Without the code, the hook is
+    // skipped (no structured descriptor) and the prose classifier matches the
+    // "server_error" substring in the folded message as timeout. Pre-fix the
+    // thrown failure carried no code field at all.
+    const model = createAzureResponsesModel();
+    const output = createResponsesAssistantOutput(model);
+
+    const failure = await testing
+      .processResponsesStream(
+        streamChunks([
+          {
+            type: "response.failed",
+            response: {
+              id: "resp_failed_server_error",
+              status: "failed",
+              model: "gpt-5.4-pro",
+              error: { code: "server_error", message: "provider failed" },
+            },
+          },
+        ]),
+        output,
+        { push: vi.fn() },
+        model,
+      )
+      .catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as { name?: string }).name).toBe("ResponsesStreamFailure");
+    expect((failure as { code?: string }).code).toBe("server_error");
+    // The message stays in the prose-folded form, which is exactly what the
+    // prose classifier would misread as timeout without the preserved code.
+    expect((failure as { message?: string }).message).toBe("server_error: provider failed");
+  });
+
   it("tags Responses encrypted reasoning with replay provenance while streaming", async () => {
     const model = makeResponsesModel({
       id: "gpt-5.4",
@@ -265,11 +271,17 @@ describe("openai transport stream", () => {
             summary: [{ type: "summary_text", text: "Need a tool." }],
           },
         },
+        { type: "response.completed", response: { id: "resp_123", status: "completed" } },
       ]),
       output,
       { push: vi.fn() },
       model,
-      { authProfileId: "openai:oauth", sessionId: "session-123" },
+      {
+        reasoningReplayMetadata: testing.buildOpenAIResponsesReasoningReplayMetadata(model, {
+          authProfileId: "openai:oauth",
+          sessionId: "session-123",
+        }),
+      },
     );
 
     const expectedReplayMetadata = testing.buildOpenAIResponsesReasoningReplayMetadata(model, {
@@ -326,6 +338,7 @@ describe("openai transport stream", () => {
       reasoningTokens: 3,
       totalTokens: 9,
     });
+    expect(output.usage.contextUsage).toEqual({ state: "unavailable" });
   });
 
   it("prices Responses cache writes separately from ordinary input", async () => {
@@ -365,6 +378,11 @@ describe("openai transport stream", () => {
       cacheRead: 20,
       cacheWrite: 30,
       reasoningTokens: 0,
+      totalTokens: 110,
+    });
+    expect(output.usage.contextUsage).toEqual({
+      state: "available",
+      promptTokens: 100,
       totalTokens: 110,
     });
     expect(output.usage.cost.input).toBeCloseTo(0.00025);
@@ -873,7 +891,6 @@ describe("openai transport stream", () => {
         id: "call_123|fc_123",
         name: "session_status",
         arguments: { sessionKey: "current" },
-        partialJson: '{"sessionKey":"current"}',
       },
     ]);
   });
@@ -954,6 +971,7 @@ describe("openai transport stream", () => {
   });
 
   it("enforces the code mode responses tool surface before requests leave OpenClaw", () => {
+    const visibleToolNames = new Set(["exec", "wait", "computer"]);
     const payload = {
       tools: [
         { type: "function", name: "exec" },
@@ -963,8 +981,8 @@ describe("openai transport stream", () => {
       ],
     };
 
-    testing.enforceCodeModeResponsesToolSurface(payload);
-    testing.assertCodeModeResponsesToolSurface(payload);
+    testing.enforceCodeModeResponsesToolSurface(payload, visibleToolNames);
+    testing.assertCodeModeResponsesToolSurface(payload, visibleToolNames);
     expect(payload.tools).toEqual([
       { type: "function", name: "exec" },
       { type: "function", name: "computer" },
@@ -973,6 +991,7 @@ describe("openai transport stream", () => {
   });
 
   it("skips unreadable code mode response payload tool names", () => {
+    const visibleToolNames = new Set(["exec", "wait"]);
     const payload = {
       tools: [
         { type: "function", name: "exec" },
@@ -994,8 +1013,8 @@ describe("openai transport stream", () => {
       ],
     };
 
-    testing.enforceCodeModeResponsesToolSurface(payload);
-    testing.assertCodeModeResponsesToolSurface(payload);
+    testing.enforceCodeModeResponsesToolSurface(payload, visibleToolNames);
+    testing.assertCodeModeResponsesToolSurface(payload, visibleToolNames);
     expect(payload.tools).toEqual([
       { type: "function", name: "exec" },
       { type: "function", function: { name: "wait" } },
@@ -1003,6 +1022,7 @@ describe("openai transport stream", () => {
   });
 
   it("rejects duplicate direct-only tools in a code mode payload", () => {
+    const visibleToolNames = new Set(["exec", "wait", "computer"]);
     const payload = {
       tools: [
         { type: "function", name: "exec" },
@@ -1012,16 +1032,20 @@ describe("openai transport stream", () => {
       ],
     };
 
-    expect(() => testing.assertCodeModeResponsesToolSurface(payload)).toThrow(
+    expect(() => testing.assertCodeModeResponsesToolSurface(payload, visibleToolNames)).toThrow(
       /tool surface violation/,
     );
   });
 
   it("fails closed when the code mode final payload tool surface is not exec/wait", () => {
+    const visibleToolNames = new Set(["exec", "wait"]);
     expect(() =>
-      testing.assertCodeModeResponsesToolSurface({
-        tools: [{ type: "function", name: "exec" }, { type: "web_search_preview" }],
-      }),
+      testing.assertCodeModeResponsesToolSurface(
+        {
+          tools: [{ type: "function", name: "exec" }, { type: "web_search_preview" }],
+        },
+        visibleToolNames,
+      ),
     ).toThrow(/Code mode payload tool surface violation/);
   });
 
@@ -1201,71 +1225,6 @@ describe("openai transport stream", () => {
     expect(
       testing.buildOpenAISdkRequestOptions(openAIModel, undefined, { stream: true }),
     ).toBeUndefined();
-  });
-
-  it("moves Azure OpenAI completions api-version headers into default query params", () => {
-    const config = testing.buildOpenAICompletionsClientConfig(
-      {
-        id: "gpt-4o-mini",
-        name: "GPT-4o Mini",
-        api: "openai-completions",
-        provider: "azure-custom",
-        baseUrl: "https://example.openai.azure.com/openai/deployments/gpt-4o-mini?existing=1",
-        headers: {
-          "api-key": "azure-key",
-          "api-version": "2024-10-21",
-          "X-Tenant": "acme",
-        },
-        reasoning: false,
-        input: ["text"],
-        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-        contextWindow: 128000,
-        maxTokens: 4096,
-      } as unknown as Model<"openai-completions">,
-      { systemPrompt: "", messages: [] } as never,
-    );
-
-    expect(config).toEqual({
-      baseURL: "https://example.openai.azure.com/openai/deployments/gpt-4o-mini",
-      defaultHeaders: {
-        "api-key": "azure-key",
-        "X-Tenant": "acme",
-      },
-      defaultQuery: {
-        existing: "1",
-        "api-version": "2024-10-21",
-      },
-    });
-  });
-
-  it("preserves configured base URL query params without moving non-Azure headers", () => {
-    const config = testing.buildOpenAICompletionsClientConfig(
-      makeCompletionsModel({
-        id: "proxy-model",
-        name: "Proxy Model",
-        provider: "custom-proxy",
-        baseUrl: "https://proxy.example.com/v1?tenant=acme",
-        headers: {
-          "api-version": "proxy-header",
-          "X-Tenant": "acme",
-        },
-        reasoning: false,
-        contextWindow: 128000,
-        maxTokens: 4096,
-      }),
-      { systemPrompt: "", messages: [] } as never,
-    );
-
-    expect(config).toEqual({
-      baseURL: "https://proxy.example.com/v1",
-      defaultHeaders: {
-        "api-version": "proxy-header",
-        "X-Tenant": "acme",
-      },
-      defaultQuery: {
-        tenant: "acme",
-      },
-    });
   });
 
   it("builds boundary-aware stream shapers for supported default agent transports", () => {

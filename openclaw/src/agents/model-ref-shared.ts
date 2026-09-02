@@ -12,7 +12,7 @@ import {
   collectManifestModelIdNormalizationPolicies,
   normalizeBuiltInProviderModelId,
   normalizeConfiguredProviderCatalogModelRef,
-  normalizeConfiguredProviderCatalogModelId as normalizeConfiguredProviderCatalogModelIdShared,
+  type ManifestModelIdNormalizationRecord,
   normalizeStaticProviderModelIdWithPolicies,
   stripSelfProviderModelPrefix,
 } from "@openclaw/model-catalog-core/provider-model-id-normalization";
@@ -35,22 +35,6 @@ export type ModelManifestNormalizationContext = {
 export type ProviderModelIdNormalizationOptions = {
   allowManifestNormalization?: boolean;
   manifestPlugins?: readonly ManifestModelIdNormalizationRecord[];
-};
-
-type ManifestModelIdNormalizationProvider = {
-  aliases?: Record<string, string>;
-  stripPrefixes?: string[];
-  prefixWhenBare?: string;
-  prefixWhenBareAfterAliasStartsWith?: {
-    modelPrefix: string;
-    prefix: string;
-  }[];
-};
-
-type ManifestModelIdNormalizationRecord = {
-  modelIdNormalization?: {
-    providers?: Record<string, ManifestModelIdNormalizationProvider>;
-  };
 };
 
 /** Normalize a provider ID using the shared catalog rules. */
@@ -99,25 +83,46 @@ export function normalizeStaticProviderModelId(
   return normalizeBuiltInProviderModelId(normalizedProvider, manifestModelId);
 }
 
+/**
+ * Captures manifest policies once for repeated static model-id comparisons.
+ * Lifecycle-prepared callers must not rediscover plugin metadata inside model loops.
+ */
+export function createStaticProviderModelIdNormalizer(
+  options: ProviderModelIdNormalizationOptions = {},
+): (provider: string, model: string) => string {
+  if (options.allowManifestNormalization === false) {
+    return (provider, model) =>
+      normalizeBuiltInProviderModelId(normalizeProviderId(provider), model);
+  }
+  if (options.manifestPlugins) {
+    const policies = collectManifestModelIdNormalizationPolicies(options.manifestPlugins);
+    return (provider, model) =>
+      normalizeStaticProviderModelIdWithPolicies(normalizeProviderId(provider), model, policies);
+  }
+  return (provider, model) => normalizeStaticProviderModelId(provider, model, options);
+}
+
 /** Normalize a configured catalog model ID for comparisons against provider catalogs. */
 export function normalizeConfiguredProviderCatalogModelId(
   provider: string,
   model: string,
   options: ProviderModelIdNormalizationOptions = {},
 ): string {
-  if (options.allowManifestNormalization === false) {
-    return normalizeConfiguredProviderCatalogModelIdShared(provider, model, new Map());
-  }
-  if (options.manifestPlugins) {
-    return normalizeConfiguredProviderCatalogModelIdShared(
-      provider,
-      model,
-      collectManifestModelIdNormalizationPolicies(options.manifestPlugins),
-    );
-  }
   return normalizeConfiguredProviderCatalogModelRef(
     normalizeStaticProviderModelId(provider, model, options),
   );
+}
+
+/** Reuses one manifest-policy view across configured model rows in an operation. */
+export function createConfiguredProviderCatalogModelIdNormalizer(
+  options: ProviderModelIdNormalizationOptions = {},
+): (provider: string, model: string) => string {
+  let normalizeStatic: ReturnType<typeof createStaticProviderModelIdNormalizer> | undefined;
+  return (provider, model) =>
+    normalizeConfiguredProviderCatalogModelRef(
+      // Empty operations never prepare policies; default scalar readers retain their current scope.
+      (normalizeStatic ??= createStaticProviderModelIdNormalizer(options))(provider, model),
+    );
 }
 
 type ModelRefNormalizeOptions = ModelManifestNormalizationContext & {

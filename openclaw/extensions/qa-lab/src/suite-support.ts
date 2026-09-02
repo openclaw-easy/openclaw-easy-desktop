@@ -1,7 +1,7 @@
 import type { OpenClawCrablineChannelDriverSelection } from "@openclaw/crabline";
+import { parseBooleanValue } from "openclaw/plugin-sdk/string-coerce-runtime";
 import type { QaSuiteChannelDriverSelection } from "./crabline-artifacts.js";
 import type { QaProviderMode } from "./model-selection.js";
-import { parseQaProgressBooleanEnv as parseQaSuiteBooleanEnv } from "./progress-format.js";
 import type { QaTransportId } from "./qa-transport-registry.js";
 import type { QaTransportAdapter } from "./qa-transport.js";
 import type { RuntimeId } from "./runtime-parity.js";
@@ -79,6 +79,7 @@ export function buildQaIsolatedScenarioWorkerParams(params: {
     channelId: params.input?.channelId,
     repoRoot: params.repoRoot,
     sutOpenClawCommand: params.input?.sutOpenClawCommand,
+    mutateConfig: params.input?.mutateConfig,
     outputDir: params.outputDir,
     providerMode: params.providerMode,
     transportId: params.transportId,
@@ -93,7 +94,7 @@ export function buildQaIsolatedScenarioWorkerParams(params: {
     enabledPluginIds: params.input?.enabledPluginIds,
     concurrency: 1,
     startLab: params.startLab,
-    controlUiEnabled: scenarioRequiresControlUi(params.scenario),
+    controlUiEnabled: params.input?.controlUiEnabled ?? scenarioRequiresControlUi(params.scenario),
     transportReadyTimeoutMs: params.input?.transportReadyTimeoutMs,
     workerStartStaggerMs: params.input?.workerStartStaggerMs,
     forcedRuntime: params.input?.forcedRuntime,
@@ -120,42 +121,13 @@ export function remapModelRefForForcedRuntime(params: {
   return `openai/${split.model}`;
 }
 
-export function buildQaRuntimeEnvPatch(params: {
-  providerMode: QaProviderMode;
-  forcedRuntime?: RuntimeId;
-  mockBaseUrl?: string;
-}): NodeJS.ProcessEnv | undefined {
-  const patch: NodeJS.ProcessEnv = {};
-  if (params.forcedRuntime) {
-    patch.OPENCLAW_BUILD_PRIVATE_QA = "1";
-    patch.OPENCLAW_QA_FORCE_RUNTIME = params.forcedRuntime;
-  }
-  if (params.forcedRuntime !== "codex" || params.providerMode !== "mock-openai") {
-    return Object.keys(patch).length > 0 ? patch : undefined;
-  }
-  let mockBaseUrl = params.mockBaseUrl?.trim();
-  while (mockBaseUrl?.endsWith("/")) {
-    mockBaseUrl = mockBaseUrl.slice(0, -1);
-  }
-  if (!mockBaseUrl) {
-    return Object.keys(patch).length > 0 ? patch : undefined;
-  }
-  // The forced codex lane uses the Codex app-server's native OpenAI provider
-  // path, so pin the managed app-server to the QA mock endpoint instead of
-  // leaking to the maintainer's real OpenAI config.
-  patch.OPENCLAW_CODEX_APP_SERVER_ARGS = `app-server -c openai_base_url=${mockBaseUrl}/v1 --listen stdio://`;
-  patch.OPENAI_API_KEY = "qa-mock-openai-key";
-  patch.CODEX_API_KEY = "qa-mock-openai-key";
-  return patch;
-}
-
-export function appendNodeOption(raw: string | undefined, option: string) {
+function appendNodeOption(raw: string | undefined, option: string) {
   const parts = (raw ?? "").split(/\s+/u).filter(Boolean);
   return parts.includes(option) ? parts.join(" ") : [...parts, option].join(" ");
 }
 
 export function shouldCaptureGatewayHeapCheckpoints(env: NodeJS.ProcessEnv = process.env) {
-  return parseQaSuiteBooleanEnv(env.OPENCLAW_QA_GATEWAY_HEAP_CHECKPOINTS) === true;
+  return parseBooleanValue(env.OPENCLAW_QA_GATEWAY_HEAP_CHECKPOINTS) === true;
 }
 
 export function buildQaGatewayHeapCheckpointRuntimeEnvPatch(

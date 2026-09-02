@@ -7,7 +7,7 @@ import {
 import {
   buildChannelConfigSchema,
   buildChannelReactionShape,
-  buildCommonChannelAccountShape,
+  buildChannelAccountSchemaParts,
   buildGroupEntrySchema,
   ChannelDeliveryStreamingConfigSchema,
   ChannelSendReadReceiptsSchema,
@@ -16,7 +16,7 @@ import {
   requireAllowlistAllowFrom,
   requireOpenAllowFrom,
 } from "openclaw/plugin-sdk/channel-config-schema";
-import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
+import { isRecord, normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { z } from "zod";
 import { signalChannelConfigUiHints } from "./config-ui-hints.js";
 
@@ -43,10 +43,6 @@ const SignalTransportUrlSchema = z
     SIGNAL_TRANSPORT_URL_PATTERN,
     "Expected http:// or https:// URL without embedded credentials",
   );
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 function projectSignalConfigForUpdateValidation(value: unknown): unknown {
   if (process.env.OPENCLAW_UPDATE_IN_PROGRESS !== "1" || !isRecord(value)) {
@@ -117,14 +113,15 @@ const SignalGroupEntrySchema = buildGroupEntrySchema(
 
 const SignalGroupsSchema = z.record(z.string(), SignalGroupEntrySchema.optional()).optional();
 
+const { accountShape, rootPolicyShape } = buildChannelAccountSchemaParts({
+  omit: ["mentionPatterns"],
+  streaming: ChannelDeliveryStreamingConfigSchema.optional(),
+  mediaMaxMb: z.number().int().positive().optional(),
+});
+
 const SignalAccountSchemaBase = z
   .object({
-    ...buildCommonChannelAccountShape({
-      useDefaults: true,
-      omit: ["mentionPatterns"],
-      streaming: ChannelDeliveryStreamingConfigSchema.optional(),
-      mediaMaxMb: z.number().int().positive().optional(),
-    }),
+    ...accountShape,
     account: z.string().optional(),
     accountUuid: z.string().optional(),
     transport: SignalTransportSchema.optional(),
@@ -148,6 +145,7 @@ const SignalAccountSchemaBase = z
   .strict();
 
 const SignalConfigSchemaBase = SignalAccountSchemaBase.extend({
+  ...rootPolicyShape,
   // Account-level schemas skip allowFrom validation because accounts inherit
   // allowFrom from the parent channel config at runtime.
   accounts: z.record(z.string(), SignalAccountSchemaBase.optional()).optional(),

@@ -5,9 +5,10 @@ import {
   getModelProviderRequestTransport,
   resolveUserPath,
 } from "openclaw/plugin-sdk/agent-harness-runtime";
+import { toStringifiedError as toCopilotError } from "openclaw/plugin-sdk/error-runtime";
+import { readNonEmptyStringPreservingWhitespace as readNonEmptyString } from "openclaw/plugin-sdk/string-coerce-runtime";
 import {
   COPILOT_ASK_USER_AVAILABLE_TOOLS,
-  COPILOT_SETTLED_FINALIZATION_EXCLUDED_TOOLS,
   COPILOT_SETTLED_FINALIZATION_SYSTEM_MESSAGE,
   withPromptFailure,
   type AgentHarnessAttemptResult,
@@ -26,39 +27,56 @@ import { createPermissionBridge, rejectAllPolicy } from "./permission-bridge.js"
 import { resolveCopilotProvider, type ResolvedCopilotProvider } from "./provider-bridge.js";
 import { computeReplayMetadata, copilotToolMetasHavePotentialSideEffects } from "./replay-shim.js";
 import type { ClientCreateOptions, PoolKey } from "./runtime.js";
+import { createCopilotIsolatedSessionRestrictions } from "./session-restrictions.js";
+
+export { toCopilotError };
 export function createResult(
   params: AttemptParamsLike,
   state: {
     aborted?: boolean;
+    assistantTranscriptOwned?: boolean;
+    assistantTranscriptIdempotencyKey?: string;
+    contextEngineTerminalAnchor?: import("openclaw/plugin-sdk/session-transcript-runtime").TranscriptEntryAnchor;
     assistantTexts?: string[];
+    codeModeEngaged?: boolean;
     currentAttemptAssistant?: AssistantMessage;
     currentAttemptCompletedAssistant?: AssistantMessage;
     downgradedFromResume?: boolean;
     externalAbort?: boolean;
     itemLifecycle?: { activeCount: number; completedCount: number; startedCount: number };
     lastAssistant?: AssistantMessage;
+    journalValidated?: boolean;
     lastToolError?: AgentHarnessAttemptResult["lastToolError"];
     messagesSnapshot: AgentMessage[];
+    nativeReplayInvalid?: boolean;
     now: () => number;
     promptError: Error | undefined;
     resumeFailureRecovered?: boolean;
     sdkSessionId?: string;
-    sessionIdUsed?: string;
     timedOut?: boolean;
     timedOutDuringCompaction?: boolean;
     toolMetas?: AgentHarnessAttemptResult["toolMetas"];
     usage?: AssistantUsageSnapshot;
     yieldDetected?: boolean;
+    yieldAcknowledgment?: string;
   },
 ): AttemptResultWithSdkSessionId {
   const promptError = state.promptError;
+  const transcriptPersistenceFailed =
+    (promptError as PromptErrorWithCode | undefined)?.code === "transcript_persistence_failed";
   const timedOut = state.timedOut === true;
   const toolMetas = state.toolMetas ?? [];
   const replayMetadata =
     params.operation === "settled-tool-finalization"
-      ? { hadPotentialSideEffects: false, replaySafe: true }
+      ? {
+          hadPotentialSideEffects: false,
+          replaySafe: !transcriptPersistenceFailed,
+        }
       : computeReplayMetadata({
-          priorReplayInvalid: params.initialReplayState?.replayInvalid,
+          priorReplayInvalid:
+            params.initialReplayState?.replayInvalid === true ||
+            state.nativeReplayInvalid === true ||
+            transcriptPersistenceFailed,
           priorHadPotentialSideEffects: params.initialReplayState?.hadPotentialSideEffects,
           thisAttemptTimedOut: timedOut,
           thisAttemptHadPotentialSideEffects: copilotToolMetasHavePotentialSideEffects(toolMetas),
@@ -82,7 +100,20 @@ export function createResult(
     promptError !== undefined ? withPromptFailure(interruption, promptError) : interruption;
   return {
     terminal,
+    ...(state.assistantTranscriptOwned
+      ? {
+          assistantTranscriptOwned: true,
+          ...(state.assistantTranscriptIdempotencyKey
+            ? { assistantTranscriptIdempotencyKey: state.assistantTranscriptIdempotencyKey }
+            : {}),
+        }
+      : {}),
     ...(state.sdkSessionId ? { sdkSessionId: state.sdkSessionId } : {}),
+    ...(state.contextEngineTerminalAnchor
+      ? { contextEngineTerminalAnchor: state.contextEngineTerminalAnchor }
+      : {}),
+    ...(state.journalValidated !== undefined ? { journalValidated: state.journalValidated } : {}),
+    ...(state.codeModeEngaged !== undefined ? { codeModeEngaged: state.codeModeEngaged } : {}),
     assistantTexts: state.assistantTexts ?? [],
     attemptUsage: state.usage,
     cloudCodeAssistFormatError: false,
@@ -101,10 +132,13 @@ export function createResult(
     messagingToolSentTargets: [],
     messagingToolSentTexts: [],
     replayMetadata,
-    sessionFileUsed: readString(params.sessionFile),
-    sessionIdUsed: state.sessionIdUsed ?? readString(params.sessionId) ?? "copilot-session",
+    sessionFileUsed: readNonEmptyString(params.sessionFile),
+    // Core adopts this identity before its next transcript write; SDK session
+    // identity belongs only in sdkSessionId and must not replace the host id.
+    sessionIdUsed: params.sessionId,
     toolMetas,
     yieldDetected: state.yieldDetected === true,
+    ...(state.yieldAcknowledgment ? { yieldAcknowledgment: state.yieldAcknowledgment } : {}),
   };
 }
 export function createPromptError(
@@ -118,37 +152,6 @@ export function createPromptError(
     error.cause = cause;
   }
   return error;
-}
-function createSettledFinalizationSessionRestrictions(): Partial<CopilotSessionConfig> {
-  return {
-    availableTools: [],
-    coauthorEnabled: false,
-    customAgents: [],
-    customAgentsLocalOnly: true,
-    embeddingCacheStorage: "in-memory",
-    enableConfigDiscovery: false,
-    enableFileHooks: false,
-    enableHostGitOperations: false,
-    enableOnDemandInstructionDiscovery: false,
-    enableSessionStore: false,
-    enableSkills: false,
-    excludedTools: [...COPILOT_SETTLED_FINALIZATION_EXCLUDED_TOOLS],
-    includeSubAgentStreamingEvents: false,
-    infiniteSessions: { enabled: false },
-    instructionDirectories: [],
-    manageScheduleEnabled: false,
-    mcpOAuthTokenStorage: "in-memory",
-    mcpServers: {},
-    memory: { enabled: false },
-    pluginDirectories: [],
-    remoteSession: "off",
-    requestCanvasRenderer: false,
-    requestExtensions: false,
-    skillDirectories: [],
-    skipCustomInstructions: true,
-    skipEmbeddingRetrieval: true,
-    tools: [],
-  };
 }
 export function createSessionConfig(
   params: AttemptParamsLike,
@@ -190,7 +193,7 @@ export function createSessionConfig(
     reasoningEffort: params.reasoningEffort,
     tools: sdkTools,
     availableTools: buildCopilotAvailableTools(sdkTools, options.includeAskUser),
-    ...(settledToolFinalization ? createSettledFinalizationSessionRestrictions() : {}),
+    ...(settledToolFinalization ? createCopilotIsolatedSessionRestrictions() : {}),
     workingDirectory:
       effectiveCwd ?? effectiveWorkspaceDir ?? readResolvedAttemptPath(params.workspaceDir),
     ...(!settledToolFinalization &&
@@ -314,61 +317,9 @@ function resolveImageCapabilityModel(params: AttemptParamsLike): { input?: strin
   }
   return { input: ["image"] };
 }
-export function createSystemMessageContent(
-  params: AttemptParamsLike,
-  workspaceBootstrapInstructions: string | undefined,
-): string | undefined {
-  const sections: string[] = [];
-  const bootstrap = workspaceBootstrapInstructions?.trim();
-  if (bootstrap) {
-    sections.push(bootstrap);
-  }
-  const extraSystemPrompt = readString(params.extraSystemPrompt)?.trim();
-  if (extraSystemPrompt && !isRawCopilotModelRun(params)) {
-    const contextHeader =
-      params.promptMode === "minimal" ? "## Subagent Context" : "## Conversation Context";
-    sections.push(`${contextHeader}\n${extraSystemPrompt}`);
-  }
-  return sections.length > 0 ? sections.join("\n\n") : undefined;
-}
-export function isRawCopilotModelRun(params: AttemptParamsLike): boolean {
-  return params.modelRun === true || params.promptMode === "none";
-}
-export function readTailUserText(messages: AgentMessage[]): string | undefined {
-  const tail = messages[messages.length - 1];
-  if (!tail || tail.role !== "user") {
-    return undefined;
-  }
-  const content = (tail as { content?: unknown }).content;
-  if (typeof content === "string") {
-    return content;
-  }
-  if (Array.isArray(content)) {
-    for (const part of content) {
-      if (part && typeof part === "object" && (part as { type?: unknown }).type === "text") {
-        const text = (part as { text?: unknown }).text;
-        if (typeof text === "string" && text.length > 0) {
-          return text;
-        }
-      }
-    }
-  }
-  return undefined;
-}
-export function hasMirrorIdentity(message: AgentMessage): boolean {
-  const record = message as unknown as { __openclaw?: unknown };
-  const meta = record["__openclaw"];
-  if (!meta || typeof meta !== "object" || Array.isArray(meta)) {
-    return false;
-  }
-  const id = (meta as Record<string, unknown>).mirrorIdentity;
-  return typeof id === "string" && id.length > 0;
-}
-export function readString(value: unknown): string | undefined {
-  return typeof value === "string" && value.length > 0 ? value : undefined;
-}
+export { readNonEmptyString };
 export function readResolvedAttemptPath(value: unknown): string | undefined {
-  const raw = readString(value)?.trim();
+  const raw = readNonEmptyString(value)?.trim();
   if (!raw) {
     return undefined;
   }
@@ -384,20 +335,20 @@ export function resolveModelRef(params: AttemptParamsLike): ModelRef {
     const requestTransport = getModelProviderRequestTransport(rawModel);
     const rawRequest = model.request;
     return {
-      api: readString(model.api),
+      api: readNonEmptyString(model.api),
       id:
-        readString(model.id) ??
-        readString((params as { modelId?: unknown }).modelId) ??
+        readNonEmptyString(model.id) ??
+        readNonEmptyString((params as { modelId?: unknown }).modelId) ??
         "unknown-model",
       provider:
-        readString(model.provider) ??
-        readString((params as { provider?: unknown }).provider) ??
+        readNonEmptyString(model.provider) ??
+        readNonEmptyString((params as { provider?: unknown }).provider) ??
         "unknown-provider",
-      baseUrl: readString(model.baseUrl),
-      azureApiVersion: readString(model.azureApiVersion ?? model.params?.azureApiVersion),
+      baseUrl: readNonEmptyString(model.baseUrl),
+      azureApiVersion: readNonEmptyString(model.azureApiVersion ?? model.params?.azureApiVersion),
       headers: model.headers,
       authHeader: model.authHeader,
-      requestAuthMode: readString(requestTransport?.auth?.mode ?? rawRequest?.auth?.mode),
+      requestAuthMode: readNonEmptyString(requestTransport?.auth?.mode ?? rawRequest?.auth?.mode),
       requestProxy: requestTransport?.proxy ?? rawRequest?.proxy,
       requestTls: requestTransport?.tls ?? rawRequest?.tls,
       requestAllowPrivateNetwork:
@@ -409,10 +360,10 @@ export function resolveModelRef(params: AttemptParamsLike): ModelRef {
   }
   return {
     id:
-      readString(typeof rawModel === "string" ? rawModel : undefined) ??
-      readString((params as { modelId?: unknown }).modelId) ??
+      readNonEmptyString(typeof rawModel === "string" ? rawModel : undefined) ??
+      readNonEmptyString((params as { modelId?: unknown }).modelId) ??
       "unknown-model",
-    provider: readString((params as { provider?: unknown }).provider) ?? "unknown-provider",
+    provider: readNonEmptyString((params as { provider?: unknown }).provider) ?? "unknown-provider",
   };
 }
 export function resolvePoolAcquire(params: AttemptParamsLike): {
@@ -424,28 +375,28 @@ export function resolvePoolAcquire(params: AttemptParamsLike): {
   const model = resolveModelRef(params);
   const provider = resolveCopilotProvider({
     model,
-    resolvedApiKey: readString(params.resolvedApiKey),
-    authProfileId: readString(params.authProfileId),
+    resolvedApiKey: readNonEmptyString(params.resolvedApiKey),
+    authProfileId: readNonEmptyString(params.authProfileId),
   });
   const auth =
     provider.mode === "byok"
       ? createCopilotByokAuth({
-          agentId: readString(params.agentId),
-          agentDir: readString(params.agentDir),
-          workspaceDir: readString(params.workspaceDir),
-          copilotHome: readString(params.copilotHome),
+          agentId: readNonEmptyString(params.agentId),
+          agentDir: readNonEmptyString(params.agentDir),
+          workspaceDir: readNonEmptyString(params.workspaceDir),
+          copilotHome: readNonEmptyString(params.copilotHome),
           authProfileId: provider.authProfileId,
           authProfileVersion: provider.authProfileVersion,
         })
       : resolveCopilotAuth({
-          agentId: readString(params.agentId),
-          agentDir: readString(params.agentDir),
-          workspaceDir: readString(params.workspaceDir),
-          copilotHome: readString(params.copilotHome),
+          agentId: readNonEmptyString(params.agentId),
+          agentDir: readNonEmptyString(params.agentDir),
+          workspaceDir: readNonEmptyString(params.workspaceDir),
+          copilotHome: readNonEmptyString(params.copilotHome),
           auth: params.auth,
-          resolvedApiKey: readString(params.resolvedApiKey),
-          authProfileId: readString(params.authProfileId),
-          profileVersion: readString(params.profileVersion),
+          resolvedApiKey: readNonEmptyString(params.resolvedApiKey),
+          authProfileId: readNonEmptyString(params.authProfileId),
+          profileVersion: readNonEmptyString(params.profileVersion),
         });
   return {
     key: {
@@ -469,9 +420,6 @@ export function resolvePoolAcquire(params: AttemptParamsLike): {
     auth,
     provider,
   };
-}
-export function toError(error: unknown): Error {
-  return error instanceof Error ? error : new Error(String(error));
 }
 export function isSdkSendAndWaitTimeoutError(error: unknown): boolean {
   if (error === null || typeof error !== "object") {

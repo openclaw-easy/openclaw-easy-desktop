@@ -1,6 +1,5 @@
 import {
   createStatusReactionController,
-  DEFAULT_TIMING,
   logAckFailure,
   logTypingFailure,
   type StatusReactionAdapter,
@@ -10,31 +9,24 @@ import {
   resolveAgentOutboundIdentity,
   resolveChannelMessageSourceReplyDeliveryMode,
   resolveChannelStreamingBlockEnabled,
-  resolveChannelStreamingNativeTransport,
 } from "openclaw/plugin-sdk/channel-outbound";
-import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
+import { getGlobalHookRunner } from "openclaw/plugin-sdk/plugin-runtime";
 import { resolveInboundLastRouteSessionKey } from "openclaw/plugin-sdk/routing";
 import { danger, logVerbose } from "openclaw/plugin-sdk/runtime-env";
 import { resolvePinnedMainDmOwnerFromAllowlist } from "openclaw/plugin-sdk/security-runtime";
 import { normalizeOptionalLowercaseString } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { reactSlackMessage, removeSlackReaction } from "../../actions.js";
 import { formatSlackError } from "../../errors.js";
-import {
-  compileSlackInteractiveReplies,
-  isSlackInteractiveRepliesEnabled,
-} from "../../interactive-replies.js";
 import { resolveSlackStreamingConfig } from "../../stream-mode.js";
 import { resolveSlackThreadTargets } from "../../threading.js";
 import { normalizeSlackAllowOwnerEntry } from "../allow-list.js";
 import { resolveStorePath, updateLastRoute } from "../config.runtime.js";
-import { createSlackReplyDeliveryPlan } from "../replies.js";
+import { createSlackReplyDeliveryPlan, sanitizeSlackMonitorReplyPayload } from "../replies.js";
 import {
   isSlackStreamingEnabled,
   resolveSlackDisableBlockStreaming,
   resolveSlackNativeProgressTaskCards,
   resolveSlackStreamingThreadHint,
-  shouldEnableSlackPreviewStreaming,
-  shouldInitializeSlackDraftStream,
   shouldUseStreaming,
 } from "./dispatch-helpers.js";
 import type { PreparedSlackMessage } from "./types.js";
@@ -86,7 +78,7 @@ export async function createSlackDispatchSetup(prepared: PreparedSlackMessage) {
         sessionKey: inboundLastRouteSessionKey,
         deliveryContext: {
           channel: "slack",
-          to: `user:${message.user}`,
+          to: prepared.ctxPayload.OriginatingTo ?? prepared.ctxPayload.To ?? `user:${message.user}`,
           accountId: route.accountId,
           threadId: prepared.ctxPayload.MessageThreadId ?? prepared.ctxPayload.TransportThreadId,
         },
@@ -129,6 +121,7 @@ export async function createSlackDispatchSetup(prepared: PreparedSlackMessage) {
   const messageTs = message.ts ?? message.event_ts;
   const incomingThreadTs = message.thread_ts;
   let didSetStatus = false;
+  let didAddTypingReaction = false;
   const statusReactionsEnabled =
     prepared.ctxPayload.InboundEventKind !== "room_event" &&
     Boolean(prepared.ackReactionPromise) &&
@@ -139,22 +132,12 @@ export async function createSlackDispatchSetup(prepared: PreparedSlackMessage) {
       await reactSlackMessage(message.channel, reactionMessageTs ?? "", emoji, {
         token: ctx.botToken,
         client: slackClient,
-      }).catch((err: unknown) => {
-        if (formatErrorMessage(err).includes("already_reacted")) {
-          return;
-        }
-        throw err;
       });
     },
     removeReaction: async (emoji) => {
       await removeSlackReaction(message.channel, reactionMessageTs ?? "", emoji, {
         token: ctx.botToken,
         client: slackClient,
-      }).catch((err: unknown) => {
-        if (formatErrorMessage(err).includes("no_reaction")) {
-          return;
-        }
-        throw err;
       });
     },
   };
@@ -162,8 +145,7 @@ export async function createSlackDispatchSetup(prepared: PreparedSlackMessage) {
     enabled: statusReactionsEnabled,
     adapter: slackStatusAdapter,
     initialEmoji: prepared.ackReactionValue || "eyes",
-    emojis: undefined,
-    timing: DEFAULT_TIMING,
+    presentation: "acknowledgement",
     onError: (err) => {
       logAckFailure({
         log: logVerbose,
@@ -191,29 +173,31 @@ export async function createSlackDispatchSetup(prepared: PreparedSlackMessage) {
 
   const typingTarget = statusThreadTs ? `${message.channel}/${statusThreadTs}` : message.channel;
   const typingReaction = ctx.typingReaction;
+  // Slack clears the assistant thread status as soon as the app puts anything
+  // in the thread, then renders its own rotating "agent working" row for every
+  // later status write. Once this turn has visible output, the keepalive would
+  // paint that duplicate row under the streamed card, so it must go quiet.
+  // Installed by the dispatcher, which owns the delivered/preview facts.
+  const threadStatusGate = { hasVisibleOutput: () => false };
   const { onModelSelected, ...replyPipeline } = createChannelMessageReplyPipeline({
     cfg,
     agentId: route.agentId,
     channel: "slack",
     accountId: route.accountId,
-    transformReplyPayload: (payload) => {
-      if (payload.isReasoning === true) {
-        return null;
-      }
-      return isSlackInteractiveRepliesEnabled({ cfg, accountId: route.accountId })
-        ? compileSlackInteractiveReplies(payload)
-        : payload;
-    },
+    transformReplyPayload: sanitizeSlackMonitorReplyPayload,
     typing: {
       start: async () => {
-        didSetStatus = true;
-        await ctx.setSlackThreadStatus({
-          channelId: message.channel,
-          threadTs: statusThreadTs,
-          status: "is typing...",
-          eventScope: prepared.eventScope,
-        });
+        if (!threadStatusGate.hasVisibleOutput()) {
+          didSetStatus = true;
+          await ctx.setSlackThreadStatus({
+            channelId: message.channel,
+            threadTs: statusThreadTs,
+            status: "is typing...",
+            eventScope: prepared.eventScope,
+          });
+        }
         if (typingReaction && message.ts) {
+          didAddTypingReaction = true;
           await reactSlackMessage(message.channel, message.ts, typingReaction, {
             token: ctx.botToken,
             client: slackClient,
@@ -223,17 +207,19 @@ export async function createSlackDispatchSetup(prepared: PreparedSlackMessage) {
         }
       },
       stop: async () => {
-        if (!didSetStatus) {
-          return;
+        if (didSetStatus) {
+          didSetStatus = false;
+          await ctx.setSlackThreadStatus({
+            channelId: message.channel,
+            threadTs: statusThreadTs,
+            status: "",
+            eventScope: prepared.eventScope,
+          });
         }
-        didSetStatus = false;
-        await ctx.setSlackThreadStatus({
-          channelId: message.channel,
-          threadTs: statusThreadTs,
-          status: "",
-          eventScope: prepared.eventScope,
-        });
-        if (typingReaction && message.ts) {
+        // Tracked apart from the status write: a suppressed status refresh
+        // still adds the reaction, and that reaction must still be removed.
+        if (didAddTypingReaction && typingReaction && message.ts) {
+          didAddTypingReaction = false;
           await removeSlackReaction(message.channel, message.ts, typingReaction, {
             token: ctx.botToken,
             client: slackClient,
@@ -263,10 +249,7 @@ export async function createSlackDispatchSetup(prepared: PreparedSlackMessage) {
     },
   });
 
-  const slackStreaming = resolveSlackStreamingConfig({
-    streaming: account.config.streaming,
-    nativeStreaming: resolveChannelStreamingNativeTransport(account.config),
-  });
+  const slackStreaming = resolveSlackStreamingConfig({ streaming: account.config.streaming });
   const streamThreadHint =
     forcedReplyThreadTs ??
     resolveSlackStreamingThreadHint({
@@ -275,16 +258,21 @@ export async function createSlackDispatchSetup(prepared: PreparedSlackMessage) {
       messageTs,
       isThreadReply,
     });
+  const hookRunner = getGlobalHookRunner();
+  const modifyingHooksRegistered =
+    (hookRunner?.hasHooks("reply_payload_sending") ?? false) ||
+    (hookRunner?.hasHooks("message_sending") ?? false);
+  // Portable previews and native progress cards exist before outbound modifiers accept the
+  // payload. Native answer streaming stays enabled because it begins after both hook gates.
+  const allowPreHookProviderStreaming = !modifyingHooksRegistered;
   const previewStreamingEnabled =
-    !sourceRepliesAreToolOnly &&
-    shouldEnableSlackPreviewStreaming({
-      mode: slackStreaming.mode,
-    });
+    allowPreHookProviderStreaming && !sourceRepliesAreToolOnly && slackStreaming.mode !== "off";
   const hasSlackCustomIdentity = Boolean(
     slackIdentity?.username || slackIdentity?.iconUrl || slackIdentity?.iconEmoji,
   );
   const streamingEnabled =
     !sourceRepliesAreToolOnly &&
+    (allowPreHookProviderStreaming || slackStreaming.mode !== "progress") &&
     isSlackStreamingEnabled({
       mode: slackStreaming.mode,
       nativeStreaming: slackStreaming.nativeStreaming,
@@ -294,14 +282,7 @@ export async function createSlackDispatchSetup(prepared: PreparedSlackMessage) {
     streamingEnabled,
     threadTs: streamThreadHint,
   });
-  // chat.update cannot preserve custom authorship. Use native streaming when
-  // possible; otherwise keep identity intact with one final postMessage.
-  const shouldUseDraftStream =
-    !hasSlackCustomIdentity &&
-    shouldInitializeSlackDraftStream({
-      previewStreamingEnabled,
-      useStreaming,
-    });
+  const shouldUseDraftStream = previewStreamingEnabled && !useStreaming;
   const blockStreamingEnabled = resolveChannelStreamingBlockEnabled(account.config);
   const disableBlockStreaming = sourceRepliesAreToolOnly
     ? true
@@ -343,12 +324,14 @@ export async function createSlackDispatchSetup(prepared: PreparedSlackMessage) {
     statusReactionsEnabled,
     statusReactions,
     hasRepliedRef,
+    threadStatusGate,
     replyPlan,
     onModelSelected,
     replyPipeline,
     slackStreaming,
     streamThreadHint,
     previewStreamingEnabled,
+    hasSlackCustomIdentity,
     shouldUseDraftStream,
     disableBlockStreaming,
     useStreaming,

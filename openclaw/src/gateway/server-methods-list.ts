@@ -1,7 +1,11 @@
 // Gateway method/event catalog.
 // Lists advertised core, auxiliary, channel plugin methods, and websocket events.
 import { listLoadedChannelPlugins } from "../channels/plugins/registry-loaded.js";
-import { GATEWAY_EVENT_UPDATE_AVAILABLE } from "./events.js";
+import {
+  GATEWAY_EVENT_DEVICE_PAIR_CHANGED,
+  GATEWAY_EVENT_NODE_RUNNER_INVENTORY_CHANGED,
+  GATEWAY_EVENT_UPDATE_AVAILABLE,
+} from "./events.js";
 import { listCoreAdvertisedGatewayMethodNames } from "./methods/core-descriptors.js";
 import { GATEWAY_AUX_METHODS } from "./server-aux-methods.js";
 
@@ -40,16 +44,19 @@ export const GATEWAY_EVENTS = [
   "connect.challenge",
   "agent",
   "chat",
+  "chat.metadata.changed",
   "ui.command",
   "session.approval",
   "session.message",
   "session.observer",
   "session.operation",
   "session.sharing",
+  "session.sharing.evidence",
   "session.suggestion",
   "session.typing",
   "session.tool",
   "sessions.changed",
+  "controlUi.sessionPullRequests.changed",
   "presence",
   "tick",
   "talk.mode",
@@ -63,11 +70,17 @@ export const GATEWAY_EVENTS = [
   "node.pair.requested",
   "node.pair.resolved",
   "node.presence",
+  GATEWAY_EVENT_NODE_RUNNER_INVENTORY_CHANGED,
   "node.invoke.cancel",
   "node.invoke.input",
   "node.invoke.request",
+  GATEWAY_EVENT_DEVICE_PAIR_CHANGED,
   "device.pair.requested",
   "device.pair.resolved",
+  "device.pair.setup.completed",
+  "device.pair.setup.deliveryUncertain",
+  "users.prefs.changed",
+  "skills.changed",
   "voicewake.changed",
   "voicewake.routing.changed",
   "exec.approval.requested",
@@ -81,4 +94,6 @@ export const GATEWAY_EVENTS = [
   "terminal.data",
   "terminal.exit",
   GATEWAY_EVENT_UPDATE_AVAILABLE,
+  "portal.changed",
+  "progressCard.changed",
 ];

@@ -165,7 +165,7 @@ function scopedSandboxDefaultDisabledForAgent(
         candidate.kind === "backend" &&
         scopedAgentIdMatches(candidate.agentId, policyAgentId),
     );
-    if (typeof backend?.value === "string" && backend.value.toLowerCase() !== "docker") {
+    if (typeof backend?.value === "string" && !isObservableContainerSandboxBackend(backend.value)) {
       return true;
     }
   }
@@ -233,7 +233,7 @@ function sandboxModeFindings(
         message: `${sandboxPostureLabel(entry)} uses unapproved sandbox mode '${entry.value ?? ""}'.`,
         requirement: `oc://${policyDocName}/${requirementBase}/requireMode`,
         fixHint:
-          "Set agents.defaults.sandbox.mode or agents.list[].sandbox.mode to an approved value.",
+          "Set agents.defaults.sandbox.mode or agents.entries.<id>.sandbox.mode to an approved value.",
       }),
     );
 }
@@ -262,6 +262,10 @@ function sandboxBackendFindings(
     );
 }
 
+function isObservableContainerSandboxBackend(value: string): boolean {
+  return value.toLowerCase() === "docker" || value.toLowerCase() === "podman";
+}
+
 function sandboxContainerPostureUnobservableFindings(
   sandboxPolicy: Record<string, unknown>,
   policyDocName: string,
@@ -277,7 +281,10 @@ function sandboxContainerPostureUnobservableFindings(
   }
   return sandboxPostureEntries(evidence, "backend")
     .filter(evidenceFilter)
-    .filter((entry) => typeof entry.value === "string" && entry.value.toLowerCase() !== "docker")
+    .filter(
+      (entry) =>
+        typeof entry.value === "string" && !isObservableContainerSandboxBackend(entry.value),
+    )
     .flatMap((entry) =>
       enabledRules.map((rule) =>
         sandboxPostureFinding(entry, {

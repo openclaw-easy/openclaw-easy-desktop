@@ -50,6 +50,10 @@ internal const val OUTBOX_ATTACHMENT_CHUNK_BYTES = 512 * 1024
 /** Upper bound of attachment bytes on one queued command (8 images plus a voice note fit). */
 internal const val OUTBOX_MAX_COMMAND_ATTACHMENT_BYTES = 8L * 1024L * 1024L
 
+// Mirrors DEFAULT_CHAT_ATTACHMENT_MAX_MB in src/gateway/chat-attachments.ts. Only video raises
+// the durable command ceiling; existing image, audio, and document admission stays at 8 MiB.
+internal const val OUTBOX_MAX_VIDEO_COMMAND_ATTACHMENT_BYTES = 20L * 1024L * 1024L
+
 /** Upper bound of queued attachment bytes per gateway so the outbox database stays bounded. */
 internal const val OUTBOX_MAX_GATEWAY_ATTACHMENT_BYTES = 48L * 1024L * 1024L
 
@@ -133,6 +137,19 @@ data class ChatOutboxBranchState(
   val revision: Int,
 )
 
+sealed interface ChatOutboxBranchEvidence {
+  val previousState: ChatOutboxBranchState
+
+  data class History(
+    override val previousState: ChatOutboxBranchState,
+  ) : ChatOutboxBranchEvidence
+
+  data class BranchListing(
+    override val previousState: ChatOutboxBranchState,
+    val leafEntryIds: Set<String>,
+  ) : ChatOutboxBranchEvidence
+}
+
 data class ChatOutboxMutationLease(
   val revision: Int,
   val startedAtMs: Long,
@@ -155,6 +172,20 @@ class LoadedOutboxAttachment(
   val bytes: ByteArray,
 )
 
+private fun OutboxAttachmentPayload.isVideo(): Boolean = type == "video" || mimeType.startsWith("video/", ignoreCase = true)
+
+internal fun outboxCommandAttachmentsWithinByteLimits(attachments: List<OutboxAttachmentPayload>): Boolean {
+  val totalBytes = attachments.sumOf { it.bytes.size.toLong() }
+  val nonVideoBytes = attachments.filterNot(OutboxAttachmentPayload::isVideo).sumOf { it.bytes.size.toLong() }
+  val totalLimit =
+    if (attachments.any(OutboxAttachmentPayload::isVideo)) {
+      OUTBOX_MAX_VIDEO_COMMAND_ATTACHMENT_BYTES
+    } else {
+      OUTBOX_MAX_COMMAND_ATTACHMENT_BYTES
+    }
+  return totalBytes <= totalLimit && nonVideoBytes <= OUTBOX_MAX_COMMAND_ATTACHMENT_BYTES
+}
+
 sealed interface ChatOutboxEnqueueResult {
   data class Queued(
     val item: ChatOutboxItem,
@@ -162,7 +193,7 @@ sealed interface ChatOutboxEnqueueResult {
 
   data object QueueFull : ChatOutboxEnqueueResult
 
-  /** One command's attachments exceed [OUTBOX_MAX_COMMAND_ATTACHMENT_BYTES]; deleting rows cannot help. */
+  /** One command's attachments exceed its media-kind byte ceiling; deleting rows cannot help. */
   data object AttachmentsTooLarge : ChatOutboxEnqueueResult
 
   /** The per-gateway attachment byte budget is exhausted; deleting queued rows frees space. */
@@ -324,23 +355,18 @@ interface ChatCommandOutbox {
     lease: ChatOutboxMutationLease? = null,
   ): ChatOutboxBranchState? = null
 
-  suspend fun updateLastActiveLeafEntryId(
-    gatewayId: String,
-    scope: ChatOutboxScope,
-    leafEntryId: String,
-    expectedEpoch: Int,
-    expectedRevision: Int,
-  ): Boolean = false
-
+  /**
+   * Returns committed authority. History publication never adopts earlier input; branch listing
+   * retains the admission boundary captured before the request or ambiguous local mutation.
+   */
   suspend fun reconcileBranchScope(
     gatewayId: String,
     scope: ChatOutboxScope,
-    previousState: ChatOutboxBranchState,
+    evidence: ChatOutboxBranchEvidence,
     activeLeafEntryId: String?,
-    branchLeafEntryIds: Set<String>,
     activeTranscriptEntryIds: Set<String>,
     lastError: String,
-  ): Boolean = false
+  ): ChatOutboxBranchState? = null
 
   suspend fun confirmBranchChange(
     gatewayId: String,
@@ -696,7 +722,7 @@ class RoomChatCommandOutbox internal constructor(
     val key = sessionKey.trim().takeIf { it.isNotEmpty() } ?: return ChatOutboxEnqueueResult.Unavailable
     val owner = normalizedOutboxOwnerAgentId(ownerAgentId) ?: return ChatOutboxEnqueueResult.Unavailable
     val attachmentBytes = attachments.sumOf { it.bytes.size.toLong() }
-    if (attachmentBytes > OUTBOX_MAX_COMMAND_ATTACHMENT_BYTES) {
+    if (!outboxCommandAttachmentsWithinByteLimits(attachments)) {
       return ChatOutboxEnqueueResult.AttachmentsTooLarge
     }
     val dao = database.outboxDao()
@@ -1131,59 +1157,38 @@ class RoomChatCommandOutbox internal constructor(
     lease: ChatOutboxMutationLease?,
   ): ChatOutboxBranchState? = updateBranchMutationState(gatewayId, scope, needsReconciliation = true, lease = lease)
 
-  override suspend fun updateLastActiveLeafEntryId(
-    gatewayId: String,
-    scope: ChatOutboxScope,
-    leafEntryId: String,
-    expectedEpoch: Int,
-    expectedRevision: Int,
-  ): Boolean {
-    val gateway = scopedGatewayId(gatewayId) ?: return false
-    val normalized = normalizedScope(scope) ?: return false
-    val leaf = leafEntryId.trim().takeIf { it.isNotEmpty() } ?: return false
-    return database.withTransaction {
-      ensureBranchStorageLocked()
-      ensureBranchScopeLocked(gateway, normalized)
-      val state = readBranchStateLocked(gateway, normalized) ?: return@withTransaction false
-      if (
-        state.epoch != expectedEpoch ||
-        state.revision != expectedRevision ||
-        state.switchPendingSinceMs != null ||
-        state.needsReconciliation ||
-        unresolvedCountLocked(gateway, normalized, includingFailed = false) > 0
-      ) {
-        return@withTransaction false
-      }
-      writeBranchStateLocked(gateway, normalized, expectedEpoch, leaf, expectedRevision = expectedRevision)
-    }
-  }
-
   override suspend fun reconcileBranchScope(
     gatewayId: String,
     scope: ChatOutboxScope,
-    previousState: ChatOutboxBranchState,
+    evidence: ChatOutboxBranchEvidence,
     activeLeafEntryId: String?,
-    branchLeafEntryIds: Set<String>,
     activeTranscriptEntryIds: Set<String>,
     lastError: String,
-  ): Boolean {
-    val gateway = scopedGatewayId(gatewayId) ?: return false
-    val normalized = normalizedScope(scope) ?: return false
+  ): ChatOutboxBranchState? {
+    val gateway = scopedGatewayId(gatewayId) ?: return null
+    val normalized = normalizedScope(scope) ?: return null
     val leaf = activeLeafEntryId?.trim()?.takeIf { it.isNotEmpty() }
-    if (activeLeafEntryId != null && leaf == null) return false
+    if (activeLeafEntryId != null && leaf == null) return null
+    val previousState = evidence.previousState
+    val listing = evidence as? ChatOutboxBranchEvidence.BranchListing
     return database.withTransaction {
       ensureBranchStorageLocked()
       ensureBranchScopeLocked(gateway, normalized)
-      val expiredLease = expireBranchSwitchLeaseLocked(gateway, normalized, System.currentTimeMillis())
-      val state = readBranchStateLocked(gateway, normalized) ?: return@withTransaction false
-      if ((!expiredLease && state.revision != previousState.revision) || state.switchPendingSinceMs != null) {
-        return@withTransaction false
+      var state = readBranchStateLocked(gateway, normalized) ?: return@withTransaction null
+      // Expiry may retire this captured lease, but must never authorize an older response.
+      if (state.revision != previousState.revision || state.epoch != previousState.epoch) return@withTransaction null
+      if (listing != null && expireBranchSwitchLeaseLocked(gateway, normalized, System.currentTimeMillis())) {
+        state = readBranchStateLocked(gateway, normalized) ?: return@withTransaction null
       }
+      if (state.switchPendingSinceMs != null) return@withTransaction null
       val pending = unresolvedCountLocked(gateway, normalized, includingFailed = true)
       val previousLeaf = previousState.lastActiveLeafEntryId
       val canAdoptQueuedDuringReconciliation =
-        previousState.needsReconciliation && !previousState.hadDeliverableCommands
-      if (leaf != null && previousLeaf != null && previousLeaf != leaf && previousLeaf in branchLeafEntryIds) {
+        listing != null && previousState.needsReconciliation && !previousState.hadDeliverableCommands
+      val advancedOnActivePath = previousLeaf?.let(activeTranscriptEntryIds::contains) == true
+      val knownBranchSwitch =
+        leaf != null && previousLeaf != null && previousLeaf != leaf && listing?.leafEntryIds?.contains(previousLeaf) == true
+      if (knownBranchSwitch || (previousLeaf != leaf && !advancedOnActivePath && canAdoptQueuedDuringReconciliation)) {
         installConfirmedBranchChangeLocked(
           gateway,
           normalized,
@@ -1193,30 +1198,22 @@ class RoomChatCommandOutbox internal constructor(
           adoptQueuedCommands = canAdoptQueuedDuringReconciliation,
         )
       } else {
-        val advancedOnActivePath = previousLeaf?.let(activeTranscriptEntryIds::contains) == true
-        if (previousLeaf != leaf && !advancedOnActivePath && canAdoptQueuedDuringReconciliation) {
-          installConfirmedBranchChangeLocked(
-            gateway,
-            normalized,
-            state.epoch,
-            leaf,
-            lastError,
-            adoptQueuedCommands = true,
-          )
-          return@withTransaction true
-        }
-        if (
-          previousLeaf != leaf &&
-          !advancedOnActivePath &&
-          ((pending > 0 && (previousState.hadPendingCommands || previousState.needsReconciliation)) || leaf == null)
-        ) {
+        // Before history publication every existing row predates the visible branch, including
+        // input admitted while its RPC was in flight. Only explicit branch reconciliation adopts.
+        val earlierInput =
+          pending > 0 &&
+            (evidence is ChatOutboxBranchEvidence.History || previousState.hadPendingCommands || previousState.needsReconciliation)
+        if (previousLeaf != leaf && !advancedOnActivePath && (earlierInput || leaf == null)) {
           parkPendingCommandsLocked(gateway, normalized, lastError)
         }
         if (!writeBranchStateLocked(gateway, normalized, state.epoch, leaf, expectedRevision = state.revision)) {
-          return@withTransaction false
+          return@withTransaction null
         }
       }
-      true
+      readBranchStateLocked(gateway, normalized)?.copy(
+        hadPendingCommands = unresolvedCountLocked(gateway, normalized, includingFailed = true) > 0,
+        hadDeliverableCommands = unresolvedCountLocked(gateway, normalized, includingFailed = false) > 0,
+      )
     }
   }
 

@@ -1,5 +1,16 @@
 {
   "id": "anthropic",
+  "doctorContract": {},
+  "sessionRouteStateOwners": [
+    {
+      "id": "anthropic",
+      "label": "Anthropic",
+      "providerIds": ["anthropic", "claude-cli"],
+      "runtimeIds": ["claude-cli"],
+      "cliSessionKeys": ["claude-cli"],
+      "authProfilePrefixes": ["anthropic:", "claude-cli:"]
+    }
+  ],
   "name": "Anthropic",
   "description": "Anthropic models, Claude CLI, and native Claude session catalog.",
   "icon": "https://cdn.simpleicons.org/anthropic",
@@ -26,6 +37,11 @@
               "image": { "maxSidePx": 2576, "preferredSidePx": 2576, "tokenMode": "provider" }
             },
             "contextWindow": 1000000,
+            "contextWindows": [
+              { "id": "200k", "label": "200K", "contextWindow": 200000 },
+              { "id": "1m", "label": "1M", "contextWindow": 1000000 }
+            ],
+            "contextWindowDefault": "1m",
             "maxTokens": 128000
           },
           {
@@ -37,6 +53,11 @@
               "image": { "maxSidePx": 2576, "preferredSidePx": 2576, "tokenMode": "provider" }
             },
             "contextWindow": 1000000,
+            "contextWindows": [
+              { "id": "200k", "label": "200K", "contextWindow": 200000 },
+              { "id": "1m", "label": "1M", "contextWindow": 1000000 }
+            ],
+            "contextWindowDefault": "1m",
             "maxTokens": 128000
           },
           {
@@ -48,6 +69,11 @@
               "image": { "maxSidePx": 2576, "preferredSidePx": 2576, "tokenMode": "provider" }
             },
             "contextWindow": 1000000,
+            "contextWindows": [
+              { "id": "200k", "label": "200K", "contextWindow": 200000 },
+              { "id": "1m", "label": "1M", "contextWindow": 1000000 }
+            ],
+            "contextWindowDefault": "1m",
             "maxTokens": 128000
           },
           {
@@ -80,13 +106,18 @@
             },
             "cost": { "input": 10, "output": 50, "cacheRead": 1, "cacheWrite": 12.5 },
             "contextWindow": 1000000,
+            "contextWindows": [
+              { "id": "200k", "label": "200K", "contextWindow": 200000 },
+              { "id": "1m", "label": "1M", "contextWindow": 1000000 }
+            ],
+            "contextWindowDefault": "1m",
             "maxTokens": 128000,
             "thinkingLevelMap": {
-              "off": "low",
               "minimal": "low",
               "xhigh": "xhigh",
               "max": "max"
-            }
+            },
+            "compat": { "codeMode": "preferred" }
           },
           {
             "id": "claude-opus-5",
@@ -98,11 +129,17 @@
             },
             "cost": { "input": 5, "output": 25, "cacheRead": 0.5, "cacheWrite": 6.25 },
             "contextWindow": 1000000,
+            "contextWindows": [
+              { "id": "200k", "label": "200K", "contextWindow": 200000 },
+              { "id": "1m", "label": "1M", "contextWindow": 1000000 }
+            ],
+            "contextWindowDefault": "1m",
             "maxTokens": 128000,
             "thinkingLevelMap": {
               "xhigh": "xhigh",
               "max": "max"
-            }
+            },
+            "compat": { "codeMode": "preferred" }
           },
           {
             "id": "claude-sonnet-5",
@@ -114,11 +151,17 @@
             },
             "cost": { "input": 2, "output": 10, "cacheRead": 0.2, "cacheWrite": 2.5 },
             "contextWindow": 1000000,
+            "contextWindows": [
+              { "id": "200k", "label": "200K", "contextWindow": 200000 },
+              { "id": "1m", "label": "1M", "contextWindow": 1000000 }
+            ],
+            "contextWindowDefault": "1m",
             "maxTokens": 128000,
             "thinkingLevelMap": {
               "xhigh": "xhigh",
               "max": "max"
-            }
+            },
+            "compat": { "codeMode": "preferred" }
           },
           {
             "id": "claude-mythos-5",
@@ -132,11 +175,11 @@
             "contextWindow": 1000000,
             "maxTokens": 128000,
             "thinkingLevelMap": {
-              "off": "low",
               "minimal": "low",
               "xhigh": "xhigh",
               "max": "max"
-            }
+            },
+            "compat": { "codeMode": "preferred" }
           },
           {
             "id": "claude-opus-4-8",
@@ -149,7 +192,8 @@
               "image": { "maxSidePx": 2576, "preferredSidePx": 2576, "tokenMode": "provider" }
             },
             "contextWindow": 1000000,
-            "maxTokens": 128000
+            "maxTokens": 128000,
+            "compat": { "codeMode": "preferred" }
           },
           {
             "id": "claude-haiku-4-5",
@@ -160,7 +204,8 @@
               "image": { "maxSidePx": 1568, "preferredSidePx": 1568, "tokenMode": "provider" }
             },
             "contextWindow": 200000,
-            "maxTokens": 64000
+            "maxTokens": 64000,
+            "compat": { "codeMode": "preferred" }
           }
         ]
       }
@@ -213,7 +258,7 @@
   },
   "cliBackends": ["claude-cli"],
   "syntheticAuthRefs": ["claude-cli"],
-  "nonSecretAuthMarkers": ["openclaw:claude-cli-api-key-helper"],
+  "nonSecretAuthMarkers": ["openclaw:claude-cli-native-auth"],
   "setup": {
     "providers": [
       {

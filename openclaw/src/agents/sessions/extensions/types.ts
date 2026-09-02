@@ -34,6 +34,7 @@ import type { Static, TSchema } from "typebox";
 import type { Theme } from "../../modes/interactive/theme/theme.js";
 import type {
   AgentMessage,
+  AgentTool,
   AgentToolResult,
   AgentToolUpdateCallback,
   StreamFn,
@@ -496,6 +497,8 @@ export interface ToolDefinition<
   label: string;
   /** Preserve lifecycle telemetry without rendering transient channel progress. */
   hideFromChannelProgress?: boolean;
+  /** Tool results contain externally controlled network content. */
+  resultContentSource?: AgentTool["resultContentSource"];
   /** Description for LLM */
   description: string;
   /** Optional one-line snippet for the Available tools section in the default system prompt. Custom tools are omitted from that section when this is not provided. */
@@ -920,6 +923,7 @@ interface ToolResultEventBase {
   input: Record<string, unknown>;
   content: (TextContent | ImageContent)[];
   isError: boolean;
+  terminate?: boolean;
 }
 
 interface BashToolResultEvent extends ToolResultEventBase {
@@ -1083,8 +1087,6 @@ export interface ContextEventResult {
   messages?: AgentMessage[];
 }
 
-type BeforeProviderRequestEventResult = unknown;
-
 export interface ToolCallEventResult {
   /** Block tool execution. To modify arguments, mutate `event.input` in place instead. */
   block?: boolean;
@@ -1103,6 +1105,7 @@ export interface ToolResultEventResult {
   content?: (TextContent | ImageContent)[];
   details?: unknown;
   isError?: boolean;
+  terminate?: boolean;
 }
 
 export interface MessageEndEventResult {
@@ -1222,7 +1225,7 @@ export interface ExtensionAPI {
   on(event: "context", handler: ExtensionHandler<ContextEvent, ContextEventResult>): void;
   on(
     event: "before_provider_request",
-    handler: ExtensionHandler<BeforeProviderRequestEvent, BeforeProviderRequestEventResult>,
+    handler: ExtensionHandler<BeforeProviderRequestEvent, unknown>,
   ): void;
   on(event: "after_provider_response", handler: ExtensionHandler<AfterProviderResponseEvent>): void;
   on(

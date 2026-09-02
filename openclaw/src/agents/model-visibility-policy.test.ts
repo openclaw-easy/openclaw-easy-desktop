@@ -150,7 +150,7 @@ describe("explicit model visibility policy", () => {
         (entry) => entry.provider === "external" && entry.id === "sensitive",
       ),
     ).toBe(false);
-    expect(policy.automaticFallbackKeys).toEqual(new Set(["external/sensitive"]));
+    expect(policy.retainedKeys).toEqual(new Set(["openai/gpt-5.5", "external/sensitive"]));
   });
 
   it("allows a configured fallback when the explicit policy also allows it", () => {
@@ -206,6 +206,27 @@ describe("explicit model visibility policy", () => {
     expect(policy.allowsKey("clawrouter/google/gemini-3.5-flash")).toBe(false);
     expect(policy.allowsKey("openai/gpt-5.5")).toBe(true);
     expect(policy.allowsByWildcard({ provider: "openai", model: "gpt-5.5" })).toBe(false);
+    expect(policy.allowsKey("openai/gpt-5.6-sol")).toBe(false);
+    expect(policy.allowedCatalog.map((entry) => `${entry.provider}/${entry.id}`)).toEqual([
+      "clawrouter/anthropic/claude-haiku-4-5",
+      "openai/gpt-5.5",
+    ]);
+  });
+
+  it("keeps nested prefix wildcards scoped when segments carry boundary whitespace", () => {
+    const policy = createPolicy({
+      agents: {
+        defaults: {
+          modelPolicy: { allow: [" clawrouter / anthropic / * ", " openai / gpt-5.5 "] },
+        },
+      },
+    });
+
+    // The padded nested wildcard must keep its namespace rather than widening to
+    // every clawrouter model.
+    expect(policy.allowsKey("clawrouter/anthropic/claude-haiku-4-5")).toBe(true);
+    expect(policy.allowsKey("clawrouter/google/gemini-3.5-flash")).toBe(false);
+    expect(policy.allowsKey("openai/gpt-5.5")).toBe(true);
     expect(policy.allowsKey("openai/gpt-5.6-sol")).toBe(false);
     expect(policy.allowedCatalog.map((entry) => `${entry.provider}/${entry.id}`)).toEqual([
       "clawrouter/anthropic/claude-haiku-4-5",

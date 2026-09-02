@@ -1,6 +1,6 @@
 {
   "name": "moltbot-easy",
-  "version": "2026.7.27",
+  "version": "2026.9.1",
   "private": true,
   "description": "User-friendly desktop app for OpenClaw — bring your own AI provider key",
   "license": "Apache-2.0",
@@ -23,5 +23,5 @@
   "engines": {
     "node": ">=22.22.3 <23 || >=24.15.0 <25 || >=25.9.0"
   },
-  "packageManager": "pnpm@11.15.1+sha512.81350b07e53c9538a02f1f2303b4290fa2d7be04e56e2a970c4cc4b417dc761de196edabd49d55c7dc9580db81007c44143e4e3d7e462b3000d23c255122d065"
+  "packageManager": "pnpm@12.1.0+sha512.d9b8276d97f6ec86e49815877f91ee9f63cee61f2063b304e43b6dab8fa07ce8a9afd46d2facd39f921e6a9d06b3c75a81349c7b888c2d22886bae0229901037"
 }

@@ -1,6 +1,6 @@
 import type { ReplyDirectiveParseResult } from "../auto-reply/reply/reply-directives.js";
 import type { AssistantPhase } from "../shared/chat-message-content.js";
-import "./embedded-agent-subscribe.handlers.messages.js";
+import "./embedded-agent-subscribe.handlers.messages.update.js";
 import type { EmbeddedAgentSubscribeState } from "./embedded-agent-subscribe.handlers.types.js";
 
 type AssistantStreamDataParams = {
@@ -9,6 +9,7 @@ type AssistantStreamDataParams = {
   replace?: boolean;
   mediaUrls?: string[];
   mediaUrl?: string;
+  managedMediaUrls?: string[];
   phase?: AssistantPhase;
   itemId?: string;
 };
@@ -18,6 +19,7 @@ type AssistantStreamData = {
   delta: string;
   replace?: true;
   mediaUrls?: string[];
+  managedMediaUrls?: string[];
   phase?: AssistantPhase;
   itemId?: string;
 };
@@ -28,10 +30,17 @@ type EmbeddedSubscribeMessagesTestApi = {
     state: Pick<EmbeddedAgentSubscribeState, "pendingAssistantReplyDirectives">,
     parsed: ReplyDirectiveParseResult | null | undefined,
   ): void;
-  resolveSilentReplyFallbackText(params: {
-    text: unknown;
-    messagingToolSentTexts: string[];
-  }): string;
+  resolveCurrentSourceMessagingToolPartial(
+    state: Pick<
+      EmbeddedAgentSubscribeState,
+      "currentSourceMessagingToolHeldPartial" | "currentSourceMessagingToolSentTextsNormalized"
+    >,
+    params: {
+      evtType: "text_delta" | "text_start" | "text_end";
+      text: string;
+      visibleDelta: string;
+    },
+  ): { hold: boolean; text: string };
 };
 
 function getTestApi(): EmbeddedSubscribeMessagesTestApi {
@@ -55,9 +64,16 @@ export function recordPendingAssistantReplyDirectives(
   getTestApi().recordPendingAssistantReplyDirectives(state, parsed);
 }
 
-export function resolveSilentReplyFallbackText(params: {
-  text: unknown;
-  messagingToolSentTexts: string[];
-}): string {
-  return getTestApi().resolveSilentReplyFallbackText(params);
+export function resolveCurrentSourceMessagingToolPartial(
+  state: Pick<
+    EmbeddedAgentSubscribeState,
+    "currentSourceMessagingToolHeldPartial" | "currentSourceMessagingToolSentTextsNormalized"
+  >,
+  params: {
+    evtType: "text_delta" | "text_start" | "text_end";
+    text: string;
+    visibleDelta: string;
+  },
+): { hold: boolean; text: string } {
+  return getTestApi().resolveCurrentSourceMessagingToolPartial(state, params);
 }

@@ -5,7 +5,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { cleanupTempDirs, makeTempDir } from "../helpers/temp-dir.js";
 
-const scriptPath = path.resolve("scripts/check-workflows.mjs");
+const scriptPath = path.resolve("scripts/check-workflows.mts");
 const tempDirs: string[] = [];
 
 afterEach(() => {
@@ -14,7 +14,7 @@ afterEach(() => {
 
 describe("check-workflows", () => {
   it("prints an actionable diagnostic when actionlint and go are unavailable", () => {
-    const result = spawnSync(process.execPath, [scriptPath], {
+    const result = spawnSync(process.execPath, ["--import", "tsx", scriptPath], {
       encoding: "utf8",
       env: {
         ...process.env,
@@ -25,6 +25,7 @@ describe("check-workflows", () => {
     expect(result.status).toBe(1);
     expect(result.stderr).toContain("missing workflow linter");
     expect(result.stderr).toContain("install actionlint, Go");
+    expect(result.stderr).toContain("011a6d15e749bb3f2d771eed9c7aa0e7e3e10ee7");
   });
 
   it("uses the pinned go fallback and audits all workflows with zizmor", () => {
@@ -59,7 +60,7 @@ describe("check-workflows", () => {
       writeFileSync(path.join(binDir, command), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
     }
 
-    const result = spawnSync(process.execPath, [scriptPath], {
+    const result = spawnSync(process.execPath, ["--import", "tsx", scriptPath], {
       encoding: "utf8",
       env: {
         ...process.env,
@@ -71,7 +72,7 @@ describe("check-workflows", () => {
 
     expect(result.status).toBe(0);
     expect(readFileSync(markerPath, "utf8")).toContain(
-      "github.com/rhysd/actionlint/cmd/actionlint@v1.7.12",
+      "github.com/rhysd/actionlint/cmd/actionlint@011a6d15e749bb3f2d771eed9c7aa0e7e3e10ee7",
     );
     const preCommitArgs = readFileSync(preCommitMarkerPath, "utf8");
     expect(preCommitArgs).toContain("run --config .pre-commit-config.yaml zizmor --files");
@@ -111,7 +112,7 @@ describe("check-workflows", () => {
       { mode: 0o755 },
     );
 
-    const result = spawnSync(process.execPath, [scriptPath], {
+    const result = spawnSync(process.execPath, ["--import", "tsx", scriptPath], {
       encoding: "utf8",
       env: {
         ...process.env,
@@ -122,7 +123,7 @@ describe("check-workflows", () => {
 
     expect(result.status).toBe(0);
     const pythonArgs = readFileSync(markerPath, "utf8");
-    expect(pythonArgs).toContain("-m pip install --disable-pip-version-check pre-commit==4.2.0");
+    expect(pythonArgs).toContain("-m pip install --disable-pip-version-check pre-commit==4.6.2");
     expect(pythonArgs).toContain(
       "-m pre_commit run --config .pre-commit-config.yaml actionlint --files",
     );
@@ -152,7 +153,7 @@ describe("check-workflows", () => {
       { mode: 0o755 },
     );
 
-    const result = spawnSync(process.execPath, [scriptPath], {
+    const result = spawnSync(process.execPath, ["--import", "tsx", scriptPath], {
       encoding: "utf8",
       env: {
         ...process.env,
@@ -163,7 +164,7 @@ describe("check-workflows", () => {
     expect(result.status).toBe(1);
     expect(result.stderr).toContain("python venv unavailable");
     expect(result.stderr).toContain("missing pre-commit runtime for actionlint");
-    expect(result.stderr).toContain("Python venv support for pre-commit 4.2.0");
+    expect(result.stderr).toContain("Python venv support for pre-commit 4.6.2");
   });
 
   it("cleans the temporary Python venv before exiting on hook failure", () => {
@@ -196,7 +197,7 @@ describe("check-workflows", () => {
       { mode: 0o755 },
     );
 
-    const result = spawnSync(process.execPath, [scriptPath], {
+    const result = spawnSync(process.execPath, ["--import", "tsx", scriptPath], {
       encoding: "utf8",
       env: {
         ...process.env,
@@ -243,7 +244,7 @@ describe("check-workflows", () => {
 
     expect(workflow).toContain("run_windows_ci:");
     expect(workflow).toContain(
-      'description: "Run the focused Windows-native CI test shard after probing"',
+      'description: "Run the focused Windows CI shard and native Scheduled Task proof"',
     );
     expect(workflow).toContain("default: false");
     expect(workflow).toContain("if: ${{ inputs.run_windows_ci }}");
@@ -251,6 +252,20 @@ describe("check-workflows", () => {
     expect(workflow).toContain("uses: ./.github/actions/setup-pnpm-store-cache");
     expect(workflow).toContain("pnpm install --frozen-lockfile --prefer-offline");
     expect(workflow).toContain("pnpm test:windows:ci");
+    expect(workflow).toContain("pnpm test:windows:schtasks:integration");
+    expect(workflow).toContain('CI_WINDOWS_SCHTASKS_HEAD="$(git rev-parse HEAD)"');
+    expect(workflow).toContain('if [[ "$CI_WINDOWS_SCHTASKS_HEAD" != "$EXPECTED_HEAD" ]]; then');
+    expect(workflow).toContain('$activePidPath = Join-Path $env:TEST_ROOT "active-pid.txt"');
+    expect(workflow).toContain('$process.CommandLine -like "*$probePath*"');
+    expect(workflow).toContain('$process.CommandLine -like "*$eventsPath*"');
+    expect(workflow).toContain("schtasks.exe /Delete /F /TN $taskName");
+    expect(workflow).toContain('$service = New-Object -ComObject "Schedule.Service"');
+    expect(workflow).toContain("failure-diagnostics.json");
+    expect(workflow).toContain("cleanup-summary.txt");
+    expect(workflow).not.toContain("task-before-cleanup.xml");
+    expect(workflow).not.toContain("Copy-Item -LiteralPath $stateDir");
+    expect(workflow).toContain("          exit 0");
+    expect(workflow).toContain(".artifacts/windows-schtasks/");
     expect(workflow).toContain("if: ${{ always() && !cancelled() }}");
     expect(workflow).toContain("if: ${{ always() && !cancelled() && inputs.require_wsl2 }}");
   });

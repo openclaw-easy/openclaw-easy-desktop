@@ -1,3 +1,4 @@
+import { formatErrorMessage } from "../infra/errors.js";
 import { executeSqliteQuerySync, getNodeSqliteKysely } from "../infra/kysely-sync.js";
 // Stores config health fingerprints in shared SQLite state.
 import type { DB as OpenClawStateKyselyDatabase } from "../state/openclaw-state-db.generated.js";
@@ -5,6 +6,12 @@ import {
   openOpenClawStateDatabase,
   runOpenClawStateWriteTransaction,
 } from "../state/openclaw-state-db.js";
+import { resolveOpenClawStateSqlitePath } from "../state/openclaw-state-db.paths.js";
+import { OpenClawStateOwnershipError } from "../state/openclaw-state-ownership.js";
+import { setBoundedConfigIoWarningEntry } from "./io.state.js";
+
+// Fresh config snapshots share a database; retain failures until a write recovers.
+const loggedHealthWriteFailures = new Map<string, string>();
 
 export type ConfigHealthFingerprint = {
   hash: string;
@@ -65,10 +72,6 @@ function stringifyConfigHealthFingerprint(
   return value ? JSON.stringify(value) : null;
 }
 
-function formatConfigHealthStateError(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
-
 export function readConfigHealthStateFromStore(deps: ConfigHealthStateDeps): ConfigHealthState {
   try {
     const database = openOpenClawStateDatabase({ env: resolveConfigHealthStateEnv(deps) });
@@ -97,7 +100,10 @@ export function readConfigHealthStateFromStore(deps: ConfigHealthStateDeps): Con
         ]),
       ),
     };
-  } catch {
+  } catch (error) {
+    if (error instanceof OpenClawStateOwnershipError) {
+      throw error;
+    }
     return {};
   }
 }
@@ -106,6 +112,8 @@ export function writeConfigHealthStateToStore(
   deps: ConfigHealthStateDeps,
   state: ConfigHealthState,
 ): void {
+  const env = resolveConfigHealthStateEnv(deps);
+  const databasePath = resolveOpenClawStateSqlitePath(env);
   try {
     const entries = Object.entries(state.entries ?? {});
     if (entries.length === 0) {
@@ -139,9 +147,18 @@ export function writeConfigHealthStateToStore(
             ),
         );
       },
-      { env: resolveConfigHealthStateEnv(deps) },
+      { env, path: databasePath },
     );
+    loggedHealthWriteFailures.delete(databasePath);
   } catch (error) {
-    deps.logger.warn(`Config health-state write failed: ${formatConfigHealthStateError(error)}`);
+    if (error instanceof OpenClawStateOwnershipError) {
+      throw error;
+    }
+    const message = formatErrorMessage(error);
+    const repeated = loggedHealthWriteFailures.get(databasePath) === message;
+    setBoundedConfigIoWarningEntry(loggedHealthWriteFailures, databasePath, message);
+    if (!repeated) {
+      deps.logger.warn(`Config health-state write failed: ${message}`);
+    }
   }
 }

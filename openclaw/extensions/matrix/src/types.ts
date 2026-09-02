@@ -1,15 +1,13 @@
 // Matrix type declarations define plugin contracts.
 import type {
   ChannelBotLoopProtectionConfig,
-  MentionPatternsPolicyConfig,
-} from "openclaw/plugin-sdk/config-contracts";
-import type {
   ContextVisibilityMode,
   DmPolicy,
   GroupPolicy,
+  MentionPatternsPolicyConfig,
   OpenClawConfig,
-  SecretInput,
-} from "./runtime-api.js";
+} from "openclaw/plugin-sdk/config-contracts";
+import type { SecretInput } from "openclaw/plugin-sdk/secret-input";
 
 export type ReplyToMode = "off" | "first" | "all" | "batched";
 
@@ -77,8 +75,8 @@ type MatrixThreadBindingsConfig = {
 type MatrixExecApprovalTarget = "dm" | "channel" | "both";
 
 type MatrixExecApprovalConfig = {
-  /** If true, deliver exec approvals through Matrix-native prompts. */
-  enabled?: boolean;
+  /** Explicitly enable Matrix-native approval prompts when approvers are available. */
+  enabled?: boolean | "auto";
   /** Optional approver Matrix user IDs. Falls back to dm.allowFrom. */
   approvers?: Array<string | number>;
   /** Optional agent allowlist for approval delivery. */
@@ -114,6 +112,8 @@ type MatrixNetworkConfig = {
 export type MatrixAccountConfig = Omit<MatrixConfig, "accounts">;
 
 export type MatrixConfig = {
+  /** Introduce the bot when it joins an allowed group room. Default: true. */
+  joinIntro?: boolean;
   /** Optional display name for this account (used in CLI/UI lists). */
   name?: string;
   /** If false, do not start Matrix. Default: true. */

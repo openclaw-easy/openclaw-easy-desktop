@@ -1,4 +1,6 @@
 // Windows schtasks startup fallback tests cover fallback startup task behavior.
+import type { ChildProcess } from "node:child_process";
+import { EventEmitter } from "node:events";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { PassThrough } from "node:stream";
@@ -24,9 +26,10 @@ vi.mock("../infra/windows-encoding.js", async () => {
 });
 
 import {
-  inspectPortUsage,
-  killProcessTree,
+  inspectPortUsageMock,
+  killProcessTreeMock,
   resetSchtasksBaseMocks,
+  schtasksCalls,
   schtasksResponses,
   withWindowsEnv,
   writeGatewayScript,
@@ -38,7 +41,7 @@ const sleepMock = vi.hoisted(() =>
   }),
 );
 const childUnref = vi.hoisted(() => vi.fn());
-const spawn = vi.hoisted(() => vi.fn(() => ({ unref: childUnref })));
+const spawn = vi.hoisted(() => vi.fn());
 type SpawnSyncResult = {
   pid: number;
   output: (string | null)[];
@@ -92,6 +95,19 @@ const {
   stopScheduledTask,
   uninstallScheduledTask,
 } = await import("./schtasks.js");
+const { launchFallbackTaskScript, removeStartupEntries } = await import("./schtasks-runtime.js");
+const { createMockGatewayService } = await import("./service.test-helpers.js");
+const { readServiceStatusSummary } = await import("../commands/status.service-summary.js");
+const { formatStatusServiceValue } = await import("../commands/status-all/format.js");
+
+function createSpawnChild(error?: Error): ChildProcess {
+  const child = new EventEmitter() as ChildProcess;
+  child.unref = childUnref;
+  queueMicrotask(() => {
+    child.emit(error ? "error" : "spawn", error);
+  });
+  return child;
+}
 
 function resolveStartupEntryPath(env: Record<string, string>, extension = "cmd") {
   const taskName = env.OPENCLAW_WINDOWS_TASK_NAME ?? "OpenClaw Gateway";
@@ -215,10 +231,10 @@ function expectStartupFallbackSpawn() {
 
 function expectGatewayTermination(pid: number) {
   if (process.platform === "win32") {
-    expect(killProcessTree).not.toHaveBeenCalled();
+    expect(killProcessTreeMock).not.toHaveBeenCalled();
     return;
   }
-  expect(killProcessTree).toHaveBeenCalledWith(pid, { graceMs: 300 });
+  expect(killProcessTreeMock).toHaveBeenCalledWith(pid, { graceMs: 300 });
 }
 
 function useListenerBackedFallbackOwnership(): void {
@@ -227,14 +243,13 @@ function useListenerBackedFallbackOwnership(): void {
   vi.spyOn(process, "platform", "get").mockReturnValue("linux");
 }
 
-function addStartupFallbackMissingResponses(
-  extraResponses: Array<{ code: number; stdout: string; stderr: string }> = [],
-) {
-  schtasksResponses.push(
-    { code: 0, stdout: "", stderr: "" },
-    { code: 1, stdout: "", stderr: "not found" },
-    ...extraResponses,
-  );
+function addMissingTaskInstallResponses(responses: typeof schtasksResponses): void {
+  schtasksResponses.push({ code: 1, stdout: "", stderr: "not found" }, ...responses);
+}
+
+function addStartupFallbackMissingResponses(extraResponses: typeof schtasksResponses = []) {
+  schtasksResponses.push({ code: 0, stdout: "", stderr: "" });
+  addMissingTaskInstallResponses(extraResponses);
 }
 
 function installGatewayScheduledTask(
@@ -275,7 +290,7 @@ function fastForwardTaskStartWait(): void {
 }
 
 function addAcceptedRunNeverStartsResponses(): void {
-  addStartupFallbackMissingResponses([
+  addMissingTaskInstallResponses([
     { code: 0, stdout: "", stderr: "" },
     { code: 0, stdout: "", stderr: "" },
     { code: 0, stdout: "", stderr: "" },
@@ -305,13 +320,10 @@ function addSuccessfulScheduledTaskRestartResponses(
   }
 }
 
-function notYetRunTaskQueryOutput() {
-  return [
-    "Status: Ready",
-    "Last Run Time: 11/30/1999 12:00:00 AM",
-    "Last Run Result: 267011",
-    "",
-  ].join("\r\n");
+function notYetRunTaskQueryOutput(lastRunTime = "11/30/1999 12:00:00 AM") {
+  return ["Status: Ready", `Last Run Time: ${lastRunTime}`, "Last Run Result: 267011", ""].join(
+    "\r\n",
+  );
 }
 
 function cleanExitTaskQueryOutput(lastRunTime = "5/2/2026 2:41:39 PM") {
@@ -319,7 +331,7 @@ function cleanExitTaskQueryOutput(lastRunTime = "5/2/2026 2:41:39 PM") {
 }
 
 function addAcceptedRunCleanExitResponses(initialOutput = cleanExitTaskQueryOutput()): void {
-  addStartupFallbackMissingResponses([
+  addMissingTaskInstallResponses([
     { code: 0, stdout: "", stderr: "" },
     { code: 0, stdout: "", stderr: "" },
     { code: 0, stdout: "", stderr: "" },
@@ -344,13 +356,14 @@ beforeEach(() => {
   vi.spyOn(process, "platform", "get").mockReturnValue("linux");
   findVerifiedGatewayListenerPidsOnPortSync.mockReset();
   findVerifiedGatewayListenerPidsOnPortSync.mockReturnValue([]);
-  inspectPortUsage.mockResolvedValue({
+  inspectPortUsageMock.mockResolvedValue({
     port: 18789,
     status: "free",
     listeners: [],
     hints: [],
   });
-  spawn.mockClear();
+  spawn.mockReset();
+  spawn.mockImplementation(() => createSpawnChild());
   spawnSync.mockClear();
   childUnref.mockClear();
   timeState.now = 0;
@@ -366,6 +379,217 @@ afterEach(() => {
 });
 
 describe("Windows startup fallback", () => {
+  it("rejects asynchronous direct executable spawn failures without detaching", async () => {
+    await withWindowsEnv("openclaw-win-startup-", async ({ env }) => {
+      await writeGatewayScript(env);
+      const error = Object.assign(new Error("spawn direct ENOENT"), { code: "ENOENT" });
+      spawn.mockImplementationOnce(() => createSpawnChild(error));
+
+      await expect(launchFallbackTaskScript(env)).rejects.toThrow("spawn direct ENOENT");
+      expect(childUnref).not.toHaveBeenCalled();
+    });
+  });
+
+  it("rejects asynchronous cmd fallback spawn failures without detaching", async () => {
+    await withWindowsEnv("openclaw-win-startup-", async ({ env }) => {
+      const scriptPath = resolveTaskScriptPath(env);
+      await fs.mkdir(path.dirname(scriptPath), { recursive: true });
+      await fs.writeFile(scriptPath, "@echo off\r\nrem no parsed command\r\n", "utf8");
+      const error = Object.assign(new Error("spawn cmd ENOENT"), { code: "ENOENT" });
+      spawn.mockImplementationOnce(() => createSpawnChild(error));
+
+      await expect(launchFallbackTaskScript(env)).rejects.toThrow("spawn cmd ENOENT");
+      expect(childUnref).not.toHaveBeenCalled();
+    });
+  });
+
+  it("rejects a missing cmd fallback script before starting cmd", async () => {
+    await withWindowsEnv("openclaw-win-startup-", async ({ env }) => {
+      await expect(launchFallbackTaskScript(env)).rejects.toThrow(/ENOENT|no such file/i);
+      expect(spawn).not.toHaveBeenCalled();
+    });
+  });
+
+  it("rejects an ACL-denied cmd fallback script before starting cmd", async () => {
+    await withWindowsEnv("openclaw-win-startup-", async ({ env }) => {
+      const scriptPath = resolveTaskScriptPath(env);
+      await fs.mkdir(path.dirname(scriptPath), { recursive: true });
+      await fs.writeFile(scriptPath, "@echo off\r\n", "utf8");
+      const denied = Object.assign(new Error("open fallback script EACCES"), { code: "EACCES" });
+      vi.spyOn(fs, "open").mockRejectedValueOnce(denied);
+
+      await expect(launchFallbackTaskScript(env, null)).rejects.toThrow(
+        "open fallback script EACCES",
+      );
+      expect(spawn).not.toHaveBeenCalled();
+      expect(childUnref).not.toHaveBeenCalled();
+    });
+  });
+
+  it("rejects denied cmd script access even when Node opens it with backup privileges", async () => {
+    await withWindowsEnv("openclaw-win-startup-", async ({ env, tmpDir }) => {
+      env.OPENCLAW_STATE_DIR = path.join(tmpDir, "state & %USERPROFILE%");
+      const scriptPath = resolveTaskScriptPath(env);
+      await fs.mkdir(path.dirname(scriptPath), { recursive: true });
+      await fs.writeFile(scriptPath, "@echo off\r\n", "utf8");
+      spawnSync.mockReturnValueOnce(makeSpawnSyncResult({ status: 1 }));
+
+      await expect(launchFallbackTaskScript(env, null)).rejects.toMatchObject({ code: "EACCES" });
+      expect(spawnSync).toHaveBeenCalledWith(
+        getWindowsPowerShellExePath(),
+        expect.arrayContaining(["-EncodedCommand"]),
+        expect.objectContaining({
+          env: expect.objectContaining({ OPENCLAW_TASK_SCRIPT: scriptPath }),
+          stdio: "ignore",
+          windowsHide: true,
+        }),
+      );
+      expect(spawn).not.toHaveBeenCalled();
+      expect(childUnref).not.toHaveBeenCalled();
+    });
+  });
+
+  it("detaches the direct executable only after it starts", async () => {
+    await withWindowsEnv("openclaw-win-startup-", async ({ env }) => {
+      await writeGatewayScript(env);
+
+      await expect(launchFallbackTaskScript(env)).resolves.toBeUndefined();
+      expect(spawn).toHaveBeenCalledWith(
+        "C:\\Program Files\\nodejs\\node.exe",
+        expect.arrayContaining(["gateway", "--port", "18789"]),
+        expect.objectContaining({ detached: true, stdio: "ignore", windowsHide: true }),
+      );
+      expect(childUnref).toHaveBeenCalledOnce();
+    });
+  });
+
+  it("detaches the cmd fallback only after it starts", async () => {
+    await withWindowsEnv("openclaw-win-startup-", async ({ env, tmpDir }) => {
+      env.OPENCLAW_STATE_DIR = path.join(tmpDir, "state & %USERPROFILE% !");
+      const scriptPath = resolveTaskScriptPath(env);
+      await fs.mkdir(path.dirname(scriptPath), { recursive: true });
+      await fs.writeFile(scriptPath, "@echo off\r\nrem no parsed command\r\n", "utf8");
+
+      await expect(launchFallbackTaskScript(env)).resolves.toBeUndefined();
+      const [command, args, options] = spawn.mock.calls.at(-1) as [
+        string,
+        string[],
+        {
+          detached: boolean;
+          env: NodeJS.ProcessEnv;
+          stdio: string;
+          windowsHide: boolean;
+          windowsVerbatimArguments: boolean;
+        },
+      ];
+      expect(command).toBe(getWindowsCmdExePath());
+      expect(args).toEqual(["/d", "/s", "/v:off", "/c", '""%OPENCLAW_TASK_SCRIPT%""']);
+      expect(options.env.OPENCLAW_TASK_SCRIPT).toBe(scriptPath);
+      expect(options.detached).toBe(true);
+      expect(options.stdio).toBe("ignore");
+      expect(options.windowsHide).toBe(true);
+      expect(options.windowsVerbatimArguments).toBe(true);
+      expect(childUnref).toHaveBeenCalledOnce();
+    });
+  });
+
+  it("uses the locale-independent task probe when a scheduled task is missing", async () => {
+    await withWindowsEnv("openclaw-win-startup-", async ({ env }) => {
+      schtasksResponses.push(
+        { code: 0, stdout: "", stderr: "" },
+        { code: 1, stdout: "", stderr: "FEHLER: Die angegebene Datei wurde nicht gefunden." },
+      );
+      spawnSync.mockReturnValue(makeSpawnSyncResult({ status: 1, stdout: "-2147024894" }));
+
+      await expect(readScheduledTaskRuntime(env)).resolves.toEqual({
+        status: "stopped",
+        missingUnit: true,
+      });
+    });
+  });
+
+  it("normalizes a localized schtasks availability failure", async () => {
+    await withWindowsEnv("openclaw-win-startup-", async ({ env }) => {
+      schtasksResponses.push({ code: 1, stdout: "", stderr: "错误: 拒绝访问。" });
+
+      await expect(readScheduledTaskRuntime(env)).resolves.toEqual({
+        status: "unknown",
+        detail: "service runtime inspection failed",
+        inspectionFailure: {
+          code: "service-runtime-inspection-failed",
+          detail: "schtasks unavailable: 错误: 拒绝访问。",
+        },
+      });
+    });
+  });
+
+  it("normalizes unexpected scheduled-task failures through the shared status summary", async () => {
+    await withWindowsEnv("openclaw-win-startup-", async ({ env }) => {
+      const detail = "Zugriff verweigert";
+      schtasksResponses.push(
+        { code: 0, stdout: "", stderr: "" },
+        { code: 1, stdout: "", stderr: detail },
+      );
+      spawnSync.mockReturnValue(makeSpawnSyncResult({ status: 1, stdout: "-2147024891" }));
+
+      const summary = await readServiceStatusSummary(
+        createMockGatewayService({
+          label: "Scheduled Task",
+          loadedText: "registered",
+          notLoadedText: "missing",
+          readRuntime: () => readScheduledTaskRuntime(env),
+        }),
+        "Daemon",
+      );
+
+      expect(summary.runtime).toEqual({
+        status: "unknown",
+        detail: "service runtime inspection failed",
+        inspectionFailure: {
+          code: "service-runtime-inspection-failed",
+          detail,
+        },
+        missingUnit: false,
+      });
+      expect(formatStatusServiceValue(summary)).toBe(
+        "Scheduled Task missing (inspection failed: service runtime inspection failed) · unknown",
+      );
+      expect(formatStatusServiceValue(summary)).not.toContain(detail);
+    });
+  });
+
+  it("reports login item removal failures without leaking the item path", async () => {
+    await withWindowsEnv("openclaw-win-startup-", async ({ env }) => {
+      const startupEntryPath = await writeStartupFallbackEntry(env);
+      const removalError = Object.assign(
+        new Error(`EACCES: permission denied, unlink '${startupEntryPath}'`),
+        { code: "EACCES", path: startupEntryPath },
+      );
+      vi.spyOn(fs, "unlink").mockRejectedValueOnce(removalError);
+
+      const removal = removeStartupEntries(env, new PassThrough());
+
+      await expect(removal).rejects.toThrow("Windows login item removal failed (EACCES)");
+      await expect(removal).rejects.not.toThrow(startupEntryPath);
+      const sanitizedError = await removal.catch((error: unknown) => error);
+      expect(sanitizedError).toBeInstanceOf(Error);
+      if (!(sanitizedError instanceof Error)) {
+        throw new Error("expected sanitized Windows login item removal failure");
+      }
+      expect(sanitizedError).not.toBe(removalError);
+      expect(sanitizedError.cause).toEqual({ code: "EACCES" });
+      expect(sanitizedError).not.toHaveProperty("path");
+      expect(sanitizedError.stack).not.toContain(startupEntryPath);
+      await expect(fs.access(startupEntryPath)).resolves.toBeUndefined();
+    });
+  });
+
+  it("keeps missing Startup-folder login item removal idempotent", async () => {
+    await withWindowsEnv("openclaw-win-startup-", async ({ env }) => {
+      await expect(removeStartupEntries(env, new PassThrough())).resolves.toBeUndefined();
+    });
+  });
+
   it("skips task ownership probes when no Startup fallback exists", async () => {
     await withWindowsEnv("openclaw-win-startup-", async ({ env }) => {
       await expect(readWindowsStartupFallbackRuntimeForUpdate(env)).resolves.toBeNull();
@@ -375,9 +599,7 @@ describe("Windows startup fallback", () => {
 
   it("falls back to a Startup-folder launcher when schtasks create is denied", async () => {
     await withWindowsEnv("openclaw-win-startup-", async ({ env }) => {
-      addStartupFallbackMissingResponses([
-        { code: 5, stdout: "", stderr: "ERROR: Access is denied." },
-      ]);
+      addMissingTaskInstallResponses([{ code: 5, stdout: "", stderr: "ERROR: Access is denied." }]);
 
       const stdout = new PassThrough();
       let printed = "";
@@ -402,9 +624,7 @@ describe("Windows startup fallback", () => {
 
   it("uses a hidden Startup-folder launcher when requested", async () => {
     await withWindowsEnv("openclaw-win-startup-", async ({ env }) => {
-      addStartupFallbackMissingResponses([
-        { code: 5, stdout: "", stderr: "ERROR: Access is denied." },
-      ]);
+      addMissingTaskInstallResponses([{ code: 5, stdout: "", stderr: "ERROR: Access is denied." }]);
 
       const result = await installGatewayScheduledTask({
         ...env,
@@ -429,7 +649,7 @@ describe("Windows startup fallback", () => {
     await withWindowsEnv("openclaw-win-startup-", async ({ env }) => {
       const startupEntryPath = await writeStartupFallbackEntry(env);
       const hiddenStartupEntryPath = await writeStartupFallbackEntry(env, "vbs");
-      addStartupFallbackMissingResponses([
+      addMissingTaskInstallResponses([
         { code: 0, stdout: "", stderr: "" },
         { code: 0, stdout: "", stderr: "" },
         { code: 0, stdout: "", stderr: "" },
@@ -454,35 +674,70 @@ describe("Windows startup fallback", () => {
     });
   });
 
-  it("takes over from a running Startup-folder fallback before removing its launcher", async () => {
-    useListenerBackedFallbackOwnership();
-    await withWindowsEnv("openclaw-win-startup-", async ({ env }) => {
-      const startupEntryPath = await writeStartupFallbackEntry(env);
-      findVerifiedGatewayListenerPidsOnPortSync.mockReturnValue([4242]);
-      inspectPortUsage
-        .mockResolvedValueOnce({
-          port: 18789,
-          status: "busy",
-          listeners: [{ pid: 4242, command: "node.exe" }],
-          hints: [],
-        })
-        .mockResolvedValue({ port: 18789, status: "free", listeners: [], hints: [] });
-      addStartupFallbackMissingResponses([
-        { code: 0, stdout: "", stderr: "" },
-        { code: 0, stdout: "", stderr: "" },
-        { code: 0, stdout: "", stderr: "" },
-        { code: 0, stdout: runningTaskQueryOutput(), stderr: "" },
-        { code: 0, stdout: "", stderr: "" },
-        { code: 0, stdout: runningTaskQueryOutput(), stderr: "" },
-      ]);
-      addSuccessfulScheduledTaskRestartResponses();
+  it.each([false, true])(
+    "takes over from a running Startup-folder fallback after delayed task readiness (Startup removed after capture: %s)",
+    async (removeAfterCapture) => {
+      useListenerBackedFallbackOwnership();
+      await withWindowsEnv("openclaw-win-startup-", async ({ env }) => {
+        const startupEntryPath = await writeStartupFallbackEntry(env);
+        await writeGatewayScript(env);
+        findVerifiedGatewayListenerPidsOnPortSync.mockReturnValue([4242]);
+        inspectPortUsageMock
+          .mockResolvedValueOnce({
+            port: 18789,
+            status: "busy",
+            listeners: [{ pid: 4242, command: "node.exe" }],
+            hints: [],
+          })
+          .mockImplementationOnce(async (port) => {
+            // The preflight runs after the old fallback's command and ownership were captured.
+            if (removeAfterCapture) {
+              await fs.unlink(startupEntryPath);
+            }
+            return { port, status: "free", listeners: [], hints: [] };
+          })
+          .mockResolvedValue({ port: 18789, status: "free", listeners: [], hints: [] });
+        addMissingTaskInstallResponses([
+          { code: 0, stdout: "", stderr: "" },
+          { code: 0, stdout: "", stderr: "" },
+          { code: 0, stdout: "", stderr: "" },
+          { code: 0, stdout: runningTaskQueryOutput(), stderr: "" },
+          { code: 0, stdout: "", stderr: "" }, // takeover /End
+          { code: 0, stdout: "", stderr: "" }, // takeover /Run
+        ]);
+        const startupProgress = notYetRunTaskQueryOutput("4/15/2026 11:42:31 PM");
+        // A fresh run timestamp proves launch progress, but running evidence arrives one poll later.
+        for (const output of [
+          notYetRunTaskQueryOutput(),
+          startupProgress,
+          startupProgress,
+          runningTaskQueryOutput(),
+        ]) {
+          schtasksResponses.push(
+            { code: 0, stdout: "", stderr: "" },
+            { code: 0, stdout: output, stderr: "" },
+          );
+        }
+        const stdout = new PassThrough();
+        let printed = "";
+        stdout.on("data", (chunk) => {
+          printed += String(chunk);
+        });
 
-      await installGatewayScheduledTask(env);
+        await expect(installGatewayScheduledTask(env, stdout)).resolves.toEqual({
+          scriptPath: resolveTaskScriptPath(env),
+        });
 
-      expectGatewayTermination(4242);
-      await expect(fs.access(startupEntryPath)).rejects.toThrow();
-    });
-  });
+        expectGatewayTermination(4242);
+        expect(spawn).not.toHaveBeenCalled();
+        expect(schtasksResponses).toEqual([]);
+        expect(sleepMock.mock.calls).toEqual([[250], [250]]);
+        expect(printed).toContain("Restarted Scheduled Task");
+        expect(printed.includes("Removed Windows login item")).toBe(!removeAfterCapture);
+        await expect(fs.access(startupEntryPath)).rejects.toThrow();
+      });
+    },
+  );
 
   it("migrates an exact persisted wrapper that owns the replacement port", async () => {
     await withWindowsEnv("openclaw-win-startup-", async ({ env }) => {
@@ -526,7 +781,7 @@ describe("Windows startup fallback", () => {
         }
         return makeSpawnSyncResult();
       });
-      inspectPortUsage
+      inspectPortUsageMock
         .mockResolvedValueOnce({
           port: 18789,
           status: "busy",
@@ -545,7 +800,7 @@ describe("Windows startup fallback", () => {
           listeners: [],
           hints: [],
         }));
-      addStartupFallbackMissingResponses([
+      addMissingTaskInstallResponses([
         { code: 0, stdout: "", stderr: "" },
         { code: 0, stdout: "", stderr: "" },
         { code: 0, stdout: "", stderr: "" },
@@ -575,7 +830,7 @@ describe("Windows startup fallback", () => {
           ? makeSpawnSyncResult({ status: 1 })
           : makeSpawnSyncResult(),
       );
-      inspectPortUsage.mockResolvedValue({
+      inspectPortUsageMock.mockResolvedValue({
         port: 18789,
         status: "free",
         listeners: [],
@@ -658,7 +913,7 @@ describe("Windows startup fallback", () => {
         }
         return makeSpawnSyncResult();
       });
-      addStartupFallbackMissingResponses([
+      addMissingTaskInstallResponses([
         { code: 0, stdout: "", stderr: "" },
         { code: 0, stdout: "", stderr: "" },
         { code: 0, stdout: "", stderr: "" },
@@ -683,7 +938,7 @@ describe("Windows startup fallback", () => {
     useListenerBackedFallbackOwnership();
     await withWindowsEnv("openclaw-win-startup-", async ({ env }) => {
       const startupEntryPath = await writeStartupFallbackEntry(env);
-      inspectPortUsage.mockResolvedValue({
+      inspectPortUsageMock.mockResolvedValue({
         port: 18789,
         status: "busy",
         listeners: [{ pid: 4242, command: "other.exe" }],
@@ -693,7 +948,7 @@ describe("Windows startup fallback", () => {
         "listener is not a verified gateway process",
       );
 
-      expect(killProcessTree).not.toHaveBeenCalled();
+      expect(killProcessTreeMock).not.toHaveBeenCalled();
       await expect(fs.access(startupEntryPath)).resolves.toBeUndefined();
     });
   });
@@ -726,7 +981,7 @@ describe("Windows startup fallback", () => {
         }
         return makeSpawnSyncResult();
       });
-      inspectPortUsage.mockResolvedValue({
+      inspectPortUsageMock.mockResolvedValue({
         port: 18789,
         status: "busy",
         listeners: [
@@ -744,7 +999,7 @@ describe("Windows startup fallback", () => {
         "gateway listener on port 18789 does not match the persisted command",
       );
 
-      expect(killProcessTree).not.toHaveBeenCalled();
+      expect(killProcessTreeMock).not.toHaveBeenCalled();
       await expect(fs.access(startupEntryPath)).resolves.toBeUndefined();
     });
   });
@@ -755,12 +1010,20 @@ describe("Windows startup fallback", () => {
       const startupEntryPath = await writeStartupFallbackEntry(env);
       await writeGatewayScript(env);
       findVerifiedGatewayListenerPidsOnPortSync.mockReturnValue([4242]);
-      inspectPortUsage.mockImplementation(async (port) => {
+      let portInspections = 0;
+      inspectPortUsageMock.mockImplementation(async (port) => {
         schtasksResponses.length = 0;
         schtasksResponses.push({ code: 1, stdout: "", stderr: "restart denied" });
-        return { port, status: "free", listeners: [], hints: [] };
+        return portInspections++ === 0
+          ? {
+              port,
+              status: "busy",
+              listeners: [{ pid: 4242, command: "node.exe" }],
+              hints: [],
+            }
+          : { port, status: "free", listeners: [], hints: [] };
       });
-      addStartupFallbackMissingResponses([
+      addMissingTaskInstallResponses([
         { code: 0, stdout: "", stderr: "" },
         { code: 0, stdout: "", stderr: "" },
         { code: 0, stdout: "", stderr: "" },
@@ -783,7 +1046,7 @@ describe("Windows startup fallback", () => {
       const startupEntryPath = await writeStartupFallbackEntry(env);
       await writeGatewayScript(env, 18789);
       env.OPENCLAW_GATEWAY_PORT = "19433";
-      inspectPortUsage.mockImplementation(async (port) => ({
+      inspectPortUsageMock.mockImplementation(async (port) => ({
         port,
         status: port === 18789 ? "busy" : "free",
         listeners:
@@ -798,7 +1061,7 @@ describe("Windows startup fallback", () => {
             : [],
         hints: [],
       }));
-      addStartupFallbackMissingResponses([
+      addMissingTaskInstallResponses([
         { code: 0, stdout: "", stderr: "" },
         { code: 0, stdout: "", stderr: "" },
         { code: 0, stdout: "", stderr: "" },
@@ -810,7 +1073,9 @@ describe("Windows startup fallback", () => {
 
       await installGatewayScheduledTask(env, new PassThrough(), "19433");
 
-      expect(inspectPortUsage).toHaveBeenCalledWith(18789);
+      expect(inspectPortUsageMock).toHaveBeenCalledWith(18789, {
+        probeHosts: ["127.0.0.1"],
+      });
       expectGatewayTermination(4242);
       await expect(fs.access(startupEntryPath)).rejects.toThrow();
     });
@@ -850,13 +1115,13 @@ describe("Windows startup fallback", () => {
         }
         return makeSpawnSyncResult();
       });
-      inspectPortUsage.mockImplementation(async (port) => ({
+      inspectPortUsageMock.mockImplementation(async (port) => ({
         port,
         status: "free",
         listeners: [],
         hints: [],
       }));
-      addStartupFallbackMissingResponses([
+      addMissingTaskInstallResponses([
         { code: 0, stdout: "", stderr: "" },
         { code: 0, stdout: "", stderr: "" },
         { code: 0, stdout: "", stderr: "" },
@@ -905,7 +1170,7 @@ describe("Windows startup fallback", () => {
         }
         return makeSpawnSyncResult();
       });
-      inspectPortUsage.mockResolvedValue({
+      inspectPortUsageMock.mockResolvedValue({
         port: 19433,
         status: "busy",
         listeners: [
@@ -918,7 +1183,7 @@ describe("Windows startup fallback", () => {
         ],
         hints: [],
       });
-      addStartupFallbackMissingResponses([
+      addMissingTaskInstallResponses([
         { code: 0, stdout: "", stderr: "" },
         { code: 0, stdout: "", stderr: "" },
         { code: 0, stdout: "", stderr: "" },
@@ -972,7 +1237,7 @@ describe("Windows startup fallback", () => {
             })
           : makeSpawnSyncResult(),
       );
-      inspectPortUsage.mockImplementation(async (port) =>
+      inspectPortUsageMock.mockImplementation(async (port) =>
         port === 19433
           ? {
               port,
@@ -1025,7 +1290,7 @@ describe("Windows startup fallback", () => {
             })
           : makeSpawnSyncResult(),
       );
-      inspectPortUsage.mockResolvedValue({
+      inspectPortUsageMock.mockResolvedValue({
         port: 19433,
         status: "unknown",
         listeners: [],
@@ -1075,7 +1340,7 @@ describe("Windows startup fallback", () => {
         }
         return makeSpawnSyncResult();
       });
-      inspectPortUsage
+      inspectPortUsageMock
         .mockResolvedValueOnce({
           port: 18789,
           status: "busy",
@@ -1084,7 +1349,7 @@ describe("Windows startup fallback", () => {
         })
         .mockResolvedValue({ port: 18789, status: "free", listeners: [], hints: [] });
       fastForwardTaskStartWait();
-      addStartupFallbackMissingResponses([
+      addMissingTaskInstallResponses([
         { code: 0, stdout: "", stderr: "" },
         { code: 0, stdout: "", stderr: "" },
         { code: 0, stdout: "", stderr: "" },
@@ -1106,57 +1371,106 @@ describe("Windows startup fallback", () => {
     });
   });
 
-  it("relaunches the fallback when replacement running evidence never appears", async () => {
-    await withWindowsEnv("openclaw-win-startup-", async ({ env }) => {
-      const startupEntryPath = await writeStartupFallbackEntry(env);
-      await writeGatewayScript(env);
-      vi.spyOn(process, "platform", "get").mockReturnValue("win32");
-      let processQueries = 0;
-      spawnSync.mockImplementation((command, args) => {
-        if (
-          command === getWindowsPowerShellExePath() &&
-          Array.isArray(args) &&
-          args.includes(NODE_PROCESS_QUERY)
-        ) {
-          processQueries += 1;
-          return makeSpawnSyncResult({
-            stdout: JSON.stringify(
-              processQueries < 3
-                ? [
-                    {
-                      ProcessId: 4242,
-                      CommandLine:
-                        '"C:\\Program Files\\nodejs\\node.exe" "C:\\Users\\steipete\\AppData\\Roaming\\npm\\node_modules\\openclaw\\dist\\index.js" gateway --port 18789',
-                    },
-                    { ProcessId: 9999, CommandLine: "powershell.exe" },
-                  ]
-                : [{ ProcessId: 9999, CommandLine: "powershell.exe" }],
-            ),
-          });
+  it.each([false, true])(
+    "relaunches the fallback when replacement running evidence never appears (Startup removed after capture: %s)",
+    async (removeAfterCapture) => {
+      await withWindowsEnv("openclaw-win-startup-", async ({ env }) => {
+        const startupEntryPath = await writeStartupFallbackEntry(env);
+        await writeGatewayScript(env);
+        vi.spyOn(process, "platform", "get").mockReturnValue("win32");
+        let fallbackAlive = true;
+        let replacementAlive = true;
+        inspectPortUsageMock.mockImplementationOnce(async (port) => {
+          // Replacement preflight follows capture of the old fallback's command and PID.
+          if (removeAfterCapture) {
+            await fs.unlink(startupEntryPath);
+          }
+          return { port, status: "free", listeners: [], hints: [] };
+        });
+        spawnSync.mockImplementation((command, args) => {
+          if (
+            command === getWindowsPowerShellExePath() &&
+            Array.isArray(args) &&
+            args.includes(NODE_PROCESS_QUERY)
+          ) {
+            return makeSpawnSyncResult({
+              stdout: JSON.stringify(
+                fallbackAlive
+                  ? [
+                      {
+                        ProcessId: 4242,
+                        CommandLine:
+                          '"C:\\Program Files\\nodejs\\node.exe" "C:\\Users\\steipete\\AppData\\Roaming\\npm\\node_modules\\openclaw\\dist\\index.js" gateway --port 18789',
+                      },
+                      { ProcessId: 9999, CommandLine: "powershell.exe" },
+                    ]
+                  : [
+                      // A late replacement can survive /End and still require owned teardown.
+                      ...(replacementAlive &&
+                      schtasksCalls.filter((call) => call[0] === "/End").length === 2
+                        ? [{ ProcessId: 5151, CommandLine: "node gateway.js --port 18789" }]
+                        : []),
+                      { ProcessId: 9999, CommandLine: "powershell.exe" },
+                    ],
+              ),
+            });
+          }
+          if (command.endsWith("taskkill.exe")) {
+            if (args?.includes("4242")) {
+              fallbackAlive = false;
+            }
+            if (args?.includes("5151")) {
+              replacementAlive = false;
+            }
+          }
+          return makeSpawnSyncResult();
+        });
+        fastForwardTaskStartWait();
+        addMissingTaskInstallResponses([
+          { code: 0, stdout: "", stderr: "" },
+          { code: 0, stdout: "", stderr: "" },
+          { code: 0, stdout: "", stderr: "" },
+          { code: 0, stdout: runningTaskQueryOutput(), stderr: "" },
+        ]);
+        const failedTaskQuery = "Status: Ready\r\nLast Run Result: 1\r\n";
+        schtasksResponses.push(
+          { code: 0, stdout: "", stderr: "" }, // /End
+          { code: 0, stdout: "", stderr: "" }, // /Run
+          { code: 0, stdout: "", stderr: "" }, // availability
+          { code: 0, stdout: failedTaskQuery, stderr: "" }, // launch observation: other
+          { code: 0, stdout: "", stderr: "" },
+          { code: 0, stdout: failedTaskQuery, stderr: "" }, // takeover verification
+        );
+        const stdout = new PassThrough();
+        let printed = "";
+        stdout.on("data", (chunk) => {
+          printed += String(chunk);
+        });
+
+        await expect(installGatewayScheduledTask(env, stdout)).rejects.toThrow(
+          "Replacement Windows Scheduled Task did not produce running evidence",
+        );
+
+        expectStartupFallbackSpawn();
+        expect(spawn).toHaveBeenCalledTimes(1);
+        expect(spawn.mock.calls[0]?.[0]).toBe("C:\\Program Files\\nodejs\\node.exe");
+        expect(spawn.mock.calls[0]?.[1]).not.toContain("gateway.js");
+        expectTaskkillPid(4242);
+        expectTaskkillPid(5151);
+        expect(fallbackAlive).toBe(false);
+        expect(replacementAlive).toBe(false);
+        expect(schtasksCalls.at(-1)).toEqual(["/End", "/TN", "OpenClaw Gateway"]);
+        expect(printed).not.toContain("Restarted Scheduled Task");
+        expect(schtasksCalls.filter((call) => call.includes("/V"))).toHaveLength(4);
+        expect(sleepMock).toHaveBeenCalledWith(250);
+        if (removeAfterCapture) {
+          await expect(fs.access(startupEntryPath)).rejects.toThrow();
+        } else {
+          await expect(fs.access(startupEntryPath)).resolves.toBeUndefined();
         }
-        return makeSpawnSyncResult();
       });
-      fastForwardTaskStartWait();
-      addStartupFallbackMissingResponses([
-        { code: 0, stdout: "", stderr: "" },
-        { code: 0, stdout: "", stderr: "" },
-        { code: 0, stdout: "", stderr: "" },
-        { code: 0, stdout: runningTaskQueryOutput(), stderr: "" },
-      ]);
-      addSuccessfulScheduledTaskRestartResponses(
-        [notYetRunTaskQueryOutput()],
-        notYetRunTaskQueryOutput(),
-      );
-
-      await expect(installGatewayScheduledTask(env)).rejects.toThrow(
-        "Replacement Windows Scheduled Task did not produce running evidence",
-      );
-
-      expectStartupFallbackSpawn();
-      expect(processQueries).toBeGreaterThanOrEqual(4);
-      await expect(fs.access(startupEntryPath)).resolves.toBeUndefined();
-    });
-  });
+    },
+  );
 
   it("re-probes the captured fallback port after a transient config reload", async () => {
     useListenerBackedFallbackOwnership();
@@ -1165,7 +1479,7 @@ describe("Windows startup fallback", () => {
       await writeGatewayScript(env, 18789);
       env.OPENCLAW_GATEWAY_PORT = "19433";
       let oldPortProbes = 0;
-      inspectPortUsage.mockImplementation(async (port) => {
+      inspectPortUsageMock.mockImplementation(async (port) => {
         if (port !== 18789) {
           return { port, status: "free", listeners: [], hints: [] };
         }
@@ -1185,7 +1499,7 @@ describe("Windows startup fallback", () => {
               hints: [],
             };
       });
-      addStartupFallbackMissingResponses([
+      addMissingTaskInstallResponses([
         { code: 0, stdout: "", stderr: "" },
         { code: 0, stdout: "", stderr: "" },
         { code: 0, stdout: "", stderr: "" },
@@ -1210,7 +1524,7 @@ describe("Windows startup fallback", () => {
     await withWindowsEnv("openclaw-win-startup-", async ({ env }) => {
       const startupEntryPath = await writeStartupFallbackEntry(env);
       await writeGatewayScript(env);
-      inspectPortUsage.mockResolvedValue({
+      inspectPortUsageMock.mockResolvedValue({
         port: 18789,
         status: "free",
         listeners: [],
@@ -1224,19 +1538,41 @@ describe("Windows startup fallback", () => {
     });
   });
 
-  it("removes an old Startup-folder launcher after Scheduled Task restart is proven", async () => {
-    await withWindowsEnv("openclaw-win-startup-", async ({ env }) => {
-      const startupEntryPath = await writeStartupFallbackEntry(env);
-      const hiddenStartupEntryPath = await writeStartupFallbackEntry(env, "vbs");
-      await writeGatewayScript(env);
-      addSuccessfulScheduledTaskRestartResponses();
+  it.each([false, true])(
+    "preserves Startup definitions only when requested (%s)",
+    async (preserveDefinition) => {
+      await withWindowsEnv("openclaw-win-startup-", async ({ env }) => {
+        const startupEntryPath = await writeStartupFallbackEntry(env);
+        const hiddenStartupEntryPath = await writeStartupFallbackEntry(env, "vbs");
+        const files = [startupEntryPath, hiddenStartupEntryPath];
+        const snapshot = () =>
+          Promise.all(
+            files.map(async (file) => ({
+              bytes: await fs.readFile(file),
+              mode: (await fs.stat(file)).mode,
+            })),
+          );
+        const before = await snapshot();
+        await writeGatewayScript(env);
+        addSuccessfulScheduledTaskRestartResponses([
+          notYetRunTaskQueryOutput(),
+          runningTaskQueryOutput(),
+        ]);
 
-      await restartScheduledTask({ env, stdout: new PassThrough() });
+        await restartScheduledTask({ env, stdout: new PassThrough(), preserveDefinition });
 
-      await expect(fs.access(startupEntryPath)).rejects.toThrow();
-      await expect(fs.access(hiddenStartupEntryPath)).rejects.toThrow();
-    });
-  });
+        if (preserveDefinition) {
+          expect(await snapshot()).toEqual(before);
+          expect(sleepMock).not.toHaveBeenCalled();
+          expect(schtasksCalls.filter((call) => call.includes("/V"))).toHaveLength(1);
+        } else {
+          for (const file of files) {
+            await expect(fs.access(file)).rejects.toThrow();
+          }
+        }
+      });
+    },
+  );
 
   it("waits for running evidence before removing a Startup-folder launcher", async () => {
     await withWindowsEnv("openclaw-win-startup-", async ({ env }) => {
@@ -1260,6 +1596,23 @@ describe("Windows startup fallback", () => {
       const startupEntryPath = await writeStartupFallbackEntry(hiddenEnv);
       await writeGatewayScript(hiddenEnv);
       findVerifiedGatewayListenerPidsOnPortSync.mockReturnValue([4242]);
+      inspectPortUsageMock.mockImplementation(async () =>
+        schtasksCalls.some((call) => call[0] === "/Run")
+          ? {
+              port: 18789,
+              status: "busy",
+              listeners: [
+                {
+                  pid: 4242,
+                  command: "node.exe",
+                  commandLine:
+                    '"C:\\Program Files\\nodejs\\node.exe" "C:\\Users\\steipete\\AppData\\Roaming\\npm\\node_modules\\openclaw\\dist\\index.js" gateway --port 18789',
+                },
+              ],
+              hints: [],
+            }
+          : { port: 18789, status: "free", listeners: [], hints: [] },
+      );
       addSuccessfulScheduledTaskRestartResponses(
         [cleanExitTaskQueryOutput()],
         cleanExitTaskQueryOutput(),
@@ -1311,9 +1664,7 @@ describe("Windows startup fallback", () => {
 
   it("falls back to a Startup-folder launcher when schtasks create returns Spanish access denied", async () => {
     await withWindowsEnv("openclaw-win-startup-", async ({ env }) => {
-      addStartupFallbackMissingResponses([
-        { code: 1, stdout: "", stderr: "Error: Acceso denegado." },
-      ]);
+      addMissingTaskInstallResponses([{ code: 1, stdout: "", stderr: "Error: Acceso denegado." }]);
 
       await installGatewayScheduledTask(env);
 
@@ -1324,7 +1675,7 @@ describe("Windows startup fallback", () => {
 
   it("falls back to a Startup-folder launcher when schtasks create returns localized access denied", async () => {
     await withWindowsEnv("openclaw-win-startup-", async ({ env }) => {
-      addStartupFallbackMissingResponses([{ code: 1, stdout: "", stderr: "错误: 拒绝访问。" }]);
+      addMissingTaskInstallResponses([{ code: 1, stdout: "", stderr: "错误: 拒绝访问。" }]);
 
       await installGatewayScheduledTask(env);
 
@@ -1335,7 +1686,7 @@ describe("Windows startup fallback", () => {
 
   it("falls back to a Startup-folder launcher when schtasks create hangs", async () => {
     await withWindowsEnv("openclaw-win-startup-", async ({ env }) => {
-      addStartupFallbackMissingResponses([
+      addMissingTaskInstallResponses([
         { code: 124, stdout: "", stderr: "schtasks timed out after 15000ms" },
       ]);
 
@@ -1349,7 +1700,6 @@ describe("Windows startup fallback", () => {
   it("falls back to a Startup-folder launcher when schtasks availability is slow", async () => {
     await withWindowsEnv("openclaw-win-startup-", async ({ env }) => {
       schtasksResponses.push(
-        { code: 124, stdout: "", stderr: "schtasks produced no output for 30000ms" },
         { code: 124, stdout: "", stderr: "schtasks produced no output for 30000ms" },
         { code: 124, stdout: "", stderr: "schtasks produced no output for 30000ms" },
       );
@@ -1408,7 +1758,24 @@ describe("Windows startup fallback", () => {
   it("does not fall back when a listener appears after the clean task exit", async () => {
     await withWindowsEnv("openclaw-win-startup-", async ({ env }) => {
       fastForwardTaskStartWait();
-      findVerifiedGatewayListenerPidsOnPortSync.mockReturnValueOnce([]).mockReturnValue([4242]);
+      findVerifiedGatewayListenerPidsOnPortSync.mockReturnValue([4242]);
+      let portInspections = 0;
+      inspectPortUsageMock.mockImplementation(async (port) =>
+        portInspections++ === 0
+          ? { port, status: "free", listeners: [], hints: [] }
+          : {
+              port,
+              status: "busy",
+              listeners: [
+                {
+                  pid: 4242,
+                  command: "node.exe",
+                  commandLine: "node gateway.js --port 18789",
+                },
+              ],
+              hints: [],
+            },
+      );
       addAcceptedRunCleanExitResponses();
 
       await installGatewayScheduledTask(env);
@@ -1477,25 +1844,32 @@ describe("Windows startup fallback", () => {
 
   it("does not relaunch the task script when schtasks shows startup progress after /Run", async () => {
     await withWindowsEnv("openclaw-win-startup-", async ({ env }) => {
-      addStartupFallbackMissingResponses([
+      addMissingTaskInstallResponses([
         { code: 0, stdout: "", stderr: "" },
         { code: 0, stdout: "", stderr: "" },
         { code: 0, stdout: "", stderr: "" },
         { code: 0, stdout: notYetRunTaskQueryOutput(), stderr: "" },
+        { code: 0, stdout: "", stderr: "" },
         {
           code: 0,
-          stdout: [
-            "Status: Ready",
-            "Last Run Time: 4/15/2026 11:42:31 PM",
-            "Last Run Result: 267011",
-            "",
-          ].join("\r\n"),
+          stdout: notYetRunTaskQueryOutput("4/15/2026 11:42:31 PM"),
           stderr: "",
         },
       ]);
+      const expectedCommandCount = schtasksResponses.length;
 
       await installGatewayScheduledTask(env);
 
+      expect(schtasksCalls).toHaveLength(expectedCommandCount);
+      expect(schtasksResponses).toEqual([]);
+      expect(schtasksCalls.slice(-4)).toEqual([
+        ["/Query"],
+        ["/Query", "/TN", "OpenClaw Gateway", "/V", "/FO", "LIST"],
+        ["/Query"],
+        ["/Query", "/TN", "OpenClaw Gateway", "/V", "/FO", "LIST"],
+      ]);
+      expect(sleepMock).toHaveBeenCalledTimes(1);
+      expect(sleepMock).toHaveBeenCalledWith(250);
       expect(spawn).not.toHaveBeenCalled();
     });
   });
@@ -1544,18 +1918,47 @@ describe("Windows startup fallback", () => {
     });
   });
 
-  it("reports a fallback-launched gateway as running even when schtasks still says not-yet-run", async () => {
+  it("does not attribute another gateway listener to the registered task", async () => {
     await withWindowsEnv("openclaw-win-startup-", async ({ env }) => {
       await writeGatewayScript(env);
+      vi.spyOn(process, "platform", "get").mockReturnValue("win32");
       findVerifiedGatewayListenerPidsOnPortSync.mockReturnValue([4242]);
+      inspectPortUsageMock.mockResolvedValue({
+        port: 18789,
+        status: "busy",
+        listeners: [
+          {
+            pid: 4242,
+            command: "node.exe",
+            commandLine:
+              '"C:\\Program Files\\nodejs\\node.exe" "C:\\other\\dist\\index.js" gateway --port 18789',
+          },
+        ],
+        hints: [],
+      });
+      spawnSync.mockImplementation((command, args) =>
+        command === getWindowsPowerShellExePath() &&
+        Array.isArray(args) &&
+        args.includes(NODE_PROCESS_QUERY)
+          ? makeSpawnSyncResult({
+              stdout: JSON.stringify([
+                {
+                  ProcessId: 4242,
+                  CommandLine:
+                    '"C:\\Program Files\\nodejs\\node.exe" "C:\\other\\dist\\index.js" gateway --port 18789',
+                },
+              ]),
+            })
+          : makeSpawnSyncResult(),
+      );
       schtasksResponses.push(
         { code: 0, stdout: "", stderr: "" },
         { code: 0, stdout: notYetRunTaskQueryOutput(), stderr: "" },
       );
 
       const runtime = await readScheduledTaskRuntime(env);
-      expect(runtime.status).toBe("running");
-      expect(runtime.pid).toBe(4242);
+      expect(runtime.status).toBe("stopped");
+      expect(runtime.pid).toBeUndefined();
       expect(runtime.state).toBe("Ready");
       expect(runtime.lastRunResult).toBe("267011");
     });
@@ -1593,7 +1996,7 @@ describe("Windows startup fallback", () => {
       expect(runtime.pid).toBe(4242);
       expect(runtime.detail).toContain("Gateway process detected");
       expect(findVerifiedGatewayListenerPidsOnPortSync).not.toHaveBeenCalled();
-      expect(inspectPortUsage).not.toHaveBeenCalled();
+      expect(inspectPortUsageMock).not.toHaveBeenCalled();
     });
   });
 
@@ -1669,14 +2072,14 @@ describe("Windows startup fallback", () => {
       expect(runtime.status).toBe("running");
       expect(runtime.pid).toBe(5151);
       expect(findVerifiedGatewayListenerPidsOnPortSync).not.toHaveBeenCalled();
-      expect(inspectPortUsage).not.toHaveBeenCalled();
+      expect(inspectPortUsageMock).not.toHaveBeenCalled();
     });
   });
 
   it("does not trust an unverified busy port when schtasks still says not-yet-run", async () => {
     await withWindowsEnv("openclaw-win-startup-", async ({ env }) => {
       await writeGatewayScript(env);
-      inspectPortUsage.mockResolvedValue({
+      inspectPortUsageMock.mockResolvedValue({
         port: 18789,
         status: "busy",
         listeners: [{ pid: 4242, command: "node.exe" }],
@@ -1694,30 +2097,24 @@ describe("Windows startup fallback", () => {
     });
   });
 
-  it("treats an installed Startup-folder launcher as loaded", async () => {
-    await withWindowsEnv("openclaw-win-startup-", async ({ env }) => {
-      addStartupFallbackMissingResponses();
-      await writeStartupFallbackEntry(env);
+  it.each([false, true])(
+    "treats a Startup cmd entry as installed until removed (hidden launcher=%s)",
+    async (hidden) => {
+      await withWindowsEnv("openclaw-win-startup-", async ({ env }) => {
+        const taskEnv = hidden ? { ...env, OPENCLAW_WINDOWS_TASK_HIDDEN_LAUNCHER: "1" } : env;
+        addMissingTaskInstallResponses([]);
+        const startupEntryPath = await writeStartupFallbackEntry(env);
 
-      await expect(isScheduledTaskInstalled({ env })).resolves.toBe(true);
-    });
-  });
+        await expect(isScheduledTaskInstalled({ env: taskEnv })).resolves.toBe(true);
+        expect(schtasksCalls).toEqual([["/Query", "/TN", "OpenClaw Gateway"]]);
+        expect(schtasksResponses).toEqual([]);
 
-  it("keeps legacy Startup-folder cmd entries visible after hidden launcher opt-in", async () => {
-    await withWindowsEnv("openclaw-win-startup-", async ({ env }) => {
-      addStartupFallbackMissingResponses();
-      await writeStartupFallbackEntry(env);
-
-      await expect(
-        isScheduledTaskInstalled({
-          env: {
-            ...env,
-            OPENCLAW_WINDOWS_TASK_HIDDEN_LAUNCHER: "1",
-          },
-        }),
-      ).resolves.toBe(true);
-    });
-  });
+        await fs.unlink(startupEntryPath);
+        addMissingTaskInstallResponses([]);
+        await expect(isScheduledTaskInstalled({ env: taskEnv })).resolves.toBe(false);
+      });
+    },
+  );
 
   it("removes legacy Startup-folder cmd entries after hidden launcher opt-in", async () => {
     await withWindowsEnv("openclaw-win-startup-", async ({ env }) => {
@@ -1757,7 +2154,7 @@ describe("Windows startup fallback", () => {
     await withWindowsEnv("openclaw-win-startup-", async ({ env }) => {
       addStartupFallbackMissingResponses();
       await writeStartupFallbackEntry(env);
-      inspectPortUsage.mockResolvedValue({
+      inspectPortUsageMock.mockResolvedValue({
         port: 18789,
         status: "busy",
         listeners: [
@@ -1781,7 +2178,7 @@ describe("Windows startup fallback", () => {
       const nodeEnv = makeNodeServiceEnv(env);
       addStartupFallbackMissingResponses();
       await writeStartupFallbackEntry(nodeEnv);
-      inspectPortUsage.mockResolvedValue({
+      inspectPortUsageMock.mockResolvedValue({
         port: 18789,
         status: "busy",
         listeners: [{ pid: 4242, command: "node.exe" }],
@@ -1791,7 +2188,7 @@ describe("Windows startup fallback", () => {
       const runtime = await readScheduledTaskRuntime(nodeEnv);
       expect(runtime.status).not.toBe("running");
       expect(runtime.pid).toBeUndefined();
-      expect(inspectPortUsage).not.toHaveBeenCalled();
+      expect(inspectPortUsageMock).not.toHaveBeenCalled();
     });
   });
 
@@ -1801,7 +2198,7 @@ describe("Windows startup fallback", () => {
       vi.spyOn(process, "platform", "get").mockReturnValue("win32");
       addStartupFallbackMissingResponses();
       await writeStartupFallbackEntry(nodeEnv);
-      inspectPortUsage.mockResolvedValue({
+      inspectPortUsageMock.mockResolvedValue({
         port: 18789,
         status: "busy",
         listeners: [
@@ -1816,8 +2213,8 @@ describe("Windows startup fallback", () => {
 
       await stopScheduledTask({ env: nodeEnv, stdout: new PassThrough() });
 
-      expect(inspectPortUsage).not.toHaveBeenCalled();
-      expect(killProcessTree).not.toHaveBeenCalled();
+      expect(inspectPortUsageMock).not.toHaveBeenCalled();
+      expect(killProcessTreeMock).not.toHaveBeenCalled();
     });
   });
 
@@ -1826,7 +2223,7 @@ describe("Windows startup fallback", () => {
     await withWindowsEnv("openclaw-win-startup-", async ({ env }) => {
       addStartupFallbackMissingResponses();
       await writeStartupFallbackEntry(env);
-      inspectPortUsage.mockResolvedValue({
+      inspectPortUsageMock.mockResolvedValue({
         port: 18789,
         status: "busy",
         listeners: [{ pid: 5151, command: "other.exe" }],
@@ -1836,7 +2233,7 @@ describe("Windows startup fallback", () => {
       await expect(stopScheduledTask({ env, stdout: new PassThrough() })).rejects.toThrow(
         "not a verified gateway process",
       );
-      expect(killProcessTree).not.toHaveBeenCalled();
+      expect(killProcessTreeMock).not.toHaveBeenCalled();
     });
   });
 
@@ -1850,7 +2247,7 @@ describe("Windows startup fallback", () => {
 
       await stopScheduledTask({ env: nodeEnv, stdout: new PassThrough() });
 
-      expect(inspectPortUsage).not.toHaveBeenCalled();
+      expect(inspectPortUsageMock).not.toHaveBeenCalled();
       expectTaskkillPid(5151);
     });
   });
@@ -1869,7 +2266,7 @@ describe("Windows startup fallback", () => {
 
       await stopScheduledTask({ env: nodeEnv, stdout: new PassThrough() });
 
-      expect(inspectPortUsage).not.toHaveBeenCalled();
+      expect(inspectPortUsageMock).not.toHaveBeenCalled();
       expectTaskkillPid(5151);
     });
   });
@@ -1887,7 +2284,7 @@ describe("Windows startup fallback", () => {
 
       await stopScheduledTask({ env: nodeEnv, stdout: new PassThrough() });
 
-      expect(inspectPortUsage).not.toHaveBeenCalled();
+      expect(inspectPortUsageMock).not.toHaveBeenCalled();
       expectTaskkillPid(5151);
     });
   });
@@ -1901,7 +2298,7 @@ describe("Windows startup fallback", () => {
       ]);
       await writeGatewayScript(env);
       await writeStartupFallbackEntry(env);
-      inspectPortUsage.mockResolvedValue({
+      inspectPortUsageMock.mockResolvedValue({
         port: 18789,
         status: "busy",
         listeners: [
@@ -1932,7 +2329,7 @@ describe("Windows startup fallback", () => {
       ]);
       await writeGatewayScript(env);
       await writeStartupFallbackEntry(env);
-      inspectPortUsage.mockResolvedValue({
+      inspectPortUsageMock.mockResolvedValue({
         port: 18789,
         status: "busy",
         listeners: [
@@ -1944,9 +2341,7 @@ describe("Windows startup fallback", () => {
         ],
         hints: [],
       });
-      spawn.mockImplementationOnce(() => {
-        throw new Error("spawn failed");
-      });
+      spawn.mockImplementationOnce(() => createSpawnChild(new Error("spawn failed")));
       const onMutation = vi.fn();
 
       await expect(
@@ -1964,7 +2359,7 @@ describe("Windows startup fallback", () => {
     await withWindowsEnv("openclaw-win-startup-", async ({ env }) => {
       addStartupFallbackMissingResponses();
       await writeStartupFallbackEntry(env);
-      inspectPortUsage.mockResolvedValue({
+      inspectPortUsageMock.mockResolvedValue({
         port: 18789,
         status: "busy",
         listeners: [{ pid: 5151, command: "other.exe" }],
@@ -1974,7 +2369,7 @@ describe("Windows startup fallback", () => {
       await expect(restartScheduledTask({ env, stdout: new PassThrough() })).rejects.toThrow(
         "not a verified gateway process",
       );
-      expect(killProcessTree).not.toHaveBeenCalled();
+      expect(killProcessTreeMock).not.toHaveBeenCalled();
       expect(spawn).not.toHaveBeenCalled();
     });
   });
@@ -1985,7 +2380,7 @@ describe("Windows startup fallback", () => {
       sleepMock.mockImplementationOnce(async () => {
         timeState.now += 15_000;
       });
-      inspectPortUsage.mockResolvedValue({
+      inspectPortUsageMock.mockResolvedValue({
         port: 18789,
         status: "free",
         listeners: [],
@@ -2007,6 +2402,7 @@ describe("Windows startup fallback", () => {
       });
 
       expectStartupFallbackSpawn();
+      expect(schtasksCalls.filter((call) => call.includes("/V"))).toHaveLength(2);
     });
   });
 
@@ -2017,7 +2413,7 @@ describe("Windows startup fallback", () => {
       await writeGatewayScript(env);
       await writeStartupFallbackEntry(env);
       findVerifiedGatewayListenerPidsOnPortSync.mockReturnValue([5151]);
-      inspectPortUsage
+      inspectPortUsageMock
         .mockResolvedValueOnce({
           port: 18789,
           status: "busy",

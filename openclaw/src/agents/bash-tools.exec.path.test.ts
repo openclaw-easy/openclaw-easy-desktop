@@ -115,7 +115,7 @@ vi.mock("../process/supervisor/index.js", () => ({
   }),
 }));
 
-let createExecTool: typeof import("./bash-tools.exec.js").createExecTool;
+let createExecTool: typeof import("./bash-tools.exec-run.js").createExecTool;
 
 function createExecApprovals(): ExecApprovalsResolved {
   return {
@@ -175,7 +175,7 @@ describe("exec PATH login shell merge", () => {
   let envSnapshot: ReturnType<typeof captureEnv>;
 
   beforeAll(async () => {
-    ({ createExecTool } = await import("./bash-tools.exec.js"));
+    ({ createExecTool } = await import("./bash-tools.exec-run.js"));
   });
 
   afterAll(() => {
@@ -206,11 +206,18 @@ describe("exec PATH login shell merge", () => {
         command: "echo ok</arg_value>>",
         workdir: `${tempDir}</arg_value>>`,
         host: "gateway</arg_value>>",
-        security: "full</arg_value>>",
         ask: "off</arg_value>>",
         node: "ignored-node</arg_value>>",
         yieldMs: FOREGROUND_TEST_YIELD_MS,
       } as unknown as Parameters<typeof tool.execute>[1];
+      const prepared = await tool.prepareBeforeToolCallParams?.(malformedArgs, {});
+      expect(prepared).toMatchObject({
+        command: "echo ok",
+        workdir: tempDir,
+        host: "gateway",
+        ask: "off",
+        node: "ignored-node",
+      });
       const result = await tool.execute("call-xml-suffix", malformedArgs);
       const value = normalizeText(result.content.find((c) => c.type === "text")?.text);
 

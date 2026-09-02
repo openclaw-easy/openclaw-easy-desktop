@@ -1,7 +1,10 @@
+import { fork, type ChildProcess } from "node:child_process";
 import { existsSync } from "node:fs";
 import path from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
-import { Worker } from "node:worker_threads";
+import { fileURLToPath } from "node:url";
+import { toStructuredErrorObject } from "@openclaw/normalization-core/error-coercion";
+import { runtimeProcessEntrypoints } from "../infra/runtime-process-entrypoints.js";
+import { resolveRuntimeWorkerUrl } from "../infra/runtime-worker-url.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
 import {
   confirmOpenClawAgentDatabaseIntegrity,
@@ -23,23 +26,7 @@ export const OPENCLAW_DATABASE_VERIFY_INITIAL_DELAY_MS = 5 * 60_000;
 export const OPENCLAW_DATABASE_VERIFY_INTERVAL_MS = 24 * 60 * 60_000;
 
 const log = createSubsystemLogger("state/database-verify");
-
-function toError(error: unknown): Error {
-  return error instanceof Error ? error : new Error(String(error));
-}
-
-function resolveDatabaseVerifyWorkerUrl(currentModuleUrl = import.meta.url): URL {
-  const currentPath = fileURLToPath(currentModuleUrl);
-  const normalized = currentPath.replaceAll(path.sep, "/");
-  const distMarker = "/dist/";
-  const distIndex = normalized.lastIndexOf(distMarker);
-  if (distIndex >= 0) {
-    const distRoot = currentPath.slice(0, distIndex + distMarker.length);
-    return pathToFileURL(path.join(distRoot, "state", "openclaw-database-verify.worker.js"));
-  }
-  const extension = path.extname(currentPath) || ".js";
-  return new URL(`./openclaw-database-verify.worker${extension}`, currentModuleUrl);
-}
+const DATABASE_VERIFY_CHILD_ARG = "--openclaw-database-verify-child";
 
 function isVerifyResult(value: unknown): value is OpenClawDatabaseVerifyResult {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
@@ -56,20 +43,30 @@ function isVerifyResult(value: unknown): value is OpenClawDatabaseVerifyResult {
 
 export function runDatabaseVerifyWorker(
   targets: readonly OpenClawDatabaseVerifyTarget[],
-  options: { onWorker?: (worker: Worker | undefined) => void; workerUrl?: URL } = {},
+  options: { onWorker?: (worker: ChildProcess | undefined) => void; workerUrl?: URL } = {},
 ): Promise<OpenClawDatabaseVerifyResult[]> {
-  const workerUrl = options.workerUrl ?? resolveDatabaseVerifyWorkerUrl();
+  const workerUrl =
+    options.workerUrl ?? resolveRuntimeWorkerUrl(runtimeProcessEntrypoints.databaseVerify);
   const execArgv = workerUrl.pathname.endsWith(".ts") ? ["--import", "tsx"] : undefined;
-  let worker: Worker;
+  let worker: ChildProcess;
   try {
-    worker = new Worker(workerUrl, { workerData: targets, execArgv });
+    // Snapshot preparation opens and closes raw source descriptors. Isolate it
+    // because POSIX close() can release the Gateway's process-owned SQLite locks.
+    worker = fork(fileURLToPath(workerUrl), [DATABASE_VERIFY_CHILD_ARG], {
+      execArgv,
+      stdio: ["ignore", "ignore", "ignore", "ipc"],
+    });
   } catch (error) {
-    return Promise.reject(toError(error));
+    return Promise.reject(toStructuredErrorObject(error));
   }
   options.onWorker?.(worker);
 
   return new Promise((resolve, reject) => {
     let settled = false;
+    let result: OpenClawDatabaseVerifyResult[] | undefined;
+    let protocolError: Error | undefined;
+    let exit: { code: number | null; signal: NodeJS.Signals | null } | undefined;
+    let disconnected = !worker.connected;
     const settle = (finish: () => void) => {
       if (settled) {
         return;
@@ -79,23 +76,68 @@ export function runDatabaseVerifyWorker(
       options.onWorker?.(undefined);
       finish();
     };
-    worker.once("message", (message: unknown) => {
-      settle(() => {
-        if (!Array.isArray(message) || !message.every(isVerifyResult)) {
-          reject(new Error("database verification worker returned invalid results"));
-          return;
-        }
-        resolve(message);
-      });
-    });
-    worker.once("error", (error) => settle(() => reject(toError(error))));
-    worker.once("exit", (code) => {
-      if (code !== 0) {
-        settle(() => reject(new Error(`database verification worker exited with code ${code}`)));
-      } else {
-        settle(() => reject(new Error("database verification worker exited without results")));
+    const settleAfterExitAndDisconnect = () => {
+      const completedExit = exit;
+      if (!completedExit || !disconnected) {
+        return;
       }
+      settle(() => {
+        if (protocolError) {
+          reject(toStructuredErrorObject(protocolError));
+        } else if (completedExit.code !== 0) {
+          reject(
+            new Error(
+              `database verification worker exited with ${
+                completedExit.signal
+                  ? `signal ${completedExit.signal}`
+                  : `code ${completedExit.code}`
+              }`,
+            ),
+          );
+        } else if (!result) {
+          reject(new Error("database verification worker exited without results"));
+        } else {
+          resolve(result);
+        }
+      });
+    };
+    worker.once("message", (message: unknown) => {
+      if (!Array.isArray(message) || !message.every(isVerifyResult)) {
+        protocolError = new Error("database verification worker returned invalid results");
+        worker.kill();
+        return;
+      }
+      result = message;
     });
+    worker.once("error", (error) => settle(() => reject(toStructuredErrorObject(error))));
+    worker.once("disconnect", () => {
+      disconnected = true;
+      settleAfterExitAndDisconnect();
+    });
+    worker.once("exit", (code, signal) => {
+      exit = { code, signal };
+      disconnected ||= !worker.connected;
+      settleAfterExitAndDisconnect();
+    });
+    worker.send(targets, (error) => {
+      if (!error) {
+        return;
+      }
+      worker.kill();
+      settle(() => reject(toStructuredErrorObject(error)));
+    });
+  });
+}
+
+export async function terminateDatabaseVerifyWorker(worker: ChildProcess): Promise<void> {
+  if (worker.exitCode !== null || worker.signalCode !== null) {
+    return;
+  }
+  await new Promise<void>((resolve) => {
+    worker.once("exit", () => resolve());
+    if (!worker.kill()) {
+      resolve();
+    }
   });
 }
 

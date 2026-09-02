@@ -1,44 +1,57 @@
+import { normalizeURL } from "nostr-tools/utils";
 import {
   buildChannelInboundEventContext,
   resolveChannelInboundRouteEnvelope,
 } from "openclaw/plugin-sdk/channel-inbound";
 import { resolveStableChannelMessageIngress } from "openclaw/plugin-sdk/channel-ingress-runtime";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
+import { createSubsystemLogger } from "openclaw/plugin-sdk/logging-core";
+import type { HistoryEntry } from "openclaw/plugin-sdk/reply-history";
 import type { BuzzBus } from "./buzz-bus.js";
-import type { BuzzInboundMessage } from "./message-event.js";
+import {
+  BUZZ_DIFF_MESSAGE_KIND,
+  formatBuzzMessageForAgent,
+  type BuzzInboundMessage,
+} from "./message-event.js";
+import { recordBuzzPendingHistory, snapshotBuzzPendingHistory } from "./pending-history.js";
 import { getBuzzRuntime } from "./runtime.js";
 import { buildBuzzTarget, parseBuzzTarget } from "./target.js";
 import type { ResolvedBuzzAccount } from "./types.js";
 
-function senderLabel(pubkey: string): string {
-  return `${pubkey.slice(0, 8)}...${pubkey.slice(-6)}`;
-}
+const log = createSubsystemLogger("buzz/inbound");
 
 export async function handleBuzzInbound(params: {
   account: ResolvedBuzzAccount;
   cfg: OpenClawConfig;
   bus: BuzzBus;
   message: BuzzInboundMessage;
+  signal: AbortSignal;
+  assertCurrent: () => void;
+  historyMap: Map<string, HistoryEntry[]>;
+  buildContext?: typeof buildChannelInboundEventContext;
 }) {
   const runtime = getBuzzRuntime();
-  const { account, cfg, bus, message } = params;
+  const { account, cfg, bus, message, signal } = params;
   const channelId = parseBuzzTarget(message.channelId);
   const target = buildBuzzTarget(channelId);
+  const textForAgent = formatBuzzMessageForAgent(message);
   const { route, buildEnvelope } = resolveChannelInboundRouteEnvelope({
     cfg,
     channel: "buzz",
     accountId: account.accountId,
     peer: { kind: "group", id: target },
   });
-  const textMention = runtime.channel.mentions.matchesMentionPatterns(
-    message.text,
-    runtime.channel.mentions.buildMentionRegexes(cfg, route.agentId),
-  );
+  const supportsTextInterpretation = message.kind !== BUZZ_DIFF_MESSAGE_KIND;
+  const textMention =
+    supportsTextInterpretation &&
+    runtime.channel.mentions.matchesMentionPatterns(
+      message.text,
+      runtime.channel.mentions.buildMentionRegexes(cfg, route.agentId),
+    );
   const wasMentioned = message.mentionedPubkeys.includes(bus.publicKey) || textMention;
-  const shouldComputeCommandAuthorized = runtime.channel.commands.shouldComputeCommandAuthorized(
-    message.text,
-    cfg,
-  );
+  const shouldComputeCommandAuthorized =
+    supportsTextInterpretation &&
+    runtime.channel.commands.shouldComputeCommandAuthorized(message.text, cfg);
   const hasControlCommand =
     shouldComputeCommandAuthorized && runtime.channel.text.hasControlCommand(message.text, cfg);
   const groupConfig = account.config.groups?.[channelId];
@@ -52,9 +65,15 @@ export async function handleBuzzInbound(params: {
       id: channelId,
       threadId: message.threadId,
     },
+    contextBinding: {
+      agentId: route.agentId,
+      sessionKey: route.sessionKey,
+      messageId: message.id,
+      inboundEventKind: "user_request",
+    },
     mentionFacts: { canDetectMention: true, wasMentioned },
-    groupPolicy: account.config.groupPolicy,
-    groupAllowFrom: account.config.groupAllowFrom,
+    groupPolicy: groupConfig?.groupPolicy ?? account.config.groupPolicy,
+    groupAllowFrom: groupConfig?.groupAllowFrom ?? account.config.groupAllowFrom,
     policy: {
       activation: {
         requireMention: groupConfig?.requireMention ?? true,
@@ -68,18 +87,44 @@ export async function handleBuzzInbound(params: {
         }
       : undefined,
   });
+  // Admission awaits policy; only the transport owner can confirm membership is still current.
+  params.assertCurrent();
+  const historyKey = JSON.stringify([channelId, message.threadId ?? null]);
+  const historyLimit = account.config.historyLimit ?? 0;
   if (access.ingress.admission !== "dispatch") {
+    if (access.ingress.reasonCode === "activation_skipped") {
+      await recordBuzzPendingHistory({
+        historyMap: params.historyMap,
+        key: historyKey,
+        limit: historyLimit,
+        message,
+        text: textForAgent,
+        shouldRecord: () =>
+          !signal.aborted && bus.directory.isMember(channelId, message.senderPubkey),
+      });
+    }
     return;
   }
 
-  const senderName = senderLabel(message.senderPubkey);
+  const history = snapshotBuzzPendingHistory({
+    historyMap: params.historyMap,
+    key: historyKey,
+    limit: historyLimit,
+    channelId,
+    directory: bus.directory,
+    currentMessage: textForAgent,
+  });
+
+  const senderName = bus.directory.resolveSenderName(message.senderPubkey);
+  const roomName = bus.directory.resolveRoomName(channelId);
   const body = buildEnvelope({
     channel: "Buzz",
     from: senderName,
     timestamp: new Date(message.createdAt * 1000),
-    body: message.text,
+    body: textForAgent,
   });
-  const ctxPayload = buildChannelInboundEventContext({
+  const ctxPayload = (params.buildContext ?? buildChannelInboundEventContext)({
+    channelIngress: access,
     channel: "buzz",
     accountId: route.accountId ?? account.accountId,
     messageId: message.id,
@@ -90,7 +135,7 @@ export async function handleBuzzInbound(params: {
     conversation: {
       kind: "group",
       id: channelId,
-      label: channelId,
+      label: roomName,
       threadId: message.threadId,
       nativeChannelId: channelId,
     },
@@ -109,21 +154,26 @@ export async function handleBuzzInbound(params: {
     },
     message: {
       body,
-      bodyForAgent: message.text,
+      bodyForAgent: history.bodyForAgent,
       rawBody: message.text,
-      commandBody: message.text,
+      commandBody: supportsTextInterpretation ? message.text : "",
     },
     access: {
       commands: { authorized: access.commandAccess.authorized },
       mentions: { canDetectMention: true, wasMentioned },
     },
     extra: {
-      GroupChannel: channelId,
-      GroupSubject: channelId,
+      GroupSubject: roomName,
+      BuzzEventKind: message.kind,
     },
   });
+  const replyTarget = {
+    channelId,
+    threadId: account.config.replyToMode === "off" ? undefined : message.threadId,
+    replyToId: account.config.replyToMode === "off" ? undefined : (message.threadId ?? message.id),
+  };
 
-  await runtime.channel.inbound.dispatch({
+  const result = await runtime.channel.inbound.dispatch({
     cfg,
     channel: "buzz",
     accountId: account.accountId,
@@ -133,6 +183,24 @@ export async function handleBuzzInbound(params: {
       sessionKey: route.sessionKey,
     },
     ctxPayload,
+    botLoopProtection: bus.directory.isBotMember(channelId, message.senderPubkey)
+      ? {
+          // Reciprocal accounts share the relay/room pair budget. Threads and
+          // sender timestamps must not let a bot reset or evade that budget.
+          scopeId: `buzz:${normalizeURL(account.relayUrl)}`,
+          conversationId: channelId,
+          senderId: message.senderPubkey,
+          receiverId: bus.publicKey,
+          eventId: message.id,
+          defaultsConfig: cfg.channels?.defaults?.botLoopProtection,
+          defaultEnabled: true,
+        }
+      : undefined,
+    log: (event) => {
+      if (event.reason === "bot-loop-protection") {
+        log.warn(`[${account.accountId}] Buzz bot-pair loop suppressed in ${channelId}`);
+      }
+    },
     delivery: {
       deliver: async (payload) => {
         const text =
@@ -142,18 +210,26 @@ export async function handleBuzzInbound(params: {
         if (!text.trim()) {
           return;
         }
-        await bus.sendText({
-          channelId,
-          text,
-          threadId: message.threadId,
-          replyToId: message.id,
-        });
+        await bus.sendText({ ...replyTarget, text });
       },
       onError: (error) => {
         throw error instanceof Error ? error : new Error(String(error));
       },
     },
-    replyPipeline: {},
+    replyOptions: {
+      abortSignal: signal,
+    },
+    replyPipeline: {
+      typing: {
+        start: async () => {
+          await bus.sendTyping(replyTarget);
+        },
+        keepaliveIntervalMs: 3_000,
+        onStartError: (error: unknown) => {
+          log.error(`[${account.accountId}] Buzz typing failed for ${channelId}: ${String(error)}`);
+        },
+      },
+    },
     record: {
       onRecordError: (error) => {
         throw error instanceof Error
@@ -162,4 +238,7 @@ export async function handleBuzzInbound(params: {
       },
     },
   });
+  if (result.dispatched) {
+    history.consume();
+  }
 }

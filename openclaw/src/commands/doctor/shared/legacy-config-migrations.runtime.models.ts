@@ -3,6 +3,7 @@ import {
   ensureRecord,
   getRecord,
 } from "../../../config/legacy.shared.js";
+import { materializeModelPolicyAllowlist } from "../../../config/model-policy-allowlist-migration.js";
 import { isModelThinkingFormat } from "../../../config/types.models.js";
 import * as catalog from "./legacy-config-migrations.runtime.models.catalog.js";
 import * as codex from "./legacy-config-migrations.runtime.models.codex.js";
@@ -100,9 +101,9 @@ export const LEGACY_CONFIG_MIGRATIONS_RUNTIME_MODELS = [
     apply: codex.migrateLegacyOpenAICodexProvider,
   }),
   defineLegacyConfigMigration({
-    id: "models.retired-model-refs",
-    describe: "Upgrade retired model refs to current catalog entries",
-    legacyRules: codex.RETIRED_MODEL_REF_RULES,
+    id: "models.canonical-model-refs",
+    describe: "Canonicalize retired and noncanonical model refs",
+    legacyRules: codex.MODEL_REF_CANONICALIZATION_RULES,
     apply: (raw, changes) => {
       const rewritten = refs.rewriteKnownModelRefs(raw, "config", changes);
       const rewrittenRecord = getRecord(rewritten.value);
@@ -124,8 +125,14 @@ export const LEGACY_CONFIG_MIGRATIONS_RUNTIME_MODELS = [
       {
         path: ["agents", "defaults", "models"],
         message:
-          'agents.defaults.models no longer restricts model overrides; run "openclaw doctor --fix" to preserve the previous restriction in agents.defaults.modelPolicy.allow.',
+          'Legacy agents.defaults.models restricts model overrides; run "openclaw doctor --fix" to migrate valid refs to agents.defaults.modelPolicy.allow.',
         match: (_value, root) => refs.collectLegacyDefaultModelAllowRefs(root) !== null,
+      },
+      {
+        path: ["agents", "defaults", "models"],
+        message:
+          "Legacy model restriction retained: some keys need explicit provider/model refs. Set agents.defaults.modelPolicy.allow to the intended restriction; until then, editing agents.defaults.models still changes the restriction.",
+        match: (_value, root) => materializeModelPolicyAllowlist(root).kind === "deferred",
       },
     ],
     apply: refs.migrateExplicitDefaultModelAllowPolicy,

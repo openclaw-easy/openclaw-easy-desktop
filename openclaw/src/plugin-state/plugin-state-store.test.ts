@@ -1,9 +1,12 @@
 // Plugin state store tests cover per-plugin persisted state reads and writes.
-import { rmSync, statSync } from "node:fs";
+import { chmodSync, existsSync, rmSync, statSync } from "node:fs";
 import path from "node:path";
 import { MAX_DATE_TIMESTAMP_MS } from "@openclaw/normalization-core/number-coercion";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { openOpenClawStateDatabase } from "../state/openclaw-state-db.js";
+import {
+  isOpenClawStateDatabaseOpen,
+  openOpenClawStateDatabase,
+} from "../state/openclaw-state-db.js";
 import { resolveOpenClawStateSqlitePath } from "../state/openclaw-state-db.paths.js";
 import {
   createOpenClawTestState,
@@ -12,6 +15,7 @@ import {
 } from "../test-utils/openclaw-test-state.js";
 import {
   closePluginStateDatabase,
+  countPluginStateLiveEntries,
   createCorePluginStateSyncKeyedStore,
   createPluginStateKeyedStore,
   createPluginStateSyncKeyedStore,
@@ -102,6 +106,25 @@ describe("plugin state keyed store", () => {
       expect(store.entries()).toMatchObject([{ key: "interaction:1", value: { count: 1 } }]);
       expect(store.consume("interaction:1")).toEqual({ count: 1 });
       expect(store.lookup("interaction:1")).toBeUndefined();
+    });
+  });
+
+  it("shares sync and async state while preserving their error contracts", async () => {
+    await withPluginStateTestState(async () => {
+      const options = { namespace: "shared-sync-async", maxEntries: 10 };
+      const asyncStore = createPluginStateKeyedStore<{ count: number }>("discord", options);
+      const syncStore = createPluginStateSyncKeyedStore<{ count: number }>("discord", options);
+
+      syncStore.register("counter", { count: 1 });
+      await expect(asyncStore.lookup("counter")).resolves.toEqual({ count: 1 });
+
+      await expect(
+        asyncStore.update?.("counter", (current) => ({ count: (current?.count ?? 0) + 1 })),
+      ).resolves.toBe(true);
+      expect(syncStore.lookup("counter")).toEqual({ count: 2 });
+
+      expect(() => syncStore.lookup(" ")).toThrow(PluginStateStoreError);
+      await expect(asyncStore.lookup(" ")).rejects.toThrow(PluginStateStoreError);
     });
   });
 
@@ -197,6 +220,29 @@ describe("plugin state keyed store", () => {
         { key: "a", value: { version: 1 }, createdAt: 2000 },
         { key: "b", value: { version: 2 }, createdAt: 3000 },
       ]);
+    });
+  });
+
+  it("refreshes the default TTL when register upserts an existing key", async () => {
+    await withPluginStateTestState(async () => {
+      vi.useFakeTimers();
+      const store = createPluginStateKeyedStore<{ version: number }>("beam", {
+        namespace: "sessions",
+        maxEntries: 10,
+        defaultTtlMs: 1_000,
+      });
+      vi.setSystemTime(1_000);
+      await store.register("session", { version: 1 });
+      vi.setSystemTime(1_500);
+      await store.register("session", { version: 2 });
+
+      await expect(store.entries()).resolves.toEqual([
+        { key: "session", value: { version: 2 }, createdAt: 1_500, expiresAt: 2_500 },
+      ]);
+      vi.setSystemTime(2_100);
+      await expect(store.lookup("session")).resolves.toEqual({ version: 2 });
+      vi.setSystemTime(2_501);
+      await expect(store.lookup("session")).resolves.toBeUndefined();
     });
   });
 
@@ -756,7 +802,10 @@ describe("plugin state keyed store", () => {
       await expect(store.register("non-enumerable", nonEnumerable)).rejects.toThrow(
         PluginStateStoreError,
       );
-      await expectPluginStateStoreError(store.register("big", "x".repeat(65_537)), {
+      // UTF-8 bytes, including JSON quotes, determine the 1 MiB boundary.
+      const boundary = "é".repeat(524_287);
+      await expect(store.register("large", boundary)).resolves.toBeUndefined();
+      await expectPluginStateStoreError(store.register("big", `${boundary}x`), {
         code: "PLUGIN_STATE_LIMIT_EXCEEDED",
       });
 
@@ -825,6 +874,97 @@ describe("plugin state keyed store", () => {
       await expect(store.lookup("k")).resolves.toEqual({ ok: true });
     });
   });
+
+  it("keeps plugin-state reads outside the writable database lifecycle", async () => {
+    await withPluginStateTestState(async () => {
+      const store = createPluginStateKeyedStore("discord", {
+        namespace: "read-only",
+        maxEntries: 10,
+      });
+      await store.register("k", { ok: true });
+      resetPluginStateStoreForTests();
+
+      expect(isOpenClawStateDatabaseOpen()).toBe(false);
+      await expect(store.lookup("k")).resolves.toEqual({ ok: true });
+      await expect(store.entries()).resolves.toMatchObject([{ key: "k", value: { ok: true } }]);
+      expect(
+        pluginStateEntriesInKeyRange({
+          pluginId: "discord",
+          namespace: "read-only",
+          keyStartInclusive: "k",
+          keyEndExclusive: "l",
+          limit: 1,
+        }),
+      ).toMatchObject([{ key: "k", value: { ok: true } }]);
+      expect(countPluginStateLiveEntries("discord")).toBe(1);
+      expect(isOpenClawStateDatabaseOpen()).toBe(false);
+    });
+  });
+
+  it("treats a missing plugin-state database as empty without creating it", async () => {
+    await withOpenClawTestState(
+      { label: "plugin-state-read-only-missing", applyEnv: false },
+      async (state) => {
+        const store = createPluginStateKeyedStore("discord", {
+          namespace: "read-only-missing",
+          maxEntries: 10,
+          env: state.env,
+        });
+        const databasePath = resolveOpenClawStateSqlitePath(state.env);
+
+        expect(existsSync(databasePath)).toBe(false);
+        await expect(store.lookup("k")).resolves.toBeUndefined();
+        await expect(store.entries()).resolves.toEqual([]);
+        expect(countPluginStateLiveEntries("discord", state.env)).toBe(0);
+        expect(existsSync(databasePath)).toBe(false);
+      },
+    );
+  });
+
+  it.runIf(process.platform !== "win32")(
+    "reports inaccessible explicit state directories instead of treating them as empty",
+    async () => {
+      await withPluginStateTestState(async () => {
+        const store = createPluginStateKeyedStore("discord", {
+          namespace: "inaccessible",
+          maxEntries: 10,
+        });
+        await store.register("k", { ok: true });
+        const databasePath = resolveOpenClawStateSqlitePath(testState?.env);
+        closePluginStateDatabase();
+        chmodSync(testState?.stateDir ?? "", 0o000);
+        try {
+          await expect(store.lookup("k")).rejects.toMatchObject({
+            code: "PLUGIN_STATE_OPEN_FAILED",
+            path: databasePath,
+          });
+        } finally {
+          chmodSync(testState?.stateDir ?? "", 0o700);
+        }
+      });
+    },
+  );
+
+  it.runIf(process.platform !== "win32")(
+    "reuses a process-held state database when its directory becomes inaccessible",
+    async () => {
+      await withPluginStateTestState(async () => {
+        const store = createPluginStateKeyedStore("discord", {
+          namespace: "inaccessible-open-handle",
+          maxEntries: 10,
+        });
+        await store.register("k", { ok: true });
+        const database = openOpenClawStateDatabase();
+        chmodSync(testState?.stateDir ?? "", 0o000);
+        try {
+          await expect(store.lookup("k")).resolves.toEqual({ ok: true });
+          expect(database.db.isOpen).toBe(true);
+        } finally {
+          chmodSync(testState?.stateDir ?? "", 0o700);
+        }
+      });
+    },
+  );
 
   it("does not close a shared state database opened before the plugin-state probe", async () => {
     await withPluginStateTestState(async () => {

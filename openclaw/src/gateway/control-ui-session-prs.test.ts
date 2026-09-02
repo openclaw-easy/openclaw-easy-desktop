@@ -1,8 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  loadControlUiSessionPullRequests,
-  parseControlUiSessionPullRequestsParams,
-} from "./control-ui-session-prs.js";
+import { loadControlUiSessionPullRequests } from "./control-ui-session-prs.js";
 import {
   evictPullRequestCache,
   githubJson,
@@ -33,50 +30,18 @@ describe("parseGitHubRemoteUrl", () => {
   });
 });
 
-describe("parseControlUiSessionPullRequestsParams", () => {
-  it("requires a non-empty session key", () => {
-    expect(parseControlUiSessionPullRequestsParams({ sessionKey: "agent:main:main" })).toEqual({
-      sessionKey: "agent:main:main",
-    });
-    expect(parseControlUiSessionPullRequestsParams({ sessionKey: "  " })).toBeNull();
-    expect(parseControlUiSessionPullRequestsParams("agent:main:main")).toBeNull();
-    expect(parseControlUiSessionPullRequestsParams({})).toBeNull();
-  });
-
-  it("keeps the UI's scoped agent id for global-alias session keys", () => {
-    expect(
-      parseControlUiSessionPullRequestsParams({ sessionKey: "global", agentId: "work" }),
-    ).toEqual({ sessionKey: "global", agentId: "work" });
-    expect(parseControlUiSessionPullRequestsParams({ sessionKey: "global", agentId: " " })).toEqual(
-      { sessionKey: "global" },
-    );
-  });
-
-  it("accepts only an explicit refresh request", () => {
-    expect(
-      parseControlUiSessionPullRequestsParams({
-        sessionKey: "agent:main:main",
-        refresh: true,
-      }),
-    ).toEqual({ sessionKey: "agent:main:main", refresh: true });
-    expect(
-      parseControlUiSessionPullRequestsParams({
-        sessionKey: "agent:main:main",
-        refresh: false,
-      }),
-    ).toEqual({ sessionKey: "agent:main:main" });
-  });
-});
-
 describe("loadControlUiSessionPullRequests", () => {
   beforeEach(() => {
     vi.useFakeTimers();
+    vi.stubEnv("GH_TOKEN", "");
+    vi.stubEnv("GITHUB_TOKEN", "");
     cacheEpochMs += 10 * 60_000;
     vi.setSystemTime(cacheEpochMs);
   });
 
   afterEach(async () => {
     await evictPullRequestCache();
+    vi.unstubAllEnvs();
     vi.useRealTimers();
   });
 
@@ -85,7 +50,7 @@ describe("loadControlUiSessionPullRequests", () => {
       { match: "/pulls?head=", response: () => githubJson([pullListItem()]) },
       {
         match: "/pulls/103469",
-        response: () => githubJson({ additions: 4, deletions: 3 }),
+        response: () => githubJson({ additions: 4, deletions: 3, changed_files: 2 }),
       },
       {
         match: "/check-runs",
@@ -116,6 +81,7 @@ describe("loadControlUiSessionPullRequests", () => {
           state: "open",
           additions: 4,
           deletions: 3,
+          changedFiles: 2,
           checks: { state: "passing", passed: 1, failed: 0, skipped: 1, running: 0 },
           checksUrl: "https://github.com/openclaw/openclaw/pull/103469/checks",
         },
@@ -129,6 +95,104 @@ describe("loadControlUiSessionPullRequests", () => {
       },
       rateLimited: false,
     });
+  });
+
+  it("carries the PR author from the list payload without another GitHub call", async () => {
+    const fetchImpl = vi.fn<typeof fetch>().mockResolvedValueOnce(
+      githubJson([
+        pullListItem({
+          merged_at: "2026-07-09T10:00:00Z",
+          user: {
+            login: "octocat",
+            avatar_url: "https://avatars.githubusercontent.com/u/583231?v=4",
+          },
+        }),
+      ]),
+    );
+
+    const result = await loadControlUiSessionPullRequests(
+      { sessionKey: "agent:main:main" },
+      { fetchImpl, resolveGitContext },
+    );
+
+    // Login only: avatar_url is deliberately dropped so the browser never hotlinks GitHub.
+    expect(result.pullRequests[0]?.author).toEqual({ login: "octocat" });
+    // Merged PRs skip the diff/checks calls, so the author must have come from the list.
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it("omits the author when GitHub returns no user for the PR", async () => {
+    const fetchImpl = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        githubJson([pullListItem({ merged_at: "2026-07-09T10:00:00Z", user: null })]),
+      );
+
+    const result = await loadControlUiSessionPullRequests(
+      { sessionKey: "agent:main:main" },
+      { fetchImpl, resolveGitContext },
+    );
+
+    expect(result.pullRequests).toHaveLength(1);
+    expect(result.pullRequests[0]?.author).toBeUndefined();
+  });
+
+  it("retries stale optional authentication anonymously for session PRs", async () => {
+    vi.stubEnv("GH_TOKEN", "stale-github-token");
+    const fetchImpl = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(githubJson({ message: "Bad credentials" }, 401))
+      .mockResolvedValueOnce(githubJson([pullListItem({ merged_at: "2026-07-09T10:00:00Z" })]));
+
+    const result = await loadControlUiSessionPullRequests(
+      { sessionKey: "agent:main:main" },
+      { fetchImpl, resolveGitContext },
+    );
+
+    expect(result.pullRequests).toHaveLength(1);
+    expect(result.pullRequests[0]).toMatchObject({ number: 103469, state: "merged" });
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    expect(fetchImpl.mock.calls[0]?.[1]?.headers).toHaveProperty(
+      "Authorization",
+      "Bearer stale-github-token",
+    );
+    expect(fetchImpl.mock.calls[1]?.[1]?.headers).not.toHaveProperty("Authorization");
+  });
+
+  it("does not reuse cached private PRs after the GitHub token is removed", async () => {
+    vi.stubEnv("GH_TOKEN", "github-token-a");
+    const fetchImpl = vi.fn<typeof fetch>().mockImplementation(async (_input, init) => {
+      const authorization = new Headers(init?.headers).get("Authorization");
+      return authorization === "Bearer github-token-a"
+        ? githubJson([
+            pullListItem({
+              title: "private PR from token A",
+              merged_at: "2026-08-12T00:00:00Z",
+            }),
+          ])
+        : githubJson({ message: "Not Found" }, 404);
+    });
+
+    const first = await loadControlUiSessionPullRequests(
+      { sessionKey: "agent:main:main" },
+      { fetchImpl, resolveGitContext },
+    );
+
+    vi.stubEnv("GH_TOKEN", "");
+    await expect(
+      loadControlUiSessionPullRequests(
+        { sessionKey: "agent:main:main" },
+        { fetchImpl, resolveGitContext },
+      ),
+    ).rejects.toMatchObject({ statusCode: 404 });
+
+    expect(first.pullRequests[0]?.title).toBe("private PR from token A");
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    expect(fetchImpl.mock.calls[0]?.[1]?.headers).toHaveProperty(
+      "Authorization",
+      "Bearer github-token-a",
+    );
+    expect(fetchImpl.mock.calls[1]?.[1]?.headers).not.toHaveProperty("Authorization");
   });
 
   it("skips diff and check fetches for merged PRs", async () => {
@@ -156,6 +220,20 @@ describe("loadControlUiSessionPullRequests", () => {
       },
     ]);
     expect(fetchImpl.mock.calls).toHaveLength(1);
+
+    vi.advanceTimersByTime(60_000);
+    await loadControlUiSessionPullRequests(
+      { sessionKey: "agent:main:main" },
+      { fetchImpl, resolveGitContext },
+    );
+    expect(fetchImpl.mock.calls).toHaveLength(1);
+
+    vi.advanceTimersByTime(30_001);
+    await loadControlUiSessionPullRequests(
+      { sessionKey: "agent:main:main" },
+      { fetchImpl, resolveGitContext },
+    );
+    expect(fetchImpl.mock.calls).toHaveLength(2);
   });
 
   it("marks in-flight checks pending and failed conclusions failing", async () => {
@@ -274,7 +352,7 @@ describe("loadControlUiSessionPullRequests", () => {
     expect(fresh.rateLimited).toBe(false);
 
     limited = true;
-    vi.advanceTimersByTime(61_000);
+    vi.advanceTimersByTime(91_000);
     const stale = await loadControlUiSessionPullRequests(
       { sessionKey: "agent:main:main" },
       { fetchImpl, resolveGitContext },
@@ -329,6 +407,183 @@ describe("loadControlUiSessionPullRequests", () => {
     );
     expect(result).toEqual({ pullRequests: [], rateLimited: false });
     expect(fetchImpl.mock.calls).toHaveLength(0);
+  });
+
+  it("caches git context through repeated GitHub failures, then expires it", async () => {
+    const fetchImpl = routedFetch([
+      {
+        match: "/pulls?head=",
+        response: () => githubJson({ message: "unavailable" }, 503),
+      },
+    ]);
+    const gitOutputImpl = vi.fn(async (_root: string, args: string[]) => {
+      if (args[0] === "rev-parse") {
+        return "feature";
+      }
+      if (args[0] === "remote") {
+        return "git@github.com:openclaw/openclaw.git";
+      }
+      return "origin/main";
+    });
+    const load = (root = "/repo/context-cache") =>
+      loadControlUiSessionPullRequests(
+        { sessionKey: "agent:main:main" },
+        {
+          fetchImpl,
+          resolveGitRoot: async () => root,
+          gitOutput: gitOutputImpl,
+        },
+      );
+
+    await expect(load()).rejects.toBeInstanceOf(Error);
+    await expect(load()).rejects.toBeInstanceOf(Error);
+    expect(gitOutputImpl).toHaveBeenCalledTimes(3);
+    expect(fetchImpl.mock.calls).toHaveLength(1);
+
+    await expect(load("/repo/other-context")).rejects.toBeInstanceOf(Error);
+    expect(gitOutputImpl).toHaveBeenCalledTimes(6);
+
+    vi.advanceTimersByTime(60_000);
+    await expect(load()).rejects.toBeInstanceOf(Error);
+    expect(gitOutputImpl).toHaveBeenCalledTimes(6);
+    expect(fetchImpl.mock.calls).toHaveLength(2);
+
+    vi.advanceTimersByTime(15_001);
+    await expect(load()).rejects.toBeInstanceOf(Error);
+    expect(gitOutputImpl).toHaveBeenCalledTimes(9);
+    // GitHub's shorter failure backoff stays independent of local Git expiry.
+    expect(fetchImpl.mock.calls).toHaveLength(2);
+  });
+
+  it("caches local facts across a poll while forced refresh bypasses them", async () => {
+    let pulls: Record<string, unknown>[] = [];
+    const fetchImpl = routedFetch([
+      { match: "/pulls?head=", response: () => githubJson(pulls) },
+      { match: "/repos/openclaw/openclaw", response: () => githubJson({ fork: false }) },
+    ]);
+    const resolveBranchLanding = vi.fn(async () => ({
+      pushedSha: "a".repeat(40),
+      statsBase: "base",
+      hasLandedPullRequest: false,
+      provenNewPushedWork: false,
+    }));
+    const gitOutputImpl = vi.fn(async (_root: string, args: string[]) =>
+      args[0] === "rev-list" ? "1" : null,
+    );
+    let additions = 1;
+    const runGitImpl = vi.fn(async (root: string) => ({
+      stdout: ` 1 file changed, ${root === "/repo/b" ? 3 : additions} insertions(+)`,
+      stderr: "",
+      code: 0,
+      signal: null,
+      killed: false,
+      termination: "exit" as const,
+      timeoutMs: 120_000,
+    }));
+    const load = (sessionKey: string, refresh = false) =>
+      loadControlUiSessionPullRequests(
+        { sessionKey, ...(refresh ? { refresh: true } : {}) },
+        {
+          fetchImpl,
+          resolveGitContext: async () => ({
+            ...context,
+            branch: "cache/test",
+            root: sessionKey.endsWith(":b") ? "/repo/b" : "/repo/a",
+            defaultBranch: "main",
+          }),
+          gitOutput: gitOutputImpl,
+          runGit: runGitImpl,
+          resolveBranchLanding,
+        },
+      );
+
+    expect((await load("agent:main:a")).branch?.additions).toBe(1);
+    additions = 2;
+    expect((await load("agent:main:a")).branch?.additions).toBe(1);
+    expect(resolveBranchLanding).toHaveBeenCalledTimes(1);
+    expect(runGitImpl).toHaveBeenCalledTimes(1);
+    expect(gitOutputImpl).toHaveBeenCalledTimes(2);
+    expect((await load("agent:main:a", true)).branch?.additions).toBe(2);
+    expect(resolveBranchLanding).toHaveBeenCalledTimes(2);
+    expect(runGitImpl).toHaveBeenCalledTimes(2);
+    expect(gitOutputImpl).toHaveBeenCalledTimes(4);
+    expect(
+      fetchImpl.mock.calls.filter((call) =>
+        requestUrl(call[0] as RequestInfo | URL).includes("/pulls?head="),
+      ),
+    ).toHaveLength(2);
+
+    pulls = [pullListItem({ merged_at: "2026-07-09T10:00:00Z" })];
+    additions = 4;
+    expect((await load("agent:main:a", true)).branch?.additions).toBe(4);
+    expect(resolveBranchLanding).toHaveBeenCalledTimes(3);
+    expect(runGitImpl).toHaveBeenCalledTimes(3);
+    expect(gitOutputImpl).toHaveBeenCalledTimes(6);
+
+    const githubRequests = fetchImpl.mock.calls.length;
+    vi.advanceTimersByTime(60_000);
+    additions = 5;
+    expect((await load("agent:main:a")).branch?.additions).toBe(4);
+    expect(resolveBranchLanding).toHaveBeenCalledTimes(3);
+    expect(runGitImpl).toHaveBeenCalledTimes(3);
+    expect(gitOutputImpl).toHaveBeenCalledTimes(6);
+    expect(fetchImpl.mock.calls).toHaveLength(githubRequests);
+
+    vi.advanceTimersByTime(15_001);
+    additions = 5;
+    expect((await load("agent:main:a")).branch?.additions).toBe(5);
+    expect(resolveBranchLanding).toHaveBeenCalledTimes(4);
+    expect(runGitImpl).toHaveBeenCalledTimes(4);
+    expect(gitOutputImpl).toHaveBeenCalledTimes(8);
+
+    expect((await load("agent:main:b")).branch?.additions).toBe(3);
+    expect(resolveBranchLanding).toHaveBeenCalledTimes(5);
+    expect(runGitImpl).toHaveBeenCalledTimes(5);
+    expect(gitOutputImpl).toHaveBeenCalledTimes(10);
+  });
+
+  it("forced refresh bypasses cached checkout branch context", async () => {
+    let branch = "feature-a";
+    const fetchImpl = routedFetch([
+      { match: "/pulls?head=", response: () => githubJson([]) },
+      { match: "/repos/openclaw/openclaw", response: () => githubJson({ fork: false }) },
+    ]);
+    const gitOutputImpl = vi.fn(async (_root: string, args: string[]) => {
+      if (args[0] === "rev-parse") {
+        return branch;
+      }
+      if (args[0] === "remote") {
+        return "git@github.com:openclaw/openclaw.git";
+      }
+      if (args[0] === "symbolic-ref") {
+        return "origin/main";
+      }
+      if (args[0] === "rev-list") {
+        return "1";
+      }
+      return null;
+    });
+    const resolveBranchLanding = vi.fn(async () => ({
+      pushedSha: "a".repeat(40),
+      statsBase: null,
+      hasLandedPullRequest: false,
+      provenNewPushedWork: false,
+    }));
+    const load = (refresh = false) =>
+      loadControlUiSessionPullRequests(
+        { sessionKey: "agent:main:context-refresh", ...(refresh ? { refresh: true } : {}) },
+        {
+          fetchImpl,
+          resolveGitRoot: async () => "/repo/forced-context",
+          gitOutput: gitOutputImpl,
+          resolveBranchLanding,
+        },
+      );
+
+    expect((await load()).branch?.branch).toBe("feature-a");
+    branch = "feature-b";
+    expect((await load()).branch?.branch).toBe("feature-a");
+    expect((await load(true)).branch?.branch).toBe("feature-b");
   });
 
   it("refreshes a cached empty result after the assistant creates a PR", async () => {
@@ -472,7 +727,10 @@ describe("loadControlUiSessionPullRequests", () => {
         headers: { "Content-Type": "application/json", "x-ratelimit-remaining": "0" },
       });
     const routes = [
-      { match: "/pulls?head=", response: () => githubJson([pullListItem()]) },
+      {
+        match: "/pulls?head=",
+        response: () => githubJson([pullListItem({ user: { login: "octocat" } })]),
+      },
       { match: "/pulls/103469", response: rateLimitedResponse },
       { match: "/check-runs", response: rateLimitedResponse },
     ];
@@ -493,6 +751,8 @@ describe("loadControlUiSessionPullRequests", () => {
         title: "fix(macos): tighten the link-browser tab header",
         url: "https://github.com/openclaw/openclaw/pull/103469",
         state: "open",
+        // The list fetch succeeded, so its author survives the degraded chip.
+        author: { login: "octocat" },
       },
     ]);
 

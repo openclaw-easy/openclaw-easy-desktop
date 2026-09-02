@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { createTestAdmittedRunContext } from "./admitted-run-context.test-support.js";
 import {
+  captureSessionPlacementCompactionSuccessorAssertion,
   installSessionPlacementAdmissionProvider,
-  installSessionPlacementResetGuard,
-  resolveSessionPlacementResetBlock,
   type LocalTurnPlacementClaim,
   type SessionPlacementAdmissionProvider,
   withLocalSessionPlacementTurnAdmission,
@@ -10,7 +10,7 @@ import {
 } from "./session-placement-admission.js";
 
 let uninstallProvider: (() => void) | undefined;
-let uninstallResetGuard: (() => void) | undefined;
+const assertCompactionSuccessorAllowed = () => {};
 const executeLocalTurn: SessionPlacementAdmissionProvider["executeLocalTurn"] = async (
   _claim,
   runLocal,
@@ -19,12 +19,78 @@ const executeLocalTurn: SessionPlacementAdmissionProvider["executeLocalTurn"] = 
 afterEach(() => {
   uninstallProvider?.();
   uninstallProvider = undefined;
-  uninstallResetGuard?.();
-  uninstallResetGuard = undefined;
+});
+
+describe("captured compaction placement owner", () => {
+  const params = {
+    currentTarget: {
+      agentId: "main",
+      sessionId: "before",
+      sessionKey: "agent:main:turn",
+      storePath: "/tmp/agent.sqlite",
+    },
+    successorSessionId: "after",
+  };
+  const install = (
+    guard: SessionPlacementAdmissionProvider["assertCompactionSuccessorAllowed"],
+  ) => {
+    uninstallProvider = installSessionPlacementAdmissionProvider({
+      assertCompactionSuccessorAllowed: guard,
+      executeLocalTurn,
+      executeTurn: async (_claim, _params, runLocal) => await runLocal(),
+    });
+  };
+
+  it("allows standalone acceptance only while its captured absence is unchanged", async () => {
+    const assertion = captureSessionPlacementCompactionSuccessorAssertion();
+    await Promise.resolve();
+    expect(() => assertion(params)).not.toThrow();
+  });
+
+  it.each(["installed", "replaced", "removed"] as const)(
+    "rejects a provider %s after capture without delegating to a new owner",
+    async (change) => {
+      const first = vi.fn();
+      const second = vi.fn();
+      if (change !== "installed") {
+        install(first);
+      }
+      const assertion = captureSessionPlacementCompactionSuccessorAssertion();
+      await Promise.resolve();
+      if (change === "removed") {
+        uninstallProvider?.();
+        uninstallProvider = undefined;
+      } else {
+        install(second);
+      }
+      expect(() => assertion(params)).toThrow("session placement owner changed");
+      expect(first).not.toHaveBeenCalled();
+      expect(second).not.toHaveBeenCalled();
+    },
+  );
+
+  it("rechecks the captured owner's current placement on every use", async () => {
+    const denied = new Error("worker placement cannot rotate its session ID");
+    let blocked = false;
+    const guard = vi.fn(() => {
+      if (blocked) {
+        throw denied;
+      }
+    });
+    install(guard);
+    const assertion = captureSessionPlacementCompactionSuccessorAssertion();
+    assertion(params);
+    await Promise.resolve();
+    blocked = true;
+    expect(() => assertion(params)).toThrow(denied);
+    expect(guard).toHaveBeenCalledTimes(2);
+    expect(guard).toHaveBeenCalledWith(params);
+  });
 });
 
 describe("local turn placement admission", () => {
   const turnParams = {
+    admittedRunContext: createTestAdmittedRunContext("run-1"),
     sessionId: "session-1",
     sessionFile: "/tmp/session-1.jsonl",
     workspaceDir: "/tmp/workspace",
@@ -36,6 +102,7 @@ describe("local turn placement admission", () => {
   it("delegates the final turn decision to the installed provider", async () => {
     const events: string[] = [];
     uninstallProvider = installSessionPlacementAdmissionProvider({
+      assertCompactionSuccessorAllowed,
       executeLocalTurn,
       executeTurn: async (claim, params, runLocal) => {
         events.push("claim");
@@ -62,19 +129,28 @@ describe("local turn placement admission", () => {
         events.push("turn");
         return { meta: { durationMs: 1 } };
       },
+      () => events.push("admitted"),
     );
 
     expect(result.meta.durationMs).toBe(1);
-    expect(events).toEqual(["claim", "turn", "release"]);
+    expect(events).toEqual(["claim", "admitted", "turn", "release"]);
   });
 
   it("does not start a local turn when the provider routes remotely", async () => {
     const turn = vi.fn(async () => ({ meta: { durationMs: 1 } }));
-    const executeTurn = vi.fn<SessionPlacementAdmissionProvider["executeTurn"]>(async () => ({
-      payloads: [{ text: "remote" }],
-      meta: { durationMs: 2 },
-    }));
+    const onAdmitted = vi.fn();
+    const executeTurn = vi.fn<SessionPlacementAdmissionProvider["executeTurn"]>(
+      async (_claim, _params, _runLocal, admitTurn) => {
+        admitTurn?.();
+        admitTurn?.();
+        return {
+          payloads: [{ text: "remote" }],
+          meta: { durationMs: 2 },
+        };
+      },
+    );
     uninstallProvider = installSessionPlacementAdmissionProvider({
+      assertCompactionSuccessorAllowed,
       executeLocalTurn,
       executeTurn,
     });
@@ -83,11 +159,52 @@ describe("local turn placement admission", () => {
       { sessionId: "session-2", runId: "run-2" },
       { ...turnParams, sessionId: "session-2", runId: "run-2" },
       turn,
+      onAdmitted,
     );
     expect(result.payloads).toEqual([{ text: "remote" }]);
     expect(executeTurn).toHaveBeenCalledOnce();
     expect(executeTurn.mock.calls[0]?.[0]).toEqual({ sessionId: "session-2", runId: "run-2" });
+    expect(onAdmitted).toHaveBeenCalledOnce();
     expect(turn).not.toHaveBeenCalled();
+  });
+
+  it("admits a provider-free local turn exactly once before execution", async () => {
+    const events: string[] = [];
+    await withSessionPlacementTurnAdmission(
+      { sessionId: "session-direct", runId: "run-direct" },
+      { ...turnParams, sessionId: "session-direct", runId: "run-direct" },
+      async () => {
+        events.push("turn");
+        return { meta: { durationMs: 1 } };
+      },
+      () => events.push("admitted"),
+    );
+
+    expect(events).toEqual(["admitted", "turn"]);
+  });
+
+  it("admits once when a provider signals before calling the local turn", async () => {
+    const events: string[] = [];
+    uninstallProvider = installSessionPlacementAdmissionProvider({
+      assertCompactionSuccessorAllowed,
+      executeLocalTurn,
+      executeTurn: async (_claim, _params, runLocal, admitTurn) => {
+        admitTurn?.();
+        return await runLocal();
+      },
+    });
+
+    await withSessionPlacementTurnAdmission(
+      { sessionId: "session-once", runId: "run-once" },
+      { ...turnParams, sessionId: "session-once", runId: "run-once" },
+      async () => {
+        events.push("turn");
+        return { meta: { durationMs: 1 } };
+      },
+      () => events.push("admitted"),
+    );
+
+    expect(events).toEqual(["admitted", "turn"]);
   });
 
   it("does not resurrect a replaced provider during uninstall", async () => {
@@ -96,6 +213,7 @@ describe("local turn placement admission", () => {
         await runLocal(),
     );
     const uninstallFirst = installSessionPlacementAdmissionProvider({
+      assertCompactionSuccessorAllowed,
       executeLocalTurn,
       executeTurn: firstClaim,
     });
@@ -104,6 +222,7 @@ describe("local turn placement admission", () => {
         await runLocal(),
     );
     const uninstallSecond = installSessionPlacementAdmissionProvider({
+      assertCompactionSuccessorAllowed,
       executeLocalTurn,
       executeTurn: secondClaim,
     });
@@ -132,6 +251,7 @@ describe("local turn placement admission", () => {
   it("delegates generic local execution through the placement gate", async () => {
     const events: string[] = [];
     uninstallProvider = installSessionPlacementAdmissionProvider({
+      assertCompactionSuccessorAllowed,
       async executeLocalTurn<T>(
         claim: LocalTurnPlacementClaim,
         runLocal: () => Promise<T>,
@@ -165,27 +285,5 @@ describe("local turn placement admission", () => {
 
     expect(result).toEqual({ kind: "cli", code: 0 });
     expect(events).toEqual(["claim", "turn", "release"]);
-  });
-});
-
-describe("session placement reset guard", () => {
-  it("returns the installed reset block", () => {
-    uninstallResetGuard = installSessionPlacementResetGuard((sessionId) =>
-      sessionId === "session-worker" ? "cloud worker placement is active" : undefined,
-    );
-
-    expect(resolveSessionPlacementResetBlock("session-worker")).toBe(
-      "cloud worker placement is active",
-    );
-    expect(resolveSessionPlacementResetBlock("session-local")).toBeUndefined();
-  });
-
-  it("does not clear a replacement reset guard during stale uninstall", () => {
-    const uninstallFirst = installSessionPlacementResetGuard(() => "first");
-    uninstallResetGuard = installSessionPlacementResetGuard(() => "second");
-
-    uninstallFirst();
-
-    expect(resolveSessionPlacementResetBlock("session-worker")).toBe("second");
   });
 });

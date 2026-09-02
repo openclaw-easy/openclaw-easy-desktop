@@ -3,7 +3,7 @@ import path from "node:path";
 import { createSubsystemLogger } from "../../logging/subsystem.js";
 import { normalizeAgentId } from "../../routing/session-key.js";
 import {
-  isSameOpenClawAgentDatabasePath,
+  createOpenClawAgentDatabasePathMatcher,
   listOpenClawRegisteredAgentDatabases,
 } from "../../state/openclaw-agent-db-registry.js";
 import {
@@ -56,18 +56,19 @@ export function dedupeSessionStoreTargetsBySqliteTarget(
       unsuffixedOwnerAgentId?: string;
     }>
   >();
+  // Alias targets can change between calls. Reuse prepared identities only for this
+  // synchronous dedupe invocation so collision ownership never relies on stale paths.
+  const isSameDatabasePath = createOpenClawAgentDatabasePathMatcher();
   const resolvePhysicalGroupKey = <T>(groups: ReadonlyMap<string, T>, pathname: string) =>
-    [...groups.keys()].find((candidate) => isSameOpenClawAgentDatabasePath(candidate, pathname)) ??
+    [...groups.keys()].find((candidate) => isSameDatabasePath(candidate, pathname)) ??
     path.resolve(pathname);
   for (const target of targets) {
-    const resolvedUnsuffixedPath = path.resolve(
-      resolveUnsuffixedSqliteTargetFromSessionStorePath(target.storePath).path ?? target.storePath,
-    );
     const resolved = resolveSqliteTargetFromSessionStorePath(target.storePath, {
       agentId: target.agentId,
       defaultAgentId: options.defaultAgentId,
       env: options.env,
       registeredDatabases,
+      isSameDatabasePath,
     });
     const sqlitePath = resolvePhysicalGroupKey(grouped, resolved.path ?? target.storePath);
     const group = grouped.get(sqlitePath) ?? [];
@@ -77,6 +78,13 @@ export function dedupeSessionStoreTargetsBySqliteTarget(
       ...(resolved.agentId ? { databaseOwnerAgentId: normalizeAgentId(resolved.agentId) } : {}),
     });
     grouped.set(sqlitePath, group);
+    // Exact shared locators do not allocate legacy per-agent suffixes.
+    if (resolved.shared) {
+      continue;
+    }
+    const resolvedUnsuffixedPath = path.resolve(
+      resolveUnsuffixedSqliteTargetFromSessionStorePath(target.storePath).path ?? target.storePath,
+    );
     const unsuffixedPath = resolvePhysicalGroupKey(logicalGroups, resolvedUnsuffixedPath);
     const logicalGroup = logicalGroups.get(unsuffixedPath) ?? [];
     logicalGroup.push({
@@ -122,14 +130,19 @@ export function dedupeSessionStoreTargetsBySqliteTarget(
     const byAgentId = new Map(
       group.map(({ target }) => [normalizeAgentId(target.agentId), target] as const),
     );
-    const registeredOwners = [
-      ...new Set(
-        registeredDatabases
-          .filter((entry) => isSameOpenClawAgentDatabasePath(entry.path, sqlitePath))
-          .map((entry) => normalizeAgentId(entry.agentId)),
-      ),
-    ];
     const pathOwners = [...new Set(group.flatMap((entry) => entry.databaseOwnerAgentId ?? []))];
+    // A unique path owner outranks registry owners, so identity matching cannot change the result.
+    // Registry loading above still preserves unreadable-registry semantics.
+    const registeredOwners =
+      pathOwners.length === 1
+        ? []
+        : [
+            ...new Set(
+              registeredDatabases
+                .filter((entry) => isSameDatabasePath(entry.path, sqlitePath))
+                .map((entry) => normalizeAgentId(entry.agentId)),
+            ),
+          ];
     const collision = byAgentId.size > 1;
     if (pathOwners.length !== 1 && registeredOwners.length > 1) {
       const diagnostic: SessionStoreTargetCollisionDiagnostic = {

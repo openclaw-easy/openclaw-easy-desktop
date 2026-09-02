@@ -1,611 +1,706 @@
-import { randomUUID } from "node:crypto";
-import type { Model } from "@openclaw/llm-core";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
-import type { ResponseCreateParamsStreaming } from "openai/resources/responses/responses.js";
+import type { ResponseOutputItem } from "openai/resources/responses/responses.js";
+import {
+  AZURE_RESPONSES_TEXT_CONTENT_PART_TYPE,
+  OPENAI_RESPONSES_OUTPUT_TEXT_CONTENT_PART_TYPE,
+  isAzureResponsesTextDeltaEvent,
+  isResponsesTextContentPartType,
+  resolveResponsesMessageSnapshotCollapse,
+} from "../providers/openai-responses-stream-compat.js";
 import {
   createResponsesToolCallTracker,
-  isResponsesTextContentPartType,
-  isResponsesTextDeltaEventType,
   readResponsesToolCallItemIdentity,
-  resolveResponsesMessageSnapshotCollapse,
   type ResponsesToolCallState,
-} from "../internal/openai.js";
-import { withFirstStreamEventTimeout, parseStreamingJson } from "../internal/runtime.js";
-import { emitModelTransportDebug, resolveModelSseDebugMode } from "./model-transport-debug.js";
+} from "../providers/openai-responses-tool-call-tracker.js";
+import type { Api, AssistantMessage, Model, TextContent, ToolCall } from "../types.js";
+import {
+  createToolArgumentPreviewSchedule,
+  parseStreamingJson,
+  type ToolArgumentPreviewSchedule,
+} from "../utils/json-parse.js";
+import { notifyLlmRequestActivity } from "../utils/llm-request-activity.js";
+import { withFirstStreamEventTimeout } from "../utils/stream-first-event-timeout.js";
+import { createCompactionTracker } from "./openai-responses-compaction-replay.js";
 import { OPENAI_RESPONSES_REASONING_REPLAY_BLOCK_META_KEY } from "./openai-responses-contracts.js";
+import { normalizeResponsesFailedEvent, ResponsesStreamFailure } from "./openai-responses-debug.js";
+import { encodeTextSignatureV1 } from "./openai-responses-replay-internal.js";
+import { adaptResponsesStream } from "./openai-responses-stream-observer-internal.js";
 import {
-  logResponsesFailedNoDetails,
-  normalizeResponsesFailedEvent,
-  stringifyRedactedEvent,
-  stringifyUnknown,
-  stringifyJsonLike,
-} from "./openai-responses-debug.js";
+  appendResponsesPendingTextDelta,
+  createResponsesOutputTracker,
+  createResponsesOutputSlotTracker,
+  readResponsesOutputIndex,
+  type ResponsesStreamOutputSlot,
+} from "./openai-responses-stream-slots-internal.js";
 import {
-  buildOpenAIResponsesReasoningReplayMetadata,
-  encodeTextSignatureV1,
-} from "./openai-responses-replay-internal.js";
-import { recordResponsesTerminalOutcome } from "./openai-responses-terminal-outcome.js";
-import {
-  createModelStreamCooperativeScheduler,
-  log,
-  throwIfModelStreamAborted,
-  type MutableAssistantOutput,
-} from "./openai-transport-shared.js";
+  createResponsesTerminalController,
+  resolveCompletedResponsesToolCall,
+  resolveResponsesToolCallId,
+  type ResponsesEventSink,
+  type ResponsesThinkingBlock,
+  type TextBlockReference,
+} from "./openai-responses-stream-terminal-internal.js";
+import type {
+  CompletedResponse,
+  ResponsesStreamOptions,
+  ResponsesStreamOutputMessage,
+} from "./openai-responses-stream-types-internal.js";
+import { transportAbortError } from "./transport-stream-shared.js";
 
-export async function processResponsesStream(
+export type { OpenAIResponsesStreamEvent } from "./openai-responses-stream-types-internal.js";
+
+export async function processResponsesStream<TApi extends Api>(
   openaiStream: AsyncIterable<unknown>,
-  output: MutableAssistantOutput,
-  stream: { push(event: unknown): void },
-  model: Model,
-  options?: {
-    serviceTier?: ResponseCreateParamsStreaming["service_tier"];
-    applyServiceTierPricing?: (
-      usage: MutableAssistantOutput["usage"],
-      serviceTier?: ResponseCreateParamsStreaming["service_tier"],
-    ) => void;
-    firstEventTimeoutMs?: number;
-    abortFirstEventStream?: (reason: Error) => void;
-    onFirstEventTimeout?: (reason: Error) => void;
-    signal?: AbortSignal;
-    sessionId?: string;
-    authProfileId?: string;
-  },
+  output: AssistantMessage,
+  stream: ResponsesEventSink,
+  model: Model<TApi>,
+  options?: ResponsesStreamOptions,
 ) {
-  const resolveToolCallId = (item: Record<string, unknown>, fallbackId?: string): string => {
-    const callId = stringifyUnknown(item.call_id).trim();
-    const itemId = stringifyUnknown(item.id).trim();
-    const [fallbackCallId = "", fallbackItemId = ""] = (fallbackId ?? "").split("|");
-    const resolvedCallId = callId || fallbackCallId;
-    const resolvedItemId = itemId || fallbackItemId;
-    if (resolvedCallId) {
-      return resolvedItemId ? `${resolvedCallId}|${resolvedItemId}` : resolvedCallId;
-    }
-    const generatedCallId = `call_${randomUUID().replaceAll("-", "").slice(0, 24)}`;
-    return resolvedItemId ? `${generatedCallId}|${resolvedItemId}` : generatedCallId;
-  };
-  let currentItem: Record<string, unknown> | null = null;
-  let currentBlock: Record<string, unknown> | null = null;
+  type CompletedToolCall = Extract<ResponseOutputItem, { type: "function_call" }>;
+  type StreamingToolCallBlock = ToolCall & { partialJson: string };
   type StreamingToolCallState = ResponsesToolCallState & {
-    block: Record<string, unknown>;
+    block: StreamingToolCallBlock;
     contentIndex: number;
+    // Preview refresh schedule for streamed arguments; done/terminal parses stay authoritative.
+    previewSchedule: ToolArgumentPreviewSchedule;
   };
+  type ResponsesOutputSlot = ResponsesStreamOutputSlot<
+    ResponsesStreamOutputMessage,
+    StreamingToolCallState
+  >;
   const streamingToolCalls = createResponsesToolCallTracker<StreamingToolCallState>();
-  let lastTextBlock: {
-    block: Record<string, unknown>;
-    index: number;
-    phase: "commentary" | "final_answer" | undefined;
-  } | null = null;
-  // While a message item may still be a cumulative snapshot of lastTextBlock,
-  // its public block is deferred so a collapsed item never leaves an
-  // unbalanced text_start behind (#91959). null = no deferral in progress.
-  let pendingMessageText: string | null = null;
-  const streamStartedAt = Date.now();
-  let eventCount = 0;
-  const eventTypes = new Map<string, number>();
-  const sseDebugMode = resolveModelSseDebugMode();
-  const blockIndex = () => output.content.length - 1;
-  const readIdentityValue = (value: unknown): string | undefined => {
-    const identity = typeof value === "string" ? value.trim() : "";
-    return identity || undefined;
-  };
-  // Opening fragments may carry the only function name. A conflicting
-  // completion must never retarget an already-started call.
-  const resolveCompletedToolCallName = (
-    toolCall: StreamingToolCallState | undefined,
-    value: unknown,
-  ): string => {
-    const streamedName = readIdentityValue(toolCall?.block.name);
-    const completedName = readIdentityValue(value);
-    if (streamedName && completedName && streamedName !== completedName) {
-      throw new Error(
-        `Responses stream changed tool-call function name from ${streamedName} to ${completedName}`,
-      );
+  const outputSlots = createResponsesOutputSlotTracker<ResponsesOutputSlot>();
+  const outputs = createResponsesOutputTracker();
+  let terminalResponse: CompletedResponse | null | undefined;
+  let lastTextBlock: TextBlockReference | null = null;
+  const blocks = output.content;
+  const compactionTracker = createCompactionTracker(output, model, options);
+  const createOutputSlot = (
+    event: object,
+    item: ResponseOutputItem | ResponsesStreamOutputMessage,
+  ): ResponsesOutputSlot | undefined => {
+    if (item.type === "reasoning") {
+      const block: ResponsesThinkingBlock = { type: "thinking", thinking: "" };
+      const slot = {
+        type: "thinking",
+        item,
+        block,
+        contentIndex: blocks.length,
+        outputIndex: readResponsesOutputIndex(event),
+      } satisfies ResponsesOutputSlot;
+      blocks.push(block);
+      outputs.set(item, slot.contentIndex, slot.outputIndex);
+      outputSlots.register(event, slot);
+      stream.push({ type: "thinking_start", contentIndex: slot.contentIndex, partial: output });
+      return slot;
     }
-    const name = completedName ?? streamedName;
-    if (!name) {
-      throw new Error("Responses stream completed tool call without a function name");
-    }
-    return name;
-  };
-  const appendPendingMessageDelta = (delta: string) => {
-    pendingMessageText = `${pendingMessageText ?? ""}${delta}`;
-    const priorText = stringifyUnknown(lastTextBlock?.block.text);
-    if (priorText.startsWith(pendingMessageText) || pendingMessageText.startsWith(priorText)) {
-      return;
-    }
-    // Diverged from the prior text: this is a distinct message, so open its
-    // block now and replay the withheld text as one delta.
-    const phase =
-      currentItem?.type === "message"
-        ? ((currentItem.phase as "commentary" | "final_answer" | undefined) ?? undefined)
-        : undefined;
-    currentBlock = {
-      type: "text",
-      text: pendingMessageText,
-      ...(currentItem?.type === "message" && phase
-        ? {
-            textSignature: encodeTextSignatureV1(stringifyUnknown(currentItem.id), phase),
-          }
-        : {}),
-    };
-    output.content.push(currentBlock);
-    stream.push({ type: "text_start", contentIndex: blockIndex(), partial: output });
-    stream.push({ type: "text_delta", contentIndex: blockIndex(), delta: pendingMessageText });
-    pendingMessageText = null;
-  };
-  const appendTerminalResponseTextItem = (item: Record<string, unknown>) => {
-    const text = readResponsesOutputMessageText(item);
-    if (!text) {
-      return;
-    }
-    const phase = (item.phase as "commentary" | "final_answer" | undefined) ?? undefined;
-    const collapse = resolveResponsesMessageSnapshotCollapse({
-      prior: lastTextBlock && {
-        text: stringifyUnknown(lastTextBlock.block.text),
-        phase: lastTextBlock.phase,
-      },
-      nextText: text,
-      nextPhase: phase,
-    });
-    if (collapse.kind === "extend" && lastTextBlock) {
-      // Cumulative snapshot of the prior message item: replace, don't append;
-      // the newest item's signature carries the content for replay (#91959).
-      lastTextBlock.block.text = collapse.text;
-      lastTextBlock.block.textSignature = encodeTextSignatureV1(stringifyUnknown(item.id), phase);
-      stream.push({
-        type: "text_end",
-        contentIndex: lastTextBlock.index,
-        content: collapse.text,
-        partial: output,
-      });
-      return;
-    }
-    const block: Record<string, unknown> = {
-      type: "text",
-      text,
-      textSignature: encodeTextSignatureV1(stringifyUnknown(item.id), phase),
-    };
-    output.content.push(block);
-    lastTextBlock = { block, index: blockIndex(), phase };
-    stream.push({ type: "text_start", contentIndex: blockIndex(), partial: output });
-    stream.push({
-      type: "text_end",
-      contentIndex: blockIndex(),
-      content: text,
-      partial: output,
-    });
-  };
-  const appendCompletedResponseToolCallItem = (item: Record<string, unknown>) => {
-    const args = parseStreamingJson(stringifyJsonLike(item.arguments, "{}"));
-    const name = resolveCompletedToolCallName(undefined, item.name);
-    const block = {
-      type: "toolCall",
-      id: resolveToolCallId(item),
-      name,
-      arguments: args,
-      partialJson: stringifyJsonLike(item.arguments, "{}"),
-    };
-    output.content.push(block);
-    stream.push({ type: "toolcall_start", contentIndex: blockIndex(), partial: output });
-    stream.push({
-      type: "toolcall_end",
-      contentIndex: blockIndex(),
-      toolCall: {
-        type: "toolCall",
-        id: block.id,
-        name: block.name,
-        arguments: args,
-      },
-      partial: output,
-    });
-  };
-  const backfillTerminalResponseOutput = (
-    response: Record<string, unknown> | undefined,
-    backfillOptions: { includeToolCalls: boolean },
-  ) => {
-    if (output.content.length > 0 || !Array.isArray(response?.output)) {
-      return;
-    }
-    for (const rawItem of response.output) {
-      if (!isRecord(rawItem)) {
-        continue;
-      }
-      if (rawItem.type === "message") {
-        appendTerminalResponseTextItem(rawItem);
-        continue;
-      }
-      // Any non-message item (reasoning, tool call) is a real boundary; a later
-      // message must not collapse across it, mirroring the streaming path.
-      lastTextBlock = null;
-      if (backfillOptions.includeToolCalls && rawItem.type === "function_call") {
-        appendCompletedResponseToolCallItem(rawItem);
-      }
-    }
-  };
-  const guardedStream = withFirstStreamEventTimeout(openaiStream, {
-    provider: model.provider,
-    api: model.api,
-    model: model.id,
-    timeoutMs: options?.firstEventTimeoutMs ?? 0,
-    stage: "responses",
-    abort: options?.abortFirstEventStream,
-    onTimeout: options?.onFirstEventTimeout,
-    hint: "The provider may be stalled while parsing the tool payload; retry with a smaller tool surface or enable OPENCLAW_DEBUG_MODEL_PAYLOAD=tools to inspect exposed tools.",
-  });
-  const cooperativeScheduler = createModelStreamCooperativeScheduler(options?.signal);
-  for await (const rawEvent of guardedStream) {
-    throwIfModelStreamAborted(options?.signal);
-    const event = rawEvent as Record<string, unknown>;
-    const type = stringifyUnknown(event.type);
-    eventCount += 1;
-    eventTypes.set(type, (eventTypes.get(type) ?? 0) + 1);
-    if (eventCount === 1) {
-      emitModelTransportDebug(
-        log,
-        `[responses] first_event provider=${model.provider} api=${model.api} model=${model.id} ` +
-          `elapsedMs=${Date.now() - streamStartedAt} type=${type}`,
-      );
-    }
-    if (sseDebugMode === "peek" && eventCount <= 5) {
-      emitModelTransportDebug(
-        log,
-        `[responses] event_peek provider=${model.provider} api=${model.api} model=${model.id} ` +
-          `index=${eventCount} type=${type} event=${stringifyRedactedEvent(event)}`,
-      );
-    }
-    if (type === "response.created") {
-      output.responseId = stringifyUnknown((event.response as { id?: string } | undefined)?.id);
-    } else if (type === "response.output_item.added") {
-      const item = event.item as Record<string, unknown>;
-      if (item.type !== "message") {
-        // Snapshot collapse only applies to back-to-back message items; any
-        // other item is a real boundary (see resolveResponsesMessageSnapshotCollapse).
-        lastTextBlock = null;
-        pendingMessageText = null;
-      }
-      if (item.type === "reasoning") {
-        currentItem = item;
-        currentBlock = { type: "thinking", thinking: "" };
-        output.content.push(currentBlock);
-        stream.push({ type: "thinking_start", contentIndex: blockIndex(), partial: output });
-      } else if (item.type === "message") {
-        currentItem = item;
-        if (lastTextBlock) {
-          currentBlock = null;
-          pendingMessageText = "";
-        } else {
-          const phase = (item.phase as "commentary" | "final_answer" | undefined) ?? undefined;
-          currentBlock = {
+    if (item.type === "message") {
+      const messageItem = item as ResponsesStreamOutputMessage;
+      const collapseCandidate = lastTextBlock;
+      const block: TextContent | null = collapseCandidate
+        ? null
+        : {
             type: "text",
             text: "",
-            ...(phase
-              ? { textSignature: encodeTextSignatureV1(stringifyUnknown(item.id), phase) }
+            ...(messageItem.phase
+              ? { textSignature: encodeTextSignatureV1(messageItem.id, messageItem.phase) }
               : {}),
           };
-          output.content.push(currentBlock);
-          stream.push({ type: "text_start", contentIndex: blockIndex(), partial: output });
-        }
-      } else if (item.type === "function_call") {
-        const toolCallBlock: Record<string, unknown> = {
-          type: "toolCall",
-          id: resolveToolCallId(item),
-          name: readIdentityValue(item.name) ?? "",
-          arguments: {},
-          partialJson: stringifyJsonLike(item.arguments),
-        };
-        const contentIndex = output.content.length;
-        const toolCallState: StreamingToolCallState = {
-          block: toolCallBlock,
-          contentIndex,
-          argumentStreamReliable: true,
-          ...readResponsesToolCallItemIdentity(item),
-        };
-        streamingToolCalls.register(event, toolCallState);
-        currentItem = item;
-        currentBlock = toolCallBlock;
-        output.content.push(toolCallBlock);
-        stream.push({ type: "toolcall_start", contentIndex, partial: output });
+      const slot = {
+        type: "text",
+        item: messageItem,
+        block,
+        contentIndex: block ? blocks.length : undefined,
+        outputIndex: readResponsesOutputIndex(event),
+        pendingText: collapseCandidate ? "" : null,
+        collapseCandidate,
+      } satisfies ResponsesOutputSlot;
+      if (block) {
+        blocks.push(block);
+        outputs.set(messageItem, slot.contentIndex ?? blocks.length - 1, slot.outputIndex);
       }
-    } else if (type === "response.reasoning_summary_text.delta") {
-      if (currentItem?.type === "reasoning" && currentBlock?.type === "thinking") {
-        currentBlock.thinking = `${stringifyUnknown(currentBlock.thinking)}${stringifyUnknown(event.delta)}`;
+      outputSlots.register(event, slot);
+      if (slot.contentIndex !== undefined) {
+        stream.push({ type: "text_start", contentIndex: slot.contentIndex, partial: output });
+      }
+      return slot;
+    }
+    return undefined;
+  };
+  const resolveOutputItemSlot = (
+    event: object,
+    item: ResponseOutputItem | ResponsesStreamOutputMessage,
+  ): ResponsesOutputSlot | undefined => {
+    if (item.type === "reasoning") {
+      return outputSlots.resolve(event, "thinking");
+    }
+    if (item.type === "message") {
+      return outputSlots.resolve(event, "text");
+    }
+    return readResponsesOutputIndex(event) === undefined ? undefined : outputSlots.get(event);
+  };
+  const materializeDeferredTextSlot = (
+    slot: Extract<ResponsesOutputSlot, { type: "text" }>,
+  ): void => {
+    if (slot.block || slot.pendingText === null) {
+      return;
+    }
+    const text = slot.pendingText;
+    slot.block = {
+      type: "text",
+      text,
+      ...(slot.item.phase
+        ? { textSignature: encodeTextSignatureV1(slot.item.id, slot.item.phase) }
+        : {}),
+    };
+    blocks.push(slot.block);
+    slot.contentIndex = blocks.length - 1;
+    outputs.set(slot.item, slot.contentIndex, slot.outputIndex);
+    stream.push({ type: "text_start", contentIndex: slot.contentIndex, partial: output });
+    if (text) {
+      stream.push({
+        type: "text_delta",
+        contentIndex: slot.contentIndex,
+        delta: text,
+      });
+    }
+    if (lastTextBlock === slot.collapseCandidate) {
+      lastTextBlock = null;
+    }
+    slot.pendingText = null;
+    slot.collapseCandidate = null;
+  };
+  const materializeDeferredTextSlots = (except?: ResponsesOutputSlot): void => {
+    for (const slot of outputSlots.values()) {
+      if (slot !== except && slot.type === "text") {
+        materializeDeferredTextSlot(slot);
+      }
+    }
+  };
+  const terminal = createResponsesTerminalController({
+    output,
+    stream,
+    model,
+    options,
+    outputs,
+    getLastTextBlock: () => lastTextBlock,
+    setLastTextBlock: (block) => {
+      lastTextBlock = block;
+    },
+  });
+
+  const finalizeToolCall = (
+    item: CompletedToolCall,
+    outputIndex: number | undefined,
+    streamingToolCall: StreamingToolCallState | undefined,
+    validated: Pick<ToolCall, "name" | "arguments">,
+  ): void => {
+    const identity = {
+      type: item.type,
+      id: item.id || streamingToolCall?.itemId,
+      call_id: item.call_id || streamingToolCall?.callId,
+    };
+    const finalOutputIndex = outputIndex ?? streamingToolCall?.outputIndex;
+    // A wholly anonymous, unindexed done event cannot be deduplicated. Keep
+    // its active owner until the terminal snapshot supplies an output position.
+    if (finalOutputIndex === undefined && !identity.id && !identity.call_id) {
+      if (!streamingToolCall) {
+        throw new Error("Responses stream completed tool call without an output identity");
+      }
+      return;
+    }
+    if (streamingToolCall) {
+      streamingToolCalls.forget(streamingToolCall);
+      for (const slot of outputSlots.values()) {
+        if (slot.type === "toolCall" && slot.toolCall === streamingToolCall) {
+          outputSlots.forget(slot);
+        }
+      }
+    }
+    terminal.emitToolCallCompletion(identity, finalOutputIndex, streamingToolCall, validated);
+  };
+  const prepareTerminalToolCalls = (items: ResponseOutputItem[]) => {
+    const prepared = new Map<number, () => void>();
+    const recovered: StreamingToolCallState[] = [];
+    const callIds = new Set<string>();
+    const allowUnmatchedIdentity =
+      items.filter(
+        (item, index) => item.type === "function_call" && !outputs.get(item, index)?.completed,
+      ).length === 1;
+    for (const [outputIndex, item] of items.entries()) {
+      const tracked = outputs.get(item, outputIndex);
+      if (item.type !== "function_call") {
+        continue;
+      }
+      if (item.call_id && callIds.has(item.call_id)) {
+        throw new Error("Responses stream repeated a terminal tool-call identity");
+      }
+      if (item.call_id) {
+        callIds.add(item.call_id);
+      }
+      // Completed positions must be skipped before resolve can adopt an
+      // unindexed active call. The positional tracker still checks identity.
+      if (tracked?.completed) {
+        continue;
+      }
+      const state = streamingToolCalls.resolve(
+        { output_index: outputIndex },
+        readResponsesToolCallItemIdentity(item),
+        allowUnmatchedIdentity,
+      );
+      if (tracked && !state) {
+        throw new Error("Responses stream completed with unresolved tool calls");
+      }
+      const validated = resolveCompletedResponsesToolCall(item, { name: state?.block.name });
+      if (state) {
+        recovered.push(state);
+      }
+      prepared.set(outputIndex, () => finalizeToolCall(item, outputIndex, state, validated));
+    }
+    if (!streamingToolCalls.hasExactlyActive(recovered)) {
+      throw new Error("Responses stream completed with unresolved tool calls");
+    }
+    // All terminal calls and active-call coverage are validated before any
+    // toolcall_end can authorize execution; terminal ordering is checked next.
+    return (outputIndex: number) => {
+      const complete = prepared.get(outputIndex);
+      if (!complete) {
+        throw new Error("Responses stream completed with unresolved tool calls");
+      }
+      complete();
+    };
+  };
+
+  const guardedStream = adaptResponsesStream(
+    withFirstStreamEventTimeout(openaiStream, {
+      provider: model.provider,
+      api: model.api,
+      model: model.id,
+      timeoutMs: options?.firstEventTimeoutMs ?? 0,
+      stage: "responses",
+      abort: options?.abortFirstEventStream,
+      onTimeout: options?.onFirstEventTimeout,
+      hint: "The provider may be stalled while parsing the tool payload; retry with a smaller tool surface or enable OPENCLAW_DEBUG_MODEL_PAYLOAD=tools to inspect exposed tools.",
+    }),
+    options?.signal,
+  );
+  try {
+    for await (const event of guardedStream) {
+      // Bookkeeping-only SSE events (in_progress, *.done echoes) are still
+      // provider progress; keep the idle watchdog alive without exposing them,
+      // matching the completions and anthropic transports.
+      notifyLlmRequestActivity(options?.signal);
+      if (event.type === "response.created") {
+        output.responseId = event.response.id;
+      } else if (event.type === "response.output_item.added") {
+        materializeDeferredTextSlots();
+        const item = event.item;
+        compactionTracker.added(item, blocks.length);
+        if (item.type !== "message") {
+          // Snapshot collapse only applies to back-to-back message items; any
+          // other item is a real boundary (see resolveResponsesMessageSnapshotCollapse).
+          lastTextBlock = null;
+        }
+        if (item.type === "reasoning" || item.type === "message") {
+          createOutputSlot(event, item);
+        } else if (item.type === "function_call") {
+          const toolCallBlock: StreamingToolCallBlock = {
+            type: "toolCall",
+            id: resolveResponsesToolCallId(item),
+            name: typeof item.name === "string" ? item.name.trim() : "",
+            arguments: {},
+            partialJson: item.arguments || "",
+          };
+          const contentIndex = output.content.length;
+          const toolCallState: StreamingToolCallState = {
+            block: toolCallBlock,
+            contentIndex,
+            argumentStreamReliable: true,
+            previewSchedule: createToolArgumentPreviewSchedule(),
+            ...readResponsesToolCallItemIdentity(item),
+          };
+          streamingToolCalls.register(event, toolCallState);
+          if (readResponsesOutputIndex(event) !== undefined) {
+            outputSlots.register(event, { type: "toolCall", toolCall: toolCallState });
+          }
+          output.content.push(toolCallBlock);
+          outputs.set(item, contentIndex, readResponsesOutputIndex(event));
+          stream.push({ type: "toolcall_start", contentIndex, partial: output });
+        }
+      } else if (event.type === "response.reasoning_summary_part.added") {
+        const slot = outputSlots.resolve(event, "thinking");
+        if (!slot) {
+          continue;
+        }
+        slot.item.summary = slot.item.summary || [];
+        slot.item.summary.push(event.part);
+      } else if (event.type === "response.reasoning_summary_text.delta") {
+        const slot = outputSlots.resolve(event, "thinking");
+        if (!slot) {
+          continue;
+        }
+        slot.item.summary = slot.item.summary || [];
+        const lastPart = slot.item.summary[slot.item.summary.length - 1];
+        if (!lastPart) {
+          continue;
+        }
+        slot.block.thinking += event.delta;
+        lastPart.text += event.delta;
         stream.push({
           type: "thinking_delta",
-          contentIndex: blockIndex(),
-          delta: stringifyUnknown(event.delta),
+          contentIndex: slot.contentIndex,
+          delta: event.delta,
           partial: output,
         });
-      }
-    } else if (isResponsesTextDeltaEventType(type) || type === "response.refusal.delta") {
-      if (currentItem?.type === "message") {
-        if (pendingMessageText !== null) {
-          appendPendingMessageDelta(stringifyUnknown(event.delta));
-        } else if (currentBlock?.type === "text") {
-          currentBlock.text = `${stringifyUnknown(currentBlock.text)}${stringifyUnknown(event.delta)}`;
+      } else if (event.type === "response.reasoning_summary_part.done") {
+        const slot = outputSlots.resolve(event, "thinking");
+        if (!slot) {
+          continue;
+        }
+        slot.item.summary = slot.item.summary || [];
+        const lastPart = slot.item.summary[slot.item.summary.length - 1];
+        if (!lastPart) {
+          continue;
+        }
+        slot.block.thinking += "\n\n";
+        lastPart.text += "\n\n";
+        stream.push({
+          type: "thinking_delta",
+          contentIndex: slot.contentIndex,
+          delta: "\n\n",
+          partial: output,
+        });
+      } else if (event.type === "response.reasoning_text.delta") {
+        const slot = outputSlots.resolve(event, "thinking");
+        if (!slot) {
+          continue;
+        }
+        slot.block.thinking += event.delta;
+        stream.push({
+          type: "thinking_delta",
+          contentIndex: slot.contentIndex,
+          delta: event.delta,
+          partial: output,
+        });
+      } else if (event.type === "response.content_part.added") {
+        const slot = outputSlots.resolve(event, "text");
+        if (!slot) {
+          continue;
+        }
+        slot.item.content = slot.item.content || [];
+        if (
+          event.part.type === OPENAI_RESPONSES_OUTPUT_TEXT_CONTENT_PART_TYPE ||
+          event.part.type === AZURE_RESPONSES_TEXT_CONTENT_PART_TYPE ||
+          event.part.type === "refusal"
+        ) {
+          slot.item.content.push(event.part);
+        }
+      } else if (event.type === "response.output_text.delta") {
+        const slot = outputSlots.resolve(event, "text");
+        if (!slot) {
+          continue;
+        }
+        slot.item.content ||= [];
+        let lastPart = slot.item.content[slot.item.content.length - 1];
+        if (!isResponsesTextContentPartType(lastPart?.type)) {
+          lastPart = { type: "output_text", text: "", annotations: [] };
+          slot.item.content.push(lastPart);
+        }
+        lastPart.text += event.delta;
+        if (slot.pendingText !== null) {
+          appendResponsesPendingTextDelta(slot, event.delta, materializeDeferredTextSlot);
+        } else if (slot.block && slot.contentIndex !== undefined) {
+          slot.block.text += event.delta;
+          // llm-core deliberately makes text_delta.partial optional to avoid a full snapshot per token.
           stream.push({
             type: "text_delta",
-            contentIndex: blockIndex(),
-            delta: stringifyUnknown(event.delta),
+            contentIndex: slot.contentIndex,
+            delta: event.delta,
           });
         }
-      }
-    } else if (type === "response.function_call_arguments.delta") {
-      const toolCall = streamingToolCalls.resolve(event);
-      if (toolCall) {
-        toolCall.block.partialJson = `${stringifyJsonLike(toolCall.block.partialJson)}${stringifyJsonLike(event.delta)}`;
-        toolCall.block.arguments = parseStreamingJson(
-          stringifyJsonLike(toolCall.block.partialJson),
-        );
-        stream.push({
-          type: "toolcall_delta",
-          contentIndex: toolCall.contentIndex,
-          delta: stringifyJsonLike(event.delta),
-          partial: output,
-        });
-      } else if (streamingToolCalls.hasActive()) {
-        streamingToolCalls.markArgumentsUnreliable();
-      }
-    } else if (type === "response.function_call_arguments.done") {
-      const toolCall = streamingToolCalls.resolve(event);
-      if (toolCall) {
-        const previousPartialJson = stringifyJsonLike(toolCall.block.partialJson);
-        const doneArguments = typeof event.arguments === "string" ? event.arguments : undefined;
-        if (
-          doneArguments !== undefined &&
-          (doneArguments.length > 0 || previousPartialJson === "")
-        ) {
-          toolCall.block.partialJson = doneArguments;
-          toolCall.block.arguments = parseStreamingJson(doneArguments);
-          toolCall.argumentStreamReliable = true;
+      } else if (isAzureResponsesTextDeltaEvent(event)) {
+        const slot = outputSlots.resolve(event, "text");
+        if (!slot) {
+          continue;
         }
-        if (doneArguments?.startsWith(previousPartialJson)) {
-          const delta = doneArguments.slice(previousPartialJson.length);
-          if (delta.length > 0) {
+        slot.item.content = slot.item.content || [];
+        let lastPart = slot.item.content[slot.item.content.length - 1];
+        if (lastPart?.type !== "text") {
+          lastPart = { type: "text", text: "" };
+          slot.item.content.push(lastPart);
+        }
+        lastPart.text += event.delta;
+        if (slot.pendingText !== null) {
+          appendResponsesPendingTextDelta(slot, event.delta, materializeDeferredTextSlot);
+        } else if (slot.block && slot.contentIndex !== undefined) {
+          slot.block.text += event.delta;
+          stream.push({
+            type: "text_delta",
+            contentIndex: slot.contentIndex,
+            delta: event.delta,
+          });
+        }
+      } else if (event.type === "response.refusal.delta") {
+        const slot = outputSlots.resolve(event, "text");
+        if (!slot) {
+          continue;
+        }
+        slot.item.content ||= [];
+        let lastPart = slot.item.content[slot.item.content.length - 1];
+        if (lastPart?.type !== "refusal") {
+          lastPart = { type: "refusal", refusal: "" };
+          slot.item.content.push(lastPart);
+        }
+        lastPart.refusal += event.delta;
+        if (slot.pendingText !== null) {
+          appendResponsesPendingTextDelta(slot, event.delta, materializeDeferredTextSlot);
+        } else if (slot.block && slot.contentIndex !== undefined) {
+          slot.block.text += event.delta;
+          stream.push({
+            type: "text_delta",
+            contentIndex: slot.contentIndex,
+            delta: event.delta,
+          });
+        }
+      } else if (event.type === "response.function_call_arguments.delta") {
+        const toolCall = streamingToolCalls.resolve(event);
+        if (toolCall) {
+          toolCall.block.partialJson += event.delta;
+          // Preview refresh is geometric; the done event and terminal finalize
+          // re-parse the full buffer authoritatively either way.
+          if (toolCall.previewSchedule(toolCall.block.partialJson.length)) {
+            toolCall.block.arguments = parseStreamingJson(toolCall.block.partialJson);
+          }
+          stream.push({
+            type: "toolcall_delta",
+            contentIndex: toolCall.contentIndex,
+            delta: event.delta,
+            partial: output,
+          });
+        } else if (streamingToolCalls.hasActive()) {
+          streamingToolCalls.markArgumentsUnreliable();
+        }
+      } else if (event.type === "response.function_call_arguments.done") {
+        const toolCall = streamingToolCalls.resolve(event);
+        if (toolCall) {
+          const previousPartialJson = toolCall.block.partialJson;
+          const doneArguments = typeof event.arguments === "string" ? event.arguments : undefined;
+
+          if (
+            doneArguments !== undefined &&
+            (doneArguments.length > 0 || previousPartialJson === "")
+          ) {
+            toolCall.block.partialJson = doneArguments;
+            toolCall.block.arguments = parseStreamingJson(toolCall.block.partialJson);
+            toolCall.argumentStreamReliable = true;
+          }
+
+          if (doneArguments?.startsWith(previousPartialJson)) {
+            const delta = doneArguments.slice(previousPartialJson.length);
+            if (delta.length > 0) {
+              stream.push({
+                type: "toolcall_delta",
+                contentIndex: toolCall.contentIndex,
+                delta,
+                partial: output,
+              });
+            }
+          }
+        } else if (streamingToolCalls.hasActive()) {
+          streamingToolCalls.markArgumentsUnreliable();
+        }
+      } else if (event.type === "response.output_item.done") {
+        const item = event.item;
+        if (item.type !== "message") {
+          lastTextBlock = null;
+        }
+
+        const existingOutputSlot = resolveOutputItemSlot(event, item);
+        materializeDeferredTextSlots(existingOutputSlot);
+        const outputSlot = existingOutputSlot ?? createOutputSlot(event, item);
+        compactionTracker.completed(item, blocks.length);
+        if (item.type === "reasoning" && outputSlot?.type === "thinking") {
+          const summaryText = item.summary?.map((s) => s.text).join("\n\n") || "";
+          const contentText = item.content?.map((c) => c.text).join("\n\n") || "";
+          outputSlot.block.thinking = summaryText || contentText || outputSlot.block.thinking;
+          outputSlot.block.thinkingSignature = JSON.stringify(item);
+          outputs.set(
+            item,
+            outputSlot.contentIndex,
+            readResponsesOutputIndex(event) ?? outputSlot.outputIndex,
+            true,
+          );
+          if (item.encrypted_content && options?.reasoningReplayMetadata) {
+            outputSlot.block[OPENAI_RESPONSES_REASONING_REPLAY_BLOCK_META_KEY] =
+              options.reasoningReplayMetadata;
+          }
+          stream.push({
+            type: "thinking_end",
+            contentIndex: outputSlot.contentIndex,
+            content: outputSlot.block.thinking,
+            partial: output,
+          });
+          outputSlots.forget(outputSlot);
+        } else if (
+          item.type === "message" &&
+          outputSlot?.type === "text" &&
+          (outputSlot.block || outputSlot.pendingText !== null)
+        ) {
+          // Support both OpenAI "output_text" and Azure "text" content types
+          const streamedText = outputSlot.pendingText ?? outputSlot.block?.text ?? "";
+          const finalText =
+            item.content == null
+              ? streamedText
+              : item.content
+                  .map((c) => (c.type === "output_text" || c.type === "text" ? c.text : c.refusal))
+                  .join("");
+          const phase = item.phase ?? undefined;
+          const collapse =
+            outputSlot.pendingText !== null
+              ? resolveResponsesMessageSnapshotCollapse({
+                  prior: outputSlot.collapseCandidate && {
+                    text: outputSlot.collapseCandidate.block.text,
+                    phase: outputSlot.collapseCandidate.phase,
+                  },
+                  nextText: finalText,
+                  nextPhase: phase,
+                })
+              : ({ kind: "keep" } as const);
+          outputSlot.pendingText = null;
+          if (collapse.kind === "extend" && outputSlot.collapseCandidate) {
+            // Cumulative snapshot of the prior message item: replace its text
+            // instead of appending another copy. The deferred block was never
+            // started publicly, and the newest item's signature is kept so
+            // replay carries the item that produced this content (#91959).
+            outputSlot.collapseCandidate.block.text = collapse.text;
+            outputSlot.collapseCandidate.block.textSignature = encodeTextSignatureV1(
+              item.id,
+              phase,
+            );
             stream.push({
-              type: "toolcall_delta",
-              contentIndex: toolCall.contentIndex,
-              delta,
+              type: "text_end",
+              contentIndex: outputSlot.collapseCandidate.index,
+              content: collapse.text,
+              partial: output,
+            });
+            lastTextBlock = outputSlot.collapseCandidate;
+            outputs.set(
+              item,
+              outputSlot.collapseCandidate.index,
+              readResponsesOutputIndex(event) ?? outputSlot.outputIndex,
+              true,
+            );
+          } else {
+            if (!outputSlot.block) {
+              // Deferred distinct message: open its block now, balanced with the
+              // text_end below.
+              outputSlot.block = {
+                type: "text",
+                text: "",
+                ...(phase ? { textSignature: encodeTextSignatureV1(item.id, phase) } : {}),
+              };
+              blocks.push(outputSlot.block);
+              outputSlot.contentIndex = blocks.length - 1;
+              stream.push({
+                type: "text_start",
+                contentIndex: outputSlot.contentIndex,
+                partial: output,
+              });
+            }
+            outputSlot.block.text = finalText;
+            outputSlot.block.textSignature = encodeTextSignatureV1(item.id, phase);
+            const contentIndex = outputSlot.contentIndex;
+            if (contentIndex === undefined) {
+              throw new Error("Responses stream finalized text without a content index");
+            }
+            lastTextBlock = { block: outputSlot.block, index: contentIndex, phase };
+            outputs.set(
+              item,
+              contentIndex,
+              readResponsesOutputIndex(event) ?? outputSlot.outputIndex,
+              true,
+            );
+            stream.push({
+              type: "text_end",
+              contentIndex,
+              content: outputSlot.block.text,
               partial: output,
             });
           }
-        }
-      } else if (streamingToolCalls.hasActive()) {
-        streamingToolCalls.markArgumentsUnreliable();
-      }
-    } else if (type === "response.output_item.done") {
-      const item = event.item as Record<string, unknown>;
-      if (item.type !== "message") {
-        lastTextBlock = null;
-        pendingMessageText = null;
-      }
-      if (item.type === "reasoning" && currentBlock?.type === "thinking") {
-        const summary = Array.isArray(item.summary)
-          ? item.summary
-              .map((part) => {
-                const summaryPart = part as { text?: string };
-                return summaryPart.text ?? "";
-              })
-              .join("\n\n")
-          : "";
-        currentBlock.thinking = summary;
-        currentBlock.thinkingSignature = JSON.stringify(item);
-        if ("encrypted_content" in item) {
-          currentBlock[OPENAI_RESPONSES_REASONING_REPLAY_BLOCK_META_KEY] =
-            buildOpenAIResponsesReasoningReplayMetadata(model, {
-              authProfileId: options?.authProfileId,
-              sessionId: options?.sessionId,
-            });
-        }
-        stream.push({
-          type: "thinking_end",
-          contentIndex: blockIndex(),
-          content: stringifyUnknown(currentBlock.thinking),
-          partial: output,
-        });
-        currentBlock = null;
-      } else if (
-        item.type === "message" &&
-        (currentBlock?.type === "text" || pendingMessageText !== null)
-      ) {
-        const content = Array.isArray(item.content) ? item.content : [];
-        const finalText = content
-          .map((part) => {
-            const contentPart = part as { type?: string; text?: string; refusal?: string };
-            return isResponsesTextContentPartType(contentPart.type)
-              ? (contentPart.text ?? "")
-              : (contentPart.refusal ?? "");
-          })
-          .join("");
-        const phase = (item.phase as "commentary" | "final_answer" | undefined) ?? undefined;
-        const collapse =
-          pendingMessageText !== null
-            ? resolveResponsesMessageSnapshotCollapse({
-                prior: lastTextBlock && {
-                  text: stringifyUnknown(lastTextBlock.block.text),
-                  phase: lastTextBlock.phase,
-                },
-                nextText: finalText,
-                nextPhase: phase,
-              })
-            : ({ kind: "keep" } as const);
-        pendingMessageText = null;
-        if (collapse.kind === "extend" && lastTextBlock) {
-          // Cumulative snapshot of the prior message item: replace its text
-          // instead of appending another copy. The deferred block was never
-          // started publicly, and the newest item's signature is kept so
-          // replay carries the item that produced this content (#91959).
-          lastTextBlock.block.text = collapse.text;
-          lastTextBlock.block.textSignature = encodeTextSignatureV1(
-            stringifyUnknown(item.id),
-            phase,
-          );
-          stream.push({
-            type: "text_end",
-            contentIndex: lastTextBlock.index,
-            content: collapse.text,
-            partial: output,
-          });
-        } else {
-          if (currentBlock?.type !== "text") {
-            // Deferred distinct message: open its block now, balanced with the
-            // text_end below.
-            currentBlock = {
-              type: "text",
-              text: "",
-              ...(phase
-                ? { textSignature: encodeTextSignatureV1(stringifyUnknown(item.id), phase) }
-                : {}),
-            };
-            output.content.push(currentBlock);
-            stream.push({ type: "text_start", contentIndex: blockIndex(), partial: output });
+          outputSlots.forget(outputSlot);
+        } else if (item.type === "function_call") {
+          if (outputs.get(item, readResponsesOutputIndex(event))?.completed) {
+            continue;
           }
-          currentBlock.text = finalText;
-          currentBlock.textSignature = encodeTextSignatureV1(stringifyUnknown(item.id), phase);
-          lastTextBlock = { block: currentBlock, index: blockIndex(), phase };
-          stream.push({
-            type: "text_end",
-            contentIndex: blockIndex(),
-            content: stringifyUnknown(currentBlock.text),
-            partial: output,
+          const streamingToolCall = streamingToolCalls.resolve(
+            event,
+            readResponsesToolCallItemIdentity(item),
+          );
+          // Do not turn an unresolved completion into a second public call while
+          // an indexed call is still open. Its identity or index must match.
+          if (!streamingToolCall && streamingToolCalls.hasActive()) {
+            continue;
+          }
+          const completedArguments =
+            typeof item.arguments === "string" ? item.arguments : undefined;
+          if (
+            streamingToolCall &&
+            !streamingToolCall.argumentStreamReliable &&
+            !completedArguments
+          ) {
+            continue;
+          }
+          const validated = resolveCompletedResponsesToolCall(item, {
+            name: streamingToolCall?.block.name,
+            arguments: completedArguments || streamingToolCall?.block.partialJson || "",
           });
-        }
-        currentBlock = null;
-      } else if (item.type === "function_call") {
-        const streamingToolCall = streamingToolCalls.resolve(
-          event,
-          readResponsesToolCallItemIdentity(item),
-        );
-        // Do not turn an unresolved completion into a second public call while
-        // an indexed call is still open. Its identity or index must match.
-        if (!streamingToolCall && streamingToolCalls.hasActive()) {
-          await cooperativeScheduler.afterEvent();
-          continue;
-        }
-        const completedName = resolveCompletedToolCallName(streamingToolCall, item.name);
-        const streamedPartialJson = streamingToolCall
-          ? stringifyJsonLike(streamingToolCall.block.partialJson)
-          : "";
-        const completedArguments = typeof item.arguments === "string" ? item.arguments : undefined;
-        if (streamingToolCall && !streamingToolCall.argumentStreamReliable && !completedArguments) {
-          await cooperativeScheduler.afterEvent();
-          continue;
-        }
-        const finalPartialJson =
-          completedArguments !== undefined &&
-          (completedArguments.length > 0 || !streamedPartialJson)
-            ? completedArguments
-            : streamedPartialJson || "{}";
-        const args = parseStreamingJson(finalPartialJson);
-        let toolCallBlock: Record<string, unknown>;
-        let contentIndex: number;
-        if (streamingToolCall) {
-          toolCallBlock = streamingToolCall.block;
-          contentIndex = streamingToolCall.contentIndex;
-        } else {
-          toolCallBlock = {
-            type: "toolCall",
-            id: resolveToolCallId(item),
-            name: completedName,
-            arguments: args,
-            partialJson: finalPartialJson,
-          };
-          output.content.push(toolCallBlock);
-          contentIndex = blockIndex();
-          stream.push({ type: "toolcall_start", contentIndex, partial: output });
-        }
-        const provisionalId = typeof toolCallBlock.id === "string" ? toolCallBlock.id : undefined;
-        const currentToolCallId = resolveToolCallId(item, provisionalId);
-        toolCallBlock.id = currentToolCallId;
-        toolCallBlock.name = completedName;
-        toolCallBlock.arguments = args;
-        toolCallBlock.partialJson = finalPartialJson;
-        stream.push({
-          type: "toolcall_end",
-          contentIndex,
-          toolCall: {
-            type: "toolCall",
-            id: currentToolCallId,
-            name: completedName,
-            arguments: args,
-          },
-          partial: output,
-        });
-        if (streamingToolCall) {
-          streamingToolCalls.forget(streamingToolCall);
-        }
-        if (currentBlock === toolCallBlock) {
-          currentBlock = null;
-          currentItem = null;
-        }
-      }
-    } else if (type === "response.completed" || type === "response.incomplete") {
-      if (streamingToolCalls.hasActive()) {
-        throw new Error("Responses stream completed with unresolved tool calls");
-      }
-      const response = event.response as Record<string, unknown> | undefined;
-      if (typeof response?.id === "string") {
-        output.responseId = response.id;
-      }
-      if (type === "response.completed") {
-        backfillTerminalResponseOutput(response, { includeToolCalls: true });
-      }
-      recordResponsesTerminalOutcome({
-        response,
-        output,
-        model,
-        serviceTier: options?.serviceTier,
-        applyServiceTierPricing: options?.applyServiceTierPricing,
-      });
-      if (type === "response.incomplete" && output.stopReason === "length") {
-        // Some compatible endpoints carry generated text only on the terminal event. Preserve
-        // that partial answer, but never materialize an incomplete function call for execution.
-        backfillTerminalResponseOutput(response, { includeToolCalls: false });
-      }
-    } else if (type === "error") {
-      throw new Error(
-        `Error Code ${stringifyUnknown(event.code, "unknown")}: ${stringifyUnknown(event.message, "Unknown error")}`,
-      );
-    } else if (type === "response.failed") {
-      const failure = normalizeResponsesFailedEvent(event, model);
-      if (failure.responseId) {
-        output.responseId = failure.responseId;
-      }
-      if (failure.observation) {
-        logResponsesFailedNoDetails(failure.observation);
-      }
-      throw new Error(failure.message);
-    }
-    await cooperativeScheduler.afterEvent();
-  }
-  if (streamingToolCalls.hasActive()) {
-    throw new Error("Responses stream ended with unresolved tool calls");
-  }
-  const eventTypeSummary = [...eventTypes.entries()]
-    .slice(0, 12)
-    .map(([eventType, count]) => `${eventType}:${count}`)
-    .join(",");
-  emitModelTransportDebug(
-    log,
-    `[responses] stream_done provider=${model.provider} api=${model.api} model=${model.id} ` +
-      `elapsedMs=${Date.now() - streamStartedAt} events=${eventCount} types=${eventTypeSummary} ` +
-      `stopReason=${output.stopReason ?? "unset"} contentBlocks=${output.content.length}`,
-  );
-}
 
-function readResponsesOutputMessageText(item: Record<string, unknown>): string {
-  const content = Array.isArray(item.content) ? item.content : [];
-  return content
-    .map((part) => {
-      if (!isRecord(part)) {
-        return "";
+          finalizeToolCall(item, readResponsesOutputIndex(event), streamingToolCall, validated);
+        }
+      } else if (event.type === "response.completed" || event.type === "response.incomplete") {
+        if (event.type === "response.incomplete" && streamingToolCalls.hasActive()) {
+          throw new Error("Responses stream completed with unresolved tool calls");
+        }
+        terminal.finalizeResponse(event.response, event.type);
+        if (event.type === "response.completed" || output.stopReason === "length") {
+          const items = event.response.output ?? [];
+          const completeToolCall =
+            event.type === "response.completed" ? prepareTerminalToolCalls(items) : undefined;
+          terminal.recoverTerminalOutput(items, completeToolCall);
+        }
+        terminalResponse = event.type === "response.completed" ? event.response : null;
+        if (
+          output.stopReason === "stop" &&
+          output.content.some((block) => block.type === "toolCall")
+        ) {
+          output.stopReason = "toolUse";
+        }
+        break;
+      } else if (event.type === "error") {
+        throw new Error(
+          event.message ? `Error Code ${event.code}: ${event.message}` : "Unknown error",
+        );
+      } else if (event.type === "response.failed") {
+        const failure = normalizeResponsesFailedEvent(isRecord(event) ? event : {}, model);
+        terminal.finalizeFailedResponse(event.response, failure.responseId);
+        throw new ResponsesStreamFailure(failure, event.response);
       }
-      if (part.type === "output_text" || part.type === "text") {
-        return stringifyUnknown(part.text);
-      }
-      if (part.type === "refusal") {
-        return stringifyUnknown(part.refusal);
-      }
-      return "";
-    })
-    .join("");
+    }
+    // openai-node turns an aborted SSE iterator into normal completion; preserve
+    // the caller's authoritative reason before classifying terminal stream state.
+    if (options?.signal?.aborted) {
+      throw transportAbortError(options.signal);
+    }
+    if (streamingToolCalls.hasActive()) {
+      throw new Error("Responses stream ended with unresolved tool calls");
+    }
+    if (terminalResponse === undefined) {
+      throw new Error("OpenAI Responses stream ended before a terminal response event");
+    }
+    return terminalResponse ?? undefined;
+  } finally {
+    for (const block of output.content) {
+      delete (block as { partialJson?: string }).partialJson;
+    }
+  }
 }

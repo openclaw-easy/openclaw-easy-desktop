@@ -1,8 +1,7 @@
-// QR image tests cover QR image generation and file output.
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 const { MOCK_PNG_BASE64, MOCK_PNG_BUFFER, toBuffer } = vi.hoisted(() => {
   const MOCK_PNG_BUFFERLocal = Buffer.from("fakepng");
@@ -13,13 +12,18 @@ const { MOCK_PNG_BASE64, MOCK_PNG_BUFFER, toBuffer } = vi.hoisted(() => {
   };
 });
 
-vi.mock("qrcode", () => ({
-  default: {
-    toBuffer,
-  },
+vi.mock("./qr-runtime.ts", () => ({
+  loadQrCodeRuntime: async () => ({ toBuffer }),
 }));
 
-import { renderQrPngBase64, renderQrPngDataUrl, writeQrPngTempFile } from "./qr-image.ts";
+let renderQrPngBase64: typeof import("./qr-image.ts").renderQrPngBase64;
+let renderQrPngDataUrl: typeof import("./qr-image.ts").renderQrPngDataUrl;
+let writeQrPngTempFile: typeof import("./qr-image.ts").writeQrPngTempFile;
+
+beforeAll(async () => {
+  vi.resetModules();
+  ({ renderQrPngBase64, renderQrPngDataUrl, writeQrPngTempFile } = await import("./qr-image.ts"));
+});
 
 describe("renderQrPngBase64", () => {
   const tmpRoot = path.join(os.tmpdir(), "openclaw-qr-image-tests");
@@ -105,4 +109,9 @@ describe("renderQrPngBase64", () => {
     ).rejects.toThrow(`${name} must be a non-empty filename segment.`);
     expect(toBuffer).not.toHaveBeenCalled();
   });
+});
+
+afterAll(() => {
+  vi.doUnmock("./qr-runtime.ts");
+  vi.resetModules();
 });

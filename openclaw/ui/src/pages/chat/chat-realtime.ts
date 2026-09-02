@@ -1,7 +1,9 @@
 import type { GatewayBrowserClient } from "../../api/gateway.ts";
 import { loadSettings, patchSettings, type UiSettings } from "../../app/settings.ts";
+import { formatUiError, formatUiExternalText } from "../../lib/format-error.ts";
 import {
   createRealtimeTalkConversationState,
+  orderRealtimeTalkConversation,
   updateRealtimeTalkConversation,
   type RealtimeTalkConversationEntry,
   type RealtimeTalkConversationState,
@@ -56,16 +58,15 @@ export function createInitialChatRealtimeState() {
   };
 }
 
-export function resetChatRealtimeConversation(state: ChatRealtimeState) {
+function resetChatRealtimeConversation(state: ChatRealtimeState) {
   state.realtimeTalkConversationState = createRealtimeTalkConversationState();
   state.realtimeTalkConversation = [];
 }
 
-export function dismissRealtimeTalkError(state: ChatRealtimeState) {
-  if (state.realtimeTalkStatus !== "error") {
-    return;
-  }
-  state.realtimeTalkSession?.stop();
+export function stopChatRealtimeTalk(state: ChatRealtimeState) {
+  const session = state.realtimeTalkSession;
+  // Retire callback ownership before stop() can synchronously report idle.
+  // Otherwise a closing session can still mutate the newly selected route.
   state.realtimeTalkSession = null;
   state.realtimeTalkActive = false;
   state.realtimeTalkStatus = "idle";
@@ -76,7 +77,15 @@ export function dismissRealtimeTalkError(state: ChatRealtimeState) {
   state.realtimeTalkVideoCapable = false;
   state.realtimeTalkVideoPending = false;
   state.realtimeTalkCameraError = false;
-  state.resetRealtimeTalkConversation();
+  resetChatRealtimeConversation(state);
+  session?.stop();
+}
+
+export function dismissRealtimeTalkError(state: ChatRealtimeState) {
+  if (state.realtimeTalkStatus !== "error") {
+    return;
+  }
+  stopChatRealtimeTalk(state);
 }
 
 export function attachChatRealtimeActions(state: ChatRealtimeState) {
@@ -85,7 +94,7 @@ export function attachChatRealtimeActions(state: ChatRealtimeState) {
     state.settings = patchSettings({ talkCameraAutoEnable: enabled });
   };
   const showCameraError = (error: unknown) => {
-    state.realtimeTalkDetail = error instanceof Error ? error.message : String(error);
+    state.realtimeTalkDetail = formatUiError(error);
     state.realtimeTalkCameraError = true;
     state.requestUpdate();
   };
@@ -143,18 +152,7 @@ export function attachChatRealtimeActions(state: ChatRealtimeState) {
   };
   state.toggleRealtimeTalk = async () => {
     if (state.realtimeTalkSession) {
-      state.realtimeTalkSession.stop();
-      state.realtimeTalkSession = null;
-      state.realtimeTalkActive = false;
-      state.realtimeTalkStatus = "idle";
-      state.realtimeTalkDetail = null;
-      state.realtimeTalkInputLevel.set(0);
-      state.realtimeTalkVideoStream = null;
-      state.realtimeTalkCameraDevices = [];
-      state.realtimeTalkVideoCapable = false;
-      state.realtimeTalkVideoPending = false;
-      state.realtimeTalkCameraError = false;
-      state.resetRealtimeTalkConversation();
+      stopChatRealtimeTalk(state);
       state.requestUpdate();
       return;
     }
@@ -188,7 +186,8 @@ export function attachChatRealtimeActions(state: ChatRealtimeState) {
             return;
           }
           state.realtimeTalkStatus = status;
-          state.realtimeTalkDetail = detail ?? null;
+          state.realtimeTalkDetail =
+            status === "error" && detail ? formatUiExternalText(detail) : (detail ?? null);
           state.realtimeTalkCameraError = false;
           state.realtimeTalkActive = status !== "idle";
           if (status === "idle" || status === "error") {
@@ -232,6 +231,17 @@ export function attachChatRealtimeActions(state: ChatRealtimeState) {
           state.realtimeTalkConversation = state.realtimeTalkConversationState.entries;
           state.requestUpdate();
         },
+        onTranscriptOrder: (orders) => {
+          if (state.realtimeTalkSession !== session) {
+            return;
+          }
+          state.realtimeTalkConversationState = orderRealtimeTalkConversation(
+            state.realtimeTalkConversationState,
+            orders,
+          );
+          state.realtimeTalkConversation = state.realtimeTalkConversationState.entries;
+          state.requestUpdate();
+        },
         onVideoStream: (stream) => {
           if (state.realtimeTalkSession !== session) {
             return;
@@ -265,17 +275,10 @@ export function attachChatRealtimeActions(state: ChatRealtimeState) {
       if (state.realtimeTalkSession !== session) {
         return;
       }
-      session.stop();
-      state.realtimeTalkSession = null;
-      state.realtimeTalkActive = false;
+      const detail = formatUiError(error);
+      stopChatRealtimeTalk(state);
       state.realtimeTalkStatus = "error";
-      state.realtimeTalkDetail = error instanceof Error ? error.message : String(error);
-      state.realtimeTalkInputLevel.set(0);
-      state.realtimeTalkVideoStream = null;
-      state.realtimeTalkCameraDevices = [];
-      state.realtimeTalkVideoCapable = false;
-      state.realtimeTalkVideoPending = false;
-      state.realtimeTalkCameraError = false;
+      state.realtimeTalkDetail = detail;
       state.requestUpdate();
     }
   };

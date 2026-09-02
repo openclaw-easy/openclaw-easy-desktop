@@ -1,15 +1,21 @@
+import { clampPositiveTimerTimeoutMs } from "@openclaw/normalization-core/number-coercion";
+import { isPromiseLike } from "@openclaw/normalization-core/promise-like";
+import { isRecord } from "@openclaw/normalization-core/record-coerce";
 // Model-backed image understanding runtime for providers without a native media
 // provider hook.
-import { clampPositiveTimerTimeoutMs } from "@openclaw/normalization-core/number-coercion";
-import { isRecord } from "@openclaw/normalization-core/record-coerce";
+import { normalizeMediaProviderId } from "../../packages/media-understanding-common/src/provider-id.js";
 import { isMinimaxVlmModel, minimaxUnderstandImage } from "../agents/minimax-vlm.js";
-import { requireApiKey, resolveApiKeyForProvider } from "../agents/model-auth.js";
+import { requireApiKey, resolveApiKeyForProviderCore } from "../agents/model-auth.js";
 import { resolveProviderRequestCapabilities } from "../agents/provider-attribution.js";
 import {
+  getModelProviderRequestRouteFacts,
   getModelProviderRequestTransport,
   type ModelProviderRequestTransportOverrides,
 } from "../agents/provider-request-config.js";
-import { unwrapSecretSentinelsForProviderEgress } from "../agents/provider-secret-egress.js";
+import {
+  unwrapModelHeaderSentinelsForProviderEgress,
+  unwrapSecretSentinelsForProviderEgress,
+} from "../agents/provider-secret-egress.js";
 import { registerProviderStreamForModel } from "../agents/provider-stream.js";
 import {
   coerceImageAssistantText,
@@ -18,9 +24,7 @@ import {
 import { isSecretRef } from "../config/types.secrets.js";
 import { complete } from "../llm/stream.js";
 import type { AssistantMessage, Context, Model, ProviderStreamOptions } from "../llm/types.js";
-import { buildCopilotIdeHeaders, COPILOT_INTEGRATION_ID } from "../plugin-sdk/provider-auth.js";
 import { getResolvedImageRuntimeContext, resolveImageRuntime } from "./image-model-runtime.js";
-import { normalizeMediaProviderId } from "./provider-id.js";
 import type {
   ImageDescriptionRequest,
   ImageDescriptionResult,
@@ -53,6 +57,7 @@ function isNativeResponsesReasoningPayload(model: Model): boolean {
     baseUrl: model.baseUrl,
     capability: "image",
     transport: "media-understanding",
+    providerMetadataOwners: getModelProviderRequestRouteFacts(model)?.providerMetadataOwners,
   }).usesKnownNativeOpenAIRoute;
 }
 
@@ -89,10 +94,6 @@ function disableReasoningForImageRetryPayload(payload: unknown, model: Model): u
 
 function isImageModelNoTextError(err: unknown): boolean {
   return err instanceof Error && /^Image model returned no text\b/.test(err.message);
-}
-
-function isPromiseLike(value: unknown): value is PromiseLike<unknown> {
-  return Boolean(value) && typeof (value as { then?: unknown }).then === "function";
 }
 
 function composeImageDescriptionPayloadHandlers(
@@ -163,6 +164,7 @@ function shouldPlaceImagePromptInUserContent(model: Model): boolean {
     baseUrl: model.baseUrl,
     capability: "image",
     transport: "media-understanding",
+    providerMetadataOwners: getModelProviderRequestRouteFacts(model)?.providerMetadataOwners,
   });
   return (
     capabilities.endpointClass === "openrouter" ||
@@ -176,9 +178,6 @@ function buildImageRequestHeaders(model: Model): Record<string, string> | undefi
     return undefined;
   }
   return {
-    ...buildCopilotIdeHeaders(),
-    "Copilot-Integration-Id": COPILOT_INTEGRATION_ID,
-    "Openai-Organization": "github-copilot",
     "x-initiator": "user",
     "Copilot-Vision-Request": "true",
   };
@@ -314,7 +313,7 @@ async function resolveMinimaxVlmFallbackRuntime(params: {
   preferredProfile?: string;
 }): Promise<{ runtimeValue: string; modelBaseUrl?: string }> {
   const authProvider = resolveMinimaxVlmAuthProvider(params.cfg, params.provider);
-  const auth = await resolveApiKeyForProvider({
+  const auth = await resolveApiKeyForProviderCore({
     provider: authProvider,
     cfg: params.cfg,
     secretSentinels: true,
@@ -495,8 +494,14 @@ async function describeImagesWithModelInternal(
     }
 
     const resolvedRuntimeContext = getResolvedImageRuntimeContext(model);
-    const providerStreamFn = registerProviderStreamForModel({
+    // Prepared auth may carry sentinel-protected request headers. Resolve them only at this
+    // final direct-completion boundary so provider SDKs never receive sentinel placeholders.
+    const requestModel = unwrapModelHeaderSentinelsForProviderEgress(
       model,
+      "image description provider request",
+    );
+    const providerStreamFn = registerProviderStreamForModel({
+      model: requestModel,
       cfg: resolvedRuntimeContext?.cfg ?? params.cfg,
       agentDir: resolvedRuntimeContext?.agentDir ?? params.agentDir,
       ...(resolvedRuntimeContext?.workspaceDir
@@ -515,7 +520,7 @@ async function describeImagesWithModelInternal(
       params.signal?.throwIfAborted();
       const payloadHandler = composeImageDescriptionPayloadHandlers(onPayload, options.onPayload);
       const timeoutMs = configuredTimeoutMs;
-      const headers = buildImageRequestHeaders(model);
+      const headers = buildImageRequestHeaders(requestModel);
       const streamOptions = {
         apiKey,
         maxTokens,
@@ -525,8 +530,9 @@ async function describeImagesWithModelInternal(
         ...(payloadHandler ? { onPayload: payloadHandler } : {}),
       };
       const task: Promise<AssistantMessage> = providerStreamFn
-        ? (async () => await (await providerStreamFn(model, context, streamOptions)).result())()
-        : complete(model, context, streamOptions);
+        ? (async () =>
+            await (await providerStreamFn(requestModel, context, streamOptions)).result())()
+        : complete(requestModel, context, streamOptions);
       return await withImageDescriptionTimeout({
         controller,
         signal: params.signal,
@@ -594,30 +600,30 @@ function toImagesDescriptionRequest(params: ImageDescriptionRequest): ImagesDesc
   };
 }
 
-export async function describeImagesWithModel(
+export async function describeImagesWithModelCore(
   params: ImagesDescriptionRequest,
 ): Promise<ImagesDescriptionResult> {
   return await describeImagesWithModelInternal(params);
 }
 
-export async function describeImagesWithModelPayloadTransform(
+export async function describeImagesWithModelPayloadTransformCore(
   params: ImagesDescriptionRequest,
   onPayload: ProviderStreamOptions["onPayload"],
 ): Promise<ImagesDescriptionResult> {
   return await describeImagesWithModelInternal(params, { onPayload });
 }
 
-export async function describeImageWithModel(
+export async function describeImageWithModelCore(
   params: ImageDescriptionRequest,
 ): Promise<ImageDescriptionResult> {
-  return await describeImagesWithModel(toImagesDescriptionRequest(params));
+  return await describeImagesWithModelCore(toImagesDescriptionRequest(params));
 }
 
-export async function describeImageWithModelPayloadTransform(
+export async function describeImageWithModelPayloadTransformCore(
   params: ImageDescriptionRequest,
   onPayload: ProviderStreamOptions["onPayload"],
 ): Promise<ImageDescriptionResult> {
-  return await describeImagesWithModelPayloadTransform(
+  return await describeImagesWithModelPayloadTransformCore(
     toImagesDescriptionRequest(params),
     onPayload,
   );

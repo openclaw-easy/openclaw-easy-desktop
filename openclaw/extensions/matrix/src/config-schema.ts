@@ -38,7 +38,7 @@ const matrixThreadBindingsSchema = z
 
 const matrixExecApprovalsSchema = z
   .object({
-    enabled: z.boolean().optional(),
+    enabled: z.union([z.boolean(), z.literal("auto")]).optional(),
     approvers: AllowFromListSchema,
     agentFilter: z.array(z.string()).optional(),
     sessionFilter: z.array(z.string()).optional(),
@@ -130,16 +130,21 @@ function hasCanonicalMatrixAccountStreaming(account: unknown): boolean {
 const MatrixConfigSchema = z.object({
   name: z.string().optional(),
   enabled: z.boolean().optional(),
+  configWrites: z.boolean().optional(),
+  joinIntro: z.boolean().optional(),
   defaultAccount: z.string().optional(),
   // Accounts stay schema-open, but retired scalar streaming must fail loudly
   // instead of silently resolving to "off"; doctor migrates the old spelling.
   accounts: z
     .record(
       z.string(),
-      z.unknown().refine(hasCanonicalMatrixAccountStreaming, {
-        message:
-          'flat or scalar streaming values are no longer supported; use streaming.* and run "openclaw doctor --fix"',
-      }),
+      z
+        .object({ joinIntro: z.boolean().optional() })
+        .passthrough()
+        .refine(hasCanonicalMatrixAccountStreaming, {
+          message:
+            'flat or scalar streaming values are no longer supported; use streaming.* and run "openclaw doctor --fix"',
+        }),
     )
     .optional(),
   markdown: MarkdownConfigSchema,

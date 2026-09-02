@@ -38,9 +38,46 @@ export function findClaudeMcpConfigPaths(args?: string[]): string[] {
 }
 
 /** Return Claude args with OpenClaw's strict MCP config path injected. */
+function mergeClaudeDisallowedTools(args: string[], deniedTools: string[]): string[] {
+  if (deniedTools.length === 0) {
+    return args;
+  }
+  const next: string[] = [];
+  const existingDisallowed: string[] = [];
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i] ?? "";
+    if (arg === "--disallowedTools" || arg === "--disallowed-tools") {
+      while (typeof args[i + 1] === "string" && !args[i + 1]?.startsWith("-")) {
+        i += 1;
+        existingDisallowed.push(args[i] ?? "");
+      }
+      continue;
+    }
+    if (arg.startsWith("--disallowedTools=") || arg.startsWith("--disallowed-tools=")) {
+      existingDisallowed.push(arg.slice(arg.indexOf("=") + 1));
+      continue;
+    }
+    next.push(arg);
+  }
+  next.push("--disallowedTools", [...new Set([...existingDisallowed, ...deniedTools])].join(","));
+  return next;
+}
+
+function normalizeClaudeMcpIdentifierPart(value: string): string {
+  // Claude Code replaces punctuation before registering MCP permission names.
+  // Match that wire identity so a raw-name collision cannot bypass a denial.
+  return value.replaceAll(/[^a-zA-Z0-9_-]/g, "_");
+}
+
+export function injectClaudeWebSearchDisabledArgs(args: string[] | undefined): string[] {
+  return mergeClaudeDisallowedTools(args ?? [], ["WebSearch"]);
+}
+
 export function injectClaudeMcpConfigArgs(
   args: string[] | undefined,
   mcpConfigPath: string,
+  mcpToolsDeny?: Record<string, string[]>,
+  webSearchEnabled?: boolean,
 ): string[] {
   const next: string[] = [];
   for (let i = 0; i < (args?.length ?? 0); i += 1) {
@@ -60,7 +97,16 @@ export function injectClaudeMcpConfigArgs(
     next.push(arg);
   }
   next.push("--strict-mcp-config", "--mcp-config", mcpConfigPath);
-  return next;
+  const deniedTools = Object.entries(mcpToolsDeny ?? {}).flatMap(([serverName, toolNames]) =>
+    toolNames.map(
+      (toolName) =>
+        `mcp__${normalizeClaudeMcpIdentifierPart(serverName)}__${normalizeClaudeMcpIdentifierPart(toolName)}`,
+    ),
+  );
+  if (webSearchEnabled === false) {
+    deniedTools.push("WebSearch");
+  }
+  return mergeClaudeDisallowedTools(next, deniedTools.toSorted());
 }
 
 /** Writes the active per-attempt capture token into OpenClaw's generated Claude MCP config. */

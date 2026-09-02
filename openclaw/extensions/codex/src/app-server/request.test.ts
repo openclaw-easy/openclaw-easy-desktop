@@ -1,4 +1,5 @@
 // Codex tests cover request plugin behavior.
+import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const sharedClientMocks = vi.hoisted(() => ({
@@ -20,7 +21,9 @@ vi.mock("./shared-client.js", () => ({
   getLeasedSharedCodexAppServerClient: sharedClientMocks.getSharedCodexAppServerClient,
 }));
 
-const { readCodexAppServerUsage, requestCodexAppServerJson } = await import("./request.js");
+const { readCodexAppServerUsage, requestCodexAppServerJson, withCodexAppServerJsonClient } =
+  await import("./request.js");
+const { listAllCodexAppServerModels } = await import("./models.js");
 
 const expectDeadlineOptions = () =>
   expect.objectContaining({ timeoutMs: expect.any(Number), signal: expect.anything() });
@@ -84,6 +87,102 @@ describe("requestCodexAppServerJson sandbox guard", () => {
 
     expect(request).toHaveBeenCalledWith("thread/list", { limit: 10 }, expectDeadlineOptions());
   });
+
+  it.each([
+    {
+      method: "app/installed" as const,
+      requestParams: { threadId: "thread-1", forceRefresh: false },
+      response: { apps: [] },
+    },
+    {
+      method: "app/read" as const,
+      requestParams: { appIds: ["calendar-app"], includeTools: false },
+      response: { apps: [] },
+    },
+    {
+      method: "plugin/installed" as const,
+      requestParams: { cwds: [] },
+      response: { marketplaces: [], marketplaceLoadErrors: [] },
+    },
+    {
+      method: "config/batchWrite" as const,
+      requestParams: {
+        edits: [
+          {
+            keyPath: 'apps."calendar".tools."create".approval_mode',
+            value: null,
+            mergeStrategy: "replace" as const,
+          },
+        ],
+      },
+      response: {
+        status: "ok",
+        version: "1",
+        filePath: "/codex/config.toml",
+        overriddenMetadata: null,
+      },
+    },
+  ])(
+    "allows the $method control-plane request under sandbox and node execution policies",
+    async ({ method, requestParams, response }) => {
+      const request = vi.fn(async () => response);
+      sharedClientMocks.getSharedCodexAppServerClient.mockResolvedValue({ request });
+
+      for (const policy of [
+        {
+          config: { agents: { defaults: { sandbox: { mode: "all" as const } } } },
+          sessionKey: "sandboxed-session",
+        },
+        {
+          config: { tools: { exec: { host: "node" as const, node: "worker-1" } } },
+          sessionKey: "node-session",
+        },
+      ]) {
+        await expect(
+          requestCodexAppServerJson({
+            method,
+            requestParams,
+            ...policy,
+          }),
+        ).resolves.toEqual(response);
+      }
+
+      expect(request).toHaveBeenCalledTimes(2);
+      expect(request).toHaveBeenNthCalledWith(1, method, requestParams, expectDeadlineOptions());
+      expect(request).toHaveBeenNthCalledWith(2, method, requestParams, expectDeadlineOptions());
+    },
+  );
+
+  it.each([
+    {
+      description: "sandboxed",
+      config: { agents: { defaults: { sandbox: { mode: "all" as const } } } },
+      sessionKey: "sandboxed-session",
+      reason: "OpenClaw sandboxing is active for this session",
+    },
+    {
+      description: "node-hosted",
+      config: { tools: { exec: { host: "node" as const, node: "worker-1" } } },
+      sessionKey: "node-session",
+      reason: "OpenClaw exec host=node is active for this session",
+    },
+  ])(
+    "fails closed for unlisted app methods in $description sessions",
+    async ({ config, sessionKey, reason }) => {
+      await expect(
+        requestCodexAppServerJson({
+          method: "app/activate",
+          requestParams: {},
+          config,
+          sessionKey,
+        }),
+      ).rejects.toThrow(
+        `Codex-native app-server method \`app/activate\` is unavailable because ${reason}.`,
+      );
+
+      expect(sharedClientMocks.getSharedCodexAppServerClient).not.toHaveBeenCalled();
+    },
+  );
 
   it("allows current native thread management methods in sandboxed sessions", async () => {
     const request = vi.fn(async () => ({ ok: true }));
@@ -332,6 +431,87 @@ describe("requestCodexAppServerJson sandbox guard", () => {
     expect(secondRequest).not.toHaveBeenCalled();
   });
 
+  it("does not resume or publish a control attachment after its passive preflight times out", async () => {
+    const { codexControlRequest } = await import("../command-rpc.js");
+    vi.useFakeTimers();
+    let releasePreflight!: () => void;
+    const preflight = new Promise<void>((resolve) => {
+      releasePreflight = resolve;
+    });
+    const request = vi.fn(async (_method: string) => ({ thread: { id: "thread-1" } }));
+    sharedClientMocks.getSharedCodexAppServerClient.mockResolvedValue({ request });
+    const onResponse = vi.fn();
+
+    const result = codexControlRequest(
+      {},
+      "thread/resume",
+      { threadId: "thread-1" },
+      {
+        authProfileId: null,
+        timeoutMs: 50,
+        beforeRequest: async (send) => {
+          await send({
+            method: "thread/read",
+            requestParams: { threadId: "thread-1", includeTurns: false },
+          });
+          await preflight;
+        },
+        onResponse,
+      },
+    );
+    const settled = result.then(
+      (value) => ({ status: "fulfilled", value }),
+      (error: unknown) => ({ status: "rejected", error }),
+    );
+    await vi.advanceTimersByTimeAsync(50);
+    expect(await settled).toMatchObject({
+      status: "rejected",
+      error: expect.objectContaining({ message: expect.stringContaining("timed out") }),
+    });
+    releasePreflight();
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(request.mock.calls.map(([method]) => method)).toEqual(["thread/read"]);
+    expect(onResponse).not.toHaveBeenCalled();
+    expect(sharedClientMocks.releaseLeasedSharedCodexAppServerClient).toHaveBeenCalledOnce();
+    expect(sharedClientMocks.retireSharedCodexAppServerClientIfCurrent).not.toHaveBeenCalled();
+  });
+
+  it("revokes scoped requests and mutation authority when their client lease ends", async () => {
+    const request = vi.fn(async () => ({ ok: true }));
+    sharedClientMocks.getSharedCodexAppServerClient.mockResolvedValue({ request });
+    const retained = await withCodexAppServerJsonClient({}, async (send, _client, scope) => {
+      await send({ method: "thread/read", requestParams: { threadId: "thread-1" } });
+      return { send, assertCurrent: scope.assertCurrent };
+    });
+
+    expect(retained.assertCurrent).toThrow();
+    await expect(
+      retained.send({ method: "thread/resume", requestParams: { threadId: "thread-1" } }),
+    ).rejects.toThrow();
+    await expect(listAllCodexAppServerModels({ request: retained.send })).rejects.toThrow(
+      "codex app-server request timed out",
+    );
+    expect(request).toHaveBeenCalledOnce();
+  });
+
+  it("does not request another model page after the shared deadline", async () => {
+    vi.useFakeTimers();
+    const page = createDeferred<{ data: never[]; nextCursor: string }>();
+    const request = vi.fn(() => page.promise);
+    sharedClientMocks.getSharedCodexAppServerClient.mockResolvedValue({ request });
+    const result = withCodexAppServerJsonClient({ timeoutMs: 50 }, async (scopedRequest) =>
+      listAllCodexAppServerModels({ request: scopedRequest }),
+    );
+    const rejection = expect(result).rejects.toThrow("codex app-server request timed out");
+    await vi.advanceTimersByTimeAsync(50);
+    await rejection;
+    page.resolve({ data: [], nextCursor: "next-page" });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(request).toHaveBeenCalledOnce();
+    expect(sharedClientMocks.releaseLeasedSharedCodexAppServerClient).toHaveBeenCalledOnce();
+  });
+
   it("blocks thread starts with sandbox environments when exec host=node is active", async () => {
     const params = {
       cwd: "/workspace",
@@ -353,6 +533,63 @@ describe("requestCodexAppServerJson sandbox guard", () => {
     );
 
     expect(sharedClientMocks.getSharedCodexAppServerClient).not.toHaveBeenCalled();
+  });
+
+  it("shares one guarded isolated client across installed-plugin and account reads", async () => {
+    const installed = { marketplaces: [], marketplaceLoadErrors: [] };
+    const account = { account: { email: "codex-source@example.com" } };
+    const request = vi.fn(async (method: string) =>
+      method === "plugin/installed" ? installed : account,
+    );
+    const closeAndWait = vi.fn(async () => undefined);
+    sharedClientMocks.createIsolatedCodexAppServerClient.mockResolvedValue({
+      request,
+      closeAndWait,
+    });
+    const startOptions = {
+      transport: "stdio" as const,
+      command: "codex",
+      args: ["app-server", "--listen", "stdio://"],
+      headers: {},
+      env: { CODEX_HOME: "/source/.codex", HOME: "/source" },
+    };
+
+    await expect(
+      withCodexAppServerJsonClient(
+        { timeoutMs: 5_000, startOptions, authProfileId: null, isolated: true },
+        async (scopedRequest) => ({
+          installed: await scopedRequest<typeof installed>({
+            method: "plugin/installed",
+            requestParams: { cwds: [] },
+          }),
+          account: await scopedRequest<typeof account>({
+            method: "account/read",
+            requestParams: { refreshToken: false },
+          }),
+        }),
+      ),
+    ).resolves.toEqual({ installed, account });
+
+    expect(sharedClientMocks.createIsolatedCodexAppServerClient).toHaveBeenCalledTimes(1);
+    expect(sharedClientMocks.createIsolatedCodexAppServerClient).toHaveBeenCalledWith(
+      expect.objectContaining({ startOptions, authProfileId: null }),
+    );
+    expect(request).toHaveBeenNthCalledWith(
+      1,
+      "plugin/installed",
+      { cwds: [] },
+      expectDeadlineOptions(),
+    );
+    expect(request).toHaveBeenNthCalledWith(
+      2,
+      "account/read",
+      { refreshToken: false },
+      expectDeadlineOptions(),
+    );
+    expect(closeAndWait).toHaveBeenCalledExactlyOnceWith({
+      exitTimeoutMs: 2_000,
+      forceKillDelayMs: 250,
+    });
   });
 
   it("reads usage and account identity over one isolated client", async () => {

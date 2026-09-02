@@ -1,20 +1,18 @@
 import { readProviderJsonResponse } from "openclaw/plugin-sdk/provider-http";
 // Perplexity provider module implements model/runtime integration.
 import {
-  readPositiveIntegerParam,
-  readStringArrayParam,
-  readStringParam,
-} from "openclaw/plugin-sdk/provider-web-search";
-import {
   buildSearchCacheKey,
   DEFAULT_SEARCH_COUNT,
   isoToPerplexityDate,
   MAX_SEARCH_COUNT,
   normalizeFreshness,
-  normalizeToIsoDate,
+  parseWebSearchTimeFilters,
   readCachedSearchPayload,
   readConfiguredSecretString,
+  readPositiveIntegerParam,
   readProviderEnvValue,
+  readStringArrayParam,
+  readStringParam,
   resolveSearchCacheTtlMs,
   resolveSearchCount,
   resolveSearchTimeoutSeconds,
@@ -142,10 +140,6 @@ function buildPerplexityRequestHeaders(apiKey: string, acceptJson = false): Reco
   };
 }
 
-async function readPerplexityJsonResponse<T>(response: Response, label: string): Promise<T> {
-  return await readProviderJsonResponse<T>(response, label);
-}
-
 function resolvePerplexityTransport(perplexity?: PerplexityConfig): {
   apiKey?: string;
   source: "config" | "perplexity_env" | "openrouter_env" | "none";
@@ -201,6 +195,7 @@ async function runPerplexitySearchApi(params: {
   apiKey: string;
   count: number;
   timeoutSeconds: number;
+  signal?: AbortSignal;
   country?: string;
   searchDomainFilter?: string[];
   searchRecencyFilter?: string;
@@ -239,21 +234,26 @@ async function runPerplexitySearchApi(params: {
     body.max_tokens_per_page = params.maxTokensPerPage;
   }
 
+  const headers = buildPerplexityRequestHeaders(params.apiKey, true);
   return withTrustedWebSearchEndpoint(
     {
       url: PERPLEXITY_SEARCH_ENDPOINT,
       timeoutSeconds: params.timeoutSeconds,
+      signal: params.signal,
       init: {
         method: "POST",
-        headers: buildPerplexityRequestHeaders(params.apiKey, true),
+        headers,
         body: JSON.stringify(body),
       },
     },
     async (res) => {
       if (!res.ok) {
-        return await throwWebSearchApiError(res, "Perplexity Search");
+        return await throwWebSearchApiError(res, "Perplexity Search", {
+          headers,
+          signal: params.signal,
+        });
       }
-      const data = await readPerplexityJsonResponse<PerplexitySearchApiResponse>(
+      const data = await readProviderJsonResponse<PerplexitySearchApiResponse>(
         res,
         "Perplexity Search",
       );
@@ -274,6 +274,7 @@ async function runPerplexitySearch(params: {
   baseUrl: string;
   model: string;
   timeoutSeconds: number;
+  signal?: AbortSignal;
   freshness?: string;
 }): Promise<{ content: string; citations: string[] }> {
   const endpoint = `${params.baseUrl.trim().replace(/\/$/, "")}/chat/completions`;
@@ -285,23 +286,31 @@ async function runPerplexitySearch(params: {
     body.search_recency_filter = params.freshness;
   }
 
+  const headers = buildPerplexityRequestHeaders(params.apiKey);
   return withTrustedWebSearchEndpoint(
     {
       url: endpoint,
       timeoutSeconds: params.timeoutSeconds,
+      signal: params.signal,
       init: {
         method: "POST",
-        headers: buildPerplexityRequestHeaders(params.apiKey),
+        headers,
         body: JSON.stringify(body),
       },
     },
     async (res) => {
       if (!res.ok) {
-        return await throwWebSearchApiError(res, "Perplexity");
+        return await throwWebSearchApiError(res, "Perplexity", { headers, signal: params.signal });
       }
-      const data = await readPerplexityJsonResponse<PerplexitySearchResponse>(res, "Perplexity");
+      const data = await readProviderJsonResponse<PerplexitySearchResponse>(res, "Perplexity");
+      const content = data.choices?.[0]?.message?.content;
+      if (typeof content !== "string" || !content.trim()) {
+        throw new Error(
+          "Perplexity search returned no final answer. Retry the query or choose another search provider.",
+        );
+      }
       return {
-        content: data.choices?.[0]?.message?.content ?? "No response",
+        content,
         citations: extractPerplexityCitations(data),
       };
     },
@@ -311,6 +320,7 @@ async function runPerplexitySearch(params: {
 export async function executePerplexitySearch(
   args: Record<string, unknown>,
   searchConfig?: SearchConfigRecord,
+  signal?: AbortSignal,
 ): Promise<Record<string, unknown>> {
   const perplexityConfig = resolvePerplexityConfig(searchConfig);
   const runtime = resolvePerplexityTransport(perplexityConfig);
@@ -356,45 +366,26 @@ export async function executePerplexitySearch(
   });
 
   if (!structured) {
-    if (country) {
-      return {
-        error: "unsupported_country",
-        message:
-          "country filtering is only supported by the native Perplexity Search API path. Remove Perplexity baseUrl/model overrides or use a direct PERPLEXITY_API_KEY to enable it.",
-        docs: "https://docs.openclaw.ai/tools/web",
-      };
-    }
-    if (language) {
-      return {
-        error: "unsupported_language",
-        message:
-          "language filtering is only supported by the native Perplexity Search API path. Remove Perplexity baseUrl/model overrides or use a direct PERPLEXITY_API_KEY to enable it.",
-        docs: "https://docs.openclaw.ai/tools/web",
-      };
-    }
-    if (rawDateAfter || rawDateBefore) {
-      return {
-        error: "unsupported_date_filter",
-        message:
-          "date_after/date_before are only supported by the native Perplexity Search API path. Remove Perplexity baseUrl/model overrides or use a direct PERPLEXITY_API_KEY to enable them.",
-        docs: "https://docs.openclaw.ai/tools/web",
-      };
-    }
-    if (domainFilter?.length) {
-      return {
-        error: "unsupported_domain_filter",
-        message:
-          "domain_filter is only supported by the native Perplexity Search API path. Remove Perplexity baseUrl/model overrides or use a direct PERPLEXITY_API_KEY to enable it.",
-        docs: "https://docs.openclaw.ai/tools/web",
-      };
-    }
-    if (maxTokens !== undefined || maxTokensPerPage !== undefined) {
-      return {
-        error: "unsupported_content_budget",
-        message:
-          "max_tokens and max_tokens_per_page are only supported by the native Perplexity Search API path. Remove Perplexity baseUrl/model overrides or use a direct PERPLEXITY_API_KEY to enable them.",
-        docs: "https://docs.openclaw.ai/tools/web",
-      };
+    const unsupportedOptions = [
+      [country, "unsupported_country", "country filtering", "it"],
+      [language, "unsupported_language", "language filtering", "it"],
+      [rawDateAfter || rawDateBefore, "unsupported_date_filter", "date_after/date_before", "them"],
+      [domainFilter?.length, "unsupported_domain_filter", "domain_filter", "it"],
+      [
+        maxTokens !== undefined || maxTokensPerPage !== undefined,
+        "unsupported_content_budget",
+        "max_tokens and max_tokens_per_page",
+        "them",
+      ],
+    ] as const;
+    for (const [value, error, option, pronoun] of unsupportedOptions) {
+      if (value) {
+        return {
+          error,
+          message: `${option} ${pronoun === "them" ? "are" : "is"} only supported by the native Perplexity Search API path. Remove Perplexity baseUrl/model overrides or use a direct PERPLEXITY_API_KEY to enable ${pronoun}.`,
+          docs: "https://docs.openclaw.ai/tools/web",
+        };
+      }
     }
   }
 
@@ -405,37 +396,20 @@ export async function executePerplexitySearch(
       docs: "https://docs.openclaw.ai/tools/web",
     };
   }
-  if (rawFreshness && (rawDateAfter || rawDateBefore)) {
-    return {
-      error: "conflicting_time_filters",
-      message:
-        "freshness and date_after/date_before cannot be used together. Use either freshness (day/week/month/year) or a date range (date_after/date_before), not both.",
-      docs: "https://docs.openclaw.ai/tools/web",
-    };
+  const parsedTimeFilters = parseWebSearchTimeFilters({
+    rawFreshness,
+    rawDateAfter,
+    rawDateBefore,
+    freshnessProvider: "perplexity",
+    invalidFreshnessMessage: "freshness must be day, week, month, or year.",
+    invalidDateAfterMessage: "date_after must be YYYY-MM-DD format.",
+    invalidDateBeforeMessage: "date_before must be YYYY-MM-DD format.",
+    invalidDateRangeMessage: "date_after must be before date_before.",
+  });
+  if ("error" in parsedTimeFilters) {
+    return parsedTimeFilters;
   }
-  const dateAfter = rawDateAfter ? normalizeToIsoDate(rawDateAfter) : undefined;
-  const dateBefore = rawDateBefore ? normalizeToIsoDate(rawDateBefore) : undefined;
-  if (rawDateAfter && !dateAfter) {
-    return {
-      error: "invalid_date",
-      message: "date_after must be YYYY-MM-DD format.",
-      docs: "https://docs.openclaw.ai/tools/web",
-    };
-  }
-  if (rawDateBefore && !dateBefore) {
-    return {
-      error: "invalid_date",
-      message: "date_before must be YYYY-MM-DD format.",
-      docs: "https://docs.openclaw.ai/tools/web",
-    };
-  }
-  if (dateAfter && dateBefore && dateAfter > dateBefore) {
-    return {
-      error: "invalid_date_range",
-      message: "date_after must be before date_before.",
-      docs: "https://docs.openclaw.ai/tools/web",
-    };
-  }
+  const { dateAfter, dateBefore } = parsedTimeFilters;
   if (domainFilter?.length) {
     const hasDeny = domainFilter.some((entry) => entry.startsWith("-"));
     const hasAllow = domainFilter.some((entry) => !entry.startsWith("-"));
@@ -462,7 +436,7 @@ export async function executePerplexitySearch(
     runtime.baseUrl,
     runtime.model,
     query,
-    resolveSearchCount(count, DEFAULT_SEARCH_COUNT),
+    structured ? resolveSearchCount(count, DEFAULT_SEARCH_COUNT) : undefined,
     country,
     language,
     freshness,
@@ -472,7 +446,8 @@ export async function executePerplexitySearch(
     maxTokens,
     maxTokensPerPage,
   ]);
-  const cached = readCachedSearchPayload(cacheKey);
+  const cacheTtlMs = resolveSearchCacheTtlMs(searchConfig);
+  const cached = readCachedSearchPayload(cacheKey, cacheTtlMs);
   if (cached) {
     return cached;
   }
@@ -499,6 +474,7 @@ export async function executePerplexitySearch(
               baseUrl: runtime.baseUrl,
               model: runtime.model,
               timeoutSeconds,
+              signal,
               freshness,
             });
             return {
@@ -523,6 +499,7 @@ export async function executePerplexitySearch(
             apiKey: runtime.apiKey,
             count: resolveSearchCount(count, DEFAULT_SEARCH_COUNT),
             timeoutSeconds,
+            signal,
             country: country ?? undefined,
             searchDomainFilter: domainFilter,
             searchRecencyFilter: freshness,
@@ -541,7 +518,8 @@ export async function executePerplexitySearch(
     (payload as { tookMs: number }).tookMs = Date.now() - start;
   }
 
-  writeCachedSearchPayload(cacheKey, payload, resolveSearchCacheTtlMs(searchConfig));
+  signal?.throwIfAborted();
+  writeCachedSearchPayload(cacheKey, payload, cacheTtlMs);
   return payload;
 }
 
@@ -550,11 +528,6 @@ export const testing = {
   resolvePerplexityBaseUrl,
   resolvePerplexityModel,
   resolvePerplexityTransport,
-  isDirectPerplexityBaseUrl,
   resolvePerplexityRequestModel,
   resolvePerplexityApiKey,
-  readPerplexityJsonResponse,
-  normalizeToIsoDate,
-  isoToPerplexityDate,
 } as const;
-export { testing as __testing };

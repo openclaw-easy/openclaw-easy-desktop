@@ -4,19 +4,20 @@ import { html, nothing } from "lit";
 import { unsafeHTML } from "lit/directives/unsafe-html.js";
 import { normalizeChatMessageMaxWidth } from "../../app/settings.ts";
 import { countSensitiveConfigValues } from "../../components/config-form.shared.ts";
-import { splitConfigSchemaByTier } from "../../components/config-form.tiers.ts";
 import { renderConfigForm } from "../../components/config-form.ts";
+import { renderHubTabs } from "../../components/hub-tabs.ts";
 import "../../components/tooltip.ts";
 import { icons } from "../../components/icons.ts";
 import { highlightJsonHtml } from "../../components/markdown-code-blocks.ts";
-import { renderSettingsSegmented } from "../../components/settings-ui.ts";
 import { t } from "../../i18n/index.ts";
 import { isJson5Warm, warmJson5 } from "../../lib/json5-runtime.ts";
 import { renderNotificationsSection } from "./notifications-section.ts";
+import { renderSetupSection } from "./setup.ts";
 import { renderAppearanceSection } from "./view-appearance.ts";
 import { computeRawDiff, formatConfigDiffPath, renderRawDiffValue } from "./view-diff.ts";
 import {
   CATEGORISED_KEYS,
+  getChannelConfigGroups,
   getSectionIcon,
   SECTION_CATEGORIES,
   type SectionCategory,
@@ -33,15 +34,9 @@ import {
   resetConfigEphemeralState,
   toggleSensitivePathReveal,
 } from "./view-state.ts";
-import {
-  renderBusyButtonContent,
-  renderConfigApplyBanner,
-  renderConfigAutoSaveStatus,
-} from "./view-status.ts";
 import type { ConfigProps } from "./view-types.ts";
 
 export { createConfigViewState } from "./view-state.ts";
-export { renderConfigApplyBanner, renderConfigAutoSaveStatus } from "./view-status.ts";
 export type { ConfigProps, ConfigViewState } from "./view-types.ts";
 
 // The config editor is where JSON5 text first appears; warm the parser with
@@ -112,28 +107,6 @@ export function renderConfig(props: ConfigProps) {
       configValueExistsAtPath(props.formValue, path),
   );
   const formUnsafe = unsupportedActivePaths.length > 0;
-  const schemaProperties = analysis.schema?.properties ?? {};
-  // Mirror the renderer's tier semantics (splitConfigSchemaByTier: unhinted
-  // leaves default to advanced) so the toolbar toggle appears exactly when the
-  // rendered scope can hide fields behind ghost rows; a mismatched predicate
-  // strands an enabled toggle with no control to turn it off. An active
-  // virtual section (__appearance__/__notifications__) renders no schema form,
-  // so it never offers the toggle.
-  const hasAdvancedInScope = () => {
-    const sectionKeys = props.activeSection
-      ? Object.hasOwn(schemaProperties, props.activeSection)
-        ? [props.activeSection]
-        : []
-      : Object.keys(schemaProperties);
-    return sectionKeys.some((key) => {
-      const node = schemaProperties[key];
-      if (!node) {
-        return false;
-      }
-      const split = splitConfigSchemaByTier({ schema: node, path: [key], hints: props.uiHints });
-      return split.advancedLeafCount > 0;
-    });
-  };
   const effectiveShowAdvanced = props.forceShowAdvanced === true || props.showAdvancedSettings;
   const rawAvailable = props.rawAvailable ?? true;
   // An unsaved raw draft stays authoritative in the capability; hiding the
@@ -217,8 +190,40 @@ export function renderConfig(props: ConfigProps) {
       ? { id: "other", label: t("configView.categories.other"), sections: extraSections }
       : null;
 
-  // Config subsections are always rendered as a single page per section.
-  const effectiveSubsection = null;
+  const channelSchema = props.activeSection === "channels" ? schemaProps.channels : undefined;
+  const channelGroups = channelSchema ? getChannelConfigGroups(channelSchema, props.uiHints) : [];
+  const channelGroup =
+    channelGroups.find((group) => group.key === props.activeSubsection) ?? channelGroups[0];
+  // Keep the original field paths and values: Other is navigation, not a config namespace.
+  const formSchema =
+    channelSchema && channelGroup
+      ? {
+          ...analysis.schema,
+          properties: {
+            ...schemaProps,
+            channels: {
+              ...channelSchema,
+              properties: Object.fromEntries(
+                Object.entries(channelSchema.properties ?? {}).filter(([key]) =>
+                  channelGroup.keys.includes(key),
+                ),
+              ),
+              required: channelSchema.required?.filter((key) => channelGroup.keys.includes(key)),
+              additionalProperties: false,
+            },
+          },
+        }
+      : analysis.schema;
+  const setupSchema = formSchema?.properties?.wizard;
+  const showSetup = setupSchema && (!props.activeSection || props.activeSection === "wizard");
+  const editorSchema = setupSchema
+    ? {
+        ...formSchema,
+        properties: Object.fromEntries(
+          Object.entries(formSchema.properties ?? {}).filter(([key]) => key !== "wizard"),
+        ),
+      }
+    : formSchema;
   const topTabs = [
     ...(showRootTab
       ? [{ key: null as string | null, label: props.navRootLabel ?? t("nav.settings") }]
@@ -233,20 +238,20 @@ export function renderConfig(props: ConfigProps) {
   function renderAccordionNav() {
     return html`
       <div class="config-accordion-nav">
-        ${allCategories.map(
-          (category) => html`
+        ${allCategories.map((category) => {
+          const expanded = category.sections.some((section) => section.key === props.activeSection);
+          const panelId = `config-accordion-panel-${category.id}`;
+          return html`
             <div class="config-accordion-group">
               <button
-                class="config-accordion-group__header ${props.activeSection != null &&
-                category.sections.some((section) => section.key === props.activeSection)
+                class="config-accordion-group__header ${expanded
                   ? "config-accordion-group__header--active"
                   : ""}"
+                aria-expanded=${expanded ? "true" : "false"}
+                aria-controls=${panelId}
                 @click=${(event: Event) => {
                   const firstKey = category.sections[0]?.key ?? null;
-                  const isCurrentlyInGroup = category.sections.some(
-                    (section) => section.key === props.activeSection,
-                  );
-                  props.onSectionChange(isCurrentlyInGroup ? null : firstKey);
+                  props.onSectionChange(expanded ? null : firstKey);
                   resetContentScroll(event.currentTarget);
                 }}
               >
@@ -255,9 +260,7 @@ export function renderConfig(props: ConfigProps) {
                 </span>
                 <span>${category.label}</span>
                 <svg
-                  class="config-accordion-group__chevron ${category.sections.some(
-                    (section) => section.key === props.activeSection,
-                  )
+                  class="config-accordion-group__chevron ${expanded
                     ? "config-accordion-group__chevron--open"
                     : ""}"
                   viewBox="0 0 24 24"
@@ -270,29 +273,27 @@ export function renderConfig(props: ConfigProps) {
                   <polyline points="6 9 12 15 18 9"></polyline>
                 </svg>
               </button>
-              ${category.sections.some((section) => section.key === props.activeSection)
-                ? html`<div class="config-accordion-group__items">
-                    ${category.sections.map(
-                      (section) => html`<button
-                        class="config-accordion-group__item ${props.activeSection === section.key
-                          ? "config-accordion-group__item--active"
-                          : ""}"
-                        @click=${(event: Event) => {
-                          props.onSectionChange(section.key);
-                          resetContentScroll(event.currentTarget);
-                        }}
-                      >
-                        <span class="config-accordion-group__item-icon">
-                          ${getSectionIcon(section.key)}
-                        </span>
-                        ${section.label}
-                      </button>`,
-                    )}
-                  </div>`
-                : nothing}
+              <div id=${panelId} class="config-accordion-group__items" ?hidden=${!expanded}>
+                ${category.sections.map(
+                  (section) => html`<button
+                    class="config-accordion-group__item ${props.activeSection === section.key
+                      ? "config-accordion-group__item--active"
+                      : ""}"
+                    @click=${(event: Event) => {
+                      props.onSectionChange(section.key);
+                      resetContentScroll(event.currentTarget);
+                    }}
+                  >
+                    <span class="config-accordion-group__item-icon">
+                      ${getSectionIcon(section.key)}
+                    </span>
+                    ${section.label}
+                  </button>`,
+                )}
+              </div>
             </div>
-          `,
-        )}
+          `;
+        })}
       </div>
     `;
   }
@@ -319,12 +320,8 @@ export function renderConfig(props: ConfigProps) {
   // Includes the app updater: writes are suspended while it runs, so raw
   // Save/Discard must read busy instead of silently no-opping.
   const configBusy = props.loading || props.saving || props.applying || props.updating;
-  const canRawSave = props.connected && !configBusy && hasRawChanges;
-  const autoSaveStatus = renderConfigAutoSaveStatus({
-    status: props.autoSaveStatus,
-    onRetry: props.onSave,
-    onReload: props.onRawDiscard,
-  });
+  const mutationAllowed = props.mutationAllowed !== false;
+  const canRawSave = props.connected && mutationAllowed && !configBusy && hasRawChanges;
   const showAppearanceOnRoot =
     includeVirtualSections &&
     formMode === "form" &&
@@ -393,39 +390,20 @@ export function renderConfig(props: ConfigProps) {
 
   const showSectionTabs = settingsLayout !== "accordion" && topTabs.length > 1;
   const sectionTabs = showSectionTabs
-    ? renderSettingsSegmented({
-        value: props.activeSection ?? "root",
-        options: topTabs.map((tab) => ({ value: tab.key ?? "root", label: tab.label })),
+    ? renderHubTabs({
+        id: "config-sections",
+        active: props.activeSection ?? "root",
+        tabs: topTabs.map((tab) => ({ value: tab.key ?? "root", label: tab.label })),
         ariaLabel: t("common.settingsSections"),
-        onChange: (value, element) => {
-          props.onSectionChange(value === "root" ? null : value);
-          resetContentScroll(element);
-        },
+        panelId: "config-section-panel",
+        onSelect: (value) => props.onSectionChange(value === "root" ? null : value),
+        onActivate: resetContentScroll,
       })
     : nothing;
-  const showAdvancedToggle =
-    formMode === "form" && props.forceShowAdvanced !== true && hasAdvancedInScope();
-  const showToolbar =
-    showModeToggle || showSectionTabs || showAdvancedToggle || autoSaveStatus !== nothing;
-  const applyBanner = renderConfigApplyBanner({
-    needsApply: props.needsApply,
-    applying: props.applying,
-    // Applying mid-save/mid-load would race the write that made the banner
-    // appear (or a stale snapshot); a dirty raw draft blocks apply outright
-    // (raw is explicit-save-only); restarting mid-update can corrupt the
-    // install. Wait for quiet.
-    busy:
-      props.saving ||
-      props.loading ||
-      props.updating ||
-      props.autoSaveStatus === "saving" ||
-      hasRawChanges,
-    connected: props.connected,
-    onApply: props.onApply,
-  });
+  const showToolbar = showModeToggle || showSectionTabs;
   const showValidityWarning = validity === "invalid" && !viewState.validityDismissed;
   const showLead =
-    showToolbar || settingsLayout === "accordion" || applyBanner !== nothing || showValidityWarning;
+    showToolbar || settingsLayout === "accordion" || showValidityWarning || Boolean(channelGroup);
 
   const lead = html`<div class="config-lead">
     ${showToolbar
@@ -457,23 +435,33 @@ export function renderConfig(props: ConfigProps) {
               </div>`
             : nothing}
           ${sectionTabs}
-          ${showAdvancedToggle
-            ? html`<button
-                class="btn btn--sm config-show-advanced ${props.showAdvancedSettings
-                  ? "active"
-                  : ""}"
-                aria-pressed=${props.showAdvancedSettings ? "true" : "false"}
-                @click=${() => props.setShowAdvancedSettings(!props.showAdvancedSettings)}
-              >
-                ${t("configForm.showAdvanced")}
-              </button>`
-            : nothing}
-          <div class="config-toolbar__status" role="status" aria-live="polite">
-            ${autoSaveStatus}
-          </div>
         </div>`
       : nothing}
-    ${settingsLayout === "accordion" ? renderAccordionNav() : nothing} ${applyBanner}
+    ${settingsLayout === "accordion" ? renderAccordionNav() : nothing}
+    ${channelGroup && formMode === "form"
+      ? html`<div class="config-toolbar">
+          <label class="field">
+            <span>${t("configView.channelSettings")}</span>
+            <select
+              class="settings-select"
+              .value=${channelGroup.key ?? ""}
+              @change=${(event: Event) => {
+                // SAFETY: This handler is bound directly to the native select above.
+                const select = event.currentTarget as HTMLSelectElement;
+                props.onSubsectionChange(select.value || null);
+                resetContentScroll(event.currentTarget);
+              }}
+            >
+              ${channelGroups.map(
+                (group) =>
+                  html`<option value=${group.key ?? ""} ?selected=${group.key === channelGroup.key}>
+                    ${group.label}
+                  </option>`,
+              )}
+            </select>
+          </label>
+        </div>`
+      : nothing}
     ${showValidityWarning
       ? html`<div class="config-validity-warning">
           <svg
@@ -512,8 +500,11 @@ export function renderConfig(props: ConfigProps) {
     <div
       id="config-section-panel"
       class="config-content"
-      role="region"
-      aria-label=${t("common.settingsSections")}
+      role=${showSectionTabs ? "tabpanel" : "region"}
+      aria-labelledby=${showSectionTabs
+        ? `config-sections-tab-${props.activeSection ?? "root"}`
+        : nothing}
+      aria-label=${showSectionTabs ? nothing : t("common.settingsSections")}
     >
       ${props.activeSection === "__appearance__"
         ? includeVirtualSections
@@ -546,19 +537,23 @@ export function renderConfig(props: ConfigProps) {
                       <span>${t("configView.loadingSchema")}</span>
                     </div>`
                   : renderConfigForm({
-                      schema: analysis.schema,
+                      schema: editorSchema,
                       uiHints: props.uiHints,
                       value: props.formValue,
-                      embedded: props.embeddedEditor === true,
+                      embedded: props.embeddedEditor === true || Boolean(showSetup),
                       rawAvailable,
-                      disabled: configBusy || !props.formValue,
+                      disabled: configBusy || !props.formValue || !mutationAllowed,
                       unsupportedPaths: analysis.unsupportedPaths,
                       onPatch: props.onFormPatch,
+                      onRemove: props.onFormRemove,
                       activeSection: props.activeSection,
-                      activeSubsection: effectiveSubsection,
+                      activeSubsection: null,
                       showAdvanced: effectiveShowAdvanced,
                       forceAdvancedSection: props.forceAdvancedSection,
                       onShowAdvanced: () => props.setShowAdvancedSettings(true),
+                      onHideAdvanced: props.forceShowAdvanced
+                        ? undefined
+                        : () => props.setShowAdvancedSettings(false),
                       sectionActions:
                         props.activeSection === "env"
                           ? html`<button
@@ -576,6 +571,8 @@ export function renderConfig(props: ConfigProps) {
                               ${t("configView.peek")}
                             </button>`
                           : undefined,
+                      showSectionDocs: props.showSectionDocs,
+                      sectionPrelude: props.sectionPrelude,
                       revealSensitive: props.activeSection === "env" ? envSensitiveVisible : false,
                       isSensitivePathRevealed: (path) => isSensitivePathRevealed(viewState, path),
                       onToggleSensitivePath: (path) => {
@@ -583,6 +580,13 @@ export function renderConfig(props: ConfigProps) {
                         requestUpdate();
                       },
                     })}
+                ${showSetup && !props.schemaLoading
+                  ? renderSetupSection(
+                      setupSchema,
+                      props,
+                      configBusy || !props.formValue || !mutationAllowed,
+                    )
+                  : nothing}
               `
             : (() => {
                 const sensitiveCount = countSensitiveConfigValues(
@@ -597,7 +601,7 @@ export function renderConfig(props: ConfigProps) {
                   <div class="settings-group">
                     <div class="settings-row settings-row--stacked">
                       <div class="config-raw-actions">
-                        ${props.onOpenFile
+                        ${props.onOpenFile && props.openFileAllowed !== false
                           ? html`<button class="btn btn--sm" @click=${props.onOpenFile}>
                               ${icons.fileText} ${t("configView.open")}
                             </button>`
@@ -615,11 +619,11 @@ export function renderConfig(props: ConfigProps) {
                           aria-busy=${props.saving ? "true" : "false"}
                           @click=${props.onSave}
                         >
-                          ${renderBusyButtonContent(
-                            props.saving,
-                            t("common.save"),
-                            t("common.saving"),
-                          )}
+                          ${props.saving
+                            ? html`<span class="config-action-spinner" aria-hidden="true"
+                                  >${icons.loader}</span
+                                >${t("common.saving")}`
+                            : t("common.save")}
                         </button>
                       </div>
                       <div class="field config-raw-field">
@@ -670,7 +674,7 @@ export function renderConfig(props: ConfigProps) {
                           : html`<textarea
                               placeholder=${t("configView.rawConfig")}
                               .value=${props.raw}
-                              ?disabled=${configBusy}
+                              ?disabled=${configBusy || !mutationAllowed}
                               @input=${(event: Event) => {
                                 props.onRawChange((event.target as HTMLTextAreaElement).value);
                               }}

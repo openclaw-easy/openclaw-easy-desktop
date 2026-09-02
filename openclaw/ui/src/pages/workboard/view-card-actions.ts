@@ -2,6 +2,10 @@ import { html, nothing, type TemplateResult } from "lit";
 import { icons } from "../../components/icons.ts";
 import { t } from "../../i18n/index.ts";
 import {
+  isActiveWorkboardCard,
+  nextWorkboardCardPosition,
+} from "../../lib/workboard/card-state.ts";
+import {
   archiveWorkboardCard,
   deleteWorkboardCard,
   findWorkboardSession,
@@ -22,16 +26,17 @@ import {
   cardHasUnresolvedStartedRun,
   engineBlockedByRuntime,
   formatStatusLabel,
-  nextPosition,
   type WorkboardProps,
 } from "./view-helpers.ts";
 
 function moveCardToStatus(props: WorkboardProps, card: WorkboardCard, status: WorkboardStatus) {
   const state = getWorkboardState(props.host);
   if (
+    !isActiveWorkboardCard(card) ||
     status === card.status ||
     state.busyCardIds.has(card.id) ||
     state.dispatching ||
+    !canMutate(props) ||
     !props.connected ||
     !props.client
   ) {
@@ -42,7 +47,7 @@ function moveCardToStatus(props: WorkboardProps, card: WorkboardCard, status: Wo
     client: props.client,
     cardId: card.id,
     status,
-    position: nextPosition(state.cards, status),
+    position: nextWorkboardCardPosition(state.cards, card, status),
     requestUpdate: props.onRequestUpdate,
   });
 }
@@ -57,7 +62,7 @@ export function renderCardMoveControl(
   const statuses = state.statuses.includes(card.status)
     ? state.statuses
     : [card.status, ...state.statuses];
-  if (statuses.length < 2) {
+  if (!isActiveWorkboardCard(card) || statuses.length < 2) {
     return nothing;
   }
   return html`

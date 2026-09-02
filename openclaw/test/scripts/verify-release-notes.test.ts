@@ -15,6 +15,9 @@ import {
   defaultGithubSnapshotPath,
   githubApiWithSnapshot,
   highlightCountError,
+  isEligibleHandle,
+  ledgerChecks,
+  parseArgs,
   persistGithubSnapshot,
   pullRequestTitleFromCommitSubject,
   releaseNoteReferences,
@@ -48,8 +51,20 @@ function git(cwd: string, args: string[]): string {
 }
 
 describe("release-note verification", () => {
+  it("excludes maintainer and automation identities from contributor credit", () => {
+    expect(isEligibleHandle("human-contributor")).toBe(true);
+    expect(isEligibleHandle("steipete")).toBe(false);
+    expect(isEligibleHandle("steipete-oai")).toBe(false);
+    expect(isEligibleHandle("hugin-bot")).toBe(false);
+    expect(isEligibleHandle("roboclaw-bot")).toBe(false);
+  });
+
   it("accepts only canonical commit PR suffixes", () => {
+    const repeated = "Fix status (#102147) (#102147)";
+    const distinct = "Fix status (#120582) (#120584)";
     expect(pullRequestTitleFromCommitSubject("Fix status (#102147)", 102147)).toBe("Fix status");
+    expect(pullRequestTitleFromCommitSubject(repeated, 102147)).toBeUndefined();
+    expect(pullRequestTitleFromCommitSubject(distinct, 120584)).toBeUndefined();
     expect(pullRequestTitleFromCommitSubject("Fix status(#102147)", 102147)).toBeUndefined();
     expect(pullRequestTitleFromCommitSubject("Fix status (#0102147)", 102147)).toBeUndefined();
     expect(pullRequestTitleFromCommitSubject(" Fix status (#102147)", 102147)).toBeUndefined();
@@ -66,7 +81,11 @@ describe("release-note verification", () => {
           "",
           "### Complete contribution record",
           "",
-          `This audited record covers the complete base..${target} history: 1 merged PR.`,
+          `This audited record covers the complete base..${target} history: 1 in-range PR + 0 retained seed-only PRs = 1 unique PR.`,
+          "",
+          "#### Pull requests",
+          "",
+          "- **PR #123** fix: example.",
         ].join("\n"),
       }),
     ).toBe(target);
@@ -263,6 +282,74 @@ describe("release-note verification", () => {
     ).toThrow(`conflicting release provenance markers for ${releaseCommit}`);
   });
 
+  it("accepts repeatable CLI provenance without metadata commits", () => {
+    const mappings: Array<[string, number]> = [
+      ["bdde3d1c6dd7cc415588a72cf27ebe27f83bfe47", 120085],
+      ["5090cae6d0cc3f2ec272b2448970c6238f525610", 120479],
+      ["8ff1724067c1dcfb9a63574e6f3771261033ffae", 120479],
+      ["0cd3075adf7cd201e17d25c95cbe190991f8aab1", 120538],
+    ];
+    const payloads = mappings.map(([commit, pullRequest]) => `${commit} -> #${pullRequest}`);
+    const options = parseArgs([
+      "--base",
+      "base",
+      "--target",
+      "target",
+      "--version",
+      "2026.8.1",
+      ...payloads.flatMap((payload) => ["--release-provenance", payload]),
+    ]);
+
+    expect(options.releaseProvenance).toEqual(payloads);
+    expect(
+      collectReleaseProvenanceOverrides(
+        mappings.map(([hash]) => ({ body: "", hash })),
+        options.releaseProvenance,
+      ),
+    ).toEqual(new Map(mappings.map(([commit, pullRequest]) => [commit, [pullRequest]])));
+  });
+
+  it("validates CLI provenance through the exact marker merge path", () => {
+    const activeCommit = "a".repeat(40);
+
+    expect(() =>
+      collectReleaseProvenanceOverrides([{ body: "", hash: activeCommit }], ["short -> #1"]),
+    ).toThrow("invalid release provenance marker");
+    expect(() =>
+      collectReleaseProvenanceOverrides(
+        [{ body: "", hash: activeCommit }],
+        [`${activeCommit} -> #1 trailing`],
+      ),
+    ).toThrow("invalid release provenance marker");
+    expect(() =>
+      collectReleaseProvenanceOverrides(
+        [{ body: "", hash: activeCommit }],
+        [`${activeCommit} -> #1\nRelease provenance: ${activeCommit} -> #2`],
+      ),
+    ).toThrow("invalid release provenance marker");
+    for (const payload of [
+      `${activeCommit} -> #1\n`,
+      `${activeCommit} -> #1,\n#2`,
+      `${activeCommit} -> #1\r\n`,
+    ]) {
+      expect(() =>
+        collectReleaseProvenanceOverrides([{ body: "", hash: activeCommit }], [payload]),
+      ).toThrow("invalid release provenance marker");
+    }
+    expect(() =>
+      collectReleaseProvenanceOverrides(
+        [{ body: "", hash: activeCommit }],
+        [`${"b".repeat(40)} -> #1`],
+      ),
+    ).toThrow("release provenance marker targets commit outside the active range");
+    expect(() =>
+      collectReleaseProvenanceOverrides(
+        [{ body: `Release provenance: ${activeCommit} -> #1`, hash: activeCommit }],
+        [`${activeCommit} -> #2`],
+      ),
+    ).toThrow(`conflicting release provenance markers for ${activeCommit}`);
+  });
+
   it("requires release provenance PRs to be merged into current main", () => {
     const releaseCommit = "a".repeat(40);
     const mainCommit = "b".repeat(40);
@@ -396,6 +483,12 @@ describe("release-note verification", () => {
         },
       ]),
     ).toEqual([mainCommit.hash]);
+    const backportSubject = "fix(gateway): retain work admission across hosted wizard steps";
+    mainCommit.subject = `${backportSubject} (#120582)`;
+    integratedBackport.subject = `${mainCommit.subject} (#120584)`;
+    expect(canonicalMainCommitMatches(integratedBackport, [mainCommit])).toEqual([mainCommit.hash]);
+    const malformed = { ...integratedBackport, subject: `${backportSubject}(#120582) (#120584)` };
+    expect(canonicalMainCommitMatches(malformed, [mainCommit])).toEqual([]);
     expect(canonicalPullRequests([456], [123])).toEqual([123]);
   });
 
@@ -776,6 +869,95 @@ describe("release-note verification", () => {
     expect(releaseNoteReferences(section, baselines)).toEqual([1, 3]);
   });
 
+  it.each([
+    {
+      name: "CSS palette comparisons in a commit message",
+      source: [
+        "fix(control-ui): darken the Absolutely surface ramp (#130239)",
+        "",
+        "--bg #262624 sat above Dash #1a1210, Claw #0e1015, and Knot #080808.",
+        "Steps the ramp down (--bg #262624 -> #1c1c1a).",
+      ].join("\n"),
+      expected: [130239],
+    },
+    {
+      name: "issue refs after CSS colors on the same line",
+      source: "--bg #262624 (fixes #123), refs #1234, #123456, and #12345678.",
+      expected: [123, 1234, 123456, 12345678],
+    },
+    {
+      name: "short and alpha CSS values and numeric color transitions",
+      source:
+        "--fg: #123; --border:#1234; --bg #123456 -> #654321; --alpha: #12345678 → #87654321. (#456)",
+      expected: [456],
+    },
+    {
+      name: "qualified references beside CSS values",
+      source: "OpenClaw/OpenClaw#123 --bg #262624; openclaw/openclaw#456 and Other/Repo#123456.",
+      expected: [123, 456],
+    },
+    {
+      name: "ordinary Markdown and code references",
+      source:
+        "**PR #123**; `#456`; [#789](https://github.com/openclaw/openclaw/issues/789)\n```text\n#123456\n```\n`--bg: #262624` (#1234)",
+      expected: [123, 456, 789, 123456, 1234],
+    },
+    {
+      name: "complete numeric reference tokens",
+      source:
+        "#1a1210 #0e1015 #080808 #fff #123abc #456_def &#123; file#456; #123 #1234 #123456 #12345678",
+      expected: [123, 1234, 123456, 12345678],
+    },
+    {
+      name: "non-color custom-property prose and cross-line references",
+      source: "--bg fixes #123; --border relates to #456.\n--bg\n#789",
+      expected: [123, 456, 789],
+    },
+  ])("extracts release references from $name", ({ source, expected }) => {
+    expect(releaseNoteReferences(source, [])).toEqual(expected);
+  });
+
+  it.each([
+    { reference: "", expected: [] },
+    {
+      reference: " (fixes #262624)",
+      expected: [
+        "editorial release prose references non-editorial chore PR #262624 (chore)",
+        "missing editorial Thanks @alice for PR #262624",
+      ],
+    },
+  ])("validates editorial credit after a CSS color: '$reference'", ({ reference, expected }) => {
+    const source = [
+      "## 2026.8.1",
+      "### Highlights",
+      "- One.",
+      "- Two.",
+      "- Three.",
+      "- Four.",
+      "- Five.",
+      "### Changes",
+      "### Fixes",
+      `- Set --bg #262624${reference}.`,
+      "### Complete contribution record",
+      `This audited record covers the complete base..${"a".repeat(40)} history: 1 merged PR.`,
+      "#### Pull requests",
+      "- **PR #262624** Thanks @alice.",
+    ].join("\n");
+    const entry = {
+      number: 262624,
+      title: "chore: unrelated tooling",
+      type: "chore",
+      editorialEligible: false,
+      externalReferences: [],
+      linkedIssues: [],
+      thanks: ["alice"],
+    };
+
+    expect(
+      ledgerChecks({ source }, [entry], new Map([[262624, { __typename: "PullRequest" }]]), []),
+    ).toEqual(expected);
+  });
+
   it("records a canonical target SHA when --target is symbolic", () => {
     const cwd = mkdtempSync(join(tmpdir(), "openclaw-release-notes-"));
     try {
@@ -940,7 +1122,15 @@ describe("release-note verification", () => {
 
       expect(result.status).toBe(1);
       expect(result.stdout).toContain("1 errors");
-      expect(JSON.parse(readFileSync(manifestPath, "utf8")).version).toBe("2026.7.1");
+      expect(JSON.parse(readFileSync(manifestPath, "utf8"))).toMatchObject({
+        schemaVersion: 3,
+        version: "2026.7.1",
+        source: {
+          inRangePullRequests: 0,
+          retainedSeedOnlyPullRequests: 0,
+          uniquePullRequests: 0,
+        },
+      });
       expect(readFileSync(join(cwd, "CHANGELOG.md"), "utf8")).toBe(changelog);
     } finally {
       rmSync(cwd, { recursive: true, force: true });

@@ -4,48 +4,45 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import vm from "node:vm";
 import { describe, expect, it, vi } from "vitest";
+import { createDeferred } from "../../../test/helpers/promise.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const serviceWorkerPath = path.join(here, "../../public/sw.js");
 
 describe("Control UI service worker cache versioning", () => {
-  it("registers the service worker with a build id and bounds prior build caches", () => {
-    const mainSource = fs.readFileSync(path.join(here, "../main.ts"), "utf8");
+  it("reloads stale root and chat clients once while excluding other pages", async () => {
     const serviceWorkerSource = fs.readFileSync(serviceWorkerPath, "utf8");
-    const viteConfigSource = fs.readFileSync(path.join(here, "../../vite.config.ts"), "utf8");
-
-    expect(mainSource).toContain('swUrl.searchParams.set("v"');
-    expect(mainSource).toContain("CONTROL_UI_BUILD_INFO.buildId");
-    expect(mainSource).toContain('updateViaCache: "none"');
-    expect(mainSource).toContain('navigator.serviceWorker.addEventListener("message"');
-    expect(mainSource).toContain("event.data.version !== currentControlUiBuildId");
-    expect(serviceWorkerSource).toContain(
-      'const EMBEDDED_CACHE_VERSION = "__OPENCLAW_CONTROL_UI_BUILD_ID__"',
-    );
-    expect(serviceWorkerSource).toContain("URL_CACHE_VERSION");
-    expect(serviceWorkerSource).toContain("CONTROL_CACHE_LIMIT = 3");
-    expect(serviceWorkerSource).toContain("slice(-priorCacheLimit)");
-    expect(serviceWorkerSource).toContain("caches.delete");
-    expect(serviceWorkerSource).toContain("includeUncontrolled: true");
-    expect(serviceWorkerSource).not.toContain(
-      'postMessage({ type: "sw-updated", version: CACHE_VERSION },',
-    );
-    expect(viteConfigSource).toContain("source.replace(placeholder, JSON.stringify(buildId))");
-    expect(viteConfigSource).toContain(
-      '"globalThis.OPENCLAW_CONTROL_UI_BUILD_INFO": JSON.stringify(buildInfo)',
-    );
-    expect(viteConfigSource).not.toContain(
-      "OPENCLAW_CONTROL_UI_BUILD_ID: JSON.stringify(controlUiBuildId)",
-    );
-    expect(serviceWorkerSource).not.toContain('const CACHE_NAME = "openclaw-control-v1"');
-  });
-
-  it("broadcasts updated versions to uncontrolled window clients during activation", async () => {
-    const serviceWorkerSource = fs.readFileSync(serviceWorkerPath, "utf8");
-    const windowClient = { postMessage: vi.fn() };
-    const matchedClients = createDeferred<Array<typeof windowClient>>();
+    const client = (id: string, url: string) => ({
+      id,
+      url,
+      postMessage: vi.fn(),
+      navigate: vi.fn(async () => undefined),
+    });
+    const staleClients = [
+      client("root", "https://control.example/openclaw/"),
+      client("chat", "https://control.example/openclaw/chat"),
+      client(
+        "chat-deep-link",
+        "https://control.example/openclaw/chat/main/session?mode=compact#latest",
+      ),
+    ];
+    const excludedClients = [
+      client("settings", "https://control.example/openclaw/settings/appearance"),
+      client("chat-sibling", "https://control.example/openclaw/chatty"),
+      client("cross-origin", "https://other.example/openclaw/chat/main/session"),
+    ];
+    const matchedClients = createDeferred<Array<ReturnType<typeof client>>>();
     const listeners = new Map<string, Array<(event: ActivateEventStub) => void>>();
     const cacheDelete = vi.fn(async () => true);
+    const reloadMarkers = new Set<string>();
+    const reloadCache = {
+      match: vi.fn(async (request: Request) =>
+        reloadMarkers.has(request.url) ? new Response("new-build") : undefined,
+      ),
+      put: vi.fn(async (request: Request) => {
+        reloadMarkers.add(request.url);
+      }),
+    };
     const clients = {
       claim: vi.fn(async () => undefined),
       matchAll: vi.fn(() => matchedClients.promise),
@@ -59,22 +56,33 @@ describe("Control UI service worker cache versioning", () => {
         "openclaw-control-new-build",
         "other-cache",
       ]),
-      open: vi.fn(),
+      open: vi.fn(async () => reloadCache),
     };
     const serviceWorkerGlobal = {
       addEventListener(type: string, listener: (event: ActivateEventStub) => void) {
         listeners.set(type, [...(listeners.get(type) ?? []), listener]);
       },
       clients,
-      location: { href: "https://control.example/sw.js?v=new-build" },
+      location: { href: "https://control.example/openclaw/sw.js?v=new-build" },
       registration: { showNotification: vi.fn() },
       skipWaiting: vi.fn(),
     };
     const context = vm.createContext({
       URL,
+      MessageChannel: UnresponsiveMessageChannel,
+      Request,
+      Response,
       caches,
+      clearTimeout,
       fetch: vi.fn(),
-      self: serviceWorkerGlobal,
+      setTimeout,
+      self: {
+        ...serviceWorkerGlobal,
+        registration: {
+          scope: "https://control.example/openclaw/",
+          showNotification: vi.fn(),
+        },
+      },
     });
 
     new vm.Script(serviceWorkerSource, { filename: "ui/public/sw.js" }).runInContext(context);
@@ -95,19 +103,80 @@ describe("Control UI service worker cache versioning", () => {
     await Promise.resolve();
 
     expect(activationSettled).toBe(false);
-    expect(windowClient.postMessage).not.toHaveBeenCalled();
+    expect(staleClients[0]?.navigate).not.toHaveBeenCalled();
 
-    matchedClients.resolve([windowClient]);
+    matchedClients.resolve([...staleClients, ...excludedClients]);
     await activationPromise;
 
     expect(clients.matchAll).toHaveBeenCalledWith({ type: "window", includeUncontrolled: true });
-    expect(clients.claim).toHaveBeenCalled();
+    expect(clients.claim).toHaveBeenCalledBefore(clients.matchAll);
     expect(cacheDelete).toHaveBeenCalledWith("openclaw-control-oldest");
-    expect(windowClient.postMessage).toHaveBeenCalledWith({
-      type: "sw-updated",
-      version: "new-build",
+    for (const staleClient of staleClients) {
+      expect(staleClient.postMessage).toHaveBeenCalledOnce();
+      expect(staleClient.navigate).toHaveBeenCalledExactlyOnceWith(staleClient.url);
+    }
+    for (const excludedClient of excludedClients) {
+      expect(excludedClient.postMessage).not.toHaveBeenCalled();
+      expect(excludedClient.navigate).not.toHaveBeenCalled();
+    }
+
+    listeners.get("activate")?.[0]?.({
+      waitUntil(promise: Promise<unknown>) {
+        activationPromise = promise;
+      },
     });
-    expect(windowClient.postMessage.mock.calls[0]).toHaveLength(1);
+    await activationPromise;
+    for (const staleClient of staleClients) {
+      expect(staleClient.postMessage).toHaveBeenCalledTimes(2);
+      expect(staleClient.navigate).toHaveBeenCalledOnce();
+    }
+  });
+
+  it("keeps a current document mounted during activation", async () => {
+    const serviceWorkerSource = fs.readFileSync(serviceWorkerPath, "utf8");
+    const listeners = new Map<string, Array<(event: ActivateEventStub) => void>>();
+    const navigate = vi.fn(async () => undefined);
+    const clients = {
+      claim: vi.fn(async () => undefined),
+      matchAll: vi.fn(async () => [
+        {
+          id: "current-chat-deep-link",
+          url: "https://control.example/chat/main/session",
+          postMessage: vi.fn((_message: unknown, ports: MessagePort[]) => {
+            ports[0]?.postMessage({ version: "new-build" });
+          }),
+          navigate,
+        },
+      ]),
+    };
+    const context = vm.createContext({
+      URL,
+      MessageChannel,
+      caches: { delete: vi.fn(), keys: vi.fn(async () => []), open: vi.fn() },
+      clearTimeout,
+      fetch: vi.fn(),
+      setTimeout,
+      self: {
+        addEventListener(type: string, listener: (event: ActivateEventStub) => void) {
+          listeners.set(type, [...(listeners.get(type) ?? []), listener]);
+        },
+        clients,
+        location: { href: "https://control.example/sw.js?v=new-build" },
+        registration: { scope: "https://control.example/", showNotification: vi.fn() },
+        skipWaiting: vi.fn(),
+      },
+    });
+    new vm.Script(serviceWorkerSource, { filename: "ui/public/sw.js" }).runInContext(context);
+    let activationPromise: Promise<unknown> | undefined;
+
+    listeners.get("activate")?.[0]?.({
+      waitUntil(promise: Promise<unknown>) {
+        activationPromise = promise;
+      },
+    });
+
+    await expect(activationPromise).resolves.toBeUndefined();
+    expect(navigate).not.toHaveBeenCalled();
   });
 });
 
@@ -115,337 +184,292 @@ describe("Control UI service worker notification scope", () => {
   const rootScope = "https://control.example/";
   const nestedScope = "https://control.example/openclaw/";
   const nestedScopeWithoutSlash = "https://control.example/openclaw";
+
+  function notificationScenario(
+    name: string,
+    scope: string,
+    clientUrls: string[],
+    options: {
+      target?: string | null;
+      focusedClientIndex?: number;
+      navigatedUrl?: string;
+      openedUrl?: string | null;
+    } = {},
+  ): NotificationClickScenario {
+    return {
+      name,
+      scope,
+      target: options.target ?? null,
+      clientUrls,
+      focusedClientIndex: options.focusedClientIndex ?? (clientUrls.length > 0 ? 0 : -1),
+      ...(options.navigatedUrl === undefined ? {} : { navigatedUrl: options.navigatedUrl }),
+      openedUrl:
+        options.openedUrl === undefined
+          ? clientUrls.length > 0
+            ? null
+            : scope
+          : options.openedUrl,
+    };
+  }
+
   const scenarios: NotificationClickScenario[] = [
-    {
-      name: "focuses an existing root-scoped window for a title/body-only notification",
-      scope: rootScope,
-      target: null,
-      clientUrls: [rootScope],
-      focusedClientIndex: 0,
-      openedUrl: null,
-    },
-    {
-      name: "focuses an existing nested-scoped window for a title/body-only notification",
-      scope: nestedScope,
-      target: null,
-      clientUrls: [nestedScope],
-      focusedClientIndex: 0,
-      openedUrl: null,
-    },
-    {
-      name: "preserves a root window's fragment for a title/body-only notification",
-      scope: rootScope,
-      target: null,
-      clientUrls: [`${rootScope}#current-session`],
-      focusedClientIndex: 0,
-      openedUrl: null,
-    },
-    {
-      name: "preserves a root window's query and fragment for a title/body-only notification",
-      scope: rootScope,
-      target: null,
-      clientUrls: [`${rootScope}?session=42#current-session`],
-      focusedClientIndex: 0,
-      openedUrl: null,
-    },
-    {
-      name: "reuses a root-scoped child route for a title/body-only notification",
-      scope: rootScope,
-      target: null,
-      clientUrls: [`${rootScope}chat?session=42#current-session`],
-      focusedClientIndex: 0,
-      openedUrl: null,
-    },
-    {
-      name: "preserves a nested window's fragment for a title/body-only notification",
-      scope: nestedScope,
-      target: null,
-      clientUrls: [`${nestedScope}#current-session`],
-      focusedClientIndex: 0,
-      openedUrl: null,
-    },
-    {
-      name: "preserves a nested window's query and fragment for a title/body-only notification",
-      scope: nestedScope,
-      target: null,
-      clientUrls: [`${nestedScope}?session=42#current-session`],
-      focusedClientIndex: 0,
-      openedUrl: null,
-    },
-    {
-      name: "reuses a nested-scoped child route for a title/body-only notification",
-      scope: nestedScope,
-      target: null,
-      clientUrls: [`${nestedScope}chat?session=42#current-session`],
-      focusedClientIndex: 0,
-      openedUrl: null,
-    },
-    {
-      name: "focuses the exact slashless nested scope for a title/body-only notification",
-      scope: nestedScopeWithoutSlash,
-      target: null,
-      clientUrls: [nestedScopeWithoutSlash],
-      focusedClientIndex: 0,
-      openedUrl: null,
-    },
-    {
-      name: "preserves a slashless nested window's fragment for a title/body-only notification",
-      scope: nestedScopeWithoutSlash,
-      target: null,
-      clientUrls: [`${nestedScopeWithoutSlash}#current-session`],
-      focusedClientIndex: 0,
-      openedUrl: null,
-    },
-    {
-      name: "preserves a slashless nested window's query for a title/body-only notification",
-      scope: nestedScopeWithoutSlash,
-      target: null,
-      clientUrls: [`${nestedScopeWithoutSlash}?session=42#current-session`],
-      focusedClientIndex: 0,
-      openedUrl: null,
-    },
-    {
-      name: "reuses the canonical directory beneath a slashless nested scope",
-      scope: nestedScopeWithoutSlash,
-      target: null,
-      clientUrls: [`${nestedScopeWithoutSlash}/`],
-      focusedClientIndex: 0,
-      openedUrl: null,
-    },
-    {
-      name: "reuses a child route beneath a slashless nested scope",
-      scope: nestedScopeWithoutSlash,
-      target: null,
-      clientUrls: [`${nestedScopeWithoutSlash}/chat?session=42#current-session`],
-      focusedClientIndex: 0,
-      openedUrl: null,
-    },
-    {
-      name: "focuses the nested window instead of a competing same-origin root window",
-      scope: nestedScope,
-      target: null,
-      clientUrls: [rootScope, nestedScope],
-      focusedClientIndex: 1,
-      openedUrl: null,
-    },
-    {
-      name: "focuses the exact explicit nested route including its query and hash",
-      scope: nestedScope,
-      target: "chat?session=42#latest",
-      clientUrls: [`${nestedScope}chat?session=42#latest`],
-      focusedClientIndex: 0,
-      navigatedUrl: `${nestedScope}chat?session=42#latest`,
-      openedUrl: null,
-    },
-    {
-      name: "prefers a later exact explicit route over an unrelated nested app tab",
-      scope: nestedScope,
-      target: "chat?session=42#latest",
-      clientUrls: [`${nestedScope}settings`, `${nestedScope}chat?session=42#latest`],
-      focusedClientIndex: 1,
-      navigatedUrl: `${nestedScope}chat?session=42#latest`,
-      openedUrl: null,
-    },
-    {
-      name: "prefers a later exact route over a matching path and query with a stale fragment",
-      scope: nestedScope,
-      target: "chat?session=42#latest",
-      clientUrls: [
-        `${nestedScope}chat?session=42#previous`,
-        `${nestedScope}chat?session=42#latest`,
-      ],
-      focusedClientIndex: 1,
-      navigatedUrl: `${nestedScope}chat?session=42#latest`,
-      openedUrl: null,
-    },
-    {
-      name: "prefers a matching path and query over an unrelated nested app tab",
-      scope: nestedScope,
-      target: "chat?session=42#latest",
-      clientUrls: [`${nestedScope}settings`, `${nestedScope}chat?session=42`],
-      focusedClientIndex: 1,
-      navigatedUrl: `${nestedScope}chat?session=42#latest`,
-      openedUrl: null,
-    },
-    {
-      name: "prefers a matching route over an unrelated nested app tab when its query is stale",
-      scope: nestedScope,
-      target: "chat?session=42#latest",
-      clientUrls: [`${nestedScope}settings`, `${nestedScope}chat?session=7`],
-      focusedClientIndex: 1,
-      navigatedUrl: `${nestedScope}chat?session=42#latest`,
-      openedUrl: null,
-    },
-    {
-      name: "prefers a later exact explicit route among root-scoped app tabs",
-      scope: rootScope,
-      target: "chat?session=42#latest",
-      clientUrls: [`${rootScope}settings`, `${rootScope}chat?session=42#latest`],
-      focusedClientIndex: 1,
-      navigatedUrl: `${rootScope}chat?session=42#latest`,
-      openedUrl: null,
-    },
-    {
-      name: "prefers a later exact explicit route beneath a slashless nested scope",
-      scope: nestedScopeWithoutSlash,
-      target: "chat?session=42#latest",
-      clientUrls: [
-        `${nestedScopeWithoutSlash}/settings`,
-        `${nestedScopeWithoutSlash}/chat?session=42#latest`,
-      ],
-      focusedClientIndex: 1,
-      navigatedUrl: `${nestedScopeWithoutSlash}/chat?session=42#latest`,
-      openedUrl: null,
-    },
-    {
-      name: "restores a fragment omitted from the existing window client URL",
-      scope: nestedScope,
-      target: "chat?session=42#latest",
-      clientUrls: [`${nestedScope}chat?session=42`],
-      focusedClientIndex: 0,
-      navigatedUrl: `${nestedScope}chat?session=42#latest`,
-      openedUrl: null,
-    },
-    {
-      name: "resolves a relative route beneath a slashless nested scope",
-      scope: nestedScopeWithoutSlash,
-      target: "chat?session=42#latest",
-      clientUrls: [`${nestedScopeWithoutSlash}/chat?session=42#latest`],
-      focusedClientIndex: 0,
-      navigatedUrl: `${nestedScopeWithoutSlash}/chat?session=42#latest`,
-      openedUrl: null,
-    },
-    {
-      name: "restores an explicit fragment beneath a slashless nested scope",
-      scope: nestedScopeWithoutSlash,
-      target: "chat?session=42#latest",
-      clientUrls: [`${nestedScopeWithoutSlash}/chat?session=42`],
-      focusedClientIndex: 0,
-      navigatedUrl: `${nestedScopeWithoutSlash}/chat?session=42#latest`,
-      openedUrl: null,
-    },
-    {
-      name: "opens the relative target beneath a slashless nested scope",
-      scope: nestedScopeWithoutSlash,
-      target: "chat?session=42#latest",
-      clientUrls: [],
-      focusedClientIndex: -1,
-      openedUrl: `${nestedScopeWithoutSlash}/chat?session=42#latest`,
-    },
-    {
-      name: "navigates an explicit route instead of trusting stale SPA fragments",
-      scope: nestedScope,
-      target: "chat?session=42",
-      clientUrls: [`${nestedScope}chat?session=42#current-session`],
-      focusedClientIndex: 0,
-      navigatedUrl: `${nestedScope}chat?session=42`,
-      openedUrl: null,
-    },
-    {
-      name: "navigates a stale in-scope client to the exact explicit nested route",
-      scope: nestedScope,
-      target: "chat?session=42#latest",
-      clientUrls: [`${nestedScope}chat?session=7#latest`],
-      focusedClientIndex: 0,
-      navigatedUrl: `${nestedScope}chat?session=42#latest`,
-      openedUrl: null,
-    },
-    {
-      name: "opens the canonical root scope when no window exists",
-      scope: rootScope,
-      target: null,
-      clientUrls: [],
-      focusedClientIndex: -1,
-      openedUrl: rootScope,
-    },
-    {
-      name: "opens the canonical nested scope when no window exists",
-      scope: nestedScope,
-      target: null,
-      clientUrls: [],
-      focusedClientIndex: -1,
-      openedUrl: nestedScope,
-    },
-    {
-      name: "opens the exact slashless nested scope when no window exists",
-      scope: nestedScopeWithoutSlash,
-      target: null,
-      clientUrls: [],
-      focusedClientIndex: -1,
-      openedUrl: nestedScopeWithoutSlash,
-    },
-    {
-      name: "never focuses a cross-origin window with the same nested pathname",
-      scope: nestedScope,
-      target: null,
-      clientUrls: ["https://outside.example/openclaw/"],
-      focusedClientIndex: -1,
-      openedUrl: nestedScope,
-    },
-    {
-      name: "falls back to the registered scope for an explicit cross-origin target",
-      scope: nestedScope,
-      target: "https://outside.example/openclaw/chat",
-      clientUrls: [],
-      focusedClientIndex: -1,
-      openedUrl: nestedScope,
-    },
-    {
-      name: "rejects a sibling-prefix target and never focuses its window",
-      scope: nestedScope,
-      target: "/openclaw-other/chat",
-      clientUrls: ["https://control.example/openclaw-other/chat"],
-      focusedClientIndex: -1,
-      openedUrl: nestedScope,
-    },
-    {
-      name: "rejects a sibling-prefix target for a slashless nested scope",
-      scope: nestedScopeWithoutSlash,
-      target: "/openclaw-other/chat",
-      clientUrls: ["https://control.example/openclaw-other/chat"],
-      focusedClientIndex: -1,
-      openedUrl: nestedScopeWithoutSlash,
-    },
-    {
-      name: "rejects ancestor traversal from a slashless nested scope",
-      scope: nestedScopeWithoutSlash,
-      target: "../",
-      clientUrls: [rootScope],
-      focusedClientIndex: -1,
-      openedUrl: nestedScopeWithoutSlash,
-    },
-    {
-      name: "rejects a cross-origin target for a slashless nested scope",
-      scope: nestedScopeWithoutSlash,
-      target: "https://outside.example/openclaw/chat",
-      clientUrls: [],
-      focusedClientIndex: -1,
-      openedUrl: nestedScopeWithoutSlash,
-    },
-    {
-      name: "never focuses a sibling-prefix window for the default nested target",
-      scope: nestedScope,
-      target: null,
-      clientUrls: ["https://control.example/openclaw-other/"],
-      focusedClientIndex: -1,
-      openedUrl: nestedScope,
-    },
-    {
-      name: "falls back to the registered scope for a malformed explicit target",
-      scope: nestedScope,
-      target: "https://[invalid",
-      clientUrls: [],
-      focusedClientIndex: -1,
-      openedUrl: nestedScope,
-    },
-    {
-      name: "rejects ancestor traversal without focusing the same-origin root window",
-      scope: nestedScope,
-      target: "../",
-      clientUrls: [rootScope],
-      focusedClientIndex: -1,
-      openedUrl: nestedScope,
-    },
+    notificationScenario(
+      "focuses an existing root-scoped window for a title/body-only notification",
+      rootScope,
+      [rootScope],
+    ),
+    notificationScenario(
+      "focuses an existing nested-scoped window for a title/body-only notification",
+      nestedScope,
+      [nestedScope],
+    ),
+    notificationScenario(
+      "preserves a root window's fragment for a title/body-only notification",
+      rootScope,
+      [`${rootScope}#current-session`],
+    ),
+    notificationScenario(
+      "preserves a root window's query and fragment for a title/body-only notification",
+      rootScope,
+      [`${rootScope}?session=42#current-session`],
+    ),
+    notificationScenario(
+      "reuses a root-scoped child route for a title/body-only notification",
+      rootScope,
+      [`${rootScope}chat?session=42#current-session`],
+    ),
+    notificationScenario(
+      "preserves a nested window's fragment for a title/body-only notification",
+      nestedScope,
+      [`${nestedScope}#current-session`],
+    ),
+    notificationScenario(
+      "preserves a nested window's query and fragment for a title/body-only notification",
+      nestedScope,
+      [`${nestedScope}?session=42#current-session`],
+    ),
+    notificationScenario(
+      "reuses a nested-scoped child route for a title/body-only notification",
+      nestedScope,
+      [`${nestedScope}chat?session=42#current-session`],
+    ),
+    notificationScenario(
+      "focuses the exact slashless nested scope for a title/body-only notification",
+      nestedScopeWithoutSlash,
+      [nestedScopeWithoutSlash],
+    ),
+    notificationScenario(
+      "preserves a slashless nested window's fragment for a title/body-only notification",
+      nestedScopeWithoutSlash,
+      [`${nestedScopeWithoutSlash}#current-session`],
+    ),
+    notificationScenario(
+      "preserves a slashless nested window's query for a title/body-only notification",
+      nestedScopeWithoutSlash,
+      [`${nestedScopeWithoutSlash}?session=42#current-session`],
+    ),
+    notificationScenario(
+      "reuses the canonical directory beneath a slashless nested scope",
+      nestedScopeWithoutSlash,
+      [`${nestedScopeWithoutSlash}/`],
+    ),
+    notificationScenario(
+      "reuses a child route beneath a slashless nested scope",
+      nestedScopeWithoutSlash,
+      [`${nestedScopeWithoutSlash}/chat?session=42#current-session`],
+    ),
+    notificationScenario(
+      "focuses the nested window instead of a competing same-origin root window",
+      nestedScope,
+      [rootScope, nestedScope],
+      { focusedClientIndex: 1 },
+    ),
+    notificationScenario(
+      "focuses the exact explicit nested route including its query and hash",
+      nestedScope,
+      [`${nestedScope}chat?session=42#latest`],
+      { target: "chat?session=42#latest", navigatedUrl: `${nestedScope}chat?session=42#latest` },
+    ),
+    notificationScenario(
+      "opens a scope-relative approval route with its Gateway handoff fragment",
+      nestedScope,
+      [],
+      {
+        target: "approve/exec%3A1#gatewayUrl=wss%3A%2F%2Fgateway.example",
+        openedUrl:
+          "https://control.example/openclaw/approve/exec%3A1#gatewayUrl=wss%3A%2F%2Fgateway.example",
+      },
+    ),
+    notificationScenario(
+      "prefers a later exact explicit route over an unrelated nested app tab",
+      nestedScope,
+      [`${nestedScope}settings`, `${nestedScope}chat?session=42#latest`],
+      {
+        target: "chat?session=42#latest",
+        focusedClientIndex: 1,
+        navigatedUrl: `${nestedScope}chat?session=42#latest`,
+      },
+    ),
+    notificationScenario(
+      "prefers a later exact route over a matching path and query with a stale fragment",
+      nestedScope,
+      [`${nestedScope}chat?session=42#previous`, `${nestedScope}chat?session=42#latest`],
+      {
+        target: "chat?session=42#latest",
+        focusedClientIndex: 1,
+        navigatedUrl: `${nestedScope}chat?session=42#latest`,
+      },
+    ),
+    notificationScenario(
+      "prefers a matching path and query over an unrelated nested app tab",
+      nestedScope,
+      [`${nestedScope}settings`, `${nestedScope}chat?session=42`],
+      {
+        target: "chat?session=42#latest",
+        focusedClientIndex: 1,
+        navigatedUrl: `${nestedScope}chat?session=42#latest`,
+      },
+    ),
+    notificationScenario(
+      "prefers a matching route over an unrelated nested app tab when its query is stale",
+      nestedScope,
+      [`${nestedScope}settings`, `${nestedScope}chat?session=7`],
+      {
+        target: "chat?session=42#latest",
+        focusedClientIndex: 1,
+        navigatedUrl: `${nestedScope}chat?session=42#latest`,
+      },
+    ),
+    notificationScenario(
+      "prefers a later exact explicit route among root-scoped app tabs",
+      rootScope,
+      [`${rootScope}settings`, `${rootScope}chat?session=42#latest`],
+      {
+        target: "chat?session=42#latest",
+        focusedClientIndex: 1,
+        navigatedUrl: `${rootScope}chat?session=42#latest`,
+      },
+    ),
+    notificationScenario(
+      "prefers a later exact explicit route beneath a slashless nested scope",
+      nestedScopeWithoutSlash,
+      [`${nestedScopeWithoutSlash}/settings`, `${nestedScopeWithoutSlash}/chat?session=42#latest`],
+      {
+        target: "chat?session=42#latest",
+        focusedClientIndex: 1,
+        navigatedUrl: `${nestedScopeWithoutSlash}/chat?session=42#latest`,
+      },
+    ),
+    notificationScenario(
+      "restores a fragment omitted from the existing window client URL",
+      nestedScope,
+      [`${nestedScope}chat?session=42`],
+      { target: "chat?session=42#latest", navigatedUrl: `${nestedScope}chat?session=42#latest` },
+    ),
+    notificationScenario(
+      "resolves a relative route beneath a slashless nested scope",
+      nestedScopeWithoutSlash,
+      [`${nestedScopeWithoutSlash}/chat?session=42#latest`],
+      {
+        target: "chat?session=42#latest",
+        navigatedUrl: `${nestedScopeWithoutSlash}/chat?session=42#latest`,
+      },
+    ),
+    notificationScenario(
+      "restores an explicit fragment beneath a slashless nested scope",
+      nestedScopeWithoutSlash,
+      [`${nestedScopeWithoutSlash}/chat?session=42`],
+      {
+        target: "chat?session=42#latest",
+        navigatedUrl: `${nestedScopeWithoutSlash}/chat?session=42#latest`,
+      },
+    ),
+    notificationScenario(
+      "opens the relative target beneath a slashless nested scope",
+      nestedScopeWithoutSlash,
+      [],
+      {
+        target: "chat?session=42#latest",
+        openedUrl: `${nestedScopeWithoutSlash}/chat?session=42#latest`,
+      },
+    ),
+    notificationScenario(
+      "navigates an explicit route instead of trusting stale SPA fragments",
+      nestedScope,
+      [`${nestedScope}chat?session=42#current-session`],
+      { target: "chat?session=42", navigatedUrl: `${nestedScope}chat?session=42` },
+    ),
+    notificationScenario(
+      "navigates a stale in-scope client to the exact explicit nested route",
+      nestedScope,
+      [`${nestedScope}chat?session=7#latest`],
+      { target: "chat?session=42#latest", navigatedUrl: `${nestedScope}chat?session=42#latest` },
+    ),
+    notificationScenario("opens the canonical root scope when no window exists", rootScope, []),
+    notificationScenario("opens the canonical nested scope when no window exists", nestedScope, []),
+    notificationScenario(
+      "opens the exact slashless nested scope when no window exists",
+      nestedScopeWithoutSlash,
+      [],
+    ),
+    notificationScenario(
+      "never focuses a cross-origin window with the same nested pathname",
+      nestedScope,
+      ["https://outside.example/openclaw/"],
+      { focusedClientIndex: -1, openedUrl: nestedScope },
+    ),
+    notificationScenario(
+      "falls back to the registered scope for an explicit cross-origin target",
+      nestedScope,
+      [],
+      { target: "https://outside.example/openclaw/chat" },
+    ),
+    notificationScenario(
+      "rejects a sibling-prefix target and never focuses its window",
+      nestedScope,
+      ["https://control.example/openclaw-other/chat"],
+      { target: "/openclaw-other/chat", focusedClientIndex: -1, openedUrl: nestedScope },
+    ),
+    notificationScenario(
+      "rejects a sibling-prefix target for a slashless nested scope",
+      nestedScopeWithoutSlash,
+      ["https://control.example/openclaw-other/chat"],
+      {
+        target: "/openclaw-other/chat",
+        focusedClientIndex: -1,
+        openedUrl: nestedScopeWithoutSlash,
+      },
+    ),
+    notificationScenario(
+      "rejects ancestor traversal from a slashless nested scope",
+      nestedScopeWithoutSlash,
+      [rootScope],
+      { target: "../", focusedClientIndex: -1, openedUrl: nestedScopeWithoutSlash },
+    ),
+    notificationScenario(
+      "rejects a cross-origin target for a slashless nested scope",
+      nestedScopeWithoutSlash,
+      [],
+      { target: "https://outside.example/openclaw/chat" },
+    ),
+    notificationScenario(
+      "never focuses a sibling-prefix window for the default nested target",
+      nestedScope,
+      ["https://control.example/openclaw-other/"],
+      { focusedClientIndex: -1, openedUrl: nestedScope },
+    ),
+    notificationScenario(
+      "falls back to the registered scope for a malformed explicit target",
+      nestedScope,
+      [],
+      { target: "https://[invalid" },
+    ),
+    notificationScenario(
+      "rejects ancestor traversal without focusing the same-origin root window",
+      nestedScope,
+      [rootScope],
+      { target: "../", focusedClientIndex: -1, openedUrl: nestedScope },
+    ),
   ];
 
   it.each(scenarios)(
@@ -495,6 +519,27 @@ describe("Control UI service worker notification scope", () => {
       }
     },
   );
+
+  it("preserves a quiet shared tag for approval terminal replacements", async () => {
+    const worker = createNotificationServiceWorker(nestedScope, []);
+    const tag = "openclaw-approval-exec:replacement";
+
+    const requested = await worker.dispatchPush({
+      title: "OpenClaw approval requested",
+      body: "Open OpenClaw to review this request.",
+      tag,
+      renotify: false,
+    });
+    const terminal = await worker.dispatchPush({
+      title: "OpenClaw approval updated",
+      body: "This approval is no longer pending.",
+      tag,
+      renotify: false,
+    });
+
+    expect(requested.options).toMatchObject({ tag, renotify: false });
+    expect(terminal.options).toMatchObject({ tag, renotify: false });
+  });
 
   it.each([
     {
@@ -594,6 +639,11 @@ type ActivateEventStub = {
   waitUntil(promise: Promise<unknown>): void;
 };
 
+class UnresponsiveMessageChannel {
+  port1 = { addEventListener() {}, start() {} };
+  port2 = {};
+}
+
 type NotificationClickScenario = {
   name: string;
   scope: string;
@@ -607,6 +657,8 @@ type NotificationClickScenario = {
 type ServiceWorkerPushPayload = {
   title: string;
   body: string;
+  renotify?: boolean;
+  tag?: string;
   url?: string;
 };
 
@@ -615,6 +667,7 @@ type ServiceWorkerNotificationOptions = {
   icon: string;
   badge: string;
   tag: string;
+  renotify: boolean;
   data: { url: string; explicitUrl: boolean };
 };
 
@@ -734,12 +787,4 @@ function createNotificationServiceWorker(
       return close;
     },
   };
-}
-
-function createDeferred<T>() {
-  let resolve!: (value: T) => void;
-  const promise = new Promise<T>((resolvePromise) => {
-    resolve = resolvePromise;
-  });
-  return { promise, resolve };
 }

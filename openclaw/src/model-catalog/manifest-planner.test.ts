@@ -1,5 +1,5 @@
 // Manifest model-catalog planner tests cover plugin-owned row planning, filters, conflicts, and suppressions.
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   planManifestModelCatalogRows,
   planManifestModelCatalogSuppressions,
@@ -77,6 +77,141 @@ describe("manifest model catalog planner", () => {
       { provider: "anthropic-alias", id: "old", name: "Remote alias", source: "runtime-refresh" },
     ]);
   });
+
+  it("scopes requested merge keys while preserving alias overlays", () => {
+    const resolveRemoteProvider = vi.fn((provider: string) =>
+      provider === "anthropic"
+        ? {
+            models: [
+              { id: "requested", name: "Remote" },
+              { id: "unrelated", name: "Remote unrelated" },
+            ],
+          }
+        : undefined,
+    );
+    const plan = planManifestModelCatalogRows({
+      registry: {
+        plugins: [
+          {
+            id: "anthropic",
+            providers: ["anthropic"],
+            modelCatalog: {
+              aliases: {
+                "anthropic-alias": {
+                  provider: "anthropic",
+                  api: "anthropic-messages",
+                  baseUrl: "https://alias.anthropic.test",
+                },
+              },
+              providers: {
+                anthropic: {
+                  models: [{ id: "requested", name: "Bundled" }, { id: "unrelated" }],
+                },
+              },
+            },
+          },
+          {
+            id: "unrelated",
+            providers: ["unrelated"],
+            modelCatalog: {
+              providers: { unrelated: { models: [{ id: "unrelated" }] } },
+            },
+          },
+        ],
+      },
+      providerFilters: ["anthropic-alias"],
+      mergeKeyFilter: new Set(["anthropic-alias::requested"]),
+      resolveRemoteProvider,
+    });
+
+    expect(resolveRemoteProvider.mock.calls).toEqual([["anthropic"]]);
+    expect(plan.entries).toHaveLength(1);
+    expect(plan.rows).toMatchObject([
+      {
+        provider: "anthropic-alias",
+        id: "requested",
+        name: "Remote",
+        api: "anthropic-messages",
+        baseUrl: "https://alias.anthropic.test",
+        source: "runtime-refresh",
+      },
+    ]);
+  });
+
+  it("selects static and supplemental rows at their owning catalog boundary", () => {
+    const providers = [
+      ["static-provider", "static"],
+      ["refreshable-provider", "refreshable"],
+      ["runtime-provider", "runtime"],
+    ] as const;
+    const registry = {
+      plugins: providers.map(([provider, discovery]) => ({
+        id: provider,
+        providers: [provider],
+        modelCatalog: {
+          providers: { [provider]: { models: [{ id: "known" }] } },
+          discovery: { [provider]: discovery },
+        },
+      })),
+    };
+    const remoteOverlay = Object.fromEntries(
+      providers.map(([provider]) => [provider, { models: [{ id: "refreshed" }] }]),
+    );
+    const refsFor = (selection?: Parameters<typeof planManifestModelCatalogRows>[0]["selection"]) =>
+      planManifestModelCatalogRows({
+        registry,
+        remoteOverlay,
+        ...(selection ? { selection } : {}),
+      }).rows.map((row) => row.ref);
+
+    expect(refsFor()).toEqual([
+      "refreshable-provider/known",
+      "refreshable-provider/refreshed",
+      "runtime-provider/known",
+      "runtime-provider/refreshed",
+      "static-provider/known",
+      "static-provider/refreshed",
+    ]);
+    expect(refsFor("static")).toEqual(["static-provider/known", "static-provider/refreshed"]);
+    expect(refsFor("supplemental")).toEqual([
+      "refreshable-provider/known",
+      "refreshable-provider/refreshed",
+      "runtime-provider/refreshed",
+      "static-provider/known",
+      "static-provider/refreshed",
+    ]);
+  });
+
+  it("keeps conflicting model rows excluded from every catalog selection", () => {
+    const registry = {
+      plugins: [
+        {
+          id: "first-owner",
+          modelCatalog: {
+            providers: { shared: { models: [{ id: "conflicted" }] } },
+            discovery: { shared: "static" as const },
+          },
+        },
+        {
+          id: "second-owner",
+          modelCatalog: {
+            providers: { shared: { models: [{ id: "conflicted" }] } },
+            discovery: { shared: "runtime" as const },
+          },
+        },
+      ],
+    };
+
+    for (const selection of [undefined, "static", "supplemental"] as const) {
+      const plan = planManifestModelCatalogRows({
+        registry,
+        ...(selection ? { selection } : {}),
+      });
+      expect(plan.rows, selection).toEqual([]);
+      expect(plan.conflicts, selection).toHaveLength(1);
+    }
+  });
+
   it("builds manifest rows from plugin-owned catalog providers", () => {
     const plan = planManifestModelCatalogRows({
       registry: {

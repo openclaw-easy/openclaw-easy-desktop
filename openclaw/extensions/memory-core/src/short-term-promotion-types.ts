@@ -1,20 +1,14 @@
-import path from "node:path";
+import type { MemoryEntryProvenance } from "openclaw/plugin-sdk/memory-core-host-runtime-files";
+import {
+  DEFAULT_MEMORY_DEEP_DREAMING_MIN_RECALL_COUNT,
+  DEFAULT_MEMORY_DEEP_DREAMING_MIN_SCORE,
+  DEFAULT_MEMORY_DEEP_DREAMING_MIN_UNIQUE_QUERIES,
+} from "openclaw/plugin-sdk/memory-core-host-status";
 import type { ConceptTagScriptCoverage } from "./concept-vocabulary.js";
 
-export const DEFAULT_PROMOTION_MIN_SCORE = 0.75;
-export const DEFAULT_PROMOTION_MIN_RECALL_COUNT = 3;
-export const DEFAULT_PROMOTION_MIN_UNIQUE_QUERIES = 2;
-export const SHORT_TERM_STORE_RELATIVE_PATH = path.join(
-  "memory",
-  ".dreams",
-  "short-term-recall.json",
-);
-export const SHORT_TERM_PHASE_SIGNAL_RELATIVE_PATH = path.join(
-  "memory",
-  ".dreams",
-  "phase-signals.json",
-);
-
+export const DEFAULT_PROMOTION_MIN_SCORE = DEFAULT_MEMORY_DEEP_DREAMING_MIN_SCORE;
+export const DEFAULT_PROMOTION_MIN_RECALL_COUNT = DEFAULT_MEMORY_DEEP_DREAMING_MIN_RECALL_COUNT;
+export const DEFAULT_PROMOTION_MIN_UNIQUE_QUERIES = DEFAULT_MEMORY_DEEP_DREAMING_MIN_UNIQUE_QUERIES;
 export type PromotionWeights = {
   frequency: number;
   relevance: number;
@@ -42,7 +36,9 @@ export type ShortTermRecallEntry = {
   recallDays: string[];
   conceptTags: string[];
   claimHash?: string;
+  projectKey?: string;
   promotedAt?: string;
+  provenance?: MemoryEntryProvenance;
 };
 
 export type ShortTermRecallStore = {
@@ -99,6 +95,7 @@ export type PromotionCandidate = {
   maxScore: number;
   uniqueQueries: number;
   claimHash?: string;
+  projectKey?: string;
   promotedAt?: string;
   firstRecalledAt: string;
   lastRecalledAt: string;
@@ -107,6 +104,7 @@ export type PromotionCandidate = {
   recallDays: string[];
   conceptTags: string[];
   components: PromotionComponents;
+  provenance?: MemoryEntryProvenance;
 };
 
 export type ShortTermAuditIssue = {
@@ -115,12 +113,10 @@ export type ShortTermAuditIssue = {
     | "recall-store-unreadable"
     | "recall-store-empty"
     | "recall-store-invalid"
+    | "recall-store-dangling"
     | "recall-store-over-limit"
     | "recall-lock-stale"
-    | "recall-lock-unreadable"
-    | "qmd-index-missing"
-    | "qmd-index-empty"
-    | "qmd-collections-empty";
+    | "recall-lock-unreadable";
   message: string;
   fixable: boolean;
 };
@@ -136,19 +132,14 @@ export type ShortTermAuditSummary = {
   conceptTaggedEntryCount: number;
   conceptTagScripts?: ConceptTagScriptCoverage;
   invalidEntryCount: number;
+  danglingEntryCount?: number;
   issues: ShortTermAuditIssue[];
-  qmd?:
-    | {
-        dbPath?: string;
-        collections?: number;
-        dbBytes?: number;
-      }
-    | undefined;
 };
 
 export type RepairShortTermPromotionArtifactsResult = {
   changed: boolean;
   removedInvalidEntries: number;
+  removedDanglingEntries?: number;
   removedOverflowEntries: number;
   rewroteStore: boolean;
   removedStaleLock: boolean;
@@ -168,6 +159,8 @@ export type RankShortTermPromotionOptions = {
 };
 
 export type ApplyShortTermPromotionsOptions = {
+  agentId?: string;
+  workspaceAgentIds?: readonly string[];
   workspaceDir: string;
   candidates: PromotionCandidate[];
   limit?: number;
@@ -193,6 +186,15 @@ export type ApplyShortTermPromotionsOptions = {
    * metadata.
    */
   maxPromotedSnippetTokens?: number;
+  maxPriorEntryLossFraction?: number;
+  consolidation?: {
+    subagent?: import("./dreaming-narrative.js").SubagentSurface;
+    model?: string;
+    logger: {
+      info: (message: string) => void;
+      warn: (message: string) => void;
+    };
+  };
 };
 
 export type ApplyShortTermPromotionsResult = {
@@ -201,6 +203,10 @@ export type ApplyShortTermPromotionsResult = {
   appended: number;
   reconciledExisting: number;
   appliedCandidates: PromotionCandidate[];
+  rejectedCandidates: Array<{
+    candidate: PromotionCandidate;
+    reason: string;
+  }>;
   /** Number of older promotion sections compacted out to honor the budget. */
   compactedSections: number;
   /** Dates of the compacted promotion sections, oldest first. */

@@ -23,7 +23,7 @@ const hoisted = vi.hoisted(() => ({
       mode: "oauth",
     }),
   ),
-  resolveApiKeyForProviderMock: vi.fn(async () => ({
+  resolveApiKeyForProviderCoreMock: vi.fn(async () => ({
     [API_KEY_FIELD]: "test-token",
     source: "test",
     mode: "oauth",
@@ -46,7 +46,7 @@ const {
   completeMock,
   ensureOpenClawModelsJsonMock,
   getApiKeyForModelMock,
-  resolveApiKeyForProviderMock,
+  resolveApiKeyForProviderCoreMock,
   requireApiKeyMock,
   setRuntimeApiKeyMock,
   discoverModelsMock,
@@ -107,8 +107,8 @@ vi.mock("../agents/models-config.js", async () => ({
 
 vi.mock("../agents/model-auth.js", () => ({
   applySecretRefHeaderSentinels: (model: unknown) => model,
-  getApiKeyForModel: getApiKeyForModelMock,
-  resolveApiKeyForProvider: resolveApiKeyForProviderMock,
+  getApiKeyForModelCore: getApiKeyForModelMock,
+  resolveApiKeyForProviderCore: resolveApiKeyForProviderCoreMock,
   [REQUIRE_API_KEY_FIELD]: requireApiKeyMock,
 }));
 
@@ -154,14 +154,6 @@ vi.mock("../agents/embedded-agent-runner/model.js", () => ({
   resolveModelAsync: resolveModelAsyncMock,
 }));
 
-vi.mock("../plugin-sdk/provider-auth.js", () => ({
-  buildCopilotIdeHeaders: () => ({
-    "Editor-Version": "vscode/1.107.0",
-    "User-Agent": "GitHubCopilotChat/0.35.0",
-  }),
-  COPILOT_INTEGRATION_ID: "vscode-chat",
-}));
-
 const imageTestFetchWithSsrFGuardMock = vi.hoisted(() => vi.fn());
 vi.mock("../infra/net/fetch-guard.js", async () => {
   const mod = await vi.importActual<typeof import("../infra/net/fetch-guard.js")>(
@@ -173,9 +165,9 @@ vi.mock("../infra/net/fetch-guard.js", async () => {
   };
 });
 
-const { describeImageWithModel } = await import("./image.js");
+const { describeImageWithModelCore } = await import("./image.js");
 
-describe("describeImageWithModel", () => {
+describe("describeImageWithModelCore", () => {
   afterEach(() => {
     vi.useRealTimers();
     vi.unstubAllEnvs();
@@ -254,6 +246,12 @@ describe("describeImageWithModel", () => {
         ? {
             [API_KEY_FIELD]: "test-token",
             baseUrl: "https://api.githubcopilot.com",
+            request: {
+              headers: {
+                "Copilot-Integration-Id": "copilot-developer-cli",
+                "Openai-Organization": "github-copilot",
+              },
+            },
           }
         : undefined;
     });
@@ -271,7 +269,7 @@ describe("describeImageWithModel", () => {
     });
 
     await expect(
-      describeImageWithModel({
+      describeImageWithModelCore({
         cfg: {},
         agentDir: "/tmp/openclaw-agent",
         provider: "lmstudio",
@@ -307,7 +305,7 @@ describe("describeImageWithModel", () => {
       content: [{ type: "text", text: "codex ok" }],
     });
 
-    const result = await describeImageWithModel({
+    const result = await describeImageWithModelCore({
       cfg: {},
       agentDir: "/tmp/openclaw-agent",
       provider: "openai",
@@ -373,7 +371,7 @@ describe("describeImageWithModel", () => {
       content: [{ type: "text", text: "codex ok" }],
     });
 
-    const result = await describeImageWithModel({
+    const result = await describeImageWithModelCore({
       cfg: {},
       agentDir: "/tmp/openclaw-agent",
       provider: "openai",
@@ -414,7 +412,7 @@ describe("describeImageWithModel", () => {
       content: [{ type: "text", text: "openrouter ok" }],
     });
 
-    const result = await describeImageWithModel({
+    const result = await describeImageWithModelCore({
       cfg: {},
       agentDir: "/tmp/openclaw-agent",
       provider: "openrouter",
@@ -467,7 +465,7 @@ describe("describeImageWithModel", () => {
       content: [{ type: "text", text: "dashscope ok" }],
     });
 
-    const result = await describeImageWithModel({
+    const result = await describeImageWithModelCore({
       cfg: {},
       agentDir: "/tmp/openclaw-agent",
       provider: "qwen",
@@ -586,7 +584,7 @@ describe("describeImageWithModel", () => {
           content: [{ type: "text", text: "retry ok" }],
         });
 
-      const result = await describeImageWithModel({
+      const result = await describeImageWithModelCore({
         cfg: {},
         agentDir: "/tmp/openclaw-agent",
         provider,
@@ -645,7 +643,7 @@ describe("describeImageWithModel", () => {
     });
 
     await expect(
-      describeImageWithModel({
+      describeImageWithModelCore({
         cfg: {},
         agentDir: "/tmp/openclaw-agent",
         provider: "openai",
@@ -677,7 +675,7 @@ describe("describeImageWithModel", () => {
     });
     completeMock.mockImplementation(() => new Promise(() => {}));
 
-    const result = describeImageWithModel({
+    const result = describeImageWithModelCore({
       cfg: {},
       agentDir: "/tmp/openclaw-agent",
       provider: "openai",
@@ -715,7 +713,7 @@ describe("describeImageWithModel", () => {
     });
     completeMock.mockImplementation(() => new Promise(() => {}));
     const controller = new AbortController();
-    const result = describeImageWithModel({
+    const result = describeImageWithModelCore({
       cfg: {},
       agentDir: "/tmp/openclaw-agent",
       provider: "openai",
@@ -769,7 +767,7 @@ describe("describeImageWithModel", () => {
     );
     completeMock.mockImplementation(() => new Promise(() => {}));
 
-    const result = describeImageWithModel({
+    const result = describeImageWithModelCore({
       cfg: {},
       agentDir: "/tmp/openclaw-agent",
       provider: "openai",
@@ -803,7 +801,7 @@ describe("describeImageWithModel", () => {
     vi.useFakeTimers();
     resolveModelAsyncMock.mockImplementationOnce(() => new Promise(() => {}));
 
-    const result = describeImageWithModel({
+    const result = describeImageWithModelCore({
       cfg: {},
       agentDir: "/tmp/openclaw-agent",
       provider: "openai",
@@ -837,7 +835,7 @@ describe("describeImageWithModel", () => {
         }),
     );
 
-    const result = describeImageWithModel({
+    const result = describeImageWithModelCore({
       cfg: {},
       agentDir: "/tmp/openclaw-agent",
       provider: "openai",
@@ -882,7 +880,7 @@ describe("describeImageWithModel", () => {
         }),
     );
     const controller = new AbortController();
-    const result = describeImageWithModel({
+    const result = describeImageWithModelCore({
       cfg: {},
       agentDir: "/tmp/openclaw-agent",
       provider: "openai",

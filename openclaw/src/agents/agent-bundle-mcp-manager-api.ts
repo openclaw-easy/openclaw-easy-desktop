@@ -1,5 +1,6 @@
 /** Module-level session MCP runtime manager entry APIs. */
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
+import type { SessionToolOverrides } from "../config/sessions/types.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import type { PluginManifestRegistry } from "../plugins/manifest-registry.js";
 import { resolveGlobalSingleton } from "../shared/global-singleton.js";
@@ -7,6 +8,7 @@ import { createSessionMcpRuntimeManager } from "./agent-bundle-mcp-manager.js";
 import { SESSION_MCP_RUNTIME_MANAGER_KEY } from "./agent-bundle-mcp-runtime-shared.js";
 import type {
   McpToolCatalog,
+  RequesterScopedMcpRuntimeHandle,
   SessionMcpRuntime,
   SessionMcpRuntimeManager,
 } from "./agent-bundle-mcp-types.js";
@@ -32,6 +34,7 @@ export async function getOrCreateSessionMcpRuntime(params: {
   requesterSenderId?: string | null;
   agentAccountId?: string | null;
   messageChannel?: string | null;
+  toolOverrides?: Pick<SessionToolOverrides, "mcpServers" | "mcpToolsDeny">;
 }): Promise<SessionMcpRuntime> {
   return await getSessionMcpRuntimeManager().getOrCreate(params);
 }
@@ -50,15 +53,16 @@ export async function getOrCreateRequesterScopedMcpRuntime(params: {
   requesterSenderId?: string | null;
   agentAccountId?: string | null;
   messageChannel?: string | null;
-}): Promise<SessionMcpRuntime | undefined> {
+  toolOverrides?: Pick<SessionToolOverrides, "mcpServers" | "mcpToolsDeny">;
+}): Promise<RequesterScopedMcpRuntimeHandle | undefined> {
   return await getSessionMcpRuntimeManager().getOrCreateRequesterScoped(params);
 }
 
 export function rememberAdvertisedScopedMcpCatalog(
-  sessionId: string,
+  handle: RequesterScopedMcpRuntimeHandle,
   catalog: McpToolCatalog,
 ): void {
-  getSessionMcpRuntimeManager().rememberAdvertisedScopedCatalog(sessionId, catalog);
+  getSessionMcpRuntimeManager().rememberAdvertisedScopedCatalog(handle, catalog);
 }
 
 export function getAdvertisedScopedMcpCatalog(sessionId: string): McpToolCatalog | null {

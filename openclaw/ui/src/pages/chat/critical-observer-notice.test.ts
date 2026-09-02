@@ -15,21 +15,31 @@ describe("critical session observer notice", () => {
     {
       name: "configured selected-agent foreground alias",
       sessionKey: "agent:work:primary",
+      agentId: undefined,
       visible: false,
     },
     {
       name: "canonical selected-agent global foreground",
       sessionKey: "global",
+      agentId: "work",
       visible: false,
+    },
+    {
+      name: "canonical other-agent global background",
+      sessionKey: "global",
+      agentId: "other",
+      visible: true,
     },
     {
       name: "genuine selected-agent background session",
       sessionKey: "agent:work:investigation",
+      agentId: undefined,
       visible: true,
     },
     {
       name: "genuine other-agent configured-main session",
       sessionKey: "agent:other:primary",
+      agentId: undefined,
       visible: true,
     },
   ])("configured-global observer notice: $name", async (testCase) => {
@@ -39,6 +49,7 @@ describe("critical session observer notice", () => {
     showCriticalSessionObserverNotice({
       payload: {
         sessionKey: testCase.sessionKey,
+        agentId: testCase.agentId,
         headline: "Configured-global observer regression",
         health: "stuck",
         revision: 1,
@@ -87,7 +98,7 @@ describe("critical session observer notice", () => {
     document.body.append(toastHost);
     const show = (sessionKey: string, health: string, revision: number) =>
       showCriticalSessionObserverNotice({
-        payload: { sessionKey, headline: "Repeated test failure", health, revision },
+        payload: { sessionKey, headline: "⚠️ Repeated test failure", health, revision },
         selectedSessionKey: "agent:main:selected",
         sessionHost: {},
         sessions: [
@@ -105,7 +116,7 @@ describe("critical session observer notice", () => {
     show("agent:main:other", "stuck", 2);
     await toastHost.updateComplete;
     expect(toastHost.querySelector(".app-toast__message")?.textContent).toContain(
-      "Other work — Repeated test failure",
+      "Other work — ⚠️ Repeated test failure",
     );
 
     toastHost.querySelector<HTMLButtonElement>(".app-toast__action")?.click();

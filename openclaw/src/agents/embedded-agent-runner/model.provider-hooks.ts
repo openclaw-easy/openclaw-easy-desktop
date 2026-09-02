@@ -1,6 +1,8 @@
 import { finiteSecondsToTimerSafeMilliseconds } from "@openclaw/normalization-core/number-coercion";
+import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import type { Api, Model } from "../../llm/types.js";
+import type { ProviderRuntimeModel } from "../../plugins/provider-runtime-model.types.js";
 import {
   applyProviderResolvedTransportWithPlugin,
   buildProviderUnknownModelHintWithPlugin,
@@ -11,6 +13,7 @@ import {
   shouldPreferProviderRuntimeResolvedModel,
 } from "../../plugins/provider-runtime.js";
 import { canonicalizeOpenAIModelId } from "../openai-routing.js";
+import { inheritModelProviderRequestRouteFacts } from "../provider-request-config.js";
 import {
   normalizeResolvedTransportApi,
   resolveProviderModelInput,
@@ -26,7 +29,7 @@ export type ProviderRuntimeHooks = {
   ) => string | undefined;
   prepareProviderDynamicModel: (
     params: Parameters<typeof prepareProviderDynamicModel>[0],
-  ) => Promise<void>;
+  ) => ReturnType<typeof prepareProviderDynamicModel>;
   runProviderDynamicModel: (params: Parameters<typeof runProviderDynamicModel>[0]) => unknown;
   shouldPreferProviderRuntimeResolvedModel?: (
     params: Parameters<typeof shouldPreferProviderRuntimeResolvedModel>[0],
@@ -182,7 +185,7 @@ export function normalizeResolvedModel(params: {
       input: params.model.input,
     }),
     cost: normalizeModelCost((params.model as { cost?: unknown }).cost),
-  } as Model;
+  } as Model & ProviderRuntimeModel;
   const runtimeHooks = params.runtimeHooks ?? DEFAULT_PROVIDER_RUNTIME_HOOKS;
   const pluginNormalized = runtimeHooks.normalizeProviderResolvedModelWithPlugin({
     provider: params.provider,
@@ -219,13 +222,24 @@ export function normalizeResolvedModel(params: {
       runtimeHooks,
       model: pluginNormalized ?? normalizedInputModel,
     });
-  return canonicalizeLegacyResolvedModel({
+  const normalizedModel = normalizeResolvedProviderModel({
     provider: params.provider,
-    model: normalizeResolvedProviderModel({
+    model: fallbackTransportNormalized ?? pluginNormalized ?? normalizedInputModel,
+  }) as Model & ProviderRuntimeModel;
+  // Rebuilding provider hooks may drop the host-prepared timeout. Restore it
+  // only when the final model does not declare a provider-owned override.
+  const modelWithProviderTimeout =
+    normalizedModel.requestTimeoutMs === undefined &&
+    normalizedInputModel.requestTimeoutMs !== undefined
+      ? { ...normalizedModel, requestTimeoutMs: normalizedInputModel.requestTimeoutMs }
+      : normalizedModel;
+  return inheritModelProviderRequestRouteFacts(
+    params.model,
+    canonicalizeLegacyResolvedModel({
       provider: params.provider,
-      model: fallbackTransportNormalized ?? pluginNormalized ?? normalizedInputModel,
+      model: modelWithProviderTimeout,
     }),
-  });
+  );
 }
 
 export function resolveProviderTransport(params: {
@@ -259,11 +273,7 @@ export function resolveProviderTransport(params: {
 }
 
 export function normalizeTransportBaseUrl(baseUrl: unknown): string | undefined {
-  if (typeof baseUrl !== "string") {
-    return undefined;
-  }
-  const trimmed = baseUrl.trim();
-  return trimmed ? trimmed : undefined;
+  return normalizeOptionalString(baseUrl);
 }
 
 export function resolveProviderRequestTimeoutMs(timeoutSeconds: unknown): number | undefined {

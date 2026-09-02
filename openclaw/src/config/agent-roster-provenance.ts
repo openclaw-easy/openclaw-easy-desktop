@@ -67,11 +67,19 @@ export function includeContributionOwnsAgentRoster(event: {
     return event.path.length <= 3 || event.path[3] === "default";
   }
   if (event.path[1] === "list") {
-    // IncludeProcessor keeps array items at the list's logical owner path: an
-    // item include is agents.list, while its id/default fields occupy path[2].
-    return event.path.length <= 2 || event.path[2] === "id" || event.path[2] === "default";
+    return event.path.length <= 3 || event.path[3] === "id" || event.path[3] === "default";
   }
   return false;
+}
+
+export function includeContributionOwnsBindings(event: {
+  path: readonly string[];
+  value: unknown;
+}): boolean {
+  if (event.path.length === 0) {
+    return isRecord(event.value) && Object.hasOwn(event.value, "bindings");
+  }
+  return event.path[0] === "bindings";
 }
 
 /** Whether include/env resolution produced a non-empty roster before raw migrations. */
@@ -101,6 +109,6 @@ export function configIncludeOwnsAgentRoster(snapshot: ConfigFileSnapshot): bool
   return configIncludeOwnsAgentRosterValues({
     parsed: snapshot.parsed,
     sourceConfigBeforeMigrations: snapshot.sourceConfigBeforeMigrations,
-    includeContributesRoster: snapshot.includeProvenance?.agentRoster,
+    includeContributesRoster: snapshot.agentRosterIncludeOwned,
   });
 }

@@ -1,3 +1,4 @@
+import type { DevUpdateTarget } from "../../infra/update-dev-target.js";
 import type { ResolvedGlobalInstallTarget } from "../../infra/update-global.js";
 import type { UpdateRunResult } from "../../infra/update-runner.js";
 import { defaultRuntime } from "../../runtime.js";
@@ -5,23 +6,27 @@ import type { OpenClawSchemaVersions } from "../../state/openclaw-schema-version
 import { replaceCliName, resolveCliName } from "../cli-name.js";
 import { formatCliCommand } from "../command-format.js";
 import { createUpdateProgress } from "./progress.js";
-import { resolveGitInstallDir, type UpdateCommandOptions } from "./shared.js";
 import {
   checkTargetDatabaseSchemas,
-  createBeforeGitMutation,
   formatSchemaRefusalLines,
   hasSchemaRefusal,
-  runGitUpdate,
-} from "./update-command-git.js";
+} from "./schema-preflight.js";
+import { resolveGitInstallDir, type UpdateCommandOptions } from "./shared.js";
+import { createBeforeGitMutation, updateGitInstall } from "./update-command-git.js";
+import {
+  captureOwnedManagedUpdateContext,
+  type OwnedManagedUpdateContext,
+} from "./update-command-managed-context.js";
 import { runPackageInstallUpdate } from "./update-command-package.js";
+import type { ManagedServiceRootRedirect } from "./update-command-service-plan.js";
 import {
   createAggregateErrorWithCause,
   maybeRestartServiceAfterFailedMutableUpdate,
   maybeResumeWindowsTaskAutoStartAfterPackageUpdate,
   maybeStopManagedServiceBeforeMutableUpdate,
+  resolvePreparedGatewayUpdatePolicy,
   shouldBlockMutableUpdateFromGatewayServiceEnv,
   UpdateCommandAbort,
-  type ManagedServiceRootRedirect,
   type PreManagedServiceStop,
   type UpdateCommandRecoveryState,
 } from "./update-command-service.js";
@@ -31,6 +36,7 @@ const CLI_NAME = resolveCliName();
 type MutableUpdateExecutionResult = {
   result: UpdateRunResult;
   preManagedServiceStop: PreManagedServiceStop | undefined;
+  ownedManagedUpdateContext: OwnedManagedUpdateContext | undefined;
 };
 
 export async function executeMutableUpdate(params: {
@@ -48,7 +54,7 @@ export async function executeMutableUpdate(params: {
   showProgress: boolean;
   opts: UpdateCommandOptions;
   shouldRestart: boolean;
-  devTargetRef?: string;
+  devTarget?: DevUpdateTarget;
   packageInstallSpec: string | null;
   packageInstallEnv?: NodeJS.ProcessEnv;
   packageInstallTarget?: ResolvedGlobalInstallTarget;
@@ -60,6 +66,7 @@ export async function executeMutableUpdate(params: {
   recoveryState: UpdateCommandRecoveryState;
 }): Promise<MutableUpdateExecutionResult | null> {
   let preManagedServiceStop: PreManagedServiceStop | undefined;
+  let ownedManagedUpdateContext: OwnedManagedUpdateContext | undefined;
   let schemaRefusalAfterStop = false;
   const gitMutationRoots =
     params.updateInstallKind === "git"
@@ -69,6 +76,7 @@ export async function executeMutableUpdate(params: {
       : null;
   const stopManagedServiceBeforeMutableUpdate = async (
     mutationRoots: readonly string[] = [params.root],
+    phase: "inspect" | "prepare" = "prepare",
   ) => {
     if (params.updateInstallKind !== "package" && params.updateInstallKind !== "git") {
       return;
@@ -81,6 +89,8 @@ export async function executeMutableUpdate(params: {
           root: mutationRoot,
           shouldRestart: params.shouldRestart,
           jsonMode: Boolean(params.opts.json),
+          timeoutMs: params.updateStepTimeoutMs,
+          phase,
         });
         if (preManagedServiceStop.windowsTaskAutoStartRecovery) {
           params.recoveryState.windowsTaskAutoStartRecovery =
@@ -107,9 +117,23 @@ export async function executeMutableUpdate(params: {
       throw new UpdateCommandAbort();
     }
 
-    if (preManagedServiceStop?.blockMessage) {
+    if (phase === "inspect" && preManagedServiceStop?.serviceUpdateVerdict?.kind === "foreign") {
+      preManagedServiceStop = undefined;
+    }
+
+    try {
+      ownedManagedUpdateContext = await captureOwnedManagedUpdateContext({
+        stopState: preManagedServiceStop,
+        processEnv: process.env,
+        invocationCwd: params.invocationCwd,
+      });
+    } catch (err) {
       params.stop();
-      defaultRuntime.error(preManagedServiceStop.blockMessage);
+      defaultRuntime.error(`Failed to capture managed gateway update state: ${String(err)}`);
+      await maybeRestartServiceAfterFailedMutableUpdate({
+        preManagedServiceStop,
+        jsonMode: Boolean(params.opts.json),
+      });
       defaultRuntime.exit(1);
       throw new UpdateCommandAbort();
     }
@@ -127,11 +151,21 @@ export async function executeMutableUpdate(params: {
       defaultRuntime.exit(1);
       throw new UpdateCommandAbort();
     }
+
+    if (preManagedServiceStop?.blockMessage) {
+      params.stop();
+      defaultRuntime.error(preManagedServiceStop.blockMessage);
+      defaultRuntime.exit(1);
+      throw new UpdateCommandAbort();
+    }
   };
 
-  if (params.updateInstallKind === "package") {
+  if (params.updateInstallKind === "package" || params.updateInstallKind === "git") {
     try {
-      await stopManagedServiceBeforeMutableUpdate();
+      await stopManagedServiceBeforeMutableUpdate(
+        gitMutationRoots ?? undefined,
+        params.updateInstallKind === "git" ? "inspect" : "prepare",
+      );
     } catch (err) {
       if (err instanceof UpdateCommandAbort) {
         return null;
@@ -174,11 +208,7 @@ export async function executeMutableUpdate(params: {
               startedAt: params.startedAt,
               progress: params.progress,
               jsonMode: Boolean(params.opts.json),
-              allowGatewayServiceRepair: preManagedServiceStop?.serviceMatchesMutationRoot === true,
-              allowGatewayActivation:
-                params.shouldRestart &&
-                preManagedServiceStop?.stopped === true &&
-                preManagedServiceStop.serviceMatchesMutationRoot === true,
+              ...resolvePreparedGatewayUpdatePolicy(preManagedServiceStop, params.shouldRestart),
               managedServiceEnv: preManagedServiceStop?.serviceEnv,
               invocationCwd: params.invocationCwd,
               honorPackageRoot:
@@ -188,7 +218,7 @@ export async function executeMutableUpdate(params: {
               installEnv: params.packageInstallEnv,
               installTarget: params.packageInstallTarget,
             })
-          : await runGitUpdate({
+          : await updateGitInstall({
               root: params.root,
               switchToGit: params.switchToGit,
               installKind: params.installKind,
@@ -200,7 +230,7 @@ export async function executeMutableUpdate(params: {
               showProgress: params.showProgress,
               opts: params.opts,
               stop: params.stop,
-              devTargetRef: params.devTargetRef,
+              devTarget: params.devTarget,
               beforeGitMutation:
                 params.updateInstallKind === "git"
                   ? createBeforeGitMutation({
@@ -251,5 +281,5 @@ export async function executeMutableUpdate(params: {
     throw err;
   }
 
-  return { result, preManagedServiceStop };
+  return { result, preManagedServiceStop, ownedManagedUpdateContext };
 }

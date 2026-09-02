@@ -5,9 +5,11 @@
  * lifecycle facade used during plugin startup.
  */
 import {
-  createAgentHarnessToolSurfaceRuntime as createCoreAgentHarnessToolSurfaceRuntime,
+  createAgentHarnessToolSurfaceRuntimeCore,
   type AgentHarnessToolSurfaceRuntime as CoreAgentHarnessToolSurfaceRuntime,
 } from "../agents/harness/tool-surface-bridge.js";
+
+export { getCoreTtsToolResultMediaUrls } from "../agents/tools/tts-tool-result-provenance.js";
 
 type OpenClawCodingToolsOptions = NonNullable<
   Parameters<typeof import("./agent-harness.js").createOpenClawCodingTools>[0]
@@ -22,7 +24,7 @@ export type AgentHarnessToolSurfaceRuntime = Omit<
 };
 
 export type AgentHarnessToolSurfaceRuntimeParams = Omit<
-  Parameters<typeof createCoreAgentHarnessToolSurfaceRuntime>[0],
+  Parameters<typeof createAgentHarnessToolSurfaceRuntimeCore>[0],
   "executeTool"
 > & {
   executeTool: NonNullable<OpenClawCodingToolsOptions["toolSearchCatalogExecutor"]>;
@@ -31,5 +33,5 @@ export type AgentHarnessToolSurfaceRuntimeParams = Omit<
 export function createAgentHarnessToolSurfaceRuntime(
   params: AgentHarnessToolSurfaceRuntimeParams,
 ): AgentHarnessToolSurfaceRuntime {
-  return createCoreAgentHarnessToolSurfaceRuntime(params);
+  return createAgentHarnessToolSurfaceRuntimeCore(params);
 }

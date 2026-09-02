@@ -19,10 +19,7 @@ import {
 } from "../../utils/delivery-context.shared.js";
 import type { ReplyPayload } from "../types.js";
 import { rejectNonOwnerCommand } from "./command-gates.js";
-import {
-  buildCurrentOpenClawCliCommand,
-  buildCurrentOpenClawCliExecEnv,
-} from "./commands-openclaw-cli.js";
+import { buildCurrentOpenClawCliExecRequest } from "./commands-openclaw-cli.js";
 import {
   deliverPrivateCommandReply,
   readCommandDeliveryTarget,
@@ -242,9 +239,10 @@ function buildDiagnosticsApprovalRequest(params: HandleCommandsParams): ExecAppr
       config: params.cfg,
     });
   return {
+    approvalKind: "exec",
     id: "diagnostics-private-route",
     request: {
-      command: buildGatewayDiagnosticsExportJsonCommand(),
+      command: buildGatewayDiagnosticsExportJsonRequest().command,
       agentId,
       ...(params.sessionKey ? { sessionKey: params.sessionKey } : {}),
       turnSourceChannel: params.command.channel,
@@ -257,8 +255,8 @@ function buildDiagnosticsApprovalRequest(params: HandleCommandsParams): ExecAppr
   };
 }
 
-function buildGatewayDiagnosticsExportJsonCommand(): string {
-  return buildCurrentOpenClawCliCommand(["gateway", "diagnostics", "export", "--json"]);
+function buildGatewayDiagnosticsExportJsonRequest() {
+  return buildCurrentOpenClawCliExecRequest(["gateway", "diagnostics", "export", "--json"]);
 }
 
 async function deliverPrivateDiagnosticsReply(params: {
@@ -282,7 +280,7 @@ async function requestGatewayDiagnosticsExportApproval(
       sessionKey: params.sessionKey,
       config: params.cfg,
     });
-  const command = buildGatewayDiagnosticsExportJsonCommand();
+  const { command, env } = buildGatewayDiagnosticsExportJsonRequest();
   try {
     const execTool = deps.createExecTool({
       host: "gateway",
@@ -309,11 +307,10 @@ async function requestGatewayDiagnosticsExportApproval(
     });
     const result = await execTool.execute("chat-diagnostics-gateway-export", {
       command,
-      env: buildCurrentOpenClawCliExecEnv(),
-      security: "allowlist",
+      env,
       ask: "always",
       background: true,
-      timeout: timeoutSec,
+      timeoutSeconds: timeoutSec,
     });
     if (result.details?.status === "approval-pending") {
       return { status: "pending" };
@@ -444,7 +441,7 @@ async function executeCodexDiagnosticsAddon(
     agentId: params.agentId,
     sessionKey: params.sessionKey,
     sessionId: targetSessionEntry?.sessionId,
-    sessionFile: targetSessionEntry?.sessionFile,
+    sessionFile: targetSessionEntry ? params.sessionKey : undefined,
     authProfileId: targetSessionEntry?.authProfileOverride,
     commandBody,
     config: params.cfg,
@@ -485,11 +482,11 @@ function buildCodexDiagnosticsSessions(
     }
   }
   return Array.from(sessions.entries())
-    .filter(([, entry]) => Boolean(entry.sessionFile))
+    .filter(([, entry]) => Boolean(entry.sessionId?.trim()))
     .map(([sessionKey, entry]) => ({
       sessionKey,
       sessionId: entry.sessionId,
-      sessionFile: entry.sessionFile,
+      sessionFile: sessionKey,
       agentHarnessId: entry.agentHarnessId,
       channel: resolveDiagnosticsSessionChannel(entry, params, sessionKey),
       channelId: resolveDiagnosticsSessionChannelId(entry, params, sessionKey),
@@ -628,17 +625,15 @@ function rewritePresentationAction(action: MessagePresentationAction): MessagePr
 }
 
 function rewriteSelectPresentationAction(
-  action: Extract<MessagePresentationAction, { type: "command" | "callback" }>,
-): Extract<MessagePresentationAction, { type: "command" | "callback" }> {
-  return action.type === "command"
-    ? {
-        type: "command",
-        command: rewriteCodexDiagnosticsCommandPrefix(action.command),
-      }
-    : {
-        type: "callback",
-        value: rewriteCodexDiagnosticsCommandPrefix(action.value),
-      };
+  action: Extract<MessagePresentationAction, { type: "command" | "callback" | "model-picker" }>,
+): Extract<MessagePresentationAction, { type: "command" | "callback" | "model-picker" }> {
+  if (action.type === "command") {
+    return { type: "command", command: rewriteCodexDiagnosticsCommandPrefix(action.command) };
+  }
+  if (action.type === "callback") {
+    return { type: "callback", value: rewriteCodexDiagnosticsCommandPrefix(action.value) };
+  }
+  return action;
 }
 
 function rewriteCodexDiagnosticsCommandPrefix(value: string): string {

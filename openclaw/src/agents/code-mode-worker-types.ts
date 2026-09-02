@@ -1,20 +1,25 @@
 import type { Result } from "@openclaw/normalization-core/result";
+import type { CodeModeJsonSource, CodeModeOutputSource } from "./code-mode-json.js";
 import type { CodeModeApiVirtualFile } from "./code-mode-namespaces.js";
 
 type CodeModeBridgeMethod =
   | "search"
   | "describe"
-  | "call"
   | "callValue"
+  | "nodes"
   | "yield"
   | "namespace"
   | "agentSpawn"
   | "agentWait"
+  | "skillsList"
+  | "skillsRead"
+  | "sleep"
   | "swarmNote";
 
 export type CodeModeConfig = {
   timeoutMs: number;
   memoryLimitBytes: number;
+  maxOutputBytes: number;
   maxPendingToolCalls: number;
   maxSnapshotBytes: number;
 };
@@ -40,7 +45,7 @@ export type CodeModeNamespaceDescriptor = {
   scope: SerializedCodeModeNamespaceValue;
 };
 
-export type CodeModeWorkerInput =
+type CodeModeWorkerInput =
   | {
       kind: "exec";
       source: string;
@@ -55,19 +60,32 @@ export type CodeModeWorkerInput =
       snapshotBytes: Uint8Array;
       config: CodeModeConfig;
       settledRequests: SettledBridgeRequest[];
+      pendingRequests?: PendingBridgeRequest[];
     };
 
-export type CodeModeWorkerResult =
+export type CodeModeWorkerPayload = CodeModeWorkerInput & {
+  wasmModule: WebAssembly.Module;
+};
+
+export type CodeModeSettlementMode =
+  | { kind: "awaiting" }
+  | { kind: "draining"; requiredRequestIds: string[] };
+
+export type CodeModeFailurePhase = "input" | "guest" | "bridge" | "host";
+
+type CodeModeWorkerOutcome<Output, Value> =
   | {
       status: "completed";
-      value: unknown;
-      output: unknown[];
+      value: Value;
+      output: Output;
     }
   | {
       status: "waiting";
       snapshotBytes: Uint8Array;
       pendingRequests: PendingBridgeRequest[];
-      output: unknown[];
+      canceledRequestIds: string[];
+      settlementMode: CodeModeSettlementMode;
+      output: Output;
     }
   | {
       status: "failed";
@@ -78,5 +96,13 @@ export type CodeModeWorkerResult =
         | "timeout"
         | "snapshot_limit_exceeded"
         | "internal_error";
-      output: unknown[];
+      failurePhase: Extract<CodeModeFailurePhase, "input" | "guest">;
+      bridgeDispatchStarted: false;
+      output: Output;
     };
+
+export type CodeModeVmResult = CodeModeWorkerOutcome<unknown[], unknown>;
+export type CodeModeWorkerThreadResult = CodeModeWorkerOutcome<
+  CodeModeOutputSource,
+  CodeModeJsonSource
+>;

@@ -177,7 +177,7 @@ describe("policy doctor metadata", () => {
   it("points required-deny repair metadata at OpenClaw deny config paths", () => {
     expect(
       POLICY_FIX_METADATA_BY_CHECK_ID.get(CHECK_IDS.policyToolsRequiredDenyMissing)?.configTargets,
-    ).toEqual(["tools.deny", "agents.list[].tools.deny"]);
+    ).toEqual(["tools.deny", "agents.entries.<id>.tools.deny"]);
   });
 
   it("keeps policy fix class assignments explicit", () => {
@@ -238,6 +238,7 @@ describe("policy doctor metadata", () => {
         "policy/policy-jsonc-missing",
         "policy/sandbox-browser-cdp-source-range-missing",
         "policy/secrets-unmanaged-provider",
+        "policy/tools-md-migration-required",
         "policy/tools-missing-owner",
         "policy/tools-missing-risk-level",
         "policy/tools-missing-sensitivity-token",
