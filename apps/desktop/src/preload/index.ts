@@ -388,6 +388,25 @@ const api = {
     return () => ipcRenderer.removeListener('app:update-available', handler)
   },
   removeUpdateAvailableListener: () => ipcRenderer.removeAllListeners('app:update-available'),
+  // Consented update actions — nothing downloads or installs unprompted.
+  downloadUpdate: () => ipcRenderer.invoke('app:download-update'),
+  installUpdate: () => ipcRenderer.invoke('app:install-update'),
+  getUpdateState: () => ipcRenderer.invoke('app:update-state'),
+  onUpdateDownloadProgress: (cb: (data: any) => void) => {
+    const handler = (_: any, data: any) => cb(data)
+    ipcRenderer.on('app:update-download-progress', handler)
+    return () => ipcRenderer.removeListener('app:update-download-progress', handler)
+  },
+  onUpdateDownloaded: (cb: (data: any) => void) => {
+    const handler = (_: any, data: any) => cb(data)
+    ipcRenderer.on('app:update-downloaded', handler)
+    return () => ipcRenderer.removeListener('app:update-downloaded', handler)
+  },
+  onUpdateError: (cb: (data: any) => void) => {
+    const handler = (_: any, data: any) => cb(data)
+    ipcRenderer.on('app:update-error', handler)
+    return () => ipcRenderer.removeListener('app:update-error', handler)
+  },
 }
 
 // Use `contextBridge` APIs to expose Electron APIs to renderer

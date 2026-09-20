@@ -12,9 +12,24 @@ interface UpdateBannerProps {
   onDownload: () => void
   onDismiss: () => void
   colors: ColorScheme
+  /** Consented update flow state; omitted by callers that only notify. */
+  phase?: 'idle' | 'available' | 'downloading' | 'downloaded' | 'error'
+  percent?: number
+  error?: string | null
+  onInstall?: () => void
 }
 
-export function UpdateBanner({ latestVersion, releaseDate, onDownload, onDismiss, colors }: UpdateBannerProps) {
+export function UpdateBanner({
+  latestVersion,
+  releaseDate,
+  onDownload,
+  onDismiss,
+  colors,
+  phase = 'available',
+  percent = 0,
+  error = null,
+  onInstall,
+}: UpdateBannerProps) {
   const { t } = useTranslation()
   const formattedDate = (() => {
     try {
@@ -37,13 +52,38 @@ export function UpdateBanner({ latestVersion, releaseDate, onDownload, onDismiss
         <span style={{ color: colors.text.muted }}> — {t('updateBanner.released', { date: formattedDate })}</span>
       </span>
       <div className="flex items-center gap-2 ml-4 flex-shrink-0">
-        <button
-          onClick={onDownload}
-          className="press-pulse ripple-glow px-3 py-1 rounded-md text-xs font-medium transition-all hover:-translate-y-px hover:shadow-glow active:translate-y-0"
-          style={{ backgroundColor: colors.accent.brand, color: colors.button.primaryFg }}
-        >
-          {t('settings.download')}
-        </button>
+        {/* Nothing downloads or installs without one of these clicks. */}
+        {phase === 'downloading' && (
+          <span className="text-xs tabular-nums" style={{ color: colors.text.muted }}>
+            {t('updateBanner.downloading', 'Downloading… {{percent}}%', { percent })}
+          </span>
+        )}
+        {phase === 'error' && (
+          <span className="text-xs truncate max-w-[22rem]" title={error ?? undefined} style={{ color: colors.accent.yellow }}>
+            {t('updateBanner.failed', 'Update failed — {{message}}', { message: error ?? '' })}
+          </span>
+        )}
+        {phase === 'downloaded' && onInstall ? (
+          <button
+            onClick={onInstall}
+            className="press-pulse ripple-glow px-3 py-1 rounded-md text-xs font-medium transition-all hover:-translate-y-px hover:shadow-glow active:translate-y-0"
+            style={{ backgroundColor: colors.accent.brand, color: colors.button.primaryFg }}
+          >
+            {t('updateBanner.restartToInstall', 'Restart to install')}
+          </button>
+        ) : (
+          phase !== 'downloading' && (
+            <button
+              onClick={onDownload}
+              className="press-pulse ripple-glow px-3 py-1 rounded-md text-xs font-medium transition-all hover:-translate-y-px hover:shadow-glow active:translate-y-0"
+              style={{ backgroundColor: colors.accent.brand, color: colors.button.primaryFg }}
+            >
+              {phase === 'error'
+                ? t('updateBanner.retry', 'Retry')
+                : t('settings.download')}
+            </button>
+          )
+        )}
         <button
           onClick={onDismiss}
           className="press-pulse px-3 py-1 rounded-md text-xs transition-colors hover:bg-white/10"

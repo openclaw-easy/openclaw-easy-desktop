@@ -162,7 +162,19 @@ fs.mkdirSync(DEST_DIR, { recursive: true });
 
 // ── 1. dist/ (compiled core + Control UI) ────────────────────────────────────
 info("Copying dist/ (compiled core + Control UI)...");
-mirror(DIST, path.join(DEST_DIR, "dist"));
+// node_modules is excluded for the same reason step 2 excludes it — runtime
+// deps resolve through the bundled root node_modules — but here it is also
+// load-bearing. pnpm links a plugin's own package back to the repo root
+// (dist/extensions/zalouser/node_modules/openclaw -> ../../../..), and because
+// this mirror dereferences (codesign and NSIS reject bundled symlinks), the
+// copy re-enters the repo through that link and recurses until the path blows
+// the OS limit:
+//   ENAMETOOLONG: stat '.../dist/extensions/zalouser/node_modules/openclaw/ui/node_modules/openclaw/...'
+// Root package.json already keeps these out of the npm artifact via
+// "!dist/extensions/*/node_modules/**"; this keeps them out of the installer.
+mirror(DIST, path.join(DEST_DIR, "dist"), {
+  excludeDirNames: ["node_modules"],
+});
 
 // Sanity: Control UI must have made it into the payload.
 const destControlUi = path.join(DEST_DIR, "dist", "control-ui", "index.html");
@@ -239,26 +251,49 @@ fs.copyFileSync(ROOT_PKG, path.join(DEST_DIR, "package.json"));
 // ERR_MODULE_NOT_FOUND — caught only by the pre-notarization DMG smoke test.
 // Derive the list from the entry point instead of maintaining it by hand, and
 // fail loudly here rather than in a DMG.
-const entrySource = fs.readFileSync(OPENCLAW_MJS, "utf8");
-const siblingSpecifiers = new Set(
-  [...entrySource.matchAll(/\bfrom\s*["'](\.\/[^"']+)["']|\bimport\s*\(\s*["'](\.\/[^"']+)["']/g)].map(
-    (match) => match[1] ?? match[2],
-  ),
+//
+// The walk is TRANSITIVE. Scanning only openclaw.mjs was itself the
+// 2026-09-20 release blocker: openclaw.mjs imports node-runtime-recovery.mjs,
+// which imports cli-root-options.mjs, gateway-run-argv.mjs and
+// gateway-shutdown-budget.mjs. A one-level scan copies the first hop and
+// leaves the rest behind, so the bundle still dies at boot. Follow every
+// copied module's own relative imports until the graph closes.
+const readSiblingSpecifiers = (source) =>
+  new Set(
+    [...source.matchAll(/\bfrom\s*["'](\.\/[^"']+)["']|\bimport\s*\(\s*["'](\.\/[^"']+)["']/g)].map(
+      (match) => match[1] ?? match[2],
+    ),
+  );
+
+const pendingSiblings = [...readSiblingSpecifiers(fs.readFileSync(OPENCLAW_MJS, "utf8"))].map(
+  (specifier) => ({ specifier, importer: "openclaw.mjs" }),
 );
-for (const specifier of siblingSpecifiers) {
+const copiedSiblings = new Set();
+while (pendingSiblings.length > 0) {
+  const { specifier, importer } = pendingSiblings.shift();
   // Directory specifiers are bundle payloads copied by the steps above.
   if (!/\.[cm]?js$/.test(specifier)) continue;
+  if (copiedSiblings.has(specifier)) continue;
   const source = path.join(WORKSPACE_DIR, specifier);
   if (!fs.existsSync(source)) {
     fatal(
-      `openclaw.mjs imports ${specifier}, which does not exist at ${source}.\n` +
+      `${importer} imports ${specifier}, which does not exist at ${source}.\n` +
         `The bundled runtime would fail to boot with ERR_MODULE_NOT_FOUND.`,
     );
   }
   const destination = path.join(DEST_DIR, specifier);
   fs.mkdirSync(path.dirname(destination), { recursive: true });
   fs.copyFileSync(source, destination);
-  console.log(`  entry sibling: ${specifier}`);
+  copiedSiblings.add(specifier);
+  console.log(`  entry sibling: ${specifier}${importer === "openclaw.mjs" ? "" : ` (via ${importer})`}`);
+  for (const nested of readSiblingSpecifiers(fs.readFileSync(source, "utf8"))) {
+    // Nested specifiers are relative to their own importer's directory.
+    const resolved = path.posix.normalize(path.posix.join(path.posix.dirname(specifier), nested));
+    pendingSiblings.push({
+      specifier: resolved.startsWith(".") ? resolved : `./${resolved}`,
+      importer: specifier,
+    });
+  }
 }
 
 // ── 5b. Vendor workspace-protocol dependencies ───────────────────────────────

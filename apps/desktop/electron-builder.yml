@@ -39,6 +39,13 @@ mac:
       arch:
         - x64
         - arm64
+    # Squirrel.Mac updates from a zip, never a dmg or pkg. Without this the
+    # build produces no macOS update artifact and in-app updates silently do
+    # nothing on Mac.
+    - target: zip
+      arch:
+        - x64
+        - arm64
   icon: resources/icons/icon.icns
   category: public.app-category.productivity
   identity: null  # Set your Apple Developer identity for code signing

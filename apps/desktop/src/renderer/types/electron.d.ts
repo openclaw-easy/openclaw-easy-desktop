@@ -524,6 +524,14 @@ export interface ElectronAPI {
   getAppVersion: () => Promise<string>
   checkForUpdates: () => Promise<UpdateInfo>
   onUpdateAvailable: (cb: (data: UpdateInfo) => void) => () => void
+  downloadUpdate: () => Promise<{ ok: boolean; error?: string }>
+  installUpdate: () => Promise<{ ok: boolean }>
+  getUpdateState: () => Promise<{ phase: string; latestVersion: string | null }>
+  onUpdateDownloadProgress: (
+    cb: (data: { percent: number; transferred: number; total: number; bytesPerSecond: number }) => void,
+  ) => () => void
+  onUpdateDownloaded: (cb: (data: { version?: string }) => void) => () => void
+  onUpdateError: (cb: (data: { message: string }) => void) => () => void
   removeUpdateAvailableListener: () => void
 }
 

@@ -50,6 +50,7 @@ import { WhisperServerManager } from './managers/whisper-server-manager'
 import { TelemetryManager } from './managers/telemetry-manager'
 import { safeOpenExternal } from './safe-open-external'
 import { fetchLatestRelease } from './release-feed'
+import { AppUpdater } from './managers/app-updater'
 
 // Simple semver comparison: returns true if `latest` is strictly newer than `current`
 function isNewerVersion(latest: string, current: string): boolean {
@@ -138,6 +139,7 @@ class OpenclawEasyApp {
   private sessionManager: SessionManager
   private workspaceManager: WorkspaceManager
   private sttManager: SttManager
+  private appUpdater: AppUpdater
   private whisperServerManager: WhisperServerManager
   private telemetryManager: TelemetryManager
 
@@ -163,6 +165,13 @@ class OpenclawEasyApp {
     this.workspaceManager = new WorkspaceManager()
     this.sttManager = new SttManager()
     this.whisperServerManager = new WhisperServerManager()
+    this.appUpdater = new AppUpdater({
+      getWindow: () => this.mainWindow,
+      isEnabled: async () => (await this.settingsManager.getSettings()).autoUpdate,
+      isPackaged: app.isPackaged,
+      currentVersion: app.getVersion(),
+    })
+    this.appUpdater.init()
     this.telemetryManager = new TelemetryManager(this.configManager, this.settingsManager)
   }
 
@@ -351,6 +360,12 @@ class OpenclawEasyApp {
         const checkForUpdate = async () => {
           const settings = await this.settingsManager.getSettings()
           if (!settings.autoUpdate) return
+          if (app.isPackaged) {
+            // AppUpdater emits app:update-available itself, so the banner only
+            // offers an update that can actually be downloaded and installed.
+            await this.appUpdater.check()
+            return
+          }
           const data = await fetchLatestRelease()
           const current = app.getVersion()
           if (isNewerVersion(data.version, current)) {
@@ -2123,6 +2138,20 @@ class OpenclawEasyApp {
 
     ipcMain.handle('app:check-for-updates', async () => {
       const current = app.getVersion()
+      if (app.isPackaged) {
+        try {
+          const result = await this.appUpdater.check()
+          return {
+            hasUpdate: result.hasUpdate,
+            currentVersion: current,
+            latestVersion: result.latestVersion ?? current,
+            downloads: {},
+          }
+        } catch (error) {
+          console.error('[Update] Update feed check failed:', error)
+          return { hasUpdate: false, currentVersion: current, latestVersion: current, downloads: {} }
+        }
+      }
       try {
         const data = await fetchLatestRelease()
         const hasUpdate = isNewerVersion(data.version, current)
@@ -2138,6 +2167,24 @@ class OpenclawEasyApp {
         return { hasUpdate: false, currentVersion: current, latestVersion: current, downloads: {} }
       }
     })
+
+    // Consented update actions. Nothing downloads or installs without these.
+    ipcMain.handle('app:download-update', async () => {
+      try {
+        await this.appUpdater.download()
+        return { ok: true }
+      } catch (error: any) {
+        console.error('[Update] Download failed:', error)
+        return { ok: false, error: error?.message ?? String(error) }
+      }
+    })
+
+    ipcMain.handle('app:install-update', () => {
+      this.appUpdater.install()
+      return { ok: true }
+    })
+
+    ipcMain.handle('app:update-state', () => this.appUpdater.getState())
   }
 
   private async initializeEnvironment() {

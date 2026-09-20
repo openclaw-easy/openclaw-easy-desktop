@@ -1,6 +1,6 @@
 import { useEffect } from 'react'
 import { useTranslation } from 'react-i18next'
-import { RefreshCw, ShieldCheck, Sparkles, type LucideIcon } from 'lucide-react'
+import { Puzzle, RefreshCw, ShieldCheck, Share2, type LucideIcon } from 'lucide-react'
 import { Modal } from './ui/modal'
 import { useWhatsNewStore } from '../stores/whatsNewStore'
 import { BrandLobster } from './ui/brand-lobster'
@@ -13,14 +13,19 @@ import { BrandLobster } from './ui/brand-lobster'
 // screen — no internals, no version plumbing.
 const RELEASE_HIGHLIGHTS: Array<{ icon: LucideIcon; title: string; body: string }> = [
   {
-    icon: Sparkles,
-    title: 'Built on the newest OpenClaw',
-    body: 'Thousands of improvements to chat, channels and plugins from the OpenClaw project, covering everything through the end of August.',
+    icon: Puzzle,
+    title: 'Add plugins without a restart',
+    body: 'Installing or updating a plugin now takes effect straight away, so the assistant keeps running and your chats stay open.',
+  },
+  {
+    icon: Share2,
+    title: 'Share a conversation',
+    body: 'Publish a read-only link to a conversation when you want to show someone what happened. You choose what gets shared, and you can revoke the link later.',
   },
   {
     icon: RefreshCw,
-    title: 'A smoother upgrade',
-    body: 'This version fixes an upgrade problem that could leave the assistant unable to start after updating. Your first launch may take a moment while it finishes tidying up how your chats are stored.',
+    title: 'Your data gets an upgrade',
+    body: 'The first launch moves your settings and history to a new storage format. It happens automatically and may take a moment before the assistant comes online.',
   },
   {
     icon: ShieldCheck,

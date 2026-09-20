@@ -84,21 +84,25 @@ ICONSET_DIR="$ICONS_DIR/icon.iconset"
 mkdir -p "$ICONSET_DIR"
 
 # Generate all required sizes for macOS iconset
-declare -A mac_sizes=(
-    ["icon_16x16.png"]=16
-    ["icon_16x16@2x.png"]=32
-    ["icon_32x32.png"]=32
-    ["icon_32x32@2x.png"]=64
-    ["icon_128x128.png"]=128
-    ["icon_128x128@2x.png"]=256
-    ["icon_256x256.png"]=256
-    ["icon_256x256@2x.png"]=512
-    ["icon_512x512.png"]=512
-    ["icon_512x512@2x.png"]=1024
-)
+# "<filename>:<pixel size>" pairs, not an associative array: this script runs under
+# `#!/bin/bash`, and macOS ships Bash 3.2, where `declare -A` is a syntax error.
+# The list order is also the emit order, which a hash-ordered map did not guarantee.
+mac_sizes="
+icon_16x16.png:16
+icon_16x16@2x.png:32
+icon_32x32.png:32
+icon_32x32@2x.png:64
+icon_128x128.png:128
+icon_128x128@2x.png:256
+icon_256x256.png:256
+icon_256x256@2x.png:512
+icon_512x512.png:512
+icon_512x512@2x.png:1024
+"
 
-for filename in "${!mac_sizes[@]}"; do
-    size=${mac_sizes[$filename]}
+for entry in $mac_sizes; do
+    filename=${entry%%:*}
+    size=${entry##*:}
     echo "  Creating $filename (${size}x${size})"
     create_lobster_icon $size "$ICONSET_DIR/$filename"
 done
