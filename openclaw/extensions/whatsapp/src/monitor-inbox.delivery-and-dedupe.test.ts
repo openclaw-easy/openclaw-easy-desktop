@@ -1,5 +1,10 @@
 // WhatsApp monitor inbox behavior split by ownership.
-import { describe, expect, it, vi } from "vitest";
+import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  clearWhatsAppApprovalReactionTargetsForTest,
+  registerWhatsAppApprovalReactionTarget,
+} from "./approval-reactions.js";
 import { createWhatsAppDurableInboundQueue } from "./inbound/durable-receive.js";
 import { resolveWhatsAppIngressLifecycle } from "./inbound/ingress-lifecycle.js";
 import type { WebInboundMessage } from "./inbound/types.js";
@@ -15,11 +20,91 @@ import {
   settleInboundWork,
   startInboxMonitor,
   waitForMessageCalls,
+  waitForInboundWorkDrained,
   type InboxOnMessage,
 } from "./monitor-inbox.test-harness.js";
 
+const approvalResolver = vi.hoisted(() => vi.fn());
+vi.mock("openclaw/plugin-sdk/approval-gateway-runtime", () => ({
+  resolveApprovalOverGateway: approvalResolver,
+}));
+
 describe("web monitor inbox delivery and dedupe", () => {
   installStreamsInboundMessageHooks();
+  beforeEach(() => {
+    clearWhatsAppApprovalReactionTargetsForTest();
+    approvalResolver.mockReset();
+  });
+
+  it("replays approval reactions after Gateway loss without losing batch siblings", async () => {
+    await registerWhatsAppApprovalReactionTarget({
+      accountId: DEFAULT_ACCOUNT_ID,
+      remoteJid: "15551230000@s.whatsapp.net",
+      messageId: "approval-message",
+      approvalId: "exec-replay",
+      approvalKind: "exec",
+      allowedDecisions: ["allow-once", "deny"],
+    });
+    const replayStarted = createDeferred<void>();
+    const finishReplay = createDeferred<void>();
+    approvalResolver
+      .mockRejectedValueOnce(new Error("gateway 503"))
+      .mockRejectedValueOnce(new Error("gateway still unavailable"))
+      .mockImplementationOnce(async () => {
+        replayStarted.resolve();
+        await finishReplay.promise;
+        return { applied: true, approval: { status: "allowed", decision: "allow-once" } };
+      });
+    const onMessage = vi.fn();
+    const queue = createWhatsAppDurableInboundQueue(DEFAULT_ACCOUNT_ID);
+    const { listener, sock } = await startInboxMonitor(onMessage as InboxOnMessage, {
+      durableInboundQueue: queue,
+    });
+    try {
+      sock.ev.emit("messages.upsert", {
+        type: "notify",
+        messages: [
+          {
+            key: { id: "reaction-replay", remoteJid: "15551230000@s.whatsapp.net", fromMe: false },
+            message: {
+              reactionMessage: {
+                text: "👍",
+                key: { id: "approval-message", remoteJid: "15551230000@s.whatsapp.net" },
+              },
+            },
+            messageTimestamp: 1_700_000_000,
+          },
+          ...buildNotifyMessageUpsert({
+            id: "batch-survivor",
+            remoteJid: "999@s.whatsapp.net",
+            text: "batch survivor",
+            timestamp: 1_700_000_001,
+          }).messages,
+        ],
+      });
+      await replayStarted.promise;
+      const claim = (await queue.listClaims()).find((entry) => entry.attempts === 1);
+      expect(claim).toBeDefined();
+      if (!claim) {
+        throw new Error("expected the replayed approval claim");
+      }
+      finishReplay.resolve();
+      await waitForInboundWorkDrained();
+      expect(approvalResolver).toHaveBeenCalledTimes(3);
+      expect(approvalResolver.mock.calls[1]).toEqual(approvalResolver.mock.calls[0]);
+      expect(approvalResolver.mock.calls[2]).toEqual(approvalResolver.mock.calls[0]);
+      expect(onMessage).toHaveBeenCalledTimes(1);
+      expect(inboundMessage(onMessage).payload.body).toBe("batch survivor");
+      expect(await queue.listClaims()).toEqual([]);
+      expect(await queue.listPending({ limit: "all" })).toEqual([]);
+      await expect(
+        queue.enqueue(claim.id, claim.payload, { laneKey: claim.laneKey }),
+      ).resolves.toMatchObject({ kind: "completed" });
+    } finally {
+      finishReplay.resolve();
+      await listener.close();
+    }
+  });
 
   it("delivery coordinator streams inbound messages", async () => {
     const onMessage = vi.fn(async (msg) => {
@@ -342,10 +427,9 @@ describe("web monitor inbox delivery and dedupe", () => {
     const closePromise = listener.close().then(() => {
       closed = true;
     });
-    await waitForMessageCalls(onMessage, 3);
+    await waitForMessageCalls(onMessage, 2);
     expect(closed).toBe(false);
-    expect(inboundMessage(onMessage, 1).payload.body).toBe("second");
-    expect(inboundMessage(onMessage, 2).payload.body).toBe("third");
+    expect(inboundMessage(onMessage, 1).payload.body).toBe("second\nthird");
 
     releaseFirst?.();
     await closePromise;
@@ -662,7 +746,7 @@ describe("web monitor inbox delivery and dedupe", () => {
     await listener.close();
   });
 
-  it("delivery coordinator keeps same-lane follow-up pending until turn adoption", async () => {
+  it("delivery coordinator admits same-lane follow-up without settling the first deferred claim", async () => {
     let adoptFirst: (() => void | Promise<void>) | undefined;
     const onMessage = vi.fn(async (message: WebInboundMessage) => {
       if (!adoptFirst) {
@@ -675,7 +759,10 @@ describe("web monitor inbox delivery and dedupe", () => {
       }
     });
 
-    const { listener, sock } = await startInboxMonitor(onMessage as InboxOnMessage);
+    const queue = createWhatsAppDurableInboundQueue(DEFAULT_ACCOUNT_ID);
+    const { listener, sock } = await startInboxMonitor(onMessage as InboxOnMessage, {
+      durableInboundQueue: queue,
+    });
     sock.ev.emit("messages.upsert", {
       type: "notify",
       messages: [
@@ -700,15 +787,17 @@ describe("web monitor inbox delivery and dedupe", () => {
     });
     await settleInboundWork();
 
-    expect(onMessage).toHaveBeenCalledTimes(1);
-    expect(inboundMessage(onMessage).payload.body).toBe("ping");
+    await waitForMessageCalls(onMessage, 2);
+    expect(onMessage.mock.calls.map(([message]) => message.payload.body)).toEqual(["ping", "pong"]);
+    expect(await queue.listClaims()).toHaveLength(1);
+    expect(await queue.listPending({ limit: "all" })).toEqual([]);
 
     if (!adoptFirst) {
       throw new Error("expected first adoption callback");
     }
     await adoptFirst();
-    await waitForMessageCalls(onMessage, 2);
-    expect(inboundMessage(onMessage, 1).payload.body).toBe("pong");
+    expect(await queue.listClaims()).toEqual([]);
+    expect(onMessage).toHaveBeenCalledTimes(2);
     await listener.close();
   });
 });

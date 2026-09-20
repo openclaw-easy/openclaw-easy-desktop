@@ -1,4 +1,3 @@
-// Discord plugin module implements native command agent reply behavior.
 import { resolveHumanDelayConfig } from "openclaw/plugin-sdk/agent-runtime";
 import {
   hasVisibleInboundReplyDispatch,
@@ -79,12 +78,18 @@ export async function dispatchDiscordNativeAgentReply(params: {
         if (params.suppressReplies) {
           return {
             visibleReplySent: false,
-            suppression: { reason: "no_visible_result" as const },
+            suppression: { reason: "channel_transform" as const },
           };
         }
         const payloadDelivered = await deliverDiscordInteractionReply({
           interaction: params.interaction,
           payload,
+          componentRoute: {
+            accountId: params.effectiveRoute.accountId,
+            agentId: params.effectiveRoute.agentId,
+            sessionKey:
+              params.ctxPayload.CommandTargetSessionKey ?? params.effectiveRoute.sessionKey,
+          },
           mediaLocalRoots: params.mediaLocalRoots,
           textLimit: resolveTextChunkLimit(params.cfg, "discord", params.accountId, {
             fallbackLimit: 2000,
@@ -111,7 +116,7 @@ export async function dispatchDiscordNativeAgentReply(params: {
         if (
           params.suppressReplies &&
           info.kind === "final" &&
-          result?.suppression?.reason === "no_visible_result" &&
+          result?.suppression?.reason === "channel_transform" &&
           payload.text?.trim()
         ) {
           hiddenFinalReply = payload;

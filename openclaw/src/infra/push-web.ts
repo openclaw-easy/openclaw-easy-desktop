@@ -1,28 +1,30 @@
 // Stores and verifies web push subscriptions and delivery payloads.
 import { randomUUID } from "node:crypto";
-import fs from "node:fs";
 import path from "node:path";
 import { expectDefined, normalizeOptionalString } from "@openclaw/normalization-core";
 import { resolveStateDir } from "../config/paths.js";
 import { createLazyRuntimeModule } from "../shared/lazy-runtime.js";
+import { pathMayExistSync } from "./path-existence.js";
 import {
   WebPushSubscriptionBindingError,
   createWebPushVapidKeyPair,
   deleteBoundWebPushSubscription,
   deleteWebPushSubscriptionIfCurrent,
   hashWebPushEndpoint,
+  hasBoundWebPushSubscriptions,
   insertVapidKeyPairIfAbsent,
   isValidWebPushEndpoint,
   isValidWebPushKey,
   listBoundWebPushSubscriptions,
-  findBoundWebPushSubscriptionByEndpoint,
   listWebPushSubscriptions,
+  withWebPushSubscriptions,
   readPersistedVapidKeyPair,
   upsertWebPushSubscription,
   setWebPushSubscriptionPreferences,
   DEFAULT_WEB_PUSH_VAPID_SUBJECT,
   type VapidKeyPair,
   type WebPushSubscription,
+  type WebPushMutationGuard,
 } from "./push-web-store.js";
 
 // --- Types ---
@@ -47,8 +49,8 @@ type WebPushDeliveryOptions = Pick<
 
 export {
   WebPushSubscriptionBindingError,
-  findBoundWebPushSubscriptionByEndpoint,
   listBoundWebPushSubscriptions,
+  hasBoundWebPushSubscriptions,
   setWebPushSubscriptionPreferences,
 };
 export type { BoundWebPushSubscription } from "./push-web-store.js";
@@ -57,21 +59,13 @@ export {
   listTerminalWebPushApprovalDeliveryIds,
   listWebPushApprovalDeliveryTargets,
   prepareWebPushApprovalDeliveries,
+  withBoundWebPushSubscriptions,
+  withBoundWebPushSubscriptionByEndpoint,
 } from "./push-web-store.js";
 
 const loadWebPushRuntime = createLazyRuntimeModule(() =>
   import("web-push").then((mod: WebPushRuntimeModule) => mod.default ?? mod),
 );
-
-function legacyWebPushPathMayExist(filePath: string): boolean {
-  try {
-    fs.lstatSync(filePath);
-    return true;
-  } catch (error) {
-    // Only a definite absence permits creating a new signing identity.
-    return (error as NodeJS.ErrnoException).code !== "ENOENT";
-  }
-}
 
 // Production callers run under the Gateway's lifetime state/config lock. Doctor must
 // acquire those same locks before claiming legacy files, so this check remains stable
@@ -80,10 +74,7 @@ function assertLegacyWebPushMigrationComplete(baseDir?: string): void {
   const stateDir = baseDir ?? resolveStateDir();
   const pendingLegacyPath = LEGACY_WEB_PUSH_PATHS.find((relativePath) => {
     const sourcePath = path.join(stateDir, relativePath);
-    return (
-      legacyWebPushPathMayExist(sourcePath) ||
-      legacyWebPushPathMayExist(`${sourcePath}.doctor-importing`)
-    );
+    return pathMayExistSync(sourcePath) || pathMayExistSync(`${sourcePath}.doctor-importing`);
   });
   if (pendingLegacyPath) {
     throw new Error(
@@ -109,7 +100,7 @@ export async function resolveVapidKeys(baseDir?: string): Promise<VapidKeyPair> 
     };
   }
 
-  const existing = readPersistedVapidKeyPair(baseDir);
+  const existing = await readPersistedVapidKeyPair(baseDir);
   if (existing) {
     return { ...existing, subject: resolveVapidSubjectFromEnv() };
   }
@@ -118,7 +109,7 @@ export async function resolveVapidKeys(baseDir?: string): Promise<VapidKeyPair> 
   // identity, then every contender returns that committed keypair.
   const webPush = await loadWebPushRuntime();
   const keys = webPush.generateVAPIDKeys();
-  const pair = insertVapidKeyPairIfAbsent({
+  const pair = await insertVapidKeyPairIfAbsent({
     candidate: createWebPushVapidKeyPair(
       keys.publicKey,
       keys.privateKey,
@@ -151,6 +142,7 @@ type RegisterWebPushParams = {
   keys: { p256dh: string; auth: string };
   binding?: { deviceId: string; userProfileId: string | null };
   baseDir?: string;
+  guard?: WebPushMutationGuard;
 };
 
 export async function registerWebPushSubscription(
@@ -171,6 +163,7 @@ export async function registerWebPushSubscription(
     endpoint,
     keys: { p256dh: keys.p256dh, auth: keys.auth },
     binding: params.binding,
+    guard: params.guard,
     candidateSubscriptionId: randomUUID(),
     nowMs: Date.now(),
     stateDir: baseDir,
@@ -182,6 +175,7 @@ export async function clearBoundWebPushSubscription(params: {
   expectedDeviceId: string;
   expectedUserProfileId: string | null;
   baseDir?: string;
+  guard?: WebPushMutationGuard;
 }): Promise<boolean> {
   assertLegacyWebPushMigrationComplete(params.baseDir);
   return deleteBoundWebPushSubscription({
@@ -291,7 +285,7 @@ async function sendPreparedWebPushNotifications(params: {
   for (const subscription of expiredSubscriptions) {
     try {
       assertLegacyWebPushMigrationComplete(params.baseDir);
-      deleteWebPushSubscriptionIfCurrent({
+      await deleteWebPushSubscriptionIfCurrent({
         endpointHash: hashWebPushEndpoint(subscription.endpoint),
         subscription,
         stateDir: params.baseDir,
@@ -326,10 +320,19 @@ export async function broadcastWebPush(
   baseDir?: string,
 ): Promise<WebPushSendResult[]> {
   assertLegacyWebPushMigrationComplete(baseDir);
-  const subscriptions = listWebPushSubscriptions(baseDir);
+  const subscriptions = await listWebPushSubscriptions(baseDir);
   if (subscriptions.length === 0) {
     return [];
   }
+  const subscriptionIds = new Set(subscriptions.map((entry) => entry.subscriptionId));
   const send = await prepareWebPushNotificationSender(baseDir);
-  return await send({ subscriptions, payload });
+  return (
+    (await withWebPushSubscriptions(baseDir, (current) => ({
+      start: () =>
+        send({
+          subscriptions: current.filter((entry) => subscriptionIds.has(entry.subscriptionId)),
+          payload,
+        }),
+    }))) ?? []
+  );
 }

@@ -1,11 +1,25 @@
+import type { PluginUpdateOutcome } from "../plugins/update.js";
 import type { CommandOptions } from "../process/exec.js";
+import type { UpdateRecoveryStep } from "../shared/update-outcome.js";
 import type { OpenClawSchemaVersions } from "../state/openclaw-schema-versions.js";
+import type { LocalPackageOverridesResult } from "./package-local-overrides.js";
 import type { UpdateChannel } from "./update-channels.js";
 import type { DevUpdateTarget } from "./update-dev-target.js";
+import type {
+  UpdateDoctorConfigChange,
+  UpdateDoctorConfigWriteRefusal,
+} from "./update-doctor-config.js";
+import type { UpdateDoctorLintFinding } from "./update-doctor-lint-schema.js";
 import type { PackageUpdateStepAdvisory } from "./update-doctor-result.js";
+import type { UpdateFailureFact } from "./update-failure-facts.js";
 import type { GlobalInstallManager } from "./update-global.js";
+import type { UpdateRecovery } from "./update-recovery.js";
+import type { UpdateRollbackOutcome } from "./update-run-schema.js";
+import type { UpdateSnapshotCapacity } from "./update-snapshot-capacity.js";
 
-export type UpdateStepAdvisory = PackageUpdateStepAdvisory;
+type UpdateStepAdvisory =
+  | PackageUpdateStepAdvisory
+  | { kind: "candidate-runtime-unavailable" | "recoverable-maintenance"; message: string };
 
 export type UpdateStepResult = {
   name: string;
@@ -17,16 +31,30 @@ export type UpdateStepResult = {
   stderrTail?: string | null;
   signal?: NodeJS.Signals | null;
   killed?: boolean;
+  outputLimitExceeded?: boolean;
   termination?: "exit" | "timeout" | "no-output-timeout" | "signal";
   advisory?: UpdateStepAdvisory;
+  /** Complete owner-classified warnings when one step reports several outcomes. */
+  warnings?: string[];
+  /** Suggested operator actions, distinct from executed update steps. */
+  recoverySteps?: readonly UpdateRecoveryStep[];
+  failureFacts?: UpdateFailureFact[];
+  doctorLintFindings?: UpdateDoctorLintFinding[];
+  configChanges?: UpdateDoctorConfigChange[];
+  configWriteRefusal?: UpdateDoctorConfigWriteRefusal;
+  snapshotCapacity?: UpdateSnapshotCapacity;
 };
 
 export type UpdateRunResult = {
+  localOverrides?: LocalPackageOverridesResult;
+  runId?: string;
   status: "ok" | "error" | "skipped";
   mode: "git" | "pnpm" | "bun" | "npm" | "unknown";
   root?: string;
   reason?: string;
-  before?: { sha?: string | null; version?: string | null };
+  /** The executing owner's terminal failure; steps also retain superseded attempts. */
+  failedStep?: UpdateStepResult;
+  before?: { sha?: string | null; version?: string | null; buildId?: string | null };
   after?: {
     sha?: string | null;
     version?: string | null;
@@ -35,25 +63,19 @@ export type UpdateRunResult = {
   };
   steps: UpdateStepResult[];
   durationMs: number;
-  recovery?:
-    | { serviceRestartSafe: true }
-    | {
-        serviceRestartSafe: false;
-        reason:
-          | "source-rollback-failed"
-          | "manager-unavailable"
-          | "deps-install-failed"
-          | "build-failed"
-          | "rollback-checkout-dirty"
-          | "runtime-verification-failed";
-      };
+  recovery?: UpdateRecovery;
+  rollbackOutcome?: UpdateRollbackOutcome;
   postUpdate?: {
     plugins?: {
+      failureFacts?: UpdateFailureFact[];
+      doctorLint?: UpdateStepResult;
       status: "ok" | "warning" | "skipped" | "error";
       reason?: string;
       changed: boolean;
       warnings?: Array<{
         pluginId?: string;
+        source?: string;
+        errorCode?: string;
         reason: string;
         message: string;
         guidance: string[];
@@ -67,21 +89,7 @@ export type UpdateRunResult = {
       };
       npm: {
         changed: boolean;
-        outcomes: Array<{
-          pluginId: string;
-          status: "updated" | "unchanged" | "skipped" | "error";
-          message: string;
-          currentVersion?: string;
-          nextVersion?: string;
-          channelFallback?: {
-            requestedSpec: string;
-            usedSpec: string;
-            requestedLabel: string;
-            usedLabel: string;
-            reason: "unavailable" | "failed";
-            message: string;
-          };
-        }>;
+        outcomes: PluginUpdateOutcome[];
       };
       integrityDrifts: Array<{
         pluginId: string;
@@ -118,11 +126,21 @@ export type UpdateStepInfo = {
 type UpdateStepCompletion = UpdateStepInfo & Omit<UpdateStepResult, "cwd">;
 
 export type UpdateStepProgress = {
+  onRollbackOutcome?: (outcome: NonNullable<UpdateRunResult["rollbackOutcome"]>) => void;
+  onHeartbeat?: () => void;
   onStepStart?: (step: UpdateStepInfo) => void;
   onStepComplete?: (step: UpdateStepCompletion) => void;
 };
 
+type GitUpdateTarget = {
+  sha?: string;
+  version?: string;
+  schemaVersions?: OpenClawSchemaVersions;
+  metadataUnreadable?: string;
+};
+
 export type UpdateRunnerOptions = {
+  runId?: string;
   cwd?: string;
   argv1?: string;
   tag?: string;
@@ -131,13 +149,27 @@ export type UpdateRunnerOptions = {
   deferConfiguredPluginInstallRepair?: boolean;
   allowGatewayServiceRepair?: boolean;
   allowGatewayActivation?: boolean;
-  beforeGitMutation?: (target: {
-    schemaVersions?: OpenClawSchemaVersions;
-    metadataUnreadable?: string;
-  }) => Promise<{
+  /** Expose a new checkout only after target admission; subsequent work uses the published path. */
+  publishGitCheckout?: () => Promise<string>;
+  /** Read-only admission before executing a fetched candidate; never stops a service. */
+  inspectGitTarget?: (target: GitUpdateTarget) => Promise<void>;
+  /** Admit the built candidate after validation, before retention or activation. */
+  inspectGitCandidate?: (candidateRoot: string) => Promise<void>;
+  /** Admit required preparation after no-op detection, before allocating the candidate worktree. */
+  beforeGitStaging?: () => Promise<{ step: UpdateStepResult; failureReason: string }>;
+  validateCandidate?: (root: string) => Promise<void>;
+  /** CLI-owned activation Doctor retains its config writer and requester authority. */
+  runGitDoctor?: (root: string) => Promise<UpdateStepResult | null>;
+  prepareGitExposure?: (
+    candidateRoot: string,
+    candidateSha: string,
+    env: NodeJS.ProcessEnv | undefined,
+  ) => Promise<void>;
+  beforeGitMutation?: (target: GitUpdateTarget) => Promise<{
     allowGatewayServiceRepair?: boolean;
     allowGatewayActivation?: boolean;
   } | void>;
+  /** Operator-selected work deadline; omission leaves work unbounded, not probes or cleanup. */
   timeoutMs?: number;
   runCommand?: CommandRunner;
   progress?: UpdateStepProgress;
@@ -154,7 +186,7 @@ export type RunStepOptions = {
   name: string;
   argv: string[];
   cwd: string;
-  timeoutMs: number;
+  timeoutMs?: number;
   env?: NodeJS.ProcessEnv;
   progress?: UpdateStepProgress;
   stepIndex: number;

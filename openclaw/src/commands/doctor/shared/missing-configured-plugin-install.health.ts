@@ -1,7 +1,8 @@
 import type { OpenClawConfig } from "../../../config/types.openclaw.js";
 import type { PluginInstallRecord } from "../../../config/types.plugins.js";
 import type { HealthFinding, HealthRepairEffect } from "../../../flows/health-checks.js";
-import { resolveCompatibilityHostVersion } from "../../../version.js";
+import { resolvePluginInstallSources } from "../../../plugins/install-channel-specs.js";
+import { isPayloadMissing } from "../../../plugins/payload-verification.js";
 import {
   collectDownloadableInstallCandidates,
   collectUpdateDeferredPluginIds,
@@ -12,14 +13,8 @@ import {
   collectConfiguredChannelIds,
   collectConfiguredPluginIds,
 } from "./missing-configured-plugin-install.ids.js";
-import {
-  resolveCandidateInstallSpec,
-  resolveRecordInstallPath,
-} from "./missing-configured-plugin-install.install.js";
-import {
-  isInstalledRecordMissingOnDisk,
-  isTrustedOfficialInstallRecordForCandidate,
-} from "./missing-configured-plugin-install.records.js";
+import { resolveRecordInstallPath } from "./missing-configured-plugin-install.install.js";
+import { isTrustedOfficialInstallRecordForCandidate } from "./missing-configured-plugin-install.records.js";
 import { shouldDeferConfiguredPluginInstallRepair } from "./update-phase.js";
 
 const CONFIGURED_PLUGIN_INSTALLS_CHECK_ID = "core/doctor/configured-plugin-installs";
@@ -35,6 +30,13 @@ type ConfiguredPluginInstallHealthIssue =
       pluginId: string;
       installPath?: string;
       installSpec?: string;
+    }
+  | {
+      kind: "missing-required-dependencies";
+      pluginId: string;
+      installPath?: string;
+      installSpec?: string;
+      missingRequired: string[];
     }
   | {
       kind: "repairable-installed-plugin";
@@ -96,11 +98,12 @@ export async function detectConfiguredPluginInstallHealthIssues(params: {
     configuredChannelOwnerPluginIds,
     bundledPluginsById,
     configuredPluginIdsWithStaleDescriptors: staleDescriptorPluginIds,
+    operatorManagedPluginIds,
     records,
-    updateChannel,
     installedPluginIdsWithRepairablePackageDiagnostics: repairablePackageDiagnosticPluginIds,
     installedPluginIdsWithStaleVersionBoundRuntimePackages: staleVersionBoundRuntimePluginIds,
     installedPluginIdsWithRepairablePackages: repairableInstalledPluginIds,
+    installedPluginMissingRequiredDependencies,
     officialReplacementPluginIds,
   } = await resolveConfiguredPluginInstallContext({
     cfg: params.cfg,
@@ -123,9 +126,16 @@ export async function detectConfiguredPluginInstallHealthIssues(params: {
       configuredChannelOwnerPluginIds,
       blockedPluginIds,
     })) {
+      if (operatorManagedPluginIds.has(pluginId)) {
+        continue;
+      }
       deferredPluginIds.add(pluginId);
       const record = records[pluginId];
-      if (!record || !isInstalledRecordMissingOnDisk(record, env)) {
+      if (
+        !record ||
+        (!isPayloadMissing(env, record.installPath) &&
+          !installedPluginMissingRequiredDependencies.has(pluginId))
+      ) {
         continue;
       }
       issues.push({
@@ -141,17 +151,30 @@ export async function detectConfiguredPluginInstallHealthIssues(params: {
 
   const missingRecordedPluginIds = Object.keys(records).filter(
     (pluginId) =>
+      !operatorManagedPluginIds.has(pluginId) &&
       !deferredPluginIds.has(pluginId) &&
       !officialReplacementPluginIds.has(pluginId) &&
       !bundledPluginsById.has(pluginId) &&
       ((pluginIds.has(pluginId) &&
-        (!knownIds.has(pluginId) || isInstalledRecordMissingOnDisk(records[pluginId], env))) ||
+        (!knownIds.has(pluginId) || isPayloadMissing(env, records[pluginId]?.installPath))) ||
         staleDescriptorPluginIds.has(pluginId) ||
         repairableInstalledPluginIds.has(pluginId)),
   );
 
   for (const pluginId of missingRecordedPluginIds) {
     const record = records[pluginId];
+    const missingDependencies = installedPluginMissingRequiredDependencies.get(pluginId);
+    if (missingDependencies) {
+      issues.push({
+        kind: "missing-required-dependencies",
+        pluginId,
+        installPath: resolveRecordInstallPath(record, env),
+        ...(record?.spec ? { installSpec: record.spec } : {}),
+        missingRequired: missingDependencies.missingRequired,
+      });
+      reportedPluginIds.add(pluginId);
+      continue;
+    }
     const kind = missingRecordedPluginIssueKind({
       pluginId,
       staleVersionBoundRuntimePluginIds,
@@ -179,7 +202,7 @@ export async function detectConfiguredPluginInstallHealthIssues(params: {
 
   const missingPluginIds = new Set(
     [...pluginIds].filter((pluginId) => {
-      if (deferredPluginIds.has(pluginId)) {
+      if (operatorManagedPluginIds.has(pluginId) || deferredPluginIds.has(pluginId)) {
         return false;
       }
       const hasRecord = Object.hasOwn(records, pluginId);
@@ -187,7 +210,7 @@ export async function detectConfiguredPluginInstallHealthIssues(params: {
         (!knownIds.has(pluginId) && !hasRecord && !bundledPluginsById.has(pluginId)) ||
         (hasRecord &&
           !bundledPluginsById.has(pluginId) &&
-          isInstalledRecordMissingOnDisk(records[pluginId], env))
+          isPayloadMissing(env, records[pluginId]?.installPath))
       );
     }),
   );
@@ -199,10 +222,11 @@ export async function detectConfiguredPluginInstallHealthIssues(params: {
     configuredPluginIds: pluginIds,
     configuredChannelIds: channelIds,
     configuredChannelOwnerPluginIds,
-    blockedPluginIds:
-      deferredPluginIds.size > 0
-        ? new Set([...blockedPluginIds, ...deferredPluginIds])
-        : blockedPluginIds,
+    blockedPluginIds: new Set([
+      ...blockedPluginIds,
+      ...deferredPluginIds,
+      ...operatorManagedPluginIds,
+    ]),
   })) {
     if (bundledPluginsById.has(candidate.pluginId)) {
       continue;
@@ -223,18 +247,14 @@ export async function detectConfiguredPluginInstallHealthIssues(params: {
     }
     const hasRecord = Object.hasOwn(records, candidate.pluginId);
     const hasUsableRecord =
-      hasRecord && !isInstalledRecordMissingOnDisk(records[candidate.pluginId], env);
+      hasRecord && !isPayloadMissing(env, records[candidate.pluginId]?.installPath);
     if (
       !shouldReplaceBrokenOfficialInstall &&
       (hasUsableRecord || (knownIds.has(candidate.pluginId) && !hasRecord))
     ) {
       continue;
     }
-    const installSpec = resolveCandidateInstallSpec({
-      candidate,
-      updateChannel,
-      coreVersion: resolveCompatibilityHostVersion(env),
-    });
+    const installSpec = resolvePluginInstallSources(candidate)[0]?.spec;
     if (shouldReplaceBrokenOfficialInstall) {
       const installPath = resolveRecordInstallPath(record, env);
       if (staleVersionBoundRuntimePluginIds.has(candidate.pluginId)) {
@@ -288,6 +308,13 @@ const CONFIGURED_PLUGIN_INSTALL_ISSUE_DETAILS = {
     action: "would-reinstall-configured-plugin",
     dryRunSafe: false,
   },
+  "missing-required-dependencies": {
+    message: (pluginId: string) =>
+      `Configured plugin ${pluginId} is missing required dependencies:`,
+    fixHint: "Run `openclaw doctor --fix` to reinstall the configured plugin dependencies.",
+    action: "would-repair-configured-plugin-dependencies",
+    dryRunSafe: false,
+  },
   "repairable-installed-plugin": {
     message: (pluginId: string) =>
       `Configured plugin ${pluginId} has a repairable package install problem.`,
@@ -333,7 +360,10 @@ export function configuredPluginInstallIssueToHealthFinding(
   return {
     checkId: CONFIGURED_PLUGIN_INSTALLS_CHECK_ID,
     severity: "warning",
-    message: detail.message(issue.pluginId),
+    message:
+      issue.kind === "missing-required-dependencies"
+        ? `${detail.message(issue.pluginId)} ${issue.missingRequired.join(", ")}.`
+        : detail.message(issue.pluginId),
     target: issue.pluginId,
     ...("installPath" in issue && issue.installPath ? { path: issue.installPath } : {}),
     fixHint:

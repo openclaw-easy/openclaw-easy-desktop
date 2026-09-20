@@ -2,6 +2,8 @@ import { patchSessionEntryWithKey } from "../../config/sessions/session-accessor
 
 export async function clearLegacyEmbeddedAcpMetadata(params: {
   storePath: string;
+  assertCommitAllowed?: () => void;
+  agentId?: string;
   sessionKeys: Iterable<string | null | undefined>;
 }): Promise<void> {
   const sessionKeys = new Set(
@@ -11,7 +13,7 @@ export async function clearLegacyEmbeddedAcpMetadata(params: {
   );
   for (const sessionKey of sessionKeys) {
     await patchSessionEntryWithKey(
-      { storePath: params.storePath, sessionKey },
+      { storePath: params.storePath, agentId: params.agentId, sessionKey },
       (entry) => {
         if (!entry.acp) {
           return null;
@@ -20,7 +22,11 @@ export async function clearLegacyEmbeddedAcpMetadata(params: {
         delete next.acp;
         return next;
       },
-      { replaceEntry: true, skipMaintenance: true },
+      {
+        replaceEntry: true,
+        skipMaintenance: true,
+        assertCommitAllowed: params.assertCommitAllowed,
+      },
     );
   }
 }

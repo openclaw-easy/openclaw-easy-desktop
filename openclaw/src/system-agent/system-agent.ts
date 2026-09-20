@@ -126,12 +126,13 @@ async function runOneShot(
   // The planner may take long enough for the verified route to change. Never
   // apply its result under a different inference owner.
   await requireVerifiedInference(opts);
+  const approved = opts.yes === true || !isPersistentSystemAgentOperation(operation);
+  if (approved && isPersistentSystemAgentOperation(operation)) {
+    await requirePersistentApplyInference(opts, runtime);
+  }
   await executeSystemAgentOperation(operation, runtime, {
-    approved: opts.yes === true || !isPersistentSystemAgentOperation(operation),
+    approved,
     deps: systemAgentCommandDepsFromOptions(opts),
-    beforePersistentApply: async () => {
-      await requirePersistentApplyInference(opts, runtime);
-    },
   });
 }
 
@@ -155,8 +156,10 @@ export async function runSystemAgent(
   const { resolveAgentWorkspaceDir } = await import("../agents/agent-scope.js");
   const { loadAgentRuntimePluginRegistryHandle } = await import("../agents/runtime-plugins.js");
   const { withPluginLifecycleLease } = await import("../plugins/plugin-lifecycle-lease.js");
+  const { createPluginCache, withPluginCache } = await import("../plugins/plugin-cache.js");
   const { withPluginRuntimeRegistryScope } =
     await import("../plugins/runtime/gateway-request-scope.js");
+  await using cache = createPluginCache();
   const readSnapshot =
     boundOpts.deps?.readConfigFileSnapshot ??
     (await import("../config/config.js")).readConfigFileSnapshot;
@@ -174,25 +177,24 @@ export async function runSystemAgent(
     // Validate and import under the same lifecycle lease. Frozen probe config could
     // otherwise re-enable a revoked owner or another configured harness during loading.
     lease.assertOwned();
-    return loadAgentRuntimePluginRegistryHandle({
-      basePluginIds: [],
-      config,
-      workspaceDir,
-      selections: [
-        {
-          provider: route.provider,
-          modelId: route.model,
-          runtime: route.agentHarnessRuntimeOverride,
-          agentId: route.agentId,
-        },
-      ],
-    });
+    return withPluginCache(cache, () =>
+      loadAgentRuntimePluginRegistryHandle({
+        basePluginIds: [],
+        config,
+        workspaceDir,
+        selections: [
+          {
+            provider: route.provider,
+            modelId: route.model,
+            runtime: route.agentHarnessRuntimeOverride,
+            agentId: route.agentId,
+          },
+        ],
+      }),
+    );
   });
-  if (!registry) {
-    throw new SystemAgentInferenceUnavailableError("conversation");
-  }
-  // Probe scope has ended; CLI preflight needs its private harness before the first
-  // run prepares an owner. Do not pin metadata or hold the install lease across chat.
+  // Retain the private harness through the conversation, but do not pin metadata
+  // or hold the install lease across chat and its plugin/config mutations.
   await withPluginRuntimeRegistryScope(registry, run);
 }
 

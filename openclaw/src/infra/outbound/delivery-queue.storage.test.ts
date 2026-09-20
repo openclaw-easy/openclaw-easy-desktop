@@ -3,7 +3,14 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { openOpenClawStateDatabase } from "../../state/openclaw-state-db.js";
+import { trackSqliteStatementExecutions } from "../../../test/helpers/sqlite-statement-execution-counter.js";
+import {
+  openOpenClawStateDatabase,
+  runOpenClawStateWriteTransaction,
+} from "../../state/openclaw-state-db.js";
+import { failPendingDelivery } from "./delivery-queue-ack.js";
+import { ackDeliveryInDatabase } from "./delivery-queue-ack.kernel.js";
+import { releaseSpoolArtifacts } from "./delivery-queue-media-spool.js";
 import { OUTBOUND_DELIVERY_QUEUE_NAME } from "./delivery-queue-media-staging.js";
 import { renewDeliveryPlatformSendLease } from "./delivery-queue-platform-lease.js";
 import {
@@ -14,7 +21,6 @@ import {
   failDelivery,
   failDeliveryAfterPlatformSend,
   failDeliveryBeforePlatformSend,
-  failPendingDelivery,
   loadPendingDelivery,
   markDeliveryPlatformOutcomeUnknown,
   markDeliveryPlatformSendDispatched,
@@ -79,7 +85,7 @@ describe("delivery-queue storage", () => {
           {
             channel: "directchat",
             to: "+1555",
-            payloads: [{ mediaUrl: artifact, audioAsVoice: true }],
+            payloads: [{ text: "x".repeat(64 * 1024), mediaUrl: artifact, audioAsVoice: true }],
             completionRetention: {
               idPrefix: "cron-direct-delivery:v1:",
               maxAgeMs: 24 * 60 * 60_000,
@@ -160,14 +166,76 @@ describe("delivery-queue storage", () => {
           lostClaim,
         );
         expect(await fs.readFile(artifact, "utf8")).toBe("newer owner still needs these bytes");
-        expect(await loadPendingDelivery(id, stateDir)).toMatchObject({
+        const pending = await loadPendingDelivery(id, stateDir);
+        if (!pending) {
+          throw new Error("Expected the replacement platform owner to remain pending");
+        }
+        expect(pending).toMatchObject({
           recoveryState: "send_attempt_started",
           platformSendAttemptId: secondAttemptId,
           platformSendStartedAt: sameStartedAt,
         });
         expect(readStatus(id)).toBe("pending");
 
-        await ackDelivery(id, stateDir, { expectedPlatformSendAttemptId: secondAttemptId });
+        const { db } = openOpenClawStateDatabase({
+          env: { ...process.env, OPENCLAW_STATE_DIR: stateDir },
+        });
+        const retryCount = db.prepare(
+          "UPDATE delivery_queue_entries SET retry_count = ? WHERE queue_name = ? AND id = ?",
+        );
+        retryCount.run(9007199254740992n, OUTBOUND_DELIVERY_QUEUE_NAME, id);
+        try {
+          let readError: unknown;
+          try {
+            await loadPendingDelivery(id, stateDir);
+          } catch (error) {
+            readError = error;
+          }
+          if (!(readError instanceof Error)) {
+            throw new Error("Expected the full pending reader to reject the unsafe integer");
+          }
+          expect(readError).toMatchObject({ code: "ERR_OUT_OF_RANGE" });
+          let ackError: unknown;
+          try {
+            await ackDelivery(id, stateDir, { expectedPlatformSendAttemptId: secondAttemptId });
+          } catch (error) {
+            ackError = error;
+          }
+          expect(ackError).toBeInstanceOf(Error);
+          expect(ackError).toMatchObject({
+            code: "ERR_OUT_OF_RANGE",
+            name: readError.name,
+            message: readError.message,
+          });
+          expect(readStatus(id)).toBe("pending");
+          expect(await fs.readFile(artifact, "utf8")).toBe("newer owner still needs these bytes");
+        } finally {
+          retryCount.run(pending.retryCount, OUTBOUND_DELIVERY_QUEUE_NAME, id);
+        }
+        const entryTextBytes = Buffer.byteLength(JSON.stringify(readQueuedEntry(stateDir, id)));
+        const reads = trackSqliteStatementExecutions(db, ["queue"], (sql) =>
+          /^\s*select\b/i.test(sql) && /\bfrom\s+"?delivery_queue_entries"?\b/i.test(sql)
+            ? "queue"
+            : null,
+        );
+        try {
+          // Count the native kernel's reads; the public ACK now runs in a separate worker.
+          const spoolPaths = runOpenClawStateWriteTransaction(
+            (database) =>
+              ackDeliveryInDatabase(database, id, stateDir, {
+                expectedPlatformSendAttemptId: secondAttemptId,
+              }),
+            { env: { ...process.env, OPENCLAW_STATE_DIR: stateDir } },
+          );
+          await releaseSpoolArtifacts(spoolPaths, stateDir);
+          expect(reads.rowCounts.queue).toBeGreaterThan(0);
+          expect(reads.textBytes.queue).toBeGreaterThan(0);
+          expect.soft(reads.counts.queue).toBeLessThanOrEqual(3);
+          // One full pending row plus the existing compact receipt ownership reads.
+          expect.soft(reads.textBytes.queue).toBeLessThan(entryTextBytes + 4096);
+        } finally {
+          reads.restore();
+        }
         expect(readStatus(id)).toBe("completed");
         await expect(fs.stat(artifact)).rejects.toMatchObject({ code: "ENOENT" });
       } finally {
@@ -420,6 +488,27 @@ describe("delivery-queue storage", () => {
       await expect(ackDelivery("nonexistent-id", tmpDir())).resolves.toBeUndefined();
     });
 
+    it("claimless ack rejects a live-claimed row instead of deleting it", async () => {
+      const stateDir = tmpDir();
+      const id = await enqueueTextDelivery({
+        channel: "directchat",
+        to: "+1",
+        payloads: [{ text: "claimless-ack-guard" }],
+      });
+      const attemptId = await claimDeliveryPlatformSendAttempt(id, stateDir);
+      if (!attemptId) {
+        throw new Error("test invariant: the unclaimed row must accept a platform claim");
+      }
+
+      await expect(ackDelivery(id, stateDir)).rejects.toThrow(
+        `Delivery platform claim was lost: ${id}`,
+      );
+
+      const pending = await loadPendingDelivery(id, stateDir);
+      expect(pending).toMatchObject({ id, producerClaimId: attemptId });
+      expect(readStatus(id)).toBe("pending");
+    });
+
     it("removes acked entries from pending recovery", async () => {
       const id = await enqueueTextDelivery({
         channel: "directchat",
@@ -515,9 +604,9 @@ describe("delivery-queue storage", () => {
           availableAt: originalExpiry,
         });
         await expect(renewDeliveryPlatformSendLease(id, stateDir, claimId)).resolves.toBe(
-          Date.now() + 30_000,
+          Date.now() + 60_000,
         );
-        expect(readQueuedEntry(stateDir, id).availableAt).toBe(Date.now() + 30_000);
+        expect(readQueuedEntry(stateDir, id).availableAt).toBe(Date.now() + 60_000);
       } finally {
         vi.useRealTimers();
       }
@@ -763,6 +852,16 @@ describe("delivery-queue storage", () => {
         ),
       ).resolves.toEqual({ status: "not_pending" });
       expect(readStatus(id)).toBeUndefined();
+      await expect(
+        failPendingDelivery(
+          {
+            id,
+            entry: { ...entry, id: "unused-after-owner-removal" },
+            expectedPlatformSendAttemptId: "stale-claim",
+          },
+          tmpDir(),
+        ),
+      ).resolves.toEqual({ status: "not_pending" });
     });
   });
 

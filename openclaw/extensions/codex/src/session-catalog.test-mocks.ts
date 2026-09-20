@@ -1,13 +1,13 @@
-import { vi } from "vitest";
+import { vi, type Mock } from "vitest";
 
 const commandRpcMocks = vi.hoisted(() => ({
-  codexControlRequest: vi.fn(),
+  codexControlRequest: vi.fn() as Mock,
 }));
 const pinnedConnectionMocks = vi.hoisted(() => ({
   client: { connectionId: "pinned-catalog-client" },
-  getClient: vi.fn(),
-  releaseClient: vi.fn(),
-  request: vi.fn(),
+  getClient: vi.fn() as Mock,
+  releaseClient: vi.fn() as Mock,
+  request: vi.fn() as Mock,
 }));
 const transcriptMirrorMocks = vi.hoisted(() => ({
   importCodexThreadHistoryToTranscript: vi.fn(async () => ({
@@ -20,13 +20,29 @@ const nodeHostMocks = vi.hoisted(() => ({
   userShellPaths: new Map<string, string>(),
 }));
 
-vi.mock("./command-rpc.js", () => ({
-  codexControlRequest: commandRpcMocks.codexControlRequest,
-}));
+vi.mock("./command-rpc.js", async () => {
+  const { codexCatalogSourceForClient, getCodexCatalogSource, recordCodexCatalogResponseSource } =
+    await import("./session-catalog-source.js");
+  return {
+    codexControlRequest: async (...args: unknown[]) => {
+      const response = await commandRpcMocks.codexControlRequest(...args);
+      if (typeof args[1] === "string") {
+        recordCodexCatalogResponseSource(
+          args[1],
+          response,
+          getCodexCatalogSource(response) ??
+            codexCatalogSourceForClient(commandRpcMocks.codexControlRequest),
+        );
+      }
+      return response;
+    },
+  };
+});
 vi.mock("./app-server/request.js", () => ({
   requestCodexAppServerClientJson: pinnedConnectionMocks.request,
 }));
-vi.mock("./app-server/shared-client.js", () => ({
+vi.mock("./app-server/shared-client.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./app-server/shared-client.js")>()),
   getLeasedSharedCodexAppServerClient: pinnedConnectionMocks.getClient,
   releaseLeasedSharedCodexAppServerClient: pinnedConnectionMocks.releaseClient,
 }));

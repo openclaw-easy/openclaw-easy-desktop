@@ -310,6 +310,16 @@ describe("plugin lifecycle resource sampler", () => {
           },
         );
 
+        expect(
+          nonEmptyPathExists(pidFile),
+          JSON.stringify({
+            status: result.status,
+            signal: result.signal,
+            error: result.error?.message,
+            stdout: result.stdout,
+            stderr: result.stderr,
+          }),
+        ).toBe(true);
         descendantPid = Number.parseInt(readFileSync(pidFile, "utf8"), 10);
         expect(result.status).toBe(124);
         expect(result.stdout).toContain("signal=timeout");
@@ -406,7 +416,9 @@ describe("plugin lifecycle resource sampler", () => {
         },
       );
 
-      expect(waitForNonEmptyPath(readyFile, 1000)).toBe(true);
+      // Nested shell startup is not the latency under test; the prompt-exit clock
+      // below starts after readiness, so give startup the phase timeout budget.
+      expect(waitForNonEmptyPath(readyFile, 5000)).toBe(true);
       const started = Date.now();
       result.kill("SIGTERM");
       const close = await waitForChildClose(result, 5000);
@@ -445,7 +457,9 @@ describe("plugin lifecycle resource sampler", () => {
         },
       );
 
-      expect(waitForNonEmptyPath(readyFile, 1000)).toBe(true);
+      // Nested shell startup is not the latency under test; the prompt-exit clock
+      // below starts after readiness, so give startup the phase timeout budget.
+      expect(waitForNonEmptyPath(readyFile, 5000)).toBe(true);
       const started = Date.now();
       result.kill("SIGTERM");
       const close = await waitForChildClose(result, 5000);

@@ -1,7 +1,7 @@
 // Health gateway methods return cached or refreshed status summaries while
 // detecting stale channel runtime state against live gateway snapshots.
 import { isFutureDateTimestampMs } from "@openclaw/normalization-core/number-coercion";
-import { ErrorCodes, errorShape } from "../../../packages/gateway-protocol/src/index.js";
+import { getPreparedModelRuntimeStartupStatus } from "../../agents/prepared-model-runtime.startup-status.js";
 import type { ChannelAccountSnapshot } from "../../channels/plugins/types.public.js";
 import { getStatusSummary } from "../../status/summary.js";
 import type { GatewayHotReloadStatus } from "../config-reload-status.types.js";
@@ -11,32 +11,13 @@ import type { ChannelHealthSummary, HealthSummary } from "../health/types.js";
 import type { ChannelRuntimeSnapshot } from "../server-channel-runtime.types.js";
 import { HEALTH_REFRESH_INTERVAL_MS } from "../server-constants.js";
 import { formatError } from "../server-utils.js";
-import { formatForLog } from "../ws-log.js";
-import type { GatewayRequestContext, GatewayRequestHandlers } from "./types.js";
+import { shouldScheduleBackgroundHealthRefresh } from "../server/health-refresh-admission.js";
+import { readGatewayProcessVitals, readGatewayWorkerPoolFacts } from "../server/process-vitals.js";
+import { getSessionRowProjection } from "../session-row-projection-access.js";
+import { respondUnavailableOnThrow } from "./response.js";
+import type { GatewayRequestHandlers } from "./types.js";
 
 const ADMIN_SCOPE = "operator.admin";
-const requestRefreshStartedAt = new WeakMap<
-  GatewayRequestContext["refreshHealthSnapshot"],
-  number
->();
-
-function shouldScheduleRequestRefresh(
-  refresh: GatewayRequestContext["refreshHealthSnapshot"],
-  now: number,
-): boolean {
-  const startedAt = requestRefreshStartedAt.get(refresh);
-  if (
-    startedAt !== undefined &&
-    !isFutureDateTimestampMs(startedAt, { nowMs: now }) &&
-    now - startedAt < HEALTH_REFRESH_INTERVAL_MS
-  ) {
-    return false;
-  }
-  // Scope the throttle to the Gateway refresh owner so independent servers do
-  // not suppress each other while request bursts share one cadence.
-  requestRefreshStartedAt.set(refresh, now);
-  return true;
-}
 
 function cachedLifecycleDiffersFromRuntime(params: {
   cachedAccount: ChannelHealthSummary | undefined;
@@ -106,11 +87,11 @@ function cachedHealthDiffersFromRuntime(
 }
 
 /** Merges cheap live runtime facts into a cached health summary before responding. */
-function mergeCachedHealthRuntimeState(params: {
+async function mergeCachedHealthRuntimeState(params: {
   cached: HealthSummary;
   eventLoop?: HealthSummary["eventLoop"];
   configReloadHotReloadStatus?: GatewayHotReloadStatus;
-}): HealthSummary {
+}): Promise<HealthSummary> {
   const {
     contextEngines: _cachedContextEngines,
     deliveryQueues: _cachedDeliveryQueues,
@@ -118,12 +99,13 @@ function mergeCachedHealthRuntimeState(params: {
   } = params.cached;
   // Dead-letter counts are cheap live reads. Preserve the grouped pressure
   // aggregate for the cache interval so routine health RPCs do not amplify it.
-  const deliveryQueues = buildDeliveryQueueHealthSummary(
+  const deliveryQueues = await buildDeliveryQueueHealthSummary(
     _cachedDeliveryQueues?.ingressPressure ?? [],
   );
   const contextEngines = buildContextEngineHealthSummary();
   return {
     ...cached,
+    modelRuntime: getPreparedModelRuntimeStartupStatus(),
     ...(params.eventLoop ? { eventLoop: params.eventLoop } : {}),
     ...(contextEngines ? { contextEngines } : {}),
     ...(deliveryQueues ? { deliveryQueues } : {}),
@@ -162,7 +144,7 @@ export const healthHandlers: GatewayRequestHandlers = {
     ) {
       respond(
         true,
-        mergeCachedHealthRuntimeState({
+        await mergeCachedHealthRuntimeState({
           cached,
           eventLoop: context.getEventLoopHealth?.(),
           configReloadHotReloadStatus: context.getConfigReloaderHotReloadStatus?.(),
@@ -170,19 +152,17 @@ export const healthHandlers: GatewayRequestHandlers = {
         undefined,
         { cached: true },
       );
-      if (shouldScheduleRequestRefresh(refreshHealthSnapshot, now)) {
+      if (shouldScheduleBackgroundHealthRefresh(refreshHealthSnapshot, now)) {
         void refreshHealthSnapshot({ probe: false, includeSensitive }).catch((err: unknown) =>
           logHealth.error(`background health refresh failed: ${formatError(err)}`),
         );
       }
       return;
     }
-    try {
+    await respondUnavailableOnThrow(respond, async () => {
       const snap = await refreshHealthSnapshot({ probe: wantsProbe, includeSensitive });
-      respond(true, snap, undefined);
-    } catch (err) {
-      respond(false, undefined, errorShape(ErrorCodes.UNAVAILABLE, formatForLog(err)));
-    }
+      respond(true, { ...snap, modelRuntime: getPreparedModelRuntimeStartupStatus() }, undefined);
+    });
   },
   status: async ({ respond, client, params, context }) => {
     const scopes = Array.isArray(client?.connect?.scopes) ? client.connect.scopes : [];
@@ -190,17 +170,19 @@ export const healthHandlers: GatewayRequestHandlers = {
     const status = await getStatusSummary({
       includeSensitive: scopes.includes(ADMIN_SCOPE),
       includeChannelSummary: params.includeChannelSummary !== false,
+      includeCliProjection: params.includeCliProjection === true,
+      sessionRowProjection: getSessionRowProjection(context),
       ...(hostDesktopStatus ? { hostDesktopStatus } : {}),
     });
-    if (context.getEventLoopHealth) {
-      status.eventLoop = context.getEventLoopHealth();
-    }
-    const memory = process.memoryUsage();
-    status.processMemory = {
-      rssBytes: memory.rss,
-      heapUsedBytes: memory.heapUsed,
-      heapTotalBytes: memory.heapTotal,
-    };
-    respond(true, status, undefined);
+    respond(
+      true,
+      {
+        ...status,
+        modelRuntime: getPreparedModelRuntimeStartupStatus(),
+        ...readGatewayProcessVitals(context.getEventLoopHealth),
+        workerPools: await readGatewayWorkerPoolFacts(),
+      },
+      undefined,
+    );
   },
 };

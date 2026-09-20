@@ -17,9 +17,11 @@ import { setHeartbeatWakeHandler } from "../infra/heartbeat-wake.js";
 import { peekSystemEvents, resetSystemEventsForTest } from "../infra/system-events.js";
 import type { RuntimeEnv } from "../runtime.js";
 import { closeOpenClawAgentDatabasesForTest } from "../state/openclaw-agent-db.js";
+import { captureOpenClawStateWorkerContext } from "../state/openclaw-state-worker-context.js";
 import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
 import { createRunningTaskRunCore, recordTaskRunProgressByRunIdCore } from "./task-executor.js";
-import { createTaskRecord, getTaskById, reloadTaskRegistryFromStore } from "./task-registry.js";
+import { reloadTaskRegistryFromStoreAsync } from "./task-registry-state.js";
+import { createTaskRecord, getTaskById } from "./task-registry.js";
 import {
   configureTaskRegistryMaintenance,
   resetTaskRegistryMaintenanceRuntimeForTests,
@@ -97,9 +99,14 @@ describe("task operations product boundary", () => {
   it("runs persisted task operations through CLI, chat, notification, audit, and maintenance", async () => {
     await withOpenClawTestState(
       {
-        layout: "state-only",
+        layout: "home",
         scenario: "minimal",
         prefix: "openclaw-task-operations-e2e-",
+        env: {
+          OPENCLAW_GATEWAY_TOKEN: undefined,
+          OPENCLAW_GATEWAY_PASSWORD: undefined,
+          OPENCLAW_GATEWAY_URL: undefined,
+        },
       },
       async () => {
         resetTaskOperationsRuntime();
@@ -153,7 +160,7 @@ describe("task operations product boundary", () => {
           }
 
           resetTaskRegistryForTests({ persist: false });
-          reloadTaskRegistryFromStore();
+          await reloadTaskRegistryFromStoreAsync(captureOpenClawStateWorkerContext());
           expect(requireTask(operatorTask.taskId)).toMatchObject({
             runId: "run-a07-operator",
             status: "running",
@@ -209,7 +216,7 @@ describe("task operations product boundary", () => {
           });
 
           resetTaskRegistryForTests({ persist: false });
-          reloadTaskRegistryFromStore();
+          await reloadTaskRegistryFromStoreAsync(captureOpenClawStateWorkerContext());
           expect(requireTask(operatorTask.taskId)).toMatchObject({
             notifyPolicy: "state_changes",
             progressSummary: "Indexed 3 records",
@@ -265,19 +272,26 @@ describe("task operations product boundary", () => {
 
           const cancel = createRuntime();
           await tasksCancelCommand({ lookup: operatorTask.taskId }, cancel.runtime);
-          expect(cancel.errors).toEqual([]);
-          expect(cancel.exits).toEqual([]);
-          expect(cancel.logs).toEqual([
-            `Cancelled ${operatorTask.taskId} (cli) run run-a07-operator.`,
+          // A persisted row cannot stand in for the Gateway's live execution owner.
+          expect(cancel.errors).toEqual([
+            expect.stringContaining(
+              "CLI task cancellation requires the live Gateway tasks.cancel path:",
+            ),
           ]);
+          expect(cancel.errors[0]).toContain("requires credentials before opening a websocket");
+          expect(cancel.exits).toEqual([1]);
+          expect(cancel.logs).toEqual([]);
+          resetTaskRegistryForTests({ persist: false });
+          await reloadTaskRegistryFromStoreAsync(captureOpenClawStateWorkerContext());
           expect(requireTask(operatorTask.taskId)).toMatchObject({
-            status: "cancelled",
-            error: "Cancelled by operator.",
+            status: "running",
           });
 
-          const cancelledShow = createRuntime();
-          await tasksShowCommand({ lookup: operatorTask.taskId }, cancelledShow.runtime);
-          expect(cancelledShow.logs.join("\n")).toContain("status: cancelled");
+          expect(requireTask(operatorTask.taskId).error).toBeUndefined();
+
+          const retainedShow = createRuntime();
+          await tasksShowCommand({ lookup: operatorTask.taskId }, retainedShow.runtime);
+          expect(retainedShow.logs.join("\n")).toContain("status: running");
         } finally {
           clearHeartbeat();
           resetTaskOperationsRuntime();

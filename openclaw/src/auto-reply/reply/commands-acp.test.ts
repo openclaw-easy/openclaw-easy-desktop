@@ -15,10 +15,13 @@ import {
   createChannelTestPluginBase,
   createTestRegistry,
 } from "../../test-utils/channel-plugins.js";
+import { createInMemoryTaskRegistryStore } from "../../test-utils/task-registry-store.js";
 import { INTERNAL_MESSAGE_CHANNEL } from "../../utils/message-channel.js";
 
 const hoisted = vi.hoisted(() => {
   const callGatewayMock = vi.fn();
+  const cleanupFailedAcpSpawnMock = vi.fn();
+  const closeRuntimeOnFailureMock = vi.fn();
   const requireAcpRuntimeBackendMock = vi.fn();
   const getAcpRuntimeBackendMock = vi.fn();
   const listAcpSessionEntriesMock = vi.fn();
@@ -44,6 +47,8 @@ const hoisted = vi.hoisted(() => {
   const doctorMock = vi.fn();
   return {
     callGatewayMock,
+    cleanupFailedAcpSpawnMock,
+    closeRuntimeOnFailureMock,
     requireAcpRuntimeBackendMock,
     getAcpRuntimeBackendMock,
     listAcpSessionEntriesMock,
@@ -91,6 +96,10 @@ function createAcpCommandSessionBindingService() {
     unbind: (input: unknown) => hoisted.sessionBindingUnbindMock(input),
   };
 }
+
+vi.mock("../../acp/control-plane/spawn.js", () => ({
+  cleanupFailedAcpSpawn: (args: unknown) => hoisted.cleanupFailedAcpSpawnMock(args),
+}));
 
 vi.mock("../../gateway/call.js", () => ({
   callGateway: (args: unknown) => hoisted.callGatewayMock(args),
@@ -152,17 +161,10 @@ const { failTaskRunByRunIdCore } = await import("../../tasks/task-executor.js");
 function configureInMemoryTaskRegistryStoreForTests(): void {
   configureTaskRegistryRuntime({
     store: {
-      loadSnapshot: () => ({
-        tasks: new Map(),
-        deliveryStates: new Map(),
-      }),
-      saveSnapshot: () => {},
+      ...createInMemoryTaskRegistryStore(),
       upsertTaskWithDeliveryState: () => {},
-      upsertTask: () => {},
       deleteTaskWithDeliveryState: () => {},
-      deleteTask: () => {},
       upsertDeliveryState: () => {},
-      deleteDeliveryState: () => {},
       close: () => {},
     },
   });
@@ -682,10 +684,6 @@ function gatewayRequests(): Array<Record<string, unknown>> {
   return hoisted.callGatewayMock.mock.calls.map((call) => call[0] as Record<string, unknown>);
 }
 
-function expectGatewayMethodCalled(method: string): void {
-  expect(gatewayRequests().some((request) => request.method === method)).toBe(true);
-}
-
 function expectGatewayMethodNotCalled(method: string): void {
   expect(gatewayRequests().some((request) => request.method === method)).toBe(false);
 }
@@ -907,6 +905,8 @@ describe("/acp command", () => {
     configureInMemoryTaskRegistryStoreForTests();
     hoisted.listAcpSessionEntriesMock.mockReset().mockResolvedValue([]);
     hoisted.callGatewayMock.mockReset().mockResolvedValue({ ok: true });
+    hoisted.cleanupFailedAcpSpawnMock.mockReset().mockResolvedValue(undefined);
+    hoisted.closeRuntimeOnFailureMock.mockReset().mockResolvedValue(undefined);
     hoisted.readAcpSessionEntryMock.mockReset().mockReturnValue(null);
     hoisted.upsertAcpSessionMetaMock.mockReset().mockResolvedValue({
       sessionId: "session-1",
@@ -1024,11 +1024,13 @@ describe("/acp command", () => {
               }
             : {}),
         };
-        await hoisted.upsertAcpSessionMetaMock({
+        const sessionEntry = await hoisted.upsertAcpSessionMetaMock({
           sessionKey: input.sessionKey,
           mutate: () => meta,
         });
         return {
+          sessionEntry,
+          closeRuntimeOnFailure: hoisted.closeRuntimeOnFailureMock,
           runtime: backend.runtime,
           handle: {
             backend: meta.backend,
@@ -1101,8 +1103,8 @@ describe("/acp command", () => {
         }
       },
       setSessionRuntimeMode: async (input: { sessionKey: string; runtimeMode: string }) => {
-        await hoisted.setModeMock(input);
-        return { mode: input.runtimeMode };
+        const options = await hoisted.setModeMock(input);
+        return options ?? { runtimeMode: input.runtimeMode };
       },
       setSessionConfigOption: async (input: { key: string; value: string }) => {
         const options = await hoisted.setConfigOptionMock(input);
@@ -1162,7 +1164,10 @@ describe("/acp command", () => {
 
     const result = await handleAcpCommand(params, true);
 
-    expect(result).toEqual({ shouldContinue: false });
+    expect(result).toEqual({
+      shouldContinue: false,
+      reply: { text: expect.stringContaining("commands.ownerAllowFrom") },
+    });
   });
 
   it("keeps read-only /acp actions available to authorized non-owners", async () => {
@@ -1402,7 +1407,8 @@ describe("/acp command", () => {
     );
     const { createTestAdmittedRunContext } =
       await import("../../agents/admitted-run-context.test-support.js");
-    const { closeOpenClawStateDatabaseByPath } = await import("../../state/openclaw-state-db.js");
+    const { closeOpenClawStateDatabaseByPath } =
+      await import("../../state/openclaw-state-db-cache.js");
 
     hoisted.upsertAcpSessionMetaMock.mockImplementation((input) =>
       sessionMeta.upsertAcpSessionMeta({ ...input, cfg, databasePath, now: () => 1 }),
@@ -1619,8 +1625,14 @@ describe("/acp command", () => {
     const result = await runDiscordAcpCommand("/acp spawn codex", cfg);
 
     expect(result?.reply?.text).toContain("spawnSessions=true");
-    expect(hoisted.closeMock).toHaveBeenCalledTimes(2);
-    expectGatewayMethodCalled("sessions.delete");
+    expect(hoisted.cleanupFailedAcpSpawnMock).toHaveBeenCalledExactlyOnceWith({
+      cfg,
+      sessionKey: expect.stringContaining("agent:codex:acp:"),
+      agentId: "codex",
+      sessionEntry: expect.objectContaining({ sessionId: "session-1" }),
+      deleteTranscript: false,
+      closeRuntimeOnFailure: hoisted.closeRuntimeOnFailureMock,
+    });
     expectGatewayMethodNotCalled("sessions.patch");
   });
 
@@ -1697,6 +1709,7 @@ describe("/acp command", () => {
     );
     expect(hoisted.cancelMock).toHaveBeenCalledWith({
       cfg: baseCfg,
+      agentId: "codex",
       reason: "manual-cancel",
       sessionKey: defaultAcpSessionKey,
     });
@@ -1960,6 +1973,7 @@ describe("/acp command", () => {
 
     expect(hoisted.closeMock).toHaveBeenCalledWith({
       cfg: baseCfg,
+      agentId: "codex",
       sessionKey: defaultAcpSessionKey,
       reason: "manual-close",
       allowBackendUnavailable: true,
@@ -2052,8 +2066,8 @@ describe("/acp command", () => {
     expect(result?.reply?.text).toContain(currentSessionKey);
     expect(hoisted.readAcpSessionEntryMock).toHaveBeenCalledWith({
       cfg: baseCfg,
-      sessionKey: currentSessionKey,
       agentId: "codex",
+      sessionKey: currentSessionKey,
     });
     expect(hoisted.listAcpSessionEntriesMock).not.toHaveBeenCalled();
   });
@@ -2076,9 +2090,11 @@ describe("/acp command", () => {
 
     expect(result?.reply?.text).toContain(boundSessionKey);
     expect(result?.reply?.text).not.toContain("agent:main:raw-requester");
-    expect(hoisted.readAcpSessionEntryMock).toHaveBeenCalledWith(
-      expect.objectContaining({ cfg: baseCfg, sessionKey: boundSessionKey }),
-    );
+    expect(hoisted.readAcpSessionEntryMock).toHaveBeenCalledWith({
+      cfg: baseCfg,
+      agentId: "codex",
+      sessionKey: boundSessionKey,
+    });
     expect(hoisted.listAcpSessionEntriesMock).not.toHaveBeenCalled();
   });
 
@@ -2096,8 +2112,8 @@ describe("/acp command", () => {
     expect(result?.reply?.text).toContain("(none)");
     expect(hoisted.readAcpSessionEntryMock).toHaveBeenCalledWith({
       cfg: baseCfg,
-      sessionKey: "agent:main:raw-requester",
       agentId: "main",
+      sessionKey: "agent:main:raw-requester",
     });
     expect(hoisted.listAcpSessionEntriesMock).not.toHaveBeenCalled();
   });
@@ -2363,6 +2379,14 @@ describe("/acp command", () => {
 
   it.each([
     {
+      action: "set-mode",
+      command: "/acp set-mode plan",
+      effectiveOptions: { runtimeMode: "plan" },
+      managerMock: hoisted.setModeMock,
+      managerInput: { runtimeMode: "plan" },
+      expectedText: `✅ Updated ACP runtime mode for ${defaultAcpSessionKey}: plan. Effective options: runtimeMode=plan`,
+    },
+    {
       action: "cwd",
       command: "/acp cwd /tmp/worktree",
       effectiveOptions: { cwd: "/tmp/worktree" },
@@ -2407,19 +2431,27 @@ describe("/acp command", () => {
       ...testCase.managerInput,
     });
     expect(
-      hoisted.setConfigOptionMock.mock.calls.length +
+      hoisted.setModeMock.mock.calls.length +
+        hoisted.setConfigOptionMock.mock.calls.length +
         hoisted.updateSessionRuntimeOptionsMock.mock.calls.length,
     ).toBe(1);
   });
 
-  it("preserves the dedicated runtime-option failure boundary", async () => {
+  it.each([
+    {
+      command: "/acp model openai/gpt-5.5",
+      label: "model",
+      managerMock: hoisted.setConfigOptionMock,
+    },
+    { command: "/acp set-mode plan", label: "runtime mode", managerMock: hoisted.setModeMock },
+  ])("preserves the $label failure boundary", async ({ command, label, managerMock }) => {
     mockBoundThreadSession();
-    hoisted.setConfigOptionMock.mockRejectedValueOnce("backend failure");
+    managerMock.mockRejectedValueOnce("backend failure");
 
-    const result = await runThreadAcpCommand("/acp model openai/gpt-5.5", baseCfg);
+    const result = await runThreadAcpCommand(command, baseCfg);
 
     expect(result?.reply?.text).toBe(
-      "ACP error (ACP_TURN_FAILED): Could not update ACP model.\nnext: Retry, or use `/acp cancel` and send the message again.",
+      `ACP error (ACP_TURN_FAILED): Could not update ACP ${label}.\nnext: Retry, or use \`/acp cancel\` and send the message again.`,
     );
   });
 

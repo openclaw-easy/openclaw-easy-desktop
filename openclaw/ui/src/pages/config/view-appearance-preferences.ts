@@ -179,7 +179,7 @@ export function renderChatPreferencesSection(
   const serverQueueMode = props.serverQueueMode ?? t("chat.followUpModeLoading");
   const followUpDescription = props.chatFollowUpMode
     ? t("chat.followUpModeOverriding", { mode: serverQueueMode })
-    : t("chat.followUpModeUsingServer", { mode: serverQueueMode });
+    : nothing;
   const messageWidthDefaultDescription = renderSettingsDefaultDescription(
     UI_APPEARANCE_DEFAULTS.chatMessageMaxWidth,
     props.chatMessageMaxWidth !== undefined,
@@ -201,6 +201,10 @@ export function renderChatPreferencesSection(
     (props.composerHoldToRecord ?? UI_APPEARANCE_DEFAULTS.composerHoldToRecord) !==
       UI_APPEARANCE_DEFAULTS.composerHoldToRecord,
   );
+  const showTaskProgressDefaultDescription = renderSettingsDefaultDescription(
+    t("common.enabled"),
+    props.chatShowTaskProgress !== UI_APPEARANCE_DEFAULTS.chatShowTaskProgress,
+  );
   const collapseTaskProgressDefaultDescription = renderSettingsDefaultDescription(
     t("common.disabled"),
     props.chatCollapseTaskProgress !== UI_APPEARANCE_DEFAULTS.chatCollapseTaskProgress,
@@ -218,11 +222,19 @@ export function renderChatPreferencesSection(
           control: messageWidthInput,
         })}
         ${renderSettingsToggleRow({
+          title: t("configView.chatPrefs.showTaskProgress"),
+          description: html`${t("configView.chatPrefs.showTaskProgressHint")}<br />
+            ${showTaskProgressDefaultDescription} ${t("quickSettings.personal.browserOnly")}`,
+          checked: props.chatShowTaskProgress,
+          onChange: props.setChatShowTaskProgress,
+        })}
+        ${renderSettingsToggleRow({
           title: t("configView.chatPrefs.collapseTaskProgress"),
           description: html`${t("configView.chatPrefs.collapseTaskProgressHint")}<br />
             ${collapseTaskProgressDefaultDescription} ${t("quickSettings.personal.browserOnly")}`,
           checked: props.chatCollapseTaskProgress,
           onChange: props.setChatCollapseTaskProgress,
+          disabled: !props.chatShowTaskProgress,
         })}
         ${renderSettingsSelectRow({
           title: t("chat.sendShortcut"),
@@ -261,15 +273,17 @@ export function renderChatPreferencesSection(
                 ${t("chat.followUpModeQueue")}
               </option>
             </select>
-            ${props.chatFollowUpModeOverridden
-              ? html`<button
-                  type="button"
-                  class="btn btn--sm"
-                  @click=${props.resetChatFollowUpMode}
-                >
-                  ${t("chat.followUpModeReset")}
-                </button>`
-              : nothing}
+            ${
+              props.chatFollowUpModeOverridden
+                ? html`<button
+                    type="button"
+                    class="btn btn--sm"
+                    @click=${props.resetChatFollowUpMode}
+                  >
+                    ${t("chat.followUpModeReset")}
+                  </button>`
+                : nothing
+            }
           `,
         })}
         ${renderSettingsSelectRow({
@@ -285,15 +299,17 @@ export function renderChatPreferencesSection(
           onChange: (value) => props.setCatalogOpenTarget(normalizeCatalogOpenTarget(value)),
         })}
         ${renderSettingsMicrophoneField(props)} ${renderSettingsCameraField(props)}
-        ${props.setComposerHoldToRecord
-          ? renderSettingsToggleRow({
-              title: t("chat.composer.holdToRecordSetting"),
-              description: html`${t("chat.composer.holdToRecordSettingDescription")}<br />
-                ${holdToRecordDefaultDescription} ${t("quickSettings.personal.browserOnly")}`,
-              checked: props.composerHoldToRecord ?? UI_APPEARANCE_DEFAULTS.composerHoldToRecord,
-              onChange: props.setComposerHoldToRecord,
-            })
-          : nothing}
+        ${
+          props.setComposerHoldToRecord
+            ? renderSettingsToggleRow({
+                title: t("chat.composer.holdToRecordSetting"),
+                description: html`${t("chat.composer.holdToRecordSettingDescription")}<br />
+                  ${holdToRecordDefaultDescription} ${t("quickSettings.personal.browserOnly")}`,
+                checked: props.composerHoldToRecord ?? UI_APPEARANCE_DEFAULTS.composerHoldToRecord,
+                onChange: props.setComposerHoldToRecord,
+              })
+            : nothing
+        }
       </div>
     </section>
   `;
@@ -380,18 +396,20 @@ export function renderLobsterPetSection(props: ConfigProps) {
                   return html`
                     <openclaw-tooltip>
                       <span
-                        class="lobsterdex__mini lobster-pet--palette-${palette.id} ${seen
-                          ? ""
-                          : "lobsterdex__mini--unseen"}"
+                        class="lobsterdex__mini lobster-pet--palette-${palette.id} ${
+                          seen ? "" : "lobsterdex__mini--unseen"
+                        }"
                         style=${lobsterLookStyle(look)}
                         tabindex="0"
                         role="img"
                         aria-label=${ariaLabel}
                       >
                         ${renderLobsterSvg(look, { standalone: true })}
-                        ${shinySeen
-                          ? html`<span class="lobsterdex__mini-star" aria-hidden="true">✦</span>`
-                          : nothing}
+                        ${
+                          shinySeen
+                            ? html`<span class="lobsterdex__mini-star" aria-hidden="true">✦</span>`
+                            : nothing
+                        }
                       </span>
                       <span slot="content" class="lobsterdex__tooltip">
                         <strong>${displayName}</strong>
@@ -402,20 +420,22 @@ export function renderLobsterPetSection(props: ConfigProps) {
                   `;
                 })}
               </div>
-              ${props.lobsterdexHref
-                ? html`<a
-                    class="btn btn--sm lobsterdex__open"
-                    href=${props.lobsterdexHref}
-                    @click=${(event: MouseEvent) => {
-                      if (!shouldHandleNavigationClick(event)) {
-                        return;
-                      }
-                      event.preventDefault();
-                      props.onOpenLobsterdex?.();
-                    }}
-                    >${t("quickSettings.appearance.lobsterdexOpen")}</a
-                  >`
-                : nothing}
+              ${
+                props.lobsterdexHref
+                  ? html`<a
+                      class="btn btn--sm lobsterdex__open"
+                      href=${props.lobsterdexHref}
+                      @click=${(event: MouseEvent) => {
+                        if (!shouldHandleNavigationClick(event)) {
+                          return;
+                        }
+                        event.preventDefault();
+                        props.onOpenLobsterdex?.();
+                      }}
+                      >${t("quickSettings.appearance.lobsterdexOpen")}</a
+                    >`
+                  : nothing
+              }
             </div>
           `,
         })}
@@ -453,38 +473,44 @@ export function renderSidebarPreferencesSection(props: ConfigProps) {
           checked: props.sidebarLiveActivity,
           onChange: props.setSidebarLiveActivity,
         })}
-        ${setSessionDeleteConfirm
-          ? renderSettingsToggleRow({
-              title: t("configView.sidebarPrefs.deleteConfirm"),
-              description: html`${t("configView.sidebarPrefs.deleteConfirmHint")}<br />
-                ${deleteConfirmDefaultDescription} ${t("quickSettings.personal.browserOnly")}`,
-              checked: sessionDeleteConfirm,
-              onChange: setSessionDeleteConfirm,
-            })
-          : nothing}
+        ${
+          setSessionDeleteConfirm
+            ? renderSettingsToggleRow({
+                title: t("configView.sidebarPrefs.deleteConfirm"),
+                description: html`${t("configView.sidebarPrefs.deleteConfirmHint")}<br />
+                  ${deleteConfirmDefaultDescription} ${t("quickSettings.personal.browserOnly")}`,
+                checked: sessionDeleteConfirm,
+                onChange: setSessionDeleteConfirm,
+              })
+            : nothing
+        }
       </div>
-      ${hiddenCatalogIds.length > 0
-        ? html`
-            <div class="settings-section__header settings-section__header--subsection">
-              <h3 class="settings-section__heading">${t("chat.sidebar.hiddenSessionSections")}</h3>
-            </div>
-            <div class="settings-group">
-              ${hiddenCatalogIds.map((catalogId) =>
-                renderSettingsRow({
-                  title: props.hiddenSessionCatalogLabels.get(catalogId) ?? catalogId,
-                  description: t("quickSettings.personal.browserOnly"),
-                  control: html`<button
-                    type="button"
-                    class="btn btn--sm"
-                    @click=${() => props.setSessionCatalogHidden(catalogId, false)}
-                  >
-                    ${t("chat.sidebar.showSessionSection")}
-                  </button>`,
-                }),
-              )}
-            </div>
-          `
-        : nothing}
+      ${
+        hiddenCatalogIds.length > 0
+          ? html`
+              <div class="settings-section__header settings-section__header--subsection">
+                <h3 class="settings-section__heading">
+                  ${t("chat.sidebar.hiddenSessionSections")}
+                </h3>
+              </div>
+              <div class="settings-group">
+                ${hiddenCatalogIds.map((catalogId) =>
+                  renderSettingsRow({
+                    title: props.hiddenSessionCatalogLabels.get(catalogId) ?? catalogId,
+                    description: t("quickSettings.personal.browserOnly"),
+                    control: html`<button
+                      type="button"
+                      class="btn btn--sm"
+                      @click=${() => props.setSessionCatalogHidden(catalogId, false)}
+                    >
+                      ${t("chat.sidebar.showSessionSection")}
+                    </button>`,
+                  }),
+                )}
+              </div>
+            `
+          : nothing
+      }
       <div class="settings-section__header settings-section__header--subsection">
         <h3 class="settings-section__heading">${t("configView.sessionObserver.title")}</h3>
       </div>

@@ -1,24 +1,33 @@
 import { randomUUID } from "node:crypto";
 import { truncateUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
+import { SKILL_RESOURCE_PROTOCOL_FEATURE } from "../../../packages/gateway-protocol/src/schema/skill-resources.js";
+import { WORKER_SKILL_WORKSHOP_FEATURE } from "../../../packages/gateway-protocol/src/schema/worker-skill-workshop.js";
 import { mapThinkingLevelForProvider } from "../../agents/embedded-agent-runner/utils.js";
+import { recordModelFallbackStop } from "../../agents/failover-error.js";
 import { convertToLlm } from "../../agents/sessions/messages.js";
+import { withSessionManagerWrite } from "../../agents/sessions/session-manager-write-admission.js";
 import { SessionManager } from "../../agents/sessions/session-manager.js";
+import { withGatewayToolCallerIdentity } from "../../agents/tools/gateway-caller-context.js";
+import { createLibrarySkillWorkshopTool } from "../../agents/tools/skill-workshop-tool-library.js";
+import { buildActiveNodeContextText } from "../../infra/active-node-context.js";
 import {
   getActiveAgentRunDelegatedAuthority,
   registerAgentRunDelegatedAuthorityClosedHandler,
 } from "../../infra/agent-run-registry.js";
 import { redactSensitiveText } from "../../logging/redact.js";
 import { buildPersistedUserTurnMessage } from "../../sessions/user-turn-transcript.js";
+import { prepareSkillResourceDelivery } from "../../skills/runtime/resources.js";
 import { parseWorkerLaunchPlan } from "../../worker/launch-descriptor.js";
 import { WORKER_PROVIDER_REPLAY_LOCAL_RETRY_MESSAGE } from "../../worker/transcript-message.js";
-import { prepareGitHubPublicationAvailability } from "../github-publication-availability.js";
 import {
   STALE_WORKER_BUILD_REASON,
   StaleWorkerBuildError,
-  supportsWorkerExecutionContextLaunch,
+  supportsCurrentWorkerLaunch,
 } from "./admission.js";
 import { sameWorkerSessionTurnClaim } from "./placement-record.js";
 import { prepareWorkerDesktopLaunchPlan } from "./worker-desktop-launch-plan.js";
+import { prepareWorkerGitHubBinding } from "./worker-github-binding.js";
+import { registerWorkerSkillAuthoring } from "./worker-skill-authoring.js";
 import { waitForTurnOperation } from "./worker-turn-admission.js";
 import {
   WorkerTurnExecutionError,
@@ -40,6 +49,7 @@ import {
   type executeRemoteExecTurn,
   reconcileWorkspaceAfterTurn,
   recoverWorkspaceBeforeTurn,
+  workerWorkspaceFailure,
 } from "./workspace-result-finalize.js";
 
 export async function executeWorkerTurn(
@@ -68,13 +78,13 @@ export async function executeWorkerTurn(
   ) {
     throw new Error("Active worker placement does not match its attached environment");
   }
-  if (!supportsWorkerExecutionContextLaunch(bootstrapReceipt)) {
+  if (!supportsCurrentWorkerLaunch(bootstrapReceipt)) {
     throw new Error(
-      "Active worker bundle lacks the current execution-context capability; reprovision the worker before launch",
+      "Active worker bundle lacks the current launch capability; reprovision the worker before launch",
     );
   }
   await recoverWorkspaceBeforeTurn(params);
-  const githubPublicationAvailable = await prepareGitHubPublicationAvailability({
+  const github = await prepareWorkerGitHubBinding({
     sessionId: placement.sessionId,
     sessionKey: placement.sessionKey,
     agentId: placement.agentId,
@@ -82,10 +92,32 @@ export async function executeWorkerTurn(
   });
 
   const startedAt = Date.now();
-  turn.onExecutionStarted?.({ lifecycleGeneration: turn.lifecycleGeneration });
+  await turn.onExecutionStarted?.({ lifecycleGeneration: turn.lifecycleGeneration });
+  params.assertRunCurrent?.();
+  turn.abortSignal?.throwIfAborted();
+  if (!params.placements.validateTurnClaim(params.turnClaim)) {
+    throw new Error("Worker turn claim is no longer current");
+  }
   turn.onExecutionPhase?.({ phase: "runner_entered", backend: "cloud-worker" });
   const transcriptTarget = resolveWorkerTurnTranscriptTarget(turn);
-  const manager = SessionManager.open(transcriptTarget);
+  // The unrecorded-input fallback retains its writable view and captured append custody.
+  const readAsynchronously =
+    turn.suppressNextUserMessagePersistence === true ||
+    turn.userTurnTranscriptRecorder?.hasPersisted() === true;
+  // Pending recorder writes keep the synchronous read-before-persist ordering.
+  const manager = readAsynchronously
+    ? await SessionManager.openModelContextAsync(transcriptTarget, { signal: turn.abortSignal })
+    : turn.userTurnTranscriptRecorder
+      ? SessionManager.openModelContext(transcriptTarget)
+      : SessionManager.open(transcriptTarget);
+  if (readAsynchronously) {
+    params.assertRunCurrent?.();
+    turn.abortSignal?.throwIfAborted();
+    if (!params.placements.validateTurnClaim(params.turnClaim)) {
+      throw new Error("Worker turn claim changed during context preparation");
+    }
+    resolveWorkerTurnTranscriptTarget(turn);
+  }
   const userMessageAlreadyPersisted =
     turn.suppressNextUserMessagePersistence === true ||
     turn.userTurnTranscriptRecorder?.hasPersisted() === true;
@@ -98,11 +130,15 @@ export async function executeWorkerTurn(
   let baseLeafId = manager.getLeafId();
   if (!userMessageAlreadyPersisted) {
     const persisted = turn.userTurnTranscriptRecorder
-      ? await turn.userTurnTranscriptRecorder.persistApproved({ cwd: params.localWorkspaceDir })
+      ? await turn.userTurnTranscriptRecorder.persistApproved({
+          cwd:
+            params.workspace.kind === "local"
+              ? params.workspace.path
+              : placement.remoteWorkspaceDir,
+        })
       : undefined;
     if (persisted) {
       baseLeafId = persisted.messageId;
-      turn.userTurnTranscriptRecorder?.markRuntimePersisted(persisted.message, persisted.admission);
       turn.onUserMessagePersisted?.(persisted.message);
     } else if (turn.userTurnTranscriptRecorder?.hasPersisted()) {
       baseLeafId = SessionManager.open(transcriptTarget).getLeafId();
@@ -141,11 +177,10 @@ export async function executeWorkerTurn(
       prepareComputer: () => params.environments.prepareComputer?.(params.turnClaim),
       modelRef,
       turn,
-      githubPublicationAvailable,
       portalAvailable,
     });
   params.placements.authorizeWorkerTurnTools(params.turnClaim, toolAuthority.allowedToolNames);
-  const { operationalRunInstance, runtimeIdentity, assertActive } =
+  const { operationalRunInstance, runtimeIdentity, assertActive, takeFinishingOutcome } =
     await prepareWorkerAgentRuntimeIdentity({
       agentId: placement.agentId,
       runtimeInstanceId: placement.environmentId,
@@ -173,6 +208,7 @@ export async function executeWorkerTurn(
       cancel();
     }
   });
+  let revokeSkillAuthoring: (() => void) | undefined;
   try {
     const isAuthorized = () => {
       try {
@@ -190,15 +226,67 @@ export async function executeWorkerTurn(
         return false;
       }
     };
+    if (turn.skillLibraryAuthoring && toolAuthority.allowedToolNames.includes("skill_workshop")) {
+      if (!bootstrapReceipt.protocolFeatures.includes(WORKER_SKILL_WORKSHOP_FEATURE)) {
+        throw new StaleWorkerBuildError();
+      }
+      const assertSkillAuthority = () => {
+        if (
+          !isAuthorized() ||
+          !params.placements.isWorkerTurnToolAuthorized(params.turnClaim, "skill_workshop")
+        ) {
+          throw new Error("Worker personal authoring authority closed.");
+        }
+      };
+      const capability = turn.skillLibraryAuthoring;
+      revokeSkillAuthoring = registerWorkerSkillAuthoring(
+        params.turnClaim,
+        createLibrarySkillWorkshopTool({
+          ...capability,
+          defaultTarget: "personal",
+          invoke: (input) =>
+            withGatewayToolCallerIdentity(
+              {
+                agentId: placement.agentId,
+                sessionKey: placement.sessionKey,
+                operationalRunInstance,
+                receiptAuthority: () => {
+                  assertSkillAuthority();
+                  return true;
+                },
+                workerTurnClaim: params.turnClaim,
+              },
+              () => capability.invoke(input),
+            ),
+        }),
+        assertSkillAuthority,
+      );
+    }
     const media = await prepareWorkerTurnMedia({
       turn,
       history,
-      localWorkspaceDir: params.localWorkspaceDir,
+      workspace: params.workspace,
       remoteWorkspaceDir: placement.remoteWorkspaceDir,
       tunnel,
       isAuthorized,
       signal,
     });
+    const skillResources = await prepareSkillResourceDelivery(
+      turn.skillsSnapshot,
+      () => {
+        if (!isAuthorized()) {
+          throw new Error("Worker turn lost authority before skill resource delivery.");
+        }
+      },
+      turn.explicitSkillSelections,
+      turn.workspaceDir,
+    );
+    if (
+      skillResources &&
+      !bootstrapReceipt.protocolFeatures.includes(SKILL_RESOURCE_PROTOCOL_FEATURE)
+    ) {
+      throw new StaleWorkerBuildError();
+    }
     if (!userMessageAlreadyPersisted && !turn.userTurnTranscriptRecorder) {
       const canonical = buildPersistedUserTurnMessage({
         text: turn.transcriptPrompt ?? turn.prompt,
@@ -221,7 +309,17 @@ export async function executeWorkerTurn(
           mediaImageBlockFactIndexes: media.imageFactIndexes,
         },
       };
-      baseLeafId = manager.appendMessage(message);
+      baseLeafId = await withSessionManagerWrite(manager, () => {
+        params.assertRunCurrent?.();
+        if (!isAuthorized()) {
+          throw new Error("Worker turn authority changed before transcript write");
+        }
+        resolveWorkerTurnTranscriptTarget({
+          ...transcriptTarget,
+          sessionTarget: transcriptTarget,
+        });
+        return manager.appendMessage(message);
+      });
       turn.onUserMessagePersisted?.(message);
     }
     const initialMessagePlan = windowInitialMessages(media.history);
@@ -238,6 +336,10 @@ export async function executeWorkerTurn(
     if (!tunnel.launchTurn) {
       throw new Error("Worker tunnel does not support worker turns");
     }
+    // Presence belongs to the Gateway; workers cannot read its process-local node registry.
+    const systemPrompt = [turn.extraSystemPrompt, buildActiveNodeContextText()]
+      .filter(Boolean)
+      .join("\n\n");
     const launchPlan = await fitLaunchDescriptorWithRuntimeIdentity({
       runtimeIdentity,
       measure: (plan) => tunnel.measureLaunchTurn(plan, params.turnClaim),
@@ -262,6 +364,14 @@ export async function executeWorkerTurn(
             prompt: media.prompt,
             suppressPromptTranscript: true,
             workspaceDir: placement.remoteWorkspaceDir,
+            ...(github ? { github } : {}),
+            ...(skillResources ? { skillResources } : {}),
+            ...(turn.skillLibraryAuthoring &&
+            toolAuthority.allowedToolNames.includes("skill_workshop")
+              ? {
+                  skillAuthoring: { multipleProfiles: turn.skillLibraryAuthoring.multipleProfiles },
+                }
+              : {}),
             ...(turn.permissionMode
               ? {
                   permissionMode: turn.permissionMode,
@@ -270,9 +380,7 @@ export async function executeWorkerTurn(
               : {}),
             modelRef,
             inferenceOptions: reasoning ? { reasoning } : {},
-            ...(turn.extraSystemPrompt === undefined
-              ? {}
-              : { systemPrompt: turn.extraSystemPrompt }),
+            systemPrompt,
             initialMessages: windowedMessages,
             transcript: {
               baseLeafId,
@@ -294,7 +402,11 @@ export async function executeWorkerTurn(
         limitBytes: launchPlan.limitBytes,
         reason: launchPlan.reason,
       });
-      throw new WorkerTurnExecutionError(WORKER_PROVIDER_REPLAY_LOCAL_RETRY_MESSAGE);
+      throw new WorkerTurnExecutionError(
+        skillResources
+          ? "The selected skills and conversation exceed this worker transport limit. Detach some session skills or start a shorter session, then retry."
+          : WORKER_PROVIDER_REPLAY_LOCAL_RETRY_MESSAGE,
+      );
     }
     if (!isAuthorized()) {
       throw new Error("Worker turn authority changed while preparing its launch");
@@ -383,12 +495,20 @@ export async function executeWorkerTurn(
       .getBranch()
       .slice(baseIndex + 1)
       .flatMap((entry) => (entry.type === "message" ? [entry.message] : []));
+    // Consume and mark before reconciliation releases the exact finishing-ACK owner.
+    const finishing = workerTurnFailed ? takeFinishingOutcome(credential.deliveryId) : undefined;
+    const workerFailure = workerTurnFailed
+      ? new WorkerTurnExecutionError(finishing?.error ?? "Cloud worker turn failed")
+      : undefined;
+    if (workerFailure && finishing?.replayInvalid) {
+      recordModelFallbackStop(workerFailure);
+    }
     const workspaceConflict = await reconcileWorkspaceAfterTurn({
       placement,
       placements: params.placements,
       turnClaim: params.turnClaim,
       workspaceOperations: params.workspaceOperations,
-      localWorkspaceDir: params.localWorkspaceDir,
+      workspace: params.workspace,
       transcriptTarget,
       tunnel,
       ...(params.prepareAcceptedWorkspacePublication
@@ -397,6 +517,11 @@ export async function executeWorkerTurn(
       ...(params.publishAcceptedWorkspace
         ? { publishAcceptedWorkspace: params.publishAcceptedWorkspace }
         : {}),
+    }).catch((reconciliationError: unknown) => {
+      if (workerFailure) {
+        throw workerWorkspaceFailure(workerFailure, reconciliationError);
+      }
+      throw reconciliationError;
     });
     if (workspaceConflict) {
       const reportedWorkspaceConflict = workspaceConflict;
@@ -414,10 +539,8 @@ export async function executeWorkerTurn(
         )
         .catch(() => undefined);
     }
-    if (workerTurnFailed) {
-      throw new WorkerTurnExecutionError(
-        terminal.message.errorMessage ?? "Cloud worker turn failed",
-      );
+    if (workerFailure) {
+      throw workerFailure;
     }
     return buildWorkerTurnResult({
       messages: workerMessages,
@@ -430,6 +553,7 @@ export async function executeWorkerTurn(
       workspaceConflictSummary: workspaceConflict?.summary,
     });
   } finally {
+    revokeSkillAuthoring?.();
     stopWatchingClaim();
     stopWatchingRun();
   }

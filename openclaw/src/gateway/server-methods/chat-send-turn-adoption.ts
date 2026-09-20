@@ -1,11 +1,12 @@
 import type { TurnAdoptionLifecycle } from "../../auto-reply/get-reply-options.types.js";
-import type { QueuedFollowupReplyBatch } from "../../auto-reply/reply/queue/types.js";
+import type { QueuedFollowupReplyDelivery } from "../../auto-reply/reply/queue/types.js";
 import {
   completeQueuedChatTurn,
   registerQueuedChatTurn,
   retireQueuedChatTurnCancellation,
   type QueuedChatTurnMap,
 } from "../chat-queued-turns.js";
+import type { WebchatReplyMediaRequesterContext } from "./chat-reply-media.js";
 import { createChatSendLateFollowupDisposition } from "./chat-send-late-followup.js";
 import type { PreparedChatSendSession } from "./chat-send-session.js";
 import { createChatSendLateReplyFinalizer } from "./chat-send-source-finalization.js";
@@ -13,6 +14,7 @@ import { normalizeOptionalChatText } from "./chat-text-normalization.js";
 import type { GatewayRequestContext } from "./types.js";
 
 export function createChatSendTurnAdoptionLifecycle(params: {
+  requesterContext?: WebchatReplyMediaRequesterContext;
   accountId: string | undefined;
   chatQueuedTurns: QueuedChatTurnMap;
   context: GatewayRequestContext;
@@ -36,7 +38,7 @@ export function createChatSendTurnAdoptionLifecycle(params: {
   lifecycle: TurnAdoptionLifecycle;
   isEnqueued: () => boolean;
   onQueueDisposition: (reason: string) => void;
-  onQueuedFollowupReplyBatch: (batch: QueuedFollowupReplyBatch) => Promise<void>;
+  onQueuedFollowupReplyBatch: QueuedFollowupReplyDelivery;
 } {
   let enqueued = false;
   let releaseWorkAdmission: (() => void) | undefined;
@@ -45,6 +47,8 @@ export function createChatSendTurnAdoptionLifecycle(params: {
     originatingChannel: params.originatingChannel,
     logGateway: params.context.logGateway,
     deliver: createChatSendLateReplyFinalizer({
+      requesterContext: params.requesterContext,
+      abortSignal: params.controller.signal,
       accountId: params.accountId,
       context: params.context,
       session: params.session,
@@ -53,6 +57,7 @@ export function createChatSendTurnAdoptionLifecycle(params: {
   const lifecycle: TurnAdoptionLifecycle = {
     // Gateway cancel identity only — share collect key via ownerKey.
     admission: "cancel-only",
+    abortSignal: params.controller.signal,
     ...(params.originatingLeafEntryId !== undefined
       ? { originatingLeafEntryId: params.originatingLeafEntryId }
       : {}),

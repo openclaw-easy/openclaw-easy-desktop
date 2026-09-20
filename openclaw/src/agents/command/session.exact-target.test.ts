@@ -14,7 +14,7 @@ it.each(["work", "dashboard:incognito-work"])(
   "resolves the exact %s session without enumerating unrelated rows",
   async (key) => {
     await withOpenClawTestState({ label: "command-exact-session" }, async (state) => {
-      const storePath = state.path("sessions.sqlite");
+      const storePath = state.statePath("sessions.sqlite");
       const sessionKey = `agent:main:${key}`;
       const incognito = key.startsWith("dashboard:incognito-");
       const cfg = {
@@ -50,7 +50,7 @@ it.each(["work", "dashboard:incognito-work"])(
           { sessionId: "unrelated-session", updatedAt: Date.now() },
         );
       }
-      const list = vi.spyOn(sessionAccessor, "listSessionEntriesCore");
+      const list = vi.spyOn(sessionAccessor, "listSessionEntriesReadOnly");
       try {
         const resolved = resolveSession({ cfg, sessionKey });
         expect(resolved).toMatchObject({
@@ -79,9 +79,41 @@ it.each(["work", "dashboard:incognito-work"])(
   },
 );
 
+it.each([
+  "agent:main:assist:01M21F31SCNCCQQ3N4X43AY420",
+  "agent:main:assist:prefix-01M21F31SCNCCQQ3N4X43AY420",
+  "agent:main:assist:lowercaseletters",
+  "agent:main:assist:abcdef0123456789",
+  "agent:main:assist:ordinary-42",
+  "agent:main:signal:group:AbCdEf123",
+  "agent:main:matrix:channel:!Room:Example.org:thread:$Event",
+])("reuses the persisted session for explicit key %s", async (sessionKey) => {
+  await withOpenClawTestState({ label: "command-uppercase-tail-session" }, async (state) => {
+    const storePath = state.statePath("sessions.sqlite");
+    const cfg = {
+      agents: { defaults: {} },
+      session: { store: storePath, reset: { mode: "idle", idleMinutes: 60 } },
+    } satisfies OpenClawConfig;
+
+    const first = resolveSession({ cfg, sessionKey });
+    expect(first.sessionEntry).toBeUndefined();
+    expect(first.isNewSession).toBe(true);
+    await sessionAccessor.replaceSessionEntry(
+      { sessionKey, storePath },
+      { sessionId: first.sessionId, updatedAt: Date.now(), sessionStartedAt: Date.now() },
+    );
+
+    const second = resolveSession({ cfg, sessionKey });
+    expect(second.sessionKey).toBe(sessionKey);
+    expect(second.sessionId).toBe(first.sessionId);
+    expect(second.isNewSession).toBe(false);
+    expect(second.sessionEntry?.sessionId).toBe(first.sessionId);
+  });
+});
+
 it("does not provision a missing incognito lookup or select a hidden run-owned entry", async () => {
   await withOpenClawTestState({ label: "command-private-session" }, async (state) => {
-    const storePath = state.path("sessions.sqlite");
+    const storePath = state.statePath("sessions.sqlite");
     const cfg = { agents: { defaults: {} }, session: { store: storePath } };
     const incognitoPath = resolveIncognitoOpenClawAgentSqlitePath({ agentId: "main" });
     expect(
@@ -98,6 +130,10 @@ it("does not provision a missing incognito lookup or select a hidden run-owned e
     );
     expect(
       resolveSessionKeyForRequestCore({ cfg, sessionKey: hidden.sessionKey }).sessionEntry,
+    ).toBeUndefined();
+    expect(
+      resolveSessionKeyForRequestCore({ cfg, sessionKey: hidden.sessionKey.toUpperCase() })
+        .sessionEntry,
     ).toBeUndefined();
   });
 });

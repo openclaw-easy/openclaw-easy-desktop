@@ -164,6 +164,16 @@ describePosix("native hosted merge handoff", () => {
         (event) => event.kind === "gh" && event.args?.[0] === "pr" && event.args[1] === "merge",
       );
     expect(mergeCalls).toHaveLength(1);
+    const events = f.events().slice(before);
+    const reviewReads = events
+      .map((event, index) => ({ event, index }))
+      .filter(({ event }) => event.kind === "review-comments");
+    expect(reviewReads).toHaveLength(2);
+    expect(reviewReads[1]?.index).toBeLessThan(
+      events.findIndex(
+        (event) => event.kind === "gh" && event.args?.[0] === "pr" && event.args[1] === "merge",
+      ),
+    );
     expect(mergeCalls[0]?.args).toEqual([
       "pr",
       "merge",
@@ -173,10 +183,21 @@ describePosix("native hosted merge handoff", () => {
       "--squash",
       "--match-head-commit",
       f.head,
+      "--body-file",
+      expect.any(String),
     ]);
+    expect(f.git(f.origin, "log", "-1", "--format=%B", "main")).toBe(
+      "Fixture squash\n\nReviewed fixture body",
+    );
     expect(
       JSON.parse(f.git(f.canonical, "show", "refs/openclaw/pr-merge-outcomes/42:outcome.json")),
-    ).toMatchObject({ head: f.head, route: "immediate", phase: "complete" });
+    ).toMatchObject({ head: f.head, route: "immediate", phase: "commented" });
+    // The deliberately modified PR helper is unfinished local work, not disposable proof.
+    expect(existsSync(f.worktree)).toBe(true);
+    expect(readFileSync(join(f.worktree, "scripts/verify-pr-hosted-gates.mjs"), "utf8")).toBe(
+      "throw new Error('PR helper executed');\n",
+    );
+    expect(result.stdout + result.stderr).toContain("worktree has local changes or is locked");
     expect(
       f
         .events()

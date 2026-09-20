@@ -10,11 +10,7 @@ import {
   parseRegistryNpmSpec,
 } from "../infra/npm-registry-spec.js";
 import { resolveUserPath } from "../utils.js";
-import {
-  resolveManagedNpmGenerationUseForInstall,
-  resolveManagedNpmRootForInstall,
-  resolveManagedNpmRootPackageDir,
-} from "./install-managed-npm-state.js";
+import { resolveManagedNpmInstallPlan } from "./install-managed-npm-state.js";
 import { installPluginFromManagedNpmRoot } from "./install-managed-npm.js";
 import {
   canResolveAroundCompatibilityError,
@@ -32,7 +28,6 @@ import {
   defaultLogger,
   emitSuccessfulPluginInstallSecurityEvent,
   loadPluginInstallRuntime,
-  resolveEffectiveInstallMode,
   runInstallSourceScan,
 } from "./install-shared.js";
 import { copyPluginInstallTransactionRequest } from "./install-transaction.js";
@@ -43,7 +38,6 @@ import {
   type PluginInstallLogger,
   type PluginNpmIntegrityDriftParams,
 } from "./install-types.js";
-import { hasRetainedManagedNpmInstallMarker } from "./managed-npm-retention.js";
 
 export async function installPluginFromNpmSpec(
   params: InstallSafetyOverrides & {
@@ -51,6 +45,7 @@ export async function installPluginFromNpmSpec(
     extensionsDir?: string;
     npmDir?: string;
     timeoutMs?: number;
+    workTimeoutMs?: number | null;
     signal?: AbortSignal;
     logger?: PluginInstallLogger;
     mode?: "install" | "update";
@@ -60,10 +55,11 @@ export async function installPluginFromNpmSpec(
     expectedIntegrity?: string;
     onIntegrityDrift?: (params: PluginNpmIntegrityDriftParams) => boolean | Promise<boolean>;
     onBeforePluginArtifactCommit?: PluginInstallArtifactConsentHandler;
+    beforePersistentApply?: () => void;
   },
 ): Promise<InstallPluginResult> {
   const runtime = await loadPluginInstallRuntime();
-  const { logger, timeoutMs, mode, dryRun } = runtime.resolveTimedInstallModeOptions(
+  const { logger, timeoutMs, workTimeoutMs, mode, dryRun } = runtime.resolveTimedInstallModeOptions(
     params,
     defaultLogger,
   );
@@ -183,34 +179,13 @@ export async function installPluginFromNpmSpec(
     return { ok: false, error: driftResult.error };
   }
   const npmBaseDir = params.npmDir ? resolveUserPath(params.npmDir) : resolveDefaultPluginNpmDir();
-  const generationUse = await resolveManagedNpmGenerationUseForInstall({
+  const { policyMode } = await resolveManagedNpmInstallPlan({
     runtime,
     npmBaseDir,
     packageName: parsedSpec.name,
     requestedMode: mode,
     npmResolution,
   });
-  const npmRoot = resolveManagedNpmRootForInstall({
-    npmBaseDir,
-    packageName: parsedSpec.name,
-    npmResolution,
-    useGeneration: generationUse !== "none",
-  });
-  const installRoot = resolveManagedNpmRootPackageDir(npmRoot, parsedSpec.name);
-  const targetMode =
-    generationUse === "retained-install" && hasRetainedManagedNpmInstallMarker(installRoot)
-      ? "update"
-      : await resolveEffectiveInstallMode({
-          runtime,
-          requestedMode: mode,
-          targetPath: installRoot,
-        });
-  const policyMode =
-    generationUse === "update"
-      ? "update"
-      : generationUse === "retained-install"
-        ? "install"
-        : targetMode;
 
   const policyTempDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-npm-policy-"));
   try {
@@ -236,7 +211,6 @@ export async function installPluginFromNpmSpec(
       scan: async () =>
         await preflightPluginNpmInstallPolicy({
           config: params.config,
-          dangerouslyForceUnsafeInstall: params.dangerouslyForceUnsafeInstall,
           onInstallPolicyWarning: params.onInstallPolicyWarning,
           logger,
           mode: policyMode,
@@ -257,7 +231,6 @@ export async function installPluginFromNpmSpec(
 
   const result = await installPluginFromManagedNpmRoot(
     copyPluginInstallTransactionRequest(params, {
-      dangerouslyForceUnsafeInstall: params.dangerouslyForceUnsafeInstall,
       onInstallPolicyWarning: params.onInstallPolicyWarning,
       trustedSourceLinkedOfficialInstall: params.trustedSourceLinkedOfficialInstall,
       config: params.config,
@@ -275,6 +248,7 @@ export async function installPluginFromNpmSpec(
       extensionsDir: params.extensionsDir,
       npmDir: params.npmDir,
       timeoutMs,
+      workTimeoutMs,
       signal: params.signal,
       logger,
       mode,
@@ -283,6 +257,7 @@ export async function installPluginFromNpmSpec(
       expectedPluginId,
       expectedReplacementPluginId: params.expectedReplacementPluginId,
       onBeforePluginArtifactCommit: params.onBeforePluginArtifactCommit,
+      beforePersistentApply: params.beforePersistentApply,
       npmResolution,
       ...(driftResult.integrityDrift ? { integrityDrift: driftResult.integrityDrift } : {}),
     }),

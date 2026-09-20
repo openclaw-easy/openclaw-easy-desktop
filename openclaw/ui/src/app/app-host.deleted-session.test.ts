@@ -1,5 +1,4 @@
 /* @vitest-environment jsdom */
-
 import type { RouteLocation, RouterState } from "@openclaw/uirouter";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../../test/helpers/promise.js";
@@ -10,9 +9,9 @@ import {
   storageTargetForGateway,
   storedChatOutboxScopeKey,
 } from "../lib/chat/outbox-store.ts";
-import { createSessionCapability } from "../lib/sessions/index.ts";
 import {
   createGatewayHarness,
+  createTestSessionCapability,
   sessionsResult,
 } from "../lib/sessions/session-capability.test-support.ts";
 import { createSessionDeletionHarness } from "../lib/sessions/session-deletion.test-support.ts";
@@ -20,6 +19,7 @@ import { createStorageMock } from "../test-helpers/storage.ts";
 import { selectShellRouteState } from "./app-host-route-state.ts";
 import { resetAppHostTestGlobals } from "./app-host.test-support.ts";
 import { createChatAttachmentHandoff } from "./chat-attachment-handoff.ts";
+import { createChatSubmissions } from "./chat-submissions.ts";
 import type { ApplicationContext } from "./context.ts";
 import "./app-host.ts";
 
@@ -28,7 +28,7 @@ type DeletedSessionShell = {
   activeSessionKey: string;
   routeState: { routeId?: RouteId; location?: RouteLocation };
   didConsiderNativeRouteRestore: boolean;
-  replaceChatWithCurrentSession: () => void;
+  recoverNotFoundRoute: () => void;
   updateRouteState: (state: ReturnType<typeof selectShellRouteState>) => void;
   observeDeletedSessions: (state: ApplicationContext["sessions"]["state"]) => void;
   recoverDeletedActiveSession: (state: ApplicationContext["sessions"]["state"]) => void;
@@ -51,6 +51,8 @@ function createSessionRecoveryShell(params: {
     context: {
       basePath: "",
       chatAttachmentHandoff: createChatAttachmentHandoff(),
+      chatSubmissions: createChatSubmissions(),
+      placementStartup: { get: () => null },
       agents: {
         state: {
           agentsList: {
@@ -91,6 +93,34 @@ afterEach(() => {
 });
 
 describe("OpenClaw shell deleted-session recovery", () => {
+  it("keeps an interrupted first prompt visible after temporary-session cleanup", () => {
+    const { shell, replace, setSessionKey } = createSessionRecoveryShell({
+      activeSessionKey: deletedKey,
+      sessionKeys: [mainKey],
+      deletedSessionKeys: [deletedKey],
+    });
+    const context = shell.runtime.context;
+    const get = vi.spyOn(context.placementStartup, "get").mockReturnValue({
+      sessionKey: deletedKey,
+      phase: "cancelled",
+      startedAt: 1,
+      initialTurn: {
+        id: "unsent",
+        text: "keep this interrupted task",
+        createdAt: 1,
+        sendState: "failed",
+      },
+      retryable: false,
+    });
+    shell.recoverDeletedActiveSession(context.sessions.state);
+    expect(shell.activeSessionKey).toBe(deletedKey);
+    expect(replace).not.toHaveBeenCalled();
+    expect(setSessionKey).not.toHaveBeenCalled();
+    get.mockReturnValue(null);
+    shell.recoverDeletedActiveSession(context.sessions.state);
+    expect(shell.activeSessionKey).toBe(mainKey);
+    expect(replace).toHaveBeenCalledOnce();
+  });
   it.each(["rejection", "batch interruption", "different-client batch rejection"] as const)(
     "navigates on delete intent and visibly reports %s without replacing newer navigation",
     async (failure) => {
@@ -107,7 +137,7 @@ describe("OpenClaw shell deleted-session recovery", () => {
       const { gateway, publish } = createGatewayHarness({
         request,
       } as unknown as GatewayBrowserClient);
-      const sessions = createSessionCapability(gateway);
+      const sessions = createTestSessionCapability(gateway);
       const { shell, replace } = createSessionRecoveryShell({
         activeSessionKey: deletedKey,
         sessionKeys: [deletedKey, mainKey],
@@ -181,7 +211,7 @@ describe("OpenClaw shell deleted-session recovery", () => {
         method === "sessions.delete" ? response.promise : sessionsResult([listed], 2),
       );
       const { gateway } = createGatewayHarness({ request } as unknown as GatewayBrowserClient);
-      const sessions = createSessionCapability(gateway);
+      const sessions = createTestSessionCapability(gateway);
       await sessions.refresh({ force: true });
       if (previouslyDeleted) {
         sessions.reconcileChanged({
@@ -362,6 +392,7 @@ describe("OpenClaw shell deleted-session recovery", () => {
       context: {
         agents: { state: { agentsList: null } },
         chatAttachmentHandoff: createChatAttachmentHandoff(),
+        chatSubmissions: createChatSubmissions(),
         gateway: {
           snapshot: {
             assistantAgentId: "main",
@@ -408,7 +439,7 @@ describe("OpenClaw shell deleted-session recovery", () => {
       sessionKeys: [mainKey],
     });
 
-    shell.replaceChatWithCurrentSession();
+    shell.recoverNotFoundRoute();
 
     expect(setSessionKey).toHaveBeenCalledExactlyOnceWith(mainKey);
     expect(replace).toHaveBeenCalledExactlyOnceWith("chat", { pathname: "/chat/main" });
@@ -422,7 +453,7 @@ describe("OpenClaw shell deleted-session recovery", () => {
       sessionKeys: [mainKey, researchKey],
     });
 
-    shell.replaceChatWithCurrentSession();
+    shell.recoverNotFoundRoute();
 
     expect(setSessionKey).toHaveBeenCalledExactlyOnceWith(researchKey);
     expect(replace).toHaveBeenCalledExactlyOnceWith("chat", { pathname: "/chat/research" });
@@ -435,7 +466,7 @@ describe("OpenClaw shell deleted-session recovery", () => {
       sessionKeys: [mainKey],
     });
 
-    shell.replaceChatWithCurrentSession();
+    shell.recoverNotFoundRoute();
 
     expect(setSessionKey).toHaveBeenCalledExactlyOnceWith(mainKey);
     expect(replace).toHaveBeenCalledExactlyOnceWith("chat", { pathname: "/chat/main" });
@@ -448,7 +479,7 @@ describe("OpenClaw shell deleted-session recovery", () => {
       sessionKeys: [mainKey],
     });
 
-    shell.replaceChatWithCurrentSession();
+    shell.recoverNotFoundRoute();
 
     expect(setSessionKey).not.toHaveBeenCalled();
     expect(replace).not.toHaveBeenCalled();
@@ -461,7 +492,7 @@ describe("OpenClaw shell deleted-session recovery", () => {
       sessionKeys: [existingKey],
     });
 
-    shell.replaceChatWithCurrentSession();
+    shell.recoverNotFoundRoute();
 
     expect(setSessionKey).not.toHaveBeenCalled();
     expect(replace).toHaveBeenCalledExactlyOnceWith("chat", {
@@ -480,7 +511,7 @@ describe("OpenClaw shell deleted-session recovery", () => {
       location: { pathname: "/chat/main/unrelated-missing", search: "", hash: "" },
     };
 
-    shell.replaceChatWithCurrentSession();
+    shell.recoverNotFoundRoute();
 
     expect(setSessionKey).not.toHaveBeenCalled();
     expect(replace).toHaveBeenCalledExactlyOnceWith("chat", {
@@ -495,7 +526,7 @@ describe("OpenClaw shell deleted-session recovery", () => {
       sessionKeys: [deletedKey, mainKey],
     });
 
-    shell.replaceChatWithCurrentSession();
+    shell.recoverNotFoundRoute();
 
     expect(setSessionKey).toHaveBeenCalledExactlyOnceWith(mainKey);
     expect(replace).toHaveBeenCalledExactlyOnceWith("chat", { pathname: "/chat/main" });

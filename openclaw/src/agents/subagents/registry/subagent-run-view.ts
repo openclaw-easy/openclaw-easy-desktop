@@ -1,6 +1,6 @@
 /** Canonical ordering and visibility for numbered subagent lists and targets. */
 import type { SubagentRunRecord } from "./subagent-registry.types.js";
-import { isLiveUnendedSubagentRun } from "./subagent-run-liveness.js";
+import { isRetainedUnendedSubagentRun } from "./subagent-run-liveness.js";
 
 export function sortSubagentRuns(runs: readonly SubagentRunRecord[]): SubagentRunRecord[] {
   return runs.toSorted((a, b) => {
@@ -31,7 +31,12 @@ export function buildSubagentRunView(params: {
     seen.add(entry.childSessionKey);
     latest.push(entry);
     if (
-      isLiveUnendedSubagentRun(entry, now) ||
+      isRetainedUnendedSubagentRun(entry, now) ||
+      (entry.pauseReason === "sessions_yield" &&
+        !entry.killReconciliation &&
+        !entry.killIntent &&
+        entry.endedReason !== "subagent-killed" &&
+        entry.suppressAnnounceReason !== "killed") ||
       params.countPendingDescendantRuns(entry.childSessionKey) > 0
     ) {
       active.push(entry);

@@ -1,6 +1,9 @@
 import type { GatewayBrowserClient } from "../../api/gateway.ts";
 import type { ArtifactDownloadResult, GatewaySessionRow } from "../../api/types.ts";
 import { resolveControlUiAuthToken } from "../../app/control-ui-auth.ts";
+import { t } from "../../i18n/index.ts";
+import { getChatHistoryLoadState } from "./chat-history-state.ts";
+import type { ChatState } from "./chat-state-contract.ts";
 
 type SelectedSessionProjectionState = {
   chatEffectiveQueueMode?: GatewaySessionRow["effectiveQueueMode"];
@@ -99,6 +102,14 @@ export async function resolveChatArtifactDownload(
     params,
     { timeoutMs: CHAT_ARTIFACT_DOWNLOAD_TIMEOUT_MS },
   );
+  if (
+    result?.encoding === "base64" &&
+    result.artifact.type === "image" &&
+    /^image\/(?:png|jpeg|gif|webp|avif)$/u.test(result.artifact.mimeType ?? "") &&
+    result.data
+  ) {
+    return { url: `data:${result.artifact.mimeType};base64,${result.data}` };
+  }
   const url = typeof result?.url === "string" ? result.url.trim() : "";
   if (!url) {
     return null;
@@ -115,4 +126,13 @@ export function dismissChatError(state: {
   state.lastError = null;
   state.lastErrorCode = null;
   state.chatError = null;
+}
+
+export function initialHistorySubmitState(state: ChatState, unavailable: boolean) {
+  const historyLoad = getChatHistoryLoadState(state);
+  const failure = unavailable && historyLoad.phase === "failed" ? historyLoad.message : null;
+  return {
+    submitDisabledReason: unavailable ? (failure ?? t("chat.thread.loading")) : null,
+    submitPending: unavailable && historyLoad.phase !== "failed",
+  };
 }

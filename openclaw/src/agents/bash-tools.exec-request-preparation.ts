@@ -9,7 +9,12 @@ import {
   normalizeHostOverrideEnvVarKey,
   sanitizeHostExecEnvWithDiagnostics,
 } from "../infra/host-env-security.js";
-import { OPENCLAW_CLI_ENV_VAR } from "../infra/openclaw-exec-env.js";
+import {
+  getInstallationTarget,
+  installationTargetEnv,
+  LOCAL_INSTALLATION_TARGET_UNSUPPORTED,
+} from "../infra/installation-target-context.js";
+import { OPENCLAW_CLI_ENV_VAR, SUBAGENT_EXEC_ENV_VAR } from "../infra/openclaw-exec-env.js";
 import {
   getShellPathFromLoginShell,
   resolveShellEnvFallbackTimeoutMs,
@@ -169,13 +174,14 @@ export function resolveNotifyOnExitEmptySuccess(defaults?: ExecToolDefaults): bo
 }
 
 export function resolveExecPreparedRunEnvironment(defaults?: ExecToolDefaults) {
-  return (
-    defaults?.preparedRunEnvironment ??
-    prepareGitHubToolEnvironment({
-      config: defaults?.config ?? {},
-      agentId: defaults?.agentId ?? "main",
-    })
-  );
+  return {
+    ...(defaults?.preparedRunEnvironment ??
+      prepareGitHubToolEnvironment({
+        config: defaults?.config ?? {},
+        agentId: defaults?.agentId ?? "main",
+      })),
+    localProcessEnv: installationTargetEnv(getInstallationTarget()),
+  };
 }
 
 export function createExecRequestPreparation(params: {
@@ -252,6 +258,7 @@ export function createExecRequestPreparation(params: {
     } catch {
       return execParams;
     }
+    const sessionId = context?.hookContext?.sessionId ?? params.defaults?.sessionId;
     const rawPluginEnv = await hookRunner.runResolveExecEnv(
       {
         sessionKey: context?.hookContext?.sessionKey ?? params.defaults?.sessionKey,
@@ -261,6 +268,7 @@ export function createExecRequestPreparation(params: {
       {
         agentId: context?.hookContext?.agentId ?? params.agentId,
         sessionKey: context?.hookContext?.sessionKey ?? params.defaults?.sessionKey,
+        ...(sessionId ? { sessionId } : {}),
         messageProvider: params.defaults?.messageProvider,
         channelId: params.defaults?.currentChannelId ?? context?.hookContext?.channelId,
         ...(params.defaults?.channelContext
@@ -358,20 +366,21 @@ export function resolvePreparedExecEnvironment(params: {
   sandbox?: BashSandboxConfig;
   containerWorkdir?: string | null;
   channelContext?: PluginHookChannelContext;
+  subagentExecution?: boolean;
   defaultPathPrepend: string[];
   pluginEnv?: Record<string, string>;
   storeEnv?: Record<string, string>;
   storeSecretEnv?: Record<string, string>;
-  secretEgressEnv?: Record<string, string>;
   credentialScrubEnv?: Readonly<Record<string, string>>;
   localIdentityEnv?: Readonly<Record<string, string>>;
   managedLocalIdentity?: boolean;
+  localProcessEnv?: Readonly<Record<string, string>>;
   warnings: string[];
 }): { env: Record<string, string>; requestedEnv?: Record<string, string> } {
-  const inheritedBaseEnv = coerceEnv(process.env);
-  if (params.secretEgressEnv) {
-    Object.assign(inheritedBaseEnv, params.secretEgressEnv);
+  if (params.localProcessEnv && params.host !== "gateway") {
+    throw new Error(LOCAL_INSTALLATION_TARGET_UNSUPPORTED);
   }
+  const inheritedBaseEnv = coerceEnv(process.env);
   const channelContextEnv = buildChannelContextEnv(params.channelContext);
   const explicitEnv: Record<string, string> | undefined =
     params.execParams.env !== undefined ||
@@ -509,20 +518,25 @@ export function resolvePreparedExecEnvironment(params: {
       }
     }
   }
-  if (params.secretEgressEnv) {
-    Object.assign(env, params.secretEgressEnv);
-  }
   const preparedEnv = {
+    ...params.localProcessEnv,
     ...params.credentialScrubEnv,
     ...(params.host === "gateway" ? params.localIdentityEnv : undefined),
   };
-  // Prepared host values are authoritative over ambient, model, plugin, and store projections.
+  // Prepared values win locally; nodes sanitize their own base env and reject scrub override keys.
   Object.assign(env, preparedEnv);
+
+  const forwardedEnv = params.subagentExecution
+    ? { ...requestedEnv, [SUBAGENT_EXEC_ENV_VAR]: "1" }
+    : requestedEnv;
+  if (params.subagentExecution) {
+    env[SUBAGENT_EXEC_ENV_VAR] = "1";
+  }
 
   return {
     env,
-    ...(Object.keys(preparedEnv).length > 0
-      ? { requestedEnv: { ...requestedEnv, ...preparedEnv } }
-      : { requestedEnv }),
+    ...(params.host !== "node" && Object.keys(preparedEnv).length > 0
+      ? { requestedEnv: { ...forwardedEnv, ...preparedEnv } }
+      : { requestedEnv: forwardedEnv }),
   };
 }

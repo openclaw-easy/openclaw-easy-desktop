@@ -13,7 +13,7 @@ import { withEnvAsync } from "../test-utils/env.js";
 import { createTempHomeEnv } from "../test-utils/temp-home.js";
 import { GATEWAY_CLIENT_MODES, GATEWAY_CLIENT_NAMES } from "../utils/message-channel.js";
 import { resetPreparedModelCatalogStateForTest } from "./server-model-catalog.js";
-import { testing as startupTesting } from "./server-startup-post-attach.js";
+import { publishConfiguredModelRuntimeSnapshots } from "./server-startup-model-runtime.js";
 import { createRegistry } from "./server.e2e-registry-helpers.js";
 import {
   connectOk,
@@ -616,9 +616,8 @@ describe("gateway server models + voicewake", () => {
       agentDiscoveryMock.enabled = true;
       agentDiscoveryMock.models = startupModels;
       const { getRuntimeConfig } = await import("../config/io.js");
-      await startupTesting.publishStartupModelRuntime({
+      await publishConfiguredModelRuntimeSnapshots({
         cfg: getRuntimeConfig(),
-        log: { warn: () => {} },
       });
     };
     const readMethods = [
@@ -713,6 +712,26 @@ describe("gateway server models + voicewake", () => {
           agentId: "ops",
           workspaceDir: path.join(workspaceRoot, "ops-workspace"),
         });
+        const hotSkillDir = path.join(workspaceRoot, "ops-workspace", "skills", "hot-status");
+        await fs.mkdir(hotSkillDir, { recursive: true });
+        await fs.writeFile(
+          path.join(hotSkillDir, "SKILL.md"),
+          "---\nname: hot-status\ndescription: Hot status fixture\n---\n",
+          "utf8",
+        );
+        await expect
+          .poll(
+            async () => {
+              const refreshed = await rpcReq<{
+                skills?: Array<{ name?: string; eligible?: boolean }>;
+              }>(ws, "skills.status", {});
+              return refreshed.payload?.skills?.some(
+                (skill) => skill.name === "hot-status" && skill.eligible === true,
+              );
+            },
+            { interval: 20, timeout: 5_000 },
+          )
+          .toBe(true);
         expect(memory.payload).toMatchObject({ agentId: "ops" });
         expect(health.ok, JSON.stringify(health)).toBe(true);
       } finally {

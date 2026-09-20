@@ -1,6 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../../test/helpers/promise.js";
-import { STALE_WORKER_BUILD_REASON } from "./admission.js";
 import * as support from "./service.test-support.js";
 import type { WorkerTunnelManager } from "./tunnel.js";
 
@@ -115,7 +114,10 @@ describe("worker environment service", () => {
         }),
         { ensureNodeWorkerBundle: async () => structuredClone(support.BOOTSTRAP_RECEIPT) },
       );
-      const environment = await workerService.create("development", `request-${lease.leaseId}`);
+      const environment = await workerService.createWithRequest({
+        profileId: "development",
+        idempotencyKey: `request-${lease.leaseId}`,
+      });
       support.testState.config.cloudWorkers!.profiles = {};
 
       await workerService.reconcileOnce();
@@ -141,12 +143,11 @@ describe("worker environment service", () => {
       destroy,
     });
     const workerService = support.createService(provider);
-    const environment = await workerService.create(
-      "development",
-      "request-unadvertised-persisted-ssh",
-      undefined,
-      "remote-exec",
-    );
+    const environment = await workerService.createWithRequest({
+      profileId: "development",
+      idempotencyKey: "request-unadvertised-persisted-ssh",
+      executionMode: "remote-exec",
+    });
     provider.supportedExecutionModes = undefined;
     support.testState.config.cloudWorkers!.profiles = {};
 
@@ -182,12 +183,11 @@ describe("worker environment service", () => {
       const workerService = support.createService(provider, {
         ensureNodeWorkerBundle: async () => structuredClone(support.BOOTSTRAP_RECEIPT),
       });
-      const environment = await workerService.create(
-        "development",
-        "request-unadvertised-persisted-node",
-        undefined,
-        "remote-exec",
-      );
+      const environment = await workerService.createWithRequest({
+        profileId: "development",
+        idempotencyKey: "request-unadvertised-persisted-node",
+        executionMode: "remote-exec",
+      });
       provider.supportedExecutionModes = supportedExecutionModes;
       support.getDevelopmentProfile().settings = { region: "edited" };
 
@@ -224,12 +224,11 @@ describe("worker environment service", () => {
         }),
         { ensureNodeWorkerBundle: async () => structuredClone(support.BOOTSTRAP_RECEIPT) },
       );
-      const environment = await initial.create(
-        "development",
-        "request-persisted-multimode-node",
-        undefined,
-        "remote-exec",
-      );
+      const environment = await initial.createWithRequest({
+        profileId: "development",
+        idempotencyKey: "request-persisted-multimode-node",
+        executionMode: "remote-exec",
+      });
       await initial.stop();
 
       const restarted = support.createService(
@@ -320,80 +319,6 @@ describe("worker environment service", () => {
       bootstrapReceipt: support.BOOTSTRAP_RECEIPT,
     });
     expect(support.testState.bootstrapWorker).toHaveBeenCalledTimes(1);
-  });
-
-  it("tears down an attached worker whose admitted bundle is stale", async () => {
-    const environmentId = "worker-attached-stale";
-    support.seedBootstrapping(environmentId);
-    const ready = support.testState.store.transition({
-      environmentId,
-      from: "bootstrapping",
-      to: "ready",
-      patch: support.readyPatch(environmentId, {
-        ...support.BOOTSTRAP_RECEIPT,
-        bundleHash: "b".repeat(64),
-      }),
-    });
-    support.testState.store.transition({
-      environmentId,
-      from: ready.state,
-      to: "attached",
-      patch: support.attachedPatch(environmentId, "session-1"),
-    });
-    const destroy = vi.fn(async () => {});
-
-    await support.createService(support.createProvider({ destroy })).reconcileOnce();
-
-    expect(destroy).toHaveBeenCalledOnce();
-    expect(destroy).toHaveBeenCalledWith({
-      leaseId: `lease:${environmentId}`,
-      profile: { region: "test" },
-    });
-    expect(support.testState.store.get(environmentId)).toMatchObject({
-      state: "failed",
-      leaseId: null,
-      attachedSessionIds: [],
-      lastError: STALE_WORKER_BUILD_REASON,
-    });
-  });
-
-  it("retires a node environment whose installed Gateway bundle is stale", async () => {
-    const destroy = vi.fn(async () => {});
-    const provider = support.createProvider({
-      supportedExecutionModes: ["worker-turn"],
-      provisionBeforeInstallation: true,
-      provision: async () => ({
-        leaseId: "device-lease-stale",
-        node: { deviceId: "device-1" },
-        sharedHost: true,
-      }),
-      inspect: async () => ({ status: "active", sharedHost: true }),
-      destroy,
-    });
-    const workerService = support.createService(provider, {
-      ensureNodeWorkerBundle: async () => structuredClone(support.BOOTSTRAP_RECEIPT),
-    });
-    const environment = await workerService.create("development", "request-stale-node-bundle");
-    await workerService.attachSession({
-      environmentId: environment.environmentId,
-      ownerEpoch: environment.ownerEpoch,
-      sessionId: "session-stale-node-bundle",
-    });
-    support.testState.stateDb.db
-      .prepare(
-        "UPDATE worker_environments SET bootstrap_bundle_hash = ?, bootstrap_install_kind = 'local' WHERE environment_id = ?",
-      )
-      .run("b".repeat(64), environment.environmentId);
-
-    await workerService.reconcileOnce();
-
-    expect(destroy).toHaveBeenCalledOnce();
-    expect(support.testState.store.get(environment.environmentId)).toMatchObject({
-      state: "failed",
-      leaseId: null,
-      attachedSessionIds: [],
-      lastError: STALE_WORKER_BUILD_REASON,
-    });
   });
 
   it("does not resolve npm while an admitted receipt matches the local bundle", async () => {
@@ -578,7 +503,9 @@ describe("worker environment service", () => {
       },
     });
 
-    const result = await support.createService(provider).create("development", "request-npm");
+    const result = await support
+      .createService(provider)
+      .createWithRequest({ profileId: "development", idempotencyKey: "request-npm" });
 
     expect(result).toMatchObject({
       state: "ready",

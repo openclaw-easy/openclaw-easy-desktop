@@ -1,5 +1,5 @@
-import fs from "node:fs/promises";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { hasInternalDiagnosticEventInterest } from "../../infra/diagnostic-event-listener-presence.js";
 import {
   emitDiagnosticEvent,
   emitTrustedSkillUsedDiagnosticEvent,
@@ -14,15 +14,14 @@ import {
   createOpenClawTestState,
   type OpenClawTestState,
 } from "../../test-utils/openclaw-test-state.js";
-import { getSkillCuratorStatus, registerSkillUsageTracking } from "./curator.js";
-import { applySkillProposal, proposeCreateSkill } from "./service.js";
+import { registerSkillUsageTracking } from "./curator.js";
 
 let testState: OpenClawTestState;
 
 beforeEach(async () => {
   resetDiagnosticEventsForTest();
   testState = await createOpenClawTestState({
-    layout: "state-only",
+    layout: "home",
     prefix: "openclaw-skill-curator-",
   });
 });
@@ -39,6 +38,8 @@ describe("skill curator usage tracking", () => {
     const database = openOpenClawStateDatabase({ env: testState.env });
     const skillFile = testState.path("skills", "daily-brief", "SKILL.md");
     const unregister = registerSkillUsageTracking({ env: testState.env });
+    expect(hasInternalDiagnosticEventInterest("skill.used")).toBe(true);
+    expect(hasInternalDiagnosticEventInterest("gateway.rpc")).toBe(false);
     const now = vi.spyOn(Date, "now").mockReturnValue(1_000);
     const event = {
       type: "skill.used",
@@ -111,62 +112,11 @@ describe("skill curator usage tracking", () => {
     });
 
     unregister();
+    expect(hasInternalDiagnosticEventInterest("skill.used")).toBe(false);
     emitTrustedSkillUsedDiagnosticEvent(event, { skillUsage: { skillFile } });
     await waitForDiagnosticEventsDrained();
     expect(
       database.db.prepare("SELECT use_count FROM skill_usage WHERE skill_file = ?").get(skillFile),
     ).toEqual({ use_count: 3 });
-  });
-
-  it("reports live usage for existing applied workshop skills and excludes missing files", async () => {
-    const proposal = await proposeCreateSkill({
-      workspaceDir: testState.workspaceDir,
-      env: testState.env,
-      name: "Daily Brief",
-      description: "Prepare a daily briefing",
-      content: "# Daily Brief\nPrepare the daily briefing.\n",
-    });
-    const applied = await applySkillProposal({
-      workspaceDir: testState.workspaceDir,
-      env: testState.env,
-      proposalId: proposal.record.id,
-      expectedRevisionHash: proposal.revisionHash,
-    });
-    const skillFile = proposal.record.target.skillFile;
-    const database = openOpenClawStateDatabase({ env: testState.env });
-    database.db
-      .prepare(
-        `INSERT INTO skill_usage (
-          skill_file, skill_key, skill_name, skill_source,
-          first_used_at_ms, last_used_at_ms, use_count, last_agent_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .run(skillFile, "daily-brief", "Daily Brief", "workspace", 1_000, 2_000, 3, "main");
-
-    expect(getSkillCuratorStatus({ env: testState.env })).toMatchObject({
-      counts: { active: 1, stale: 0, archived: 0 },
-      overlaps: [],
-      skills: [
-        {
-          skillFile,
-          skillKey: "daily-brief",
-          skillName: "Daily Brief",
-          state: "active",
-          pinned: false,
-          createdAtMs: Date.parse(applied.record.appliedAt!),
-          stateChangedAtMs: Date.parse(applied.record.appliedAt!),
-          lastUsedAtMs: 2_000,
-          useCount: 3,
-          archivedReason: null,
-        },
-      ],
-    });
-
-    await fs.unlink(skillFile);
-    expect(getSkillCuratorStatus({ env: testState.env })).toMatchObject({
-      counts: { active: 0, stale: 0, archived: 0 },
-      skills: [],
-      overlaps: [],
-    });
   });
 });

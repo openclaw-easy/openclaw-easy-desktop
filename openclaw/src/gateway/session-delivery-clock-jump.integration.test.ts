@@ -3,14 +3,15 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { getDeliveryQueueEntryStatus } from "../infra/delivery-queue-sqlite.js";
 import { scheduleSessionDelivery } from "../infra/session-delivery-queue-runtime.js";
-import { testing } from "../infra/session-delivery-queue-runtime.test-support.js";
 import {
   enqueueClaimedSessionDelivery,
   loadPendingSessionDeliveries,
   releaseSessionDeliveryClaim,
-  SESSION_DELIVERY_QUEUE_NAME,
 } from "../infra/session-delivery-queue-storage.js";
+import { SESSION_DELIVERY_QUEUE_NAME } from "../infra/session-delivery-queue.records.js";
 import { getActiveGatewayRootWorkCount } from "../process/gateway-work-admission.js";
+import { closeOpenClawStateDatabaseByPathAsync } from "../state/openclaw-state-db.js";
+import { captureOpenClawStateWorkerContext } from "../state/openclaw-state-worker-context.js";
 import {
   createGatewayConfigPath,
   removeGatewayTempHome,
@@ -84,7 +85,6 @@ async function closeProofProvider(server: http.Server): Promise<void> {
 }
 
 afterEach(() => {
-  testing.reset();
   resetGatewayTestState();
   vi.restoreAllMocks();
 });
@@ -99,8 +99,10 @@ describe("session delivery clock-jump integration", () => {
       const { envSnapshot, tempHome, workspaceDir } = await setupGatewayTempHome({
         prefix: "openclaw-session-delivery-gateway-",
       });
+      const queueContext = captureOpenClawStateWorkerContext();
       let gateway: Awaited<ReturnType<typeof startGatewayWithClient>> | undefined;
       let providerServer: http.Server | undefined;
+      let deliveryId = "";
       const providerRequests: string[] = [];
 
       try {
@@ -153,14 +155,16 @@ describe("session delivery clock-jump integration", () => {
             route: { channel: "webchat", to: sessionKey, chatType: "direct" },
             inputProvenance: {
               kind: "inter_session",
-              sourceChannel: "webchat",
+              sourceChannel: "internal",
               sourceTool: "image_generate",
             },
             sourceReplyDeliveryMode: "automatic",
           },
           60_000,
+          queueContext,
         );
 
+        deliveryId = id;
         gateway = await startGatewayWithClient({
           cfg,
           configPath,
@@ -176,21 +180,24 @@ describe("session delivery clock-jump integration", () => {
         await gateway.server.startupSettled;
         await gateway.client.request("sessions.messages.subscribe", { key: sessionKey });
         await expect
-          .poll(() => scheduleSessionDelivery(id), { timeout: 10_000, interval: 50 })
+          .poll(() => scheduleSessionDelivery(id, queueContext), { timeout: 10_000, interval: 50 })
           .toBe(true);
 
         wallClock.mockReturnValue(initialTime + 24 * 60 * 60 * 1_000);
-        await releaseSessionDeliveryClaim(id);
-        await scheduleSessionDelivery(id);
+        await releaseSessionDeliveryClaim(id, queueContext);
+        await scheduleSessionDelivery(id, queueContext);
 
         await vi.waitFor(
-          async () => expect(await loadPendingSessionDeliveries()).toStrictEqual([]),
+          async () => {
+            expect(await loadPendingSessionDeliveries(queueContext)).toStrictEqual([]);
+            // Queue settlement can precede the client's WebSocket event callback.
+            expect(chatEvents.join("\n")).toContain("CLOCK_JUMP DELIVERED");
+          },
           { timeout: 15_000, interval: 50 },
         );
         expect(providerRequests).toHaveLength(1);
         expect(providerRequests[0]).toContain("clock-jump proof marker");
-        expect(chatEvents.join("\n")).toContain("CLOCK_JUMP DELIVERED");
-        expect(await loadPendingSessionDeliveries()).toStrictEqual([]);
+        expect(await loadPendingSessionDeliveries(queueContext)).toStrictEqual([]);
         expect(getDeliveryQueueEntryStatus(SESSION_DELIVERY_QUEUE_NAME, id)).toBe("completed");
       } finally {
         wallClock.mockRestore();
@@ -200,6 +207,7 @@ describe("session delivery clock-jump integration", () => {
               await disconnectGatewayClient(gateway.client);
             } finally {
               await gateway.server.close({ reason: "session delivery clock-jump proof complete" });
+              await expect(scheduleSessionDelivery(deliveryId, queueContext)).resolves.toBe(false);
             }
           }
         } finally {
@@ -209,6 +217,7 @@ describe("session delivery clock-jump integration", () => {
             }
           } finally {
             try {
+              await closeOpenClawStateDatabaseByPathAsync(queueContext.admission.databasePath);
               await removeGatewayTempHome(tempHome);
             } finally {
               envSnapshot.restore();

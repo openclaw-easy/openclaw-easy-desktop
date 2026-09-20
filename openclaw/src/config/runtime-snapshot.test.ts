@@ -1,5 +1,6 @@
 // Verifies runtime config snapshots preserve normalized public settings.
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { freezeJsonSnapshot } from "../shared/immutable-data.js";
 import {
   cloneConfigWithResolutionFacts,
   createConfigResolutionFacts,
@@ -8,6 +9,7 @@ import {
   setConfigResolutionFacts,
 } from "./resolution-facts.js";
 import {
+  createRuntimeConfigReader,
   finalizeRuntimeSnapshotWrite,
   getRuntimeConfigAppliedHash,
   hashRuntimeConfigValue,
@@ -29,6 +31,7 @@ import {
   setRuntimeConfigSnapshotRefreshHandler,
 } from "./runtime-snapshot.js";
 import { createProviderConfigFixture } from "./runtime-snapshot.test-fixtures.js";
+import { captureRuntimeConfig } from "./runtime-source-projection.js";
 import type { OpenClawConfig } from "./types.js";
 
 function resetRuntimeConfigState(): void {
@@ -140,8 +143,39 @@ describe("runtime snapshot state", () => {
     expect(hashRuntimeConfigValue({ logging: { level: "info" } })).toBe(first);
   });
 
+  it.each([false, true])("hashes one immutable fleet only once (captured: %s)", (captured) => {
+    const source = {
+      agents: {
+        entries: Object.fromEntries(
+          Array.from({ length: 200 }, (_, index) => [`agent-${index}`, { name: `${index}` }]),
+        ),
+      },
+    };
+    const keys = vi.spyOn(Object, "keys");
+    try {
+      const config = captured ? captureRuntimeConfig(source) : freezeJsonSnapshot(source);
+      const first = hashRuntimeConfigValue(config);
+      for (let index = 0; index < 200; index += 1) {
+        expect(hashRuntimeConfigValue(config)).toBe(first);
+      }
+      expect(keys.mock.calls.filter(([value]) => value === config.agents?.entries)).toHaveLength(1);
+    } finally {
+      keys.mockRestore();
+    }
+  });
+
+  it("rehashes mutable descendants of a shallow-frozen config", () => {
+    const config = Object.freeze({ gateway: { port: 18789 } });
+    const before = hashRuntimeConfigValue(config);
+    config.gateway.port = 19001;
+    expect(hashRuntimeConfigValue(config)).not.toBe(before);
+    expect(hashRuntimeConfigValue(config)).toBe(
+      hashRuntimeConfigValue({ gateway: { port: 19001 } }),
+    );
+  });
+
   it.each([false, true])(
-    "selects only matching runtime sources (resolution facts: %s)",
+    "selects and retains only matching runtime sources (resolution facts: %s)",
     (withFacts) => {
       const sourceConfig = createProviderConfigFixture();
       if (withFacts) {
@@ -154,6 +188,8 @@ describe("runtime snapshot state", () => {
           updatePlan: true,
         },
       };
+
+      const readUnbound = createRuntimeConfigReader(scopedResolvedConfig);
 
       expect(
         selectApplicableRuntimeConfig({
@@ -184,6 +220,86 @@ describe("runtime snapshot state", () => {
           runtimeSourceConfig: sourceConfig,
         }),
       ).toBe(foreignConfig);
+      setRuntimeConfigSnapshot(runtimeConfig, sourceConfig);
+      const readRuntime = createRuntimeConfigReader(cloneConfigWithResolutionFacts(sourceConfig));
+      const readScoped = createRuntimeConfigReader(scopedResolvedConfig);
+      const readForeign = createRuntimeConfigReader(foreignConfig);
+      const nextConfig = { ...runtimeConfig, messages: { ackReactionScope: "all" as const } };
+      setRuntimeConfigSnapshot(nextConfig, nextConfig);
+      expect(readRuntime()).toBe(nextConfig);
+      expect(readScoped()).toBe(scopedResolvedConfig);
+      expect(readForeign()).toBe(foreignConfig);
+      expect(readUnbound()).toBe(scopedResolvedConfig);
+    },
+  );
+
+  it("does not replace explicit config with a pinned snapshot without a source contract", () => {
+    const sourceConfig = createProviderConfigFixture();
+    const resolvedConfig = createProviderConfigFixture("synthetic-resolved-key");
+    const pinned = loadPinnedRuntimeConfig(() => sourceConfig);
+    expect(getRuntimeConfigSourceSnapshot()).toBeNull();
+
+    expect(
+      selectApplicableRuntimeConfig({ inputConfig: resolvedConfig, runtimeConfig: pinned }),
+    ).toBe(resolvedConfig);
+    expect(
+      selectApplicableRuntimeConfig({ inputConfig: sourceConfig, runtimeConfig: pinned }),
+    ).toBe(sourceConfig);
+    expect(selectApplicableRuntimeConfig({ runtimeConfig: pinned })).toBe(pinned);
+
+    // A resolved but unrelated singleton cannot supply credentials for an explicit source either.
+    setRuntimeConfigSnapshot(resolvedConfig);
+    expect(
+      selectApplicableRuntimeConfig({
+        inputConfig: sourceConfig,
+        runtimeConfig: getRuntimeConfigSnapshot(),
+      }),
+    ).toBe(sourceConfig);
+  });
+
+  it("matches independently loaded config with equivalent resolution facts", () => {
+    const source = createProviderConfigFixture();
+    const freshRead = structuredClone(source);
+    const facts = () =>
+      createConfigResolutionFacts(
+        [],
+        new Map([["models.providers.openai.apiKey", "PROVIDER_KEY"]]),
+      );
+    setConfigResolutionFacts(source, facts());
+    setConfigResolutionFacts(freshRead, facts());
+    const runtime = createProviderConfigFixture("synthetic-runtime-key");
+    setRuntimeConfigSnapshot(runtime, source);
+
+    expect(getConfigResolutionFacts(freshRead)).not.toBe(getConfigResolutionFacts(source));
+    expect(createRuntimeConfigReader(freshRead)()).toBe(runtime);
+  });
+
+  it.each(["absent", "empty", "different-ref", "different-provider", "resolved", "unresolved"])(
+    "does not reuse runtime for same-byte config with %s resolution facts",
+    (kind) => {
+      const source = createProviderConfigFixture();
+      const input = structuredClone(source);
+      const refs = new Map([["models.providers.openai.apiKey", "PROVIDER_KEY"]]);
+      setConfigResolutionFacts(source, createConfigResolutionFacts([], refs));
+      if (kind !== "absent") {
+        setConfigResolutionFacts(
+          input,
+          createConfigResolutionFacts(
+            kind === "unresolved"
+              ? [{ configPath: "models.providers.openai.apiKey", varName: "PROVIDER_KEY" }]
+              : [],
+            kind === "resolved" || kind === "empty"
+              ? new Map()
+              : kind === "different-ref"
+                ? new Map([["models.providers.openai.apiKey", "OTHER_KEY"]])
+                : refs,
+            kind === "different-provider" ? "other" : "default",
+            kind === "resolved" ? refs : new Map(),
+          ),
+        );
+      }
+      setRuntimeConfigSnapshot(createProviderConfigFixture("synthetic-runtime-key"), source);
+      expect(createRuntimeConfigReader(input)()).toBe(input);
     },
   );
 

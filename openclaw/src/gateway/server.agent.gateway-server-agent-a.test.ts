@@ -4,6 +4,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+import { createDeferred } from "../../test/helpers/promise.js";
 import {
   getAdmittedRunDelegatedAuthority,
   prepareAgentRunAdmission,
@@ -77,7 +78,7 @@ const VISION_AGENT_MODEL: GatewayModelFixture = {
   input: ["text", "image"],
 };
 
-function expectChannels(call: Record<string, unknown>, channel: string) {
+function expectChannels(call: Record<string, unknown>, channel: string | undefined) {
   expect(call.channel).toBe(channel);
   expect(call.messageChannel).toBe(channel);
   const runContext = call.runContext as { messageChannel?: string } | undefined;
@@ -381,7 +382,7 @@ describe("gateway server agent", () => {
     const call = await waitForAgentCommandCall("idem-agent-subkey");
     expect(call.sessionKey).toBe("agent:main:subagent:abc");
     expect(call.sessionId).toBe("sess-sub");
-    expectChannels(call, "webchat");
+    expectChannels(call, undefined);
     expect(call.deliver).toBe(false);
     expect(call.to).toBeUndefined();
   });
@@ -556,10 +557,7 @@ describe("gateway server agent", () => {
     "agent executes a group-only run without a resolved session key and closes authority after %s",
     async (outcome) => {
       let admittedAuthority: AgentRunDelegatedAuthority | undefined;
-      let finishExecution!: () => void;
-      const executionFinished = new Promise<void>((resolve) => {
-        finishExecution = resolve;
-      });
+      const { promise: executionFinished, resolve: finishExecution } = createDeferred();
       vi.mocked(agentCommandMock).mockImplementationOnce(async (rawOpts) => {
         const opts = rawOpts as {
           runId: string;
@@ -762,14 +760,29 @@ describe("gateway server agent", () => {
     expect(spy).not.toHaveBeenCalled();
   });
 
-  test("agent rejects malformed agent-prefixed session keys", async () => {
+  test.each([
+    {
+      name: "malformed-key",
+      sessionKey: "agent:main",
+      agentId: undefined,
+      message: "malformed session key",
+    },
+    {
+      name: "unrepresentable-agent",
+      sessionKey: "agent:main:main",
+      agentId: "!!!",
+      message: 'Unknown agent id "!!!"',
+    },
+  ])("agent rejects invalid selectors: $name", async ({ name, sessionKey, agentId, message }) => {
     const res = await rpcReq(gatewaySuite.ws, "agent", {
       message: "hi",
-      sessionKey: "agent:main",
-      idempotencyKey: "idem-agent-malformed-key",
+      sessionKey,
+      agentId,
+      idempotencyKey: `idem-agent-invalid-${name}`,
     });
     expect(res.ok).toBe(false);
-    expect(res.error?.message).toContain("malformed session key");
+    expect(res.error?.code).toBe("INVALID_REQUEST");
+    expect(res.error?.message).toContain(message);
 
     const spy = vi.mocked(agentCommandMock);
     expect(spy).not.toHaveBeenCalled();
@@ -863,7 +876,7 @@ describe("gateway server agent", () => {
     });
 
     expect(call.sessionKey).toBe("agent:main:main");
-    expectChannels(call, "webchat");
+    expectChannels(call, undefined);
     expect(typeof call.message).toBe("string");
     expect(call.message).toContain("what is in the image?");
     expectBaseImageForwarded(call.images);

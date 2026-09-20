@@ -1,32 +1,36 @@
 import { once } from "node:events";
+import fs from "node:fs";
 import { createServer } from "node:http";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { captureClawInstallSchemaVersionFacts } from "../claws/provenance-runtime-read.js";
 import { createConfigIoContext } from "../config/io.context.js";
 import { readConfigFileSnapshotFromContext } from "../config/io.snapshot.js";
 import {
   getAuthoredConfigSecretRef,
   getConfigResolutionFacts,
+  getResolvedConfigEnvSecretRef,
 } from "../config/resolution-facts.js";
 import {
   clearRuntimeConfigSnapshot,
   setRuntimeConfigSnapshot,
 } from "../config/runtime-snapshot.js";
+import { captureRuntimeConfig } from "../config/runtime-source-projection.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { withPluginSourceCaptureDirectory } from "../plugins/plugin-package-metadata-capture.js";
+import { NON_ENV_SECRETREF_MARKER } from "../secrets/provider-credential-values.js";
 import {
   createOpenClawTestState,
   type OpenClawTestState,
 } from "../test-utils/openclaw-test-state.js";
 import { clearRuntimeAuthProfileStoreSnapshots } from "./auth-profiles/runtime-snapshots.js";
 import type { AuthProfileStore } from "./auth-profiles/types.js";
-import { NON_ENV_SECRETREF_MARKER } from "./model-auth-markers.js";
 import { resolveUsableCustomProviderApiKey } from "./model-auth-provider-config.js";
 import * as modelsConfig from "./models-config.js";
 import { createPreparedModelCatalogWorkerInput } from "./prepared-model-catalog-worker.js";
 import { runPreparedModelCatalogWorkerRequest } from "./prepared-model-catalog.worker.js";
-import {
-  prepareAgentCatalogSource,
-  prepareWorkspaceBuildGroup,
-} from "./prepared-model-runtime.facts.js";
+import { prepareWorkspaceBuildGroup } from "./prepared-model-runtime.facts.js";
+import * as fullCatalog from "./prepared-model-runtime.full-catalog.js";
+import { prepareAgentCatalogSource } from "./prepared-model-runtime.scoped-catalog.js";
 
 // Run the real worker entrypoint without attaching it to Vitest's own worker port.
 vi.mock("node:worker_threads", async (importOriginal) => ({
@@ -52,7 +56,7 @@ describe("serialized catalog credential provenance", () => {
     owner: "config" | "profile";
     label: string;
     value: string;
-    loader?: { authored: string; env?: NodeJS.ProcessEnv; pending?: boolean };
+    loader?: { authored: string; env?: NodeJS.ProcessEnv; pending?: boolean; resolved?: boolean };
   }>([
     { owner: "config", label: "literal bytes", value: "synthetic-worker-config-key" },
     { owner: "config", label: "marker bytes", value: NON_ENV_SECRETREF_MARKER },
@@ -62,7 +66,11 @@ describe("serialized catalog credential provenance", () => {
       owner: "config",
       label: "loader-substituted literal",
       value: "${LITERAL_KEY}",
-      loader: { authored: "${SOURCE_KEY}", env: { SOURCE_KEY: "${LITERAL_KEY}" } },
+      loader: {
+        authored: "${SOURCE_KEY}",
+        env: { SOURCE_KEY: "${LITERAL_KEY}" },
+        resolved: true,
+      },
     },
     {
       owner: "config",
@@ -78,7 +86,7 @@ describe("serialized catalog credential provenance", () => {
     },
   ])(
     "preserves $owner $label through discovery and the writable plan",
-    async ({ owner, value, loader }) => {
+    async ({ owner, value, loader, label }) => {
       const requests: boolean[] = [];
       const server = createServer((request, response) => {
         requests.push(
@@ -227,7 +235,11 @@ module.exports = {
               : {},
         };
         const params = {
-          agentFacts: { ...prepared.agentFacts[0]!, authStore },
+          agentFacts: {
+            ...prepared.agentFacts[0]!,
+            authStore,
+            input: { ...prepared.agentFacts[0]!.input, config: captureRuntimeConfig(runtime) },
+          },
           pluginMetadataSnapshot: prepared.pluginGeneration.pluginMetadataSnapshot,
         };
         expect(params.agentFacts.providerIds).toContain(provider);
@@ -304,11 +316,19 @@ module.exports = {
             return result;
           },
         );
-        const result = await runPreparedModelCatalogWorkerRequest(serialized, {
-          kind: "catalog",
-          requestId: 1,
-        });
+        const captures = state.path("worker-captures");
+        fs.mkdirSync(captures);
+        const request = () =>
+          withPluginSourceCaptureDirectory(captures, () =>
+            runPreparedModelCatalogWorkerRequest(serialized, {
+              kind: "catalog",
+              syntheticAuth: [],
+              clawInstallSchemaVersions: captureClawInstallSchemaVersionFacts({ env }),
+            }),
+          );
+        const result = await request();
         expect(result.status).toBe("ok");
+        expect(fs.readdirSync(captures)).toEqual([]);
         const runtimeFacts = getConfigResolutionFacts(serialized.input.config);
         const sourceFacts = getConfigResolutionFacts(serialized.sourceConfigForSecrets);
         expect(runtimeFacts === null).toBe(nativeRuntimeFacts === null);
@@ -332,12 +352,19 @@ module.exports = {
               serialized.input.config,
               `models.providers.${provider}.apiKey`,
             ),
+            resolvedEnvRef: getResolvedConfigEnvSecretRef(
+              serialized.input.config,
+              `models.providers.${provider}.apiKey`,
+            ),
           }).toEqual({
             nativeAuthMatches: true,
             nativeRequests: loader.pending ? [] : [true],
             workerAuthMatches: true,
             workerRequests: loader.pending ? [] : [true],
             authoredRef: expectedRef,
+            resolvedEnvRef: loader.resolved
+              ? { source: "env", provider: "default", id: "SOURCE_KEY" }
+              : null,
           });
           if (loader.pending) {
             return;
@@ -365,6 +392,16 @@ module.exports = {
         }
         if (alternativeFingerprint !== undefined) {
           expect(serialized.generationFingerprint).not.toBe(alternativeFingerprint);
+        }
+        if (label === "literal bytes") {
+          vi.spyOn(fullCatalog, "prepareFullCatalogFacts").mockRejectedValueOnce(
+            new Error("synthetic catalog construction failure"),
+          );
+          await expect(request()).resolves.toEqual({
+            status: "failed",
+            error: "synthetic catalog construction failure",
+          });
+          expect(fs.readdirSync(captures)).toEqual([]);
         }
       } finally {
         server.closeAllConnections();

@@ -4,13 +4,14 @@ import {
   normalizeOptionalLowercaseString,
   normalizeOptionalString,
 } from "@openclaw/normalization-core/string-coerce";
+import {
+  parseAgentSessionKeyParts,
+  type ParsedAgentSessionKey,
+} from "@openclaw/session-url-contract";
 import { pruneMapToMaxSize } from "../infra/map-size.js";
 import { escapeRegExp } from "../shared/regexp.js";
 
-export type ParsedAgentSessionKey = {
-  agentId: string;
-  rest: string;
-};
+export type { ParsedAgentSessionKey };
 
 export type ParsedThreadSessionSuffix = {
   baseSessionKey: string | undefined;
@@ -65,6 +66,10 @@ const CASE_PRESERVING_PEERS: readonly CasePreservingPeerDescriptor[] = [
   // #75670 — Matrix room IDs (opaque, embedded `:server`) plus thread event suffix.
   { channel: "matrix", peerKinds: new Set(["channel", "group"]), span: "tail", unscoped: true },
 ];
+
+const CASE_PRESERVING_PEER_PREFIXES = CASE_PRESERVING_PEERS.map(
+  (descriptor) => `${descriptor.channel}:`,
+);
 
 const CASE_PRESERVING_PEER_PATTERNS = CASE_PRESERVING_PEERS.flatMap((descriptor) =>
   [...descriptor.peerKinds].map((peerKind) => {
@@ -153,9 +158,13 @@ function writeNormalizedSessionKeyCache(raw: string, normalized: string): void {
   pruneMapToMaxSize(normalizedSessionKeyCache, NORMALIZED_SESSION_KEY_CACHE_MAX_ENTRIES);
 }
 
-function mayContainCasePreservingPeer(raw: string): boolean {
-  const folded = raw.toLowerCase();
-  return CASE_PRESERVING_PEERS.some((descriptor) => folded.includes(`${descriptor.channel}:`));
+function mayContainCasePreservingPeer(folded: string): boolean {
+  for (const prefix of CASE_PRESERVING_PEER_PREFIXES) {
+    if (folded.includes(prefix)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 /**
@@ -212,10 +221,11 @@ export function normalizeSessionKeyPreservingOpaquePeerIds(
   if (cached !== undefined) {
     return cached;
   }
-  if (!mayContainCasePreservingPeer(raw)) {
-    const normalized = raw.toLowerCase();
-    writeNormalizedSessionKeyCache(raw, normalized);
-    return normalized;
+  const folded = raw.toLowerCase();
+  // Ordinary inventory keys are cheap to fold and would churn the bounded
+  // opaque-key cache, repeatedly scanning deleted Map entries during eviction.
+  if (!mayContainCasePreservingPeer(folded)) {
+    return folded;
   }
   const spans = collectCasePreservedSpans(raw)
     .filter((span) => span.end > span.start)
@@ -246,23 +256,7 @@ export function normalizeSessionKeyPreservingOpaquePeerIds(
 export function parseAgentSessionKey(
   sessionKey: string | undefined | null,
 ): ParsedAgentSessionKey | null {
-  const raw = normalizeSessionKeyPreservingOpaquePeerIds(sessionKey);
-  if (!raw) {
-    return null;
-  }
-  if (!raw.startsWith("agent:")) {
-    return null;
-  }
-  const agentIdEnd = raw.indexOf(":", "agent:".length);
-  if (agentIdEnd === -1) {
-    return null;
-  }
-  const agentId = normalizeOptionalString(raw.slice("agent:".length, agentIdEnd));
-  const rest = raw.slice(agentIdEnd + 1);
-  if (!agentId || !rest || rest.startsWith(":")) {
-    return null;
-  }
-  return { agentId, rest };
+  return parseAgentSessionKeyParts(normalizeSessionKeyPreservingOpaquePeerIds(sessionKey));
 }
 
 export function isCronRunSessionKey(sessionKey: string | undefined | null): boolean {

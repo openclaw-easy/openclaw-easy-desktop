@@ -1,11 +1,14 @@
 /** Builds embedded-agent run parameters from queued follow-up run state. */
 import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
-import { resolveEffectiveModelFallbacks } from "../../agents/agent-scope.js";
+import {
+  modelFallbackOverrideFromAvailability,
+  resolveModelFallbackAvailability,
+} from "../../agents/agent-scope.js";
 import { findModelInCatalog, modelSupportsInput } from "../../agents/model-catalog-lookup.js";
 import { modelTransportRoutesMatch } from "../../agents/model-compat-catalog.js";
 import {
+  findConfiguredProviderModel,
   resolveMergedModelProviderConfig,
-  resolveMergedModelProviderModels,
 } from "../../config/model-provider-config.js";
 import type { resolveProviderScopedAuthProfile } from "./agent-runner-auth-profile.js";
 import type { FollowupRun } from "./queue.js";
@@ -26,16 +29,16 @@ export function resolveModelFallbackOptions(
   configOverride: FollowupRun["run"]["config"] = run.config,
 ) {
   const config = configOverride;
-  const fallbacksOverride = run.modelSelectionLocked
-    ? []
-    : resolveEffectiveModelFallbacks({
-        cfg: config,
-        agentId: run.agentId,
-        sessionKey: run.sessionKey,
-        hasSessionModelOverride: run.hasSessionModelOverride === true,
-        modelOverrideSource: run.modelOverrideSource,
-        hasAutoFallbackProvenance: run.hasAutoFallbackProvenance === true,
-      });
+  const modelFallbackAvailability = resolveModelFallbackAvailability({
+    cfg: config,
+    agentId: run.agentId,
+    sessionKey: run.sessionKey,
+    hasSessionModelOverride: run.hasSessionModelOverride === true,
+    modelOverrideSource: run.modelOverrideSource,
+    hasAutoFallbackProvenance: run.hasAutoFallbackProvenance === true,
+    modelSelectionLocked: run.modelSelectionLocked,
+    subagentSpawnLineage: run.subagentSpawnLineage,
+  });
   return {
     cfg: config,
     provider: run.provider,
@@ -44,7 +47,8 @@ export function resolveModelFallbackOptions(
     agentDir: run.agentDir,
     agentId: run.agentId,
     sessionKey: run.runtimePolicySessionKey ?? run.sessionKey,
-    fallbacksOverride,
+    modelFallbackAvailability,
+    fallbacksOverride: modelFallbackOverrideFromAvailability(modelFallbackAvailability),
   };
 }
 
@@ -75,10 +79,12 @@ export async function resolveRunModelHasVision(params: {
 }): Promise<boolean> {
   const { run, provider, model } = params;
   const providerConfig = resolveMergedModelProviderConfig(run.config, provider);
-  const configured = resolveMergedModelProviderModels({
-    models: providerConfig?.models,
-    normalizeModelId: normalizeLowercaseStringOrEmpty,
-  }).get(normalizeLowercaseStringOrEmpty(model));
+  const configured = findConfiguredProviderModel(
+    providerConfig,
+    provider,
+    model,
+    normalizeLowercaseStringOrEmpty,
+  );
   if (configured?.input !== undefined) {
     return modelSupportsInput(configured, "image");
   }
@@ -116,16 +122,17 @@ export async function buildEmbeddedRunBaseParams(params: {
   isReasoningTagProvider?: ReasoningTagProviderResolver;
 }) {
   const config = params.run.config;
-  const modelFallbacksOverride = params.run.modelSelectionLocked
-    ? []
-    : resolveEffectiveModelFallbacks({
-        cfg: config,
-        agentId: params.run.agentId,
-        sessionKey: params.run.sessionKey,
-        hasSessionModelOverride: params.run.hasSessionModelOverride === true,
-        modelOverrideSource: params.run.modelOverrideSource,
-        hasAutoFallbackProvenance: params.run.hasAutoFallbackProvenance === true,
-      });
+  const modelFallbackAvailability = resolveModelFallbackAvailability({
+    cfg: config,
+    agentId: params.run.agentId,
+    sessionKey: params.run.sessionKey,
+    hasSessionModelOverride: params.run.hasSessionModelOverride === true,
+    modelOverrideSource: params.run.modelOverrideSource,
+    hasAutoFallbackProvenance: params.run.hasAutoFallbackProvenance === true,
+    modelSelectionLocked: params.run.modelSelectionLocked,
+    subagentSpawnLineage: params.run.subagentSpawnLineage,
+  });
+  const modelFallbacksOverride = modelFallbackOverrideFromAvailability(modelFallbackAvailability);
   const enforceFinalTag = resolveEnforceFinalTagWithResolver(
     params.run,
     params.provider,
@@ -154,18 +161,21 @@ export async function buildEmbeddedRunBaseParams(params: {
     approvalReviewerDeviceId: params.run.approvalReviewerDeviceId,
     enforceFinalTag,
     silentExpected: params.run.silentExpected,
-    allowEmptyAssistantReplyAsSilent: params.run.allowEmptyAssistantReplyAsSilent,
     terminalReplyExpectation: params.run.terminalReplyExpectation,
     silentReplyPromptMode: params.run.silentReplyPromptMode,
     sourceReplyDeliveryMode: params.run.sourceReplyDeliveryMode,
     clientCaps: params.run.clientCaps,
+    gatewayUiCommandTarget: params.run.gatewayUiCommandTarget,
     toolBindings: params.run.toolBindings,
     taskSuggestionDeliveryMode: params.run.taskSuggestionDeliveryMode,
     skillWorkshopProposalRevision: params.run.skillWorkshopProposalRevision,
+    skillLibraryAuthoring: params.run.skillLibraryAuthoring,
     provider: params.provider,
     model: params.model,
     modelHasVision: await resolveRunModelHasVision(params),
+    requestedRouteResolution: "resolved" as const,
     modelSelectionLocked: params.run.modelSelectionLocked,
+    modelFallbackAvailability,
     modelFallbacksOverride,
     ...params.authProfile,
     thinkLevel: params.run.thinkLevel,
@@ -176,6 +186,7 @@ export async function buildEmbeddedRunBaseParams(params: {
     execOverrides: params.run.execOverrides,
     bashElevated: params.run.bashElevated,
     timeoutMs: params.run.timeoutMs,
+    runTimeoutOverrideMs: params.run.runTimeoutOverrideMs,
     runId: params.runId,
     promptCacheKey: params.promptCacheKey,
     allowTransientCooldownProbe: params.allowTransientCooldownProbe,

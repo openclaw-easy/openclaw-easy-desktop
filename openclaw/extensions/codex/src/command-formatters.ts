@@ -123,7 +123,7 @@ export function formatAccount(
   limits: SafeValue<JsonValue | undefined>,
   authOverview?: CodexAccountAuthOverview,
 ): string {
-  if (authOverview) {
+  if (authOverview?.rows.some((row) => row.active)) {
     return formatAccountAuthOverview(authOverview);
   }
   const formattedLimits = limits.ok
@@ -137,6 +137,7 @@ export function formatAccount(
   return [
     `Account: ${account.ok ? formatCodexAccountSummary(account.value) : formatCodexDisplayText(account.error)}`,
     rateLimitBlock,
+    ...(authOverview ? [formatAccountAuthOverview(authOverview)] : []),
   ].join("\n\n");
 }
 
@@ -279,7 +280,7 @@ function formatCodexSkillEntry(entry: JsonValue): string {
   return `\`${formatCodexDisplayText(name)}\``;
 }
 
-const CODEX_RESUME_SAFE_THREAD_ID_PATTERN = /^[A-Za-z0-9._:-]+$/;
+export const CODEX_RESUME_SAFE_THREAD_ID_PATTERN = /^[A-Za-z0-9._:-]+$/;
 
 function formatCodexResumeHint(threadId: string): string {
   const safe = formatCodexTextForDisplay(threadId);
@@ -301,7 +302,7 @@ function formatCodexAccountSummary(value: JsonValue | undefined): string {
     : escapeCodexChatText(safe);
 }
 
-function formatCodexTextForDisplay(value: string): string {
+export function formatCodexTextForDisplay(value: string): string {
   const safe = sanitizeCodexTextForDisplay(value).trim();
   return safe || "<unknown>";
 }
@@ -315,7 +316,7 @@ function sanitizeCodexTextForDisplay(value: string): string {
   return safe;
 }
 
-function escapeCodexChatText(value: string): string {
+export function escapeCodexChatText(value: string): string {
   // Command output is public chat text. Escape markdown/control triggers and
   // mention characters so Codex data cannot ping users or inject formatting.
   return value
@@ -338,7 +339,7 @@ function escapeCodexChatTextPreservingAt(value: string): string {
   return escapeCodexChatText(value).replaceAll("\uff20", "@");
 }
 
-function formatCodexAccountLine(value: string): string {
+export function formatCodexAccountLine(value: string): string {
   if (value === "") {
     return "";
   }
@@ -403,6 +404,7 @@ export function buildHelp(): string {
     "- /codex diagnostics [note]",
     "- /codex computer-use [status|install]",
     "- /codex account",
+    "- /codex plugins refresh                   refresh hosted inventory for the current Codex account/runtime",
     "- /codex mcp",
     "- /codex skills",
     "- /codex plugins [list|enable|disable]",

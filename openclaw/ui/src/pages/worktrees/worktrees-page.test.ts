@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { WorktreeRecord } from "../../../../packages/gateway-protocol/src/index.js";
+import { createDeferred as deferred } from "../../../../test/helpers/promise.js";
 import type { GatewayBrowserClient } from "../../api/gateway.ts";
 import type { ApplicationContext, ApplicationGatewaySnapshot } from "../../app/context.ts";
 import { showConfirmDialog } from "../../components/confirm-dialog.ts";
@@ -30,16 +31,6 @@ type WorktreesPageTestElement = HTMLElement & {
   restore: (record: WorktreeRecord) => Promise<void>;
   gc: () => Promise<void>;
 };
-
-function deferred<T>() {
-  let resolve!: (value: T) => void;
-  let reject!: (error: unknown) => void;
-  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
-    resolve = resolvePromise;
-    reject = rejectPromise;
-  });
-  return { promise, reject, resolve };
-}
 
 function worktree(id = "worktree-1"): WorktreeRecord {
   return {
@@ -235,11 +226,11 @@ describe("WorktreesPage lifecycle", () => {
     const link = [...page.querySelectorAll("a")].find((anchor) =>
       anchor.getAttribute("href")?.includes("12345678"),
     );
-    expect(link?.getAttribute("href")).toBe("/chat/main/12345678");
+    expect(link?.getAttribute("href")).toBe("/chat/main/1234567890abcdef1234567890abcdef");
     link?.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
 
     expect(context.navigate).toHaveBeenCalledWith("chat", {
-      pathname: "/chat/main/12345678",
+      pathname: "/chat/main/1234567890abcdef1234567890abcdef",
       search: `?${SESSION_FACE_PREFERENCE_PARAM}=1`,
     });
   });

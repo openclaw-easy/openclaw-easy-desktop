@@ -6,6 +6,7 @@ import { expect, vi } from "vitest";
 import type { WebSocketServer } from "ws";
 import type { ResolvedGatewayAuth } from "../auth.js";
 import { prepareGatewayIngressAttribution } from "../ingress-attribution.js";
+import { GatewayConnectionWork } from "../server-connection-work.js";
 import { MAX_PREAUTH_PAYLOAD_BYTES } from "../server-constants.js";
 import type { attachGatewayWsConnectionHandler } from "./ws-connection.js";
 
@@ -107,13 +108,22 @@ export function attachGatewayWsForTest(params: {
     }),
   } as unknown as WebSocketServer;
   const socket = params.socket ?? createGatewayWsTestSocket();
+  const transportEvents = new EventEmitter();
   const upgradeReq = {
     headers: { host: params.host ?? "127.0.0.1:19001", ...params.headers },
-    socket: {
+    socket: Object.assign(transportEvents, {
       remoteAddress: socket["_socket"].remoteAddress,
       localAddress: socket["_socket"].localAddress,
       localPort: socket["_socket"].localPort,
-    },
+      timeout: 0,
+      timeoutTimer: undefined as ReturnType<typeof setTimeout> | undefined,
+      setTimeout(ms: number) {
+        clearTimeout(this.timeoutTimer);
+        this.timeout = ms;
+        this.timeoutTimer = ms ? setTimeout(() => transportEvents.emit("timeout"), ms) : undefined;
+        return this;
+      },
+    }),
   };
   (params.prepareIngressAttribution ?? prepareGatewayIngressAttribution)({
     req: upgradeReq as never,
@@ -124,6 +134,7 @@ export function attachGatewayWsForTest(params: {
   params.attach({
     wss,
     clients: clients as never,
+    connectionWork: new GatewayConnectionWork(),
     bootId: "ws-test-boot",
     preauthConnectionBudget: { release: vi.fn() } as never,
     port: 19001,

@@ -20,28 +20,33 @@ extension OpenClawChatComposer {
             Text("Thinking")
                 .font(OpenClawChatTypography.captionSemiBold)
         }
-        .labelsHidden()
         .pickerStyle(.menu)
         .controlSize(.small)
         .frame(maxWidth: 140, alignment: .leading)
         .disabled(self.viewModel.isUpdatingSessionSettings)
     }
 
-    #if os(macOS)
     var verbosityPicker: some View {
         Picker(selection: Binding(
             get: { self.viewModel.verboseLevel },
             set: { self.viewModel.selectVerboseLevel($0) }))
         {
             Text(String(localized: "Default (inherited)"))
+                .font(OpenClawChatTypography.captionSemiBold)
                 .tag(OpenClawChatViewModel.inheritedThinkingSelectionID)
-            Text(String(localized: "Off")).tag("off")
-            Text(String(localized: "On")).tag("on")
-            Text(String(localized: "Full")).tag("full")
+            Text(String(localized: "Off"))
+                .font(OpenClawChatTypography.captionSemiBold)
+                .tag("off")
+            Text(String(localized: "On"))
+                .font(OpenClawChatTypography.captionSemiBold)
+                .tag("on")
+            Text(String(localized: "Full"))
+                .font(OpenClawChatTypography.captionSemiBold)
+                .tag("full")
         } label: {
             Text(String(localized: "Verbosity"))
+                .font(OpenClawChatTypography.captionSemiBold)
         }
-        .labelsHidden()
         .pickerStyle(.menu)
         .controlSize(.small)
         .help(String(localized: "Verbosity"))
@@ -54,30 +59,33 @@ extension OpenClawChatComposer {
             set: { self.viewModel.selectFastMode($0) }))
         {
             Text(String(localized: "Default (inherited)"))
+                .font(OpenClawChatTypography.captionSemiBold)
                 .tag(OpenClawChatViewModel.inheritedThinkingSelectionID)
-            Text(String(localized: "On")).tag("on")
-            Text(String(localized: "Off")).tag("off")
+            Text(String(localized: "On"))
+                .font(OpenClawChatTypography.captionSemiBold)
+                .tag("on")
+                .disabled(!self.viewModel.selectedModelSupportsFastMode)
+            Text(String(localized: "Off"))
+                .font(OpenClawChatTypography.captionSemiBold)
+                .tag("off")
+                .disabled(!self.viewModel.selectedModelSupportsFastMode)
         } label: {
             Label(String(localized: "Fast"), systemImage: "bolt.fill")
+                .font(OpenClawChatTypography.captionSemiBold)
         }
-        .labelsHidden()
         .pickerStyle(.menu)
         .controlSize(.small)
         .help(String(localized: "Fast responses"))
         .disabled(self.viewModel.isUpdatingSessionSettings)
     }
-    #endif
 
     var modelPicker: some View {
         // Sections come from an O(n) recompute over the catalog; bind once per body eval.
         let sections = self.viewModel.modelPickerSections
-        return Picker(selection: Binding(
-            get: { self.viewModel.modelSelectionID },
-            set: { next in self.viewModel.selectModel(next) }))
-        {
-            Text(self.viewModel.defaultModelLabel)
-                .font(OpenClawChatTypography.captionSemiBold)
-                .tag(OpenClawChatViewModel.defaultModelSelectionID)
+        return Menu {
+            self.modelMenuOption(
+                self.viewModel.defaultModelLabel,
+                selectionID: OpenClawChatViewModel.defaultModelSelectionID)
             if !sections.pinned.isEmpty {
                 Section {
                     self.modelOptions(sections.pinned)
@@ -109,11 +117,11 @@ extension OpenClawChatComposer {
                 }
             }
         } label: {
-            Text("Model")
+            Text(self.viewModel.modelSelectionID == OpenClawChatViewModel.defaultModelSelectionID
+                ? self.viewModel.defaultModelLabel : self.viewModel.canonicalModelSelectionID)
                 .font(OpenClawChatTypography.captionSemiBold)
         }
-        .labelsHidden()
-        .pickerStyle(.menu)
+        .accessibilityLabel("Model")
         .controlSize(.small)
         .frame(maxWidth: 240, alignment: .leading)
         .help("Model")
@@ -122,17 +130,35 @@ extension OpenClawChatComposer {
 
     private func modelOptions(_ models: [OpenClawChatModelChoice]) -> some View {
         ForEach(models) { model in
-            HStack(spacing: 4) {
-                Text(model.displayLabel)
-                    .font(OpenClawChatTypography.captionSemiBold)
-                if self.viewModel.isDefaultModel(model) {
-                    Text(String(localized: "Default"))
-                        .font(OpenClawChatTypography.caption)
-                        .foregroundStyle(.secondary)
-                }
-            }
-            .tag(model.selectionID)
+            let unavailable = self.viewModel.modelUnavailableDescription(model)
+            let defaultBadge = self.viewModel.isDefaultModel(model) ? String(localized: "Default") : nil
+            self.modelMenuOption(
+                [model.displayLabel, model.capabilityDescription, unavailable, defaultBadge].compactMap(\.self)
+                    .filter { !$0.isEmpty }.joined(separator: " — "),
+                selectionID: model.selectionID)
+                .disabled(self.viewModel.isModelUnavailable(model))
+                .accessibilityHint(unavailable ?? "")
         }
+    }
+
+    func modelMenuOption(_ title: String, selectionID: String) -> some View {
+        let selected = self.viewModel.canonicalModelSelectionID == selectionID
+        return Button {
+            self.viewModel.selectModel(selectionID)
+        } label: {
+            if selected {
+                Label {
+                    Text(verbatim: title)
+                } icon: {
+                    Image(systemName: "checkmark").accessibilityHidden(true)
+                }
+            } else {
+                Text(verbatim: title)
+            }
+        }
+        .font(OpenClawChatTypography.captionSemiBold)
+        .accessibilityLabel(title)
+        .accessibilityAddTraits(selected ? .isSelected : [])
     }
 
     var modelPinButton: some View {

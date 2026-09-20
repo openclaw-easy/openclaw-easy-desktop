@@ -21,12 +21,13 @@ import { normalizeToolPolicyName } from "../tool-policy.js";
 import { isToolResultError } from "../tool-result-error.js";
 import { resolveEmbeddedCliBackendDispatchEligibility } from "./cli-backend-dispatch-eligibility.js";
 import { createCliDispatchTranscriptRecorder } from "./cli-backend-dispatch-transcript.js";
+import type { RunEmbeddedAgentInternalParams } from "./run/internal-params.js";
 import type { RunEmbeddedAgentParams } from "./run/params.js";
 import type { EmbeddedAgentRunResult } from "./types.js";
 
 const log = createSubsystemLogger("agents/embedded-cli-dispatch");
 
-type CliBackendDispatchParams = RunEmbeddedAgentParams & {
+type CliBackendDispatchParams = RunEmbeddedAgentInternalParams & {
   sessionTarget: SessionTranscriptRuntimeTarget;
 };
 
@@ -119,30 +120,28 @@ async function runEmbeddedAgentViaCliBackend(
     openClaw: dispatch.toolsAllow,
   };
   const onAgentToolResult = params.onAgentToolResult;
-  // The CLI backend writes no OpenClaw session records; mirror the run into
-  // the caller-owned session file so transcript consumers (persistTranscripts,
-  // timeout partial-text salvage, the live terminal-search watcher) keep
-  // working at parity with embedded runs.
-  const transcript = createCliDispatchTranscriptRecorder({
-    sessionId: params.sessionId,
-    sessionKey: params.sessionKey,
-    agentId: params.agentId,
-    storePath: params.sessionTarget.storePath,
-    sessionFile: dispatch.sessionFile,
-    runId: params.runId,
-    prompt: params.prompt,
-    provider: dispatch.provider,
-    model: params.model,
-    cwd: params.cwd ?? params.workspaceDir,
-    config: params.config,
-    ...(params.sessionTarget?.expectedLifecycleRevision !== undefined
-      ? { expectedLifecycleRevision: params.sessionTarget.expectedLifecycleRevision }
-      : {}),
-    ...(params.sessionTarget?.expectedWriterRunId !== undefined
-      ? { expectedWriterRunId: params.sessionTarget.expectedWriterRunId }
-      : {}),
-    ...(params.senderIsOwner !== undefined ? { senderIsOwner: params.senderIsOwner } : {}),
-  });
+  const { storePath, expectedLifecycleRevision, expectedWriterRunId } = params.sessionTarget;
+  // Durable turns mirror CLI output for transcript readers and timeout salvage.
+  // Detached runs may borrow the identity without owning its transcript.
+  const transcript =
+    params.sessionManager || params.sessionPersistence === "detached"
+      ? undefined
+      : createCliDispatchTranscriptRecorder({
+          sessionId: params.sessionId,
+          sessionKey: params.sessionKey,
+          agentId: params.agentId,
+          storePath,
+          sessionFile: dispatch.sessionFile,
+          runId: params.runId,
+          prompt: params.prompt,
+          provider: dispatch.provider,
+          model: params.model,
+          cwd: params.cwd ?? params.workspaceDir,
+          config: params.config,
+          expectedLifecycleRevision,
+          expectedWriterRunId,
+          ...(params.senderIsOwner !== undefined ? { senderIsOwner: params.senderIsOwner } : {}),
+        });
   // CLI tool results arrive as agent events with transport-prefixed MCP
   // names; strip and normalize so observers and transcript records see the
   // same tool names and soft-error signal the native embedded path reports.
@@ -151,7 +150,7 @@ async function runEmbeddedAgentViaCliBackend(
       return;
     }
     if (evt.stream === "assistant" && typeof evt.data.text === "string") {
-      transcript.noteAssistantText(evt.data.text);
+      transcript?.noteAssistantText(evt.data.text);
       return;
     }
     if (evt.stream !== "tool") {
@@ -168,7 +167,7 @@ async function runEmbeddedAgentViaCliBackend(
     const toolName = normalizeToolPolicyName(stripOpenClawMcpToolPrefix(rawName));
     const toolCallId = typeof evt.data.toolCallId === "string" ? evt.data.toolCallId : undefined;
     if (phase === "start") {
-      transcript.noteToolEvent({
+      transcript?.noteToolEvent({
         phase,
         toolName,
         toolCallId,
@@ -178,7 +177,7 @@ async function runEmbeddedAgentViaCliBackend(
     }
     const isError = evt.data.isError === true || isToolResultError(evt.data.result);
     const resultContentSource = evt.data.resultContentSource === "network" ? "network" : undefined;
-    transcript.noteToolEvent({
+    transcript?.noteToolEvent({
       phase,
       toolName,
       toolCallId,
@@ -195,35 +194,32 @@ async function runEmbeddedAgentViaCliBackend(
   // The killed CLI child can take seconds to settle after a timeout abort,
   // while the caller's partial-text salvage reads the session file within a
   // short grace window; flush the latest snapshot the moment abort fires.
-  const flushOnAbort = () => transcript.flushAssistantSnapshot();
+  const flushOnAbort = () => transcript?.flushAssistantSnapshot();
   params.abortSignal?.addEventListener("abort", flushOnAbort, { once: true });
   // Reply/cron callers advance lifecycle state and arm execution-phase
   // watchdogs on this signal; dispatched runs emit it at the same
   // post-admission boundary where the native path does.
-  params.onExecutionStarted?.(
-    params.lifecycleGeneration !== undefined
-      ? { lifecycleGeneration: params.lifecycleGeneration }
-      : undefined,
-  );
   log.info(
     `dispatching embedded run through CLI backend: runId=${params.runId} provider=${dispatch.provider} model=${params.model ?? ""}`,
   );
   let finalAssistantText: string | undefined;
   try {
+    await params.onExecutionStarted?.(
+      params.lifecycleGeneration !== undefined
+        ? { lifecycleGeneration: params.lifecycleGeneration }
+        : undefined,
+    );
     const result = await runCliAgent({
       admittedRunContext,
+      sessionManager: params.sessionManager,
       sessionId: params.sessionId,
       sessionKey: params.sessionKey,
       sessionTarget: params.sessionTarget,
-      ...(params.sessionTarget?.expectedLifecycleRevision !== undefined
-        ? { expectedLifecycleRevision: params.sessionTarget.expectedLifecycleRevision }
-        : {}),
-      ...(params.sessionTarget?.expectedWriterRunId !== undefined
-        ? { expectedWriterRunId: params.sessionTarget.expectedWriterRunId }
-        : {}),
+      expectedLifecycleRevision,
+      expectedWriterRunId,
       chatType: params.chatType,
       agentId: params.agentId,
-      storePath: params.sessionTarget.storePath,
+      storePath,
       trigger: params.trigger,
       sessionFile: dispatch.sessionFile,
       workspaceDir: params.workspaceDir,
@@ -236,9 +232,16 @@ async function runEmbeddedAgentViaCliBackend(
       media: params.media,
       provider: dispatch.provider,
       model: params.model,
+      ...(params.requestedRouteResolution === "resolved" && params.provider && params.model
+        ? { requesterModel: { provider: params.provider, model: params.model } }
+        : {}),
+      authProfileId: params.authProfileId,
       modelHasVision: params.modelHasVision,
       contextWindow: params.contextWindow,
       thinkLevel: params.thinkLevel,
+      fastMode: params.fastMode,
+      fastModeStartedAtMs: params.fastModeStartedAtMs,
+      fastModeAutoOnSeconds: params.fastModeAutoOnSeconds,
       timeoutMs: params.timeoutMs,
       runTimeoutOverrideMs: params.runTimeoutOverrideMs ?? params.timeoutMs,
       runId: params.runId,
@@ -259,10 +262,7 @@ async function runEmbeddedAgentViaCliBackend(
       disableCliLiveSession: true,
       cleanupCliLiveSessionOnRunEnd: true,
       requireExplicitMessageTarget: true,
-      // Deliberately NOT forwarding cleanupBundleMcpOnRunEnd: on the CLI
-      // runner it closes the process-wide loopback MCP server, which a
-      // concurrent main turn or overlapping recall may still be using.
-      // Session-scoped MCP runtimes are retired below instead.
+      cleanupBundleMcpOnRunEnd: params.cleanupBundleMcpOnRunEnd,
     });
     finalAssistantText = result.payloads?.find(
       (payload) => payload.isReasoning !== true && typeof payload.text === "string",
@@ -273,48 +273,7 @@ async function runEmbeddedAgentViaCliBackend(
     unsubscribe();
     // Flush before the promise settles: timeout salvage reads the session
     // file as soon as the caller observes the rejection.
-    await transcript.finalize(finalAssistantText);
-    if (params.cleanupBundleMcpOnRunEnd === true) {
-      await retireDispatchSessionMcpRuntime(params);
-    }
-  }
-}
-
-/**
- * Mirrors the embedded runner's cleanupBundleMcpOnRunEnd semantics for the
- * CLI dispatch path: retire only this run's session-scoped MCP runtimes so
- * stdio children do not idle until the TTL reaper, without touching the
- * process-wide loopback server shared with concurrent CLI turns.
- */
-async function retireDispatchSessionMcpRuntime(params: {
-  sessionId: string;
-  sessionKey?: string;
-  runId: string;
-}): Promise<void> {
-  try {
-    const { retireSessionMcpRuntime, retireSessionMcpRuntimeForSessionKey } =
-      await import("../agent-bundle-mcp-tools.js");
-    const onError = (error: unknown, sessionId: string) => {
-      log.warn(
-        `bundle-mcp cleanup failed after CLI dispatch run: runId=${params.runId} sessionId=${sessionId} error=${String(error)}`,
-      );
-    };
-    const retiredBySessionKey = await retireSessionMcpRuntimeForSessionKey({
-      sessionKey: params.sessionKey,
-      reason: "embedded-cli-dispatch-run-end",
-      onError,
-    });
-    if (!retiredBySessionKey) {
-      await retireSessionMcpRuntime({
-        sessionId: params.sessionId,
-        reason: "embedded-cli-dispatch-run-end",
-        onError,
-      });
-    }
-  } catch (error) {
-    log.warn(
-      `bundle-mcp cleanup unavailable after CLI dispatch run: runId=${params.runId} error=${String(error)}`,
-    );
+    await transcript?.finalize(finalAssistantText);
   }
 }
 

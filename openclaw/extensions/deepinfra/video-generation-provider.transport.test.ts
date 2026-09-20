@@ -1,8 +1,8 @@
-// DeepInfra transport tests cover real provider-http request policy forwarding.
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { connect, type AddressInfo } from "node:net";
 import { withEnvAsync, withServer } from "openclaw/plugin-sdk/test-env";
-import { describe, expect, it, vi } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { WEBM_VIDEO } from "./video-generation.test-support.js";
 
 const resolveApiKeyForProviderMock = vi.hoisted(() =>
   vi.fn(async () => ({
@@ -27,15 +27,21 @@ type DestroyableConnection = {
   destroy: () => void;
 };
 
-async function buildTransportProofProvider() {
+let buildDeepInfraVideoGenerationProvider: typeof import("./video-generation-provider.js").buildDeepInfraVideoGenerationProvider;
+
+beforeAll(async () => {
   vi.resetModules();
   vi.doUnmock("openclaw/plugin-sdk/provider-http");
   vi.doMock("openclaw/plugin-sdk/provider-auth-runtime", () => ({
     resolveApiKeyForProvider: resolveApiKeyForProviderMock,
   }));
-  const { buildDeepInfraVideoGenerationProvider } = await import("./video-generation-provider.js");
-  return buildDeepInfraVideoGenerationProvider();
-}
+  ({ buildDeepInfraVideoGenerationProvider } = await import("./video-generation-provider.js"));
+});
+
+afterAll(() => {
+  vi.doUnmock("openclaw/plugin-sdk/provider-auth-runtime");
+  vi.resetModules();
+});
 
 async function readRequestBody(request: IncomingMessage): Promise<string> {
   const chunks: Buffer[] = [];
@@ -45,7 +51,7 @@ async function readRequestBody(request: IncomingMessage): Promise<string> {
   return Buffer.concat(chunks).toString("utf8");
 }
 
-function createDeepInfraHandler(requests: CapturedRequest[]) {
+function createDeepInfraHandler(requests: CapturedRequest[], buffer = WEBM_VIDEO) {
   return (request: IncomingMessage, response: ServerResponse) => {
     void (async () => {
       requests.push({
@@ -61,7 +67,7 @@ function createDeepInfraHandler(requests: CapturedRequest[]) {
           status: "succeeded",
           data: [
             {
-              url: `data:video/webm;base64,${Buffer.from("local-video").toString("base64")}`,
+              url: `data:video/webm;base64,${buffer.toString("base64")}`,
             },
           ],
         }),
@@ -144,7 +150,7 @@ async function generateLocalVideo(params: {
     proxy?: { mode: "env-proxy" };
   };
 }) {
-  const provider = await buildTransportProofProvider();
+  const provider = buildDeepInfraVideoGenerationProvider();
   return await provider.generateVideo({
     provider: "deepinfra",
     model: "deepinfra/Pixverse/Pixverse-T2V",
@@ -178,7 +184,7 @@ describe("deepinfra video generation provider transport", () => {
 
       expect(result.videos).toEqual([
         {
-          buffer: Buffer.from("local-video"),
+          buffer: WEBM_VIDEO,
           mimeType: "video/webm",
           fileName: "video-1.webm",
         },
@@ -193,6 +199,22 @@ describe("deepinfra video generation provider transport", () => {
         prompt: "transport proof",
       });
     });
+  });
+
+  it("rejects non-video bytes received through the real local transport", async () => {
+    const requests: CapturedRequest[] = [];
+    await withServer(
+      createDeepInfraHandler(requests, Buffer.from("not a video")),
+      async (baseUrl) => {
+        await expect(
+          generateLocalVideo({
+            baseUrl: `${baseUrl}/v1/openai`,
+            request: { allowPrivateNetwork: true },
+          }),
+        ).rejects.toThrow("DeepInfra video response: malformed video response");
+        expect(requests).toHaveLength(1);
+      },
+    );
   });
 
   it("routes configured env proxy policy through a real CONNECT tunnel", async () => {
@@ -239,7 +261,12 @@ describe("deepinfra video generation provider transport", () => {
           baseUrl: `${baseUrl}/v1/openai`,
           request,
         }),
-      ).rejects.toThrow();
+      ).rejects.toThrow(
+        expect.objectContaining({
+          name: "SsrFBlockedError",
+          message: expect.stringContaining("private/internal/special-use IP address"),
+        }),
+      );
       expect(requests).toHaveLength(0);
     });
   });

@@ -1,4 +1,4 @@
-import { WorkerProviderError } from "openclaw/plugin-sdk/plugin-entry";
+import { WorkerProviderError, type WorkerProvider } from "openclaw/plugin-sdk/plugin-entry";
 import { crabboxCommandError } from "./crabbox-worker-command-error.js";
 import {
   isUnrecognizedLease,
@@ -17,6 +17,27 @@ import {
 } from "./crabbox-worker-timeouts.js";
 
 export type LeaseCommandContext = { binary: string; id: string; provider: string };
+
+/** Allocation retains host and project authority independently of cancellation or cleanup. */
+export function createCrabboxProvisionAuthority(
+  options: Parameters<WorkerProvider["provision"]>[2],
+): { signal?: AbortSignal; assertCurrent: () => void } {
+  const assertHostCurrent = options?.assertCurrent;
+  if (!assertHostCurrent) {
+    throw new WorkerProviderError(
+      "Crabbox provisioning requires current Gateway allocation authority",
+    );
+  }
+  const signal = options?.signal;
+  const project = options?.project;
+  const assertCurrent = () => {
+    signal?.throwIfAborted();
+    assertHostCurrent();
+    project?.assertCurrent();
+  };
+  assertCurrent();
+  return { signal, assertCurrent };
+}
 export type InspectCommandResult =
   | { status: "found"; inspect: ParsedInspect }
   | { status: "unknown" };
@@ -147,7 +168,7 @@ function assertProvisionSecurityPolicy(params: { inspect: ParsedInspect; provide
 export async function waitForProvisionReady(
   params: ProvisionInspectContext & {
     refresh?: boolean;
-    sleep: (milliseconds: number) => Promise<void>;
+    sleep: (milliseconds: number, signal?: AbortSignal) => Promise<void>;
   },
 ): Promise<ParsedInspect> {
   let inspect = params.inspect;
@@ -173,12 +194,17 @@ export async function waitForProvisionReady(
   };
   try {
     inspect = params.refresh ? await inspectAgain() : params.inspect;
+    params.signal?.throwIfAborted();
     // Reject forbidden state immediately; omitted AWS metadata is pending only until ready.
     assertProvisionSecurityPolicy({ inspect, provider: params.provider });
     while (inspect.ready !== true && !isNonRunnableState(inspect.state)) {
       params.signal?.throwIfAborted();
       const remaining = remainingProvisionTimeout(params.deadline, CRABBOX_LIFECYCLE_TIMEOUT_MS);
-      await params.sleep(Math.min(resolveCrabboxReadyPollIntervalMs(params.provider), remaining));
+      await params.sleep(
+        Math.min(resolveCrabboxReadyPollIntervalMs(params.provider), remaining),
+        params.signal,
+      );
+      params.signal?.throwIfAborted();
       inspect = await inspectAgain();
       assertProvisionSecurityPolicy({ inspect, provider: params.provider });
     }
@@ -200,15 +226,14 @@ export async function waitForProvisionReady(
 // Setup runs on every provision attempt (including replay adoption), so commands
 // must be idempotent. A failed setup stops the lease before surfacing the error;
 // otherwise the caller cannot release a box it never learned about.
-export async function runProvisionSetupAndWaitReady(
+export async function runProvisionSetup(
   params: ProvisionInspectContext & {
     phase: string;
     setup: string;
     timeoutMs?: number;
     forwardedEnv?: Record<string, string>;
-    sleep: (milliseconds: number) => Promise<void>;
   },
-): Promise<ParsedInspect> {
+): Promise<void> {
   try {
     const result = await withCrabboxWorkerEnvProfile(
       params.forwardedEnv,
@@ -228,12 +253,21 @@ export async function runProvisionSetupAndWaitReady(
         }),
     );
     if (result.termination !== "exit" || result.code !== 0) {
-      throw new WorkerProviderError(crabboxCommandError(params.phase, result).message);
+      throw crabboxCommandError(params.phase, result);
     }
   } catch (error) {
     params.signal?.throwIfAborted();
     return await failProvisionAfterCleanup({ ...params, id: params.inspect.id }, error);
   }
+  params.signal?.throwIfAborted();
+}
+
+export async function runProvisionSetupAndWaitReady(
+  params: Parameters<typeof runProvisionSetup>[0] & {
+    sleep: (milliseconds: number, signal?: AbortSignal) => Promise<void>;
+  },
+): Promise<ParsedInspect> {
+  await runProvisionSetup(params);
   // Setup may restart SSH or change its endpoint. Re-read the authoritative lease before
   // returning any endpoint or security attestation to core bootstrap.
   return await waitForProvisionReady({ ...params, refresh: true });
@@ -248,5 +282,5 @@ export async function failProvisionAfterCleanup(
   } catch (cleanupError) {
     throw WorkerProviderError.cleanupIndeterminate(params.id, provisionError, cleanupError);
   }
-  throw provisionError;
+  throw WorkerProviderError.cleanupComplete(params.id, provisionError);
 }

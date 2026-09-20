@@ -6,7 +6,9 @@ read_when:
 title: "Health checks"
 ---
 
-Short guide to verify channel connectivity without guessing.
+Short guide to verify Gateway and channel health without guessing. It covers the
+CLI health checks, the HTTP probe endpoints, the dedicated `health` command, and
+uptime monitoring.
 
 ## Quick checks
 
@@ -30,9 +32,21 @@ Per-agent session counts and recent activity include only that agent's sessions,
 even when agents share a SQLite session store. Status counts each physical store
 once in its aggregate. The top-level health session summary represents the
 default agent, or the first configured agent when there is no default; it is not
-a fleet total.
+a fleet total. A running Gateway serves clean health and status session summaries
+from its resident session-row projection. Store hydration and exact dirty-row
+refreshes retain the existing read-only SQLite fallback.
 
 ## Deep diagnostics
+
+`openclaw health --json` reports `modelRuntime.degraded: true` when a large
+fleet's model preparation exceeds the startup budget. `pendingAgents` names the
+agents still preparing and `stage` identifies the current acquisition phase.
+The Gateway remains running and completed agents remain usable. Background
+preparation clears the degraded status when all runtimes are ready.
+
+Health and status collection groups fast session-store reads into short work
+slices, keeping busy background preparation from delaying every individual read.
+Slow reads finish their transaction before yielding to other Gateway work.
 
 - Creds on disk: `ls -l ~/.openclaw/credentials/whatsapp/<accountId>/creds.json` (mtime should be recent).
 - Session store: `ls -l ~/.openclaw/agents/<agentId>/agent/openclaw-agent.sqlite`. Count and recent recipients are surfaced via `status`.
@@ -72,6 +86,75 @@ The Gateway exposes three unauthenticated `GET`/`HEAD` probe pairs:
 
 Remote unauthenticated startup responses contain only `ok` and `status`. Local-direct and authenticated callers also receive `version`, `uptimeMs`, and `pendingReason` while startup is pending. Readiness details follow the same local-or-authenticated gate because they can name failing subsystems.
 
+### Plugin replacement recovery
+
+During plugin replacement or recovery, `/readyz` returns `503`. Detailed responses
+include `failing: ["plugin-reload"]` and a `pluginReload` object with the affected
+`pluginIds`, the current `phase` (`reloading`, `recovering`, or `failed`), and any
+recovery `deadlineAtMs` and actionable `reason`. These owner-reported facts bypass
+the channel readiness cache, so a failed replacement cannot appear as only a
+generic channel outage or stale healthy result.
+
+The health monitor does not spend channel restart attempts while replacement
+holds channel admission paused. After successful rollback, the previous plugin
+configuration restarts its channels and ordinary readiness checks resume. If
+automatic recovery reaches its deadline, `phase: "failed"` retains the failure
+reason and next action. Admission pauses are released, allowing the monitor to
+restart callable channels; a plugin whose admitted work or cleanup still owns
+resources requires the reported repair or retry before it can restart. See
+[Config hot reload](/gateway/configuration/hot-reload) for the recovery contract.
+
+### CPU pressure and event-loop delay
+
+Detailed readiness can include the latest completed `eventLoop` diagnostic
+snapshot. The sampler owns observation windows; health reads do not reset a
+pending measurement. No snapshot is available until the first window completes. Its
+`cpuCoreRatio` measures user and system CPU time across the whole Gateway process,
+including worker and native threads, divided by elapsed wall time. The unit is
+core equivalents: `1` means one CPU core fully occupied over the interval, and
+parallel work can produce values above `1`. It is not a percentage of the host's
+total CPU capacity.
+
+The optional `cpuBreakdown` separates independent native counters:
+
+- `hostUtilization` is the busy fraction of the host CPU time reported by
+  `os.cpus()`, from `0` to `1` across `hostCpuCount` logical CPUs. This includes
+  other processes and is not the Gateway's CPU quota or container allowance.
+- `mainThreadCoreRatio` measures the Gateway main thread with
+  `process.threadCpuUsage()`, not event-loop utilization.
+- `workerCoreRatio` sums `Worker.cpuUsage()` counters for workers owned by the
+  task pools and SQLite broker. It does not include subprocesses, remote workers,
+  or workers created outside those owners.
+- `otherThreadsCoreRatio` is an **estimated residual**: process CPU minus the
+  measured main and tracked worker CPU, clamped at zero. It includes untracked
+  workers and native threads, not a measured worker category.
+
+Thread values use the same core-equivalent unit as `cpuCoreRatio`. Worker reads
+are asynchronous and must complete within 100 ms of each sampling boundary;
+these are not atomic cross-thread measurements. The residual can vary with
+measurement skew. A timed-out request never delays the event-loop sample, and
+at most one native request is outstanding per tracked worker, even across
+monitor resets. Startup, worker creation/exit, host CPU topology changes, counter
+resets, and collection failures require fresh baselines before publishing the
+affected rates. Missing fields mean unavailable, not zero.
+
+The main-thread and host counters are collected independently on Node and Bun.
+Tracked worker CPU and the residual are omitted on Bun: its worker API can
+report zero when native counter collection fails. Unsupported or failed native
+APIs on any platform leave the corresponding field absent.
+
+The Control UI's **CPU** box reads the same sampler through `system.info.eventLoop`.
+Its detail overlay shows host usage separately from the process and thread
+breakdown. Process and thread percentages use `100%` for one fully occupied
+core; host usage uses `100%` for all reported logical CPUs. Values show a dash
+until their first complete measurement, or while unavailable.
+
+Event-loop delay and utilization describe the main thread separately. A `cpu`
+degradation reason reports process CPU pressure with delay co-evidence; it does
+not identify the thread consuming CPU or prove a main-thread hang. Inspect the
+delay measurements alongside CPU pressure. The `eventLoop` diagnostic does not
+change the readiness result by itself.
+
 ## Uptime monitoring
 
 External uptime monitoring services should use the dedicated `/health` endpoint, not `/v1/chat/completions`.
@@ -85,7 +168,7 @@ When no `x-openclaw-session-key` header or `user` field is provided, `/v1/chat/c
 
 - **BetterStack:** Set health check URL to `https://<your-gateway-host>:<port>/health`
 - **UptimeRobot:** Add a new HTTP monitor with URL `https://<your-gateway-host>:<port>/health`
-- **Generic:** Any HTTP GET to `/health` returns 200 with `{"ok":true}` when the gateway is healthy
+- **Generic:** Any HTTP GET to `/health` returns 200 with `{"ok":true,"status":"live"}` while the gateway's HTTP server is live
 
 ## When something fails
 
@@ -98,6 +181,11 @@ When no `x-openclaw-session-key` header or `user` field is provided, `/v1/chat/c
 `openclaw health` asks the running gateway for its health snapshot (no direct channel
 sockets from the CLI). By default it returns a fresh cached gateway snapshot and the
 gateway refreshes that cache in the background; `--verbose` forces a live probe instead.
+Connections and cached health reads share a one-minute background refresh cadence, so
+repeated diagnostic connections do not each rebuild the health snapshot. Explicit live
+probes and refreshes for missing or stale health still run immediately.
+Snapshots describe loaded and configured channels. Stored credentials alone do not
+activate a channel or add it to Gateway health; use channel setup to enable it.
 The command reports linked creds/auth age when available, per-channel probe summaries,
 session-store summary, and probe duration. Live probes use bounded account concurrency
 and a Gateway-owned deadline, so one slow account returns a structured timeout while
@@ -139,3 +227,4 @@ The health snapshot includes: `ok` (boolean), `ts` (timestamp), `durationMs` (pr
 - [Gateway runbook](/gateway)
 - [Diagnostics export](/gateway/diagnostics)
 - [Gateway troubleshooting](/gateway/troubleshooting)
+- [`openclaw health`](/cli/health) — request this snapshot over RPC from the CLI

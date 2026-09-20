@@ -22,11 +22,21 @@ export const TSGO_CORE_TEST_SHARDS = [
     config: "test/tsconfig/tsconfig.core.test.gateway-root.json",
   },
   {
+    name: "gateway-server",
+    group: "src",
+    config: "test/tsconfig/tsconfig.core.test.gateway-server.json",
+  },
+  {
     name: "gateway-other",
     group: "src",
     config: "test/tsconfig/tsconfig.core.test.gateway-other.json",
   },
   { name: "infra", group: "src", config: "test/tsconfig/tsconfig.core.test.infra.json" },
+  {
+    name: "state-logging",
+    group: "src",
+    config: "test/tsconfig/tsconfig.core.test.state-logging.json",
+  },
   { name: "commands", group: "src", config: "test/tsconfig/tsconfig.core.test.commands.json" },
   {
     name: "plugins-platform",
@@ -57,6 +67,32 @@ export const TSGO_CORE_TEST_SHARDS = [
     group: "packages",
     config: "test/tsconfig/tsconfig.test.packages.json",
     sparseRoots: ["packages", "src", "ui/src"],
+  },
+  {
+    name: "plugin-sdk",
+    group: "src",
+    config: "test/tsconfig/tsconfig.core.test.plugin-sdk.json",
+  },
+  // Append new splits to preserve the existing CI stripe assignments.
+  {
+    name: "commands-doctor",
+    group: "src",
+    config: "test/tsconfig/tsconfig.core.test.commands-doctor.json",
+  },
+  {
+    name: "cli-update",
+    group: "src",
+    config: "test/tsconfig/tsconfig.core.test.cli-update.json",
+  },
+  {
+    name: "gateway-methods",
+    group: "src",
+    config: "test/tsconfig/tsconfig.core.test.gateway-methods.json",
+  },
+  {
+    name: "ui-chat",
+    group: "ui",
+    config: "test/tsconfig/tsconfig.core.test.ui-chat.json",
   },
 ] as const;
 

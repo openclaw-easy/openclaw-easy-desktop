@@ -8,8 +8,9 @@ import {
   parseSqliteSessionFileMarker,
 } from "../../config/sessions/legacy-sqlite-marker.js";
 import {
-  listSessionEntriesCore,
+  listSessionEntriesReadOnly,
   loadSessionEntry,
+  loadSessionEntryReadOnly,
   patchSessionEntryCore,
   type SessionTranscriptRuntimeTarget,
 } from "../../config/sessions/session-accessor.js";
@@ -25,9 +26,10 @@ import {
 import { resolveStableSessionEndTranscript } from "../../gateway/session-transcript-files.fs.js";
 import { logVerbose } from "../../globals.js";
 import { getGlobalHookRunner } from "../../plugins/hook-runner-global.js";
-import { runWithGatewayIndependentRootWorkContinuation } from "../../process/gateway-work-admission.js";
+import { runWithGatewayDetachedWorkContinuation } from "../../process/gateway-work-admission.js";
 import { resolveAgentIdFromSessionKey } from "../../routing/session-key.js";
 import { resolvePreferredSessionKeyForSessionIdMatches } from "../../sessions/session-id-resolution.js";
+import { retireSessionMcpRuntime } from "../agent-bundle-mcp-manager-api.js";
 import { resolveAgentRunSessionTarget } from "../run-session-target.js";
 import { captureSessionPlacementCompactionSuccessorAssertion } from "../session-placement-admission.js";
 import { log } from "./logger.js";
@@ -83,7 +85,7 @@ export async function resolveContextEngineCompactionSuccessor(params: {
     }
     const isSessionKey = successorFile.startsWith("agent:");
     const keyedEntry = isSessionKey
-      ? loadSessionEntry({
+      ? loadSessionEntryReadOnly({
           agentId: current.agentId,
           sessionKey: successorFile,
           storePath: current.storePath,
@@ -99,14 +101,14 @@ export async function resolveContextEngineCompactionSuccessor(params: {
     }
     const keyedSessionId = isSessionKey ? (successorId ?? keyedEntry?.sessionId) : undefined;
     const retainedMarkerEntry = marker
-      ? loadSessionEntry({
+      ? loadSessionEntryReadOnly({
           agentId: marker.agentId,
           sessionKey: current.sessionKey,
           storePath: marker.storePath,
         })
       : undefined;
     const markerMatches = marker
-      ? listSessionEntriesCore({
+      ? listSessionEntriesReadOnly({
           agentId: marker.agentId,
           storePath: marker.storePath,
         }).filter(({ entry }) => entry.sessionId === marker.sessionId)
@@ -259,6 +261,14 @@ export async function acceptCompactionSuccessor(params: {
     log.warn(`compaction successor committed but publication failed: ${String(error)}`);
     return committed;
   } finally {
+    if (committed) {
+      await retireSessionMcpRuntime({
+        sessionId: currentTarget.sessionId,
+        reason: "compaction-session-end",
+        retainAcrossReuse: true,
+        preserveActiveLeases: true,
+      });
+    }
     if (committed && params.config) {
       try {
         emitCompactionSessionLifecycleHooks({
@@ -333,9 +343,9 @@ function emitCompactionSessionLifecycleHooks(params: {
       transcriptArchived: transcript.transcriptArchived,
       nextSessionId: params.nextEntry.sessionId,
     });
-    void runWithGatewayIndependentRootWorkContinuation(async () => {
+    void runWithGatewayDetachedWorkContinuation(async () => {
       await hookRunner.runSessionEnd(payload.event, payload.context);
-    }).catch((error: unknown) => {
+    }, "hooks:session-end").catch((error: unknown) => {
       logVerbose(`session_end hook failed: ${String(error)}`);
     });
   }
@@ -346,9 +356,9 @@ function emitCompactionSessionLifecycleHooks(params: {
       agentId,
       resumedFrom: params.previousEntry.sessionId,
     });
-    void runWithGatewayIndependentRootWorkContinuation(async () => {
+    void runWithGatewayDetachedWorkContinuation(async () => {
       await hookRunner.runSessionStart(payload.event, payload.context);
-    }).catch((error: unknown) => {
+    }, "hooks:session-start").catch((error: unknown) => {
       logVerbose(`session_start hook failed: ${String(error)}`);
     });
   }

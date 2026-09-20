@@ -12,6 +12,7 @@ import {
 import { writeGeneratedOutput } from "./lib/generated-output-utils.mts";
 
 type JsonSchema = {
+  "~openclawClosedObjectIdentity"?: symbol;
   type?: string | string[];
   const?: boolean | number | string | null;
   properties?: Record<string, JsonSchema>;
@@ -133,8 +134,46 @@ function swiftCompatibilityPropertyLines(structName: string, key: string): strin
 
 // filled later once schemas are loaded
 const schemaNameByObject = new Map<object, string>();
-const schemaNameBySignature = new Map<string, string>();
-const duplicateSchemaSignatures = new Set<string>();
+const schemaNameBySignature = new Map<string, string | undefined>();
+const schemaNamesByIdentity = new Map<symbol, Map<string, string | undefined>>();
+
+// These names already appear in generated public field types. Registry ordering
+// must not choose a different nominal type when schemas share the same object.
+const CANONICAL_SCHEMA_ALIASES = new Set([
+  "ArtifactsDownloadParams",
+  "DevicePairSetupDeliveryUncertainEvent",
+  "GatewaySuspendResumeParams",
+  "ProgressCardPutResult",
+  "ProjectsAddResult",
+  "SessionDiscussionOpenResult",
+  "SessionMemberRemoveParams",
+  "UsersAuthConnectCancelParams",
+  "WizardStartResult",
+  "WizardStatusParams",
+]);
+
+function resolveSchemaObjectAliases(
+  definitions: Array<[string, JsonSchema]>,
+): Map<JsonSchema, string> {
+  const aliases = new Map<JsonSchema, string[]>();
+  for (const [name, schema] of definitions) {
+    const names = aliases.get(schema) ?? [];
+    names.push(name);
+    aliases.set(schema, names);
+  }
+  const result = new Map<JsonSchema, string>();
+  for (const [schema, names] of aliases) {
+    if (names.length === 1) {
+      continue;
+    }
+    const [preferred, duplicate] = names.filter((name) => CANONICAL_SCHEMA_ALIASES.has(name));
+    if (preferred === undefined || duplicate !== undefined) {
+      throw new Error(`Choose one canonical Swift schema name for aliases: ${names.join(", ")}`);
+    }
+    result.set(schema, preferred);
+  }
+  return result;
+}
 
 function stableJson(value: unknown): unknown {
   if (Array.isArray(value)) {
@@ -155,24 +194,38 @@ function schemaSignature(schema: JsonSchema): string {
   return JSON.stringify(stableJson(schema));
 }
 
-function registerNamedSchema(name: string, schema: JsonSchema): void {
-  schemaNameByObject.set(schema as object, name);
+function registerNamedSchema(name: string, schema: JsonSchema, objectName: string): void {
+  schemaNameByObject.set(schema as object, objectName);
   const signature = schemaSignature(schema);
-  if (duplicateSchemaSignatures.has(signature)) {
-    return;
+  registerUniqueName(schemaNameBySignature, signature, name);
+  const identity = schema["~openclawClosedObjectIdentity"];
+  if (identity) {
+    const names = schemaNamesByIdentity.get(identity) ?? new Map<string, string | undefined>();
+    registerUniqueName(names, signature, name);
+    schemaNamesByIdentity.set(identity, names);
   }
-  if (schemaNameBySignature.has(signature)) {
-    schemaNameBySignature.delete(signature);
-    duplicateSchemaSignatures.add(signature);
-    return;
-  }
-  schemaNameBySignature.set(signature, name);
 }
 
-function namedSchema(schema: JsonSchema, allowStructuralFallback = false): string | undefined {
+function registerUniqueName(
+  names: Map<string, string | undefined>,
+  signature: string,
+  name: string,
+) {
+  names.set(signature, names.has(signature) ? undefined : name);
+}
+
+function namedSchema(
+  schema: JsonSchema,
+  allowStructuralFallback = false,
+  identity?: symbol,
+): string | undefined {
   return (
     schemaNameByObject.get(schema as object) ??
-    (allowStructuralFallback ? schemaNameBySignature.get(schemaSignature(schema)) : undefined)
+    (identity
+      ? schemaNamesByIdentity.get(identity)?.get(schemaSignature(schema))
+      : allowStructuralFallback
+        ? schemaNameBySignature.get(schemaSignature(schema))
+        : undefined)
   );
 }
 
@@ -195,10 +248,12 @@ function swiftType(schema: JsonSchema, required: boolean, allowStructuralNamed =
   const t = normalizedSchema.type;
   const isOptional = !required;
   let base: string;
-  let named = namedSchema(normalizedSchema, allowStructuralNamed);
+  // Normalization spreads the schema, so retain its hidden identity before copying.
+  const identity = schema["~openclawClosedObjectIdentity"];
+  let named = namedSchema(normalizedSchema, allowStructuralNamed, identity);
   if (!named && nullableTypeArray && (normalizedSchema.anyOf || normalizedSchema.oneOf)) {
     const { type: _normalizedType, ...normalizedStructuralSchema } = normalizedSchema;
-    named = namedSchema(normalizedStructuralSchema, allowStructuralNamed);
+    named = namedSchema(normalizedStructuralSchema, allowStructuralNamed, identity);
   }
   if (named) {
     base = named;
@@ -678,24 +733,41 @@ function emitDiscriminatedUnionCompatibility(
   ];
 }
 
+function objectUnionBranches(schema: JsonSchema): JsonSchema[] {
+  if (schema.type === "object") {
+    return [schema];
+  }
+  const branches = (schema.oneOf ?? schema.anyOf)?.map(objectUnionBranches);
+  return branches?.length && branches.every((branch) => branch.length > 0) ? branches.flat() : [];
+}
+
 function emitDiscriminatedUnion(name: string, schema: JsonSchema): string | undefined {
   const branches = schema.oneOf ?? schema.anyOf;
   if (!branches || branches.length < 2) {
     return undefined;
   }
-  const objectBranches = branches.filter((branch) => branch.type === "object");
-  if (objectBranches.length !== branches.length) {
+  const objectBranches = branches.map(objectUnionBranches);
+  if (objectBranches.some((branch) => branch.length === 0)) {
     return undefined;
   }
-  const discriminatorCandidates = Object.keys(objectBranches[0]?.properties ?? {});
+  const discriminatorCandidates = Object.keys(objectBranches[0]?.[0]?.properties ?? {});
   for (const discriminator of discriminatorCandidates) {
-    const cases = objectBranches.map((branch, index) => {
-      const discriminatorSchema = branch.properties?.[discriminator];
-      const literal = discriminatorSchema ? literalSchemaValue(discriminatorSchema) : undefined;
-      if (literal === undefined) {
+    const caseCounts = new Map<string, number>();
+    const cases = branches.map((branch, index) => {
+      const literals = objectBranches[index]!.map((object) => {
+        const property = object.properties?.[discriminator];
+        return property ? literalSchemaValue(property) : undefined;
+      });
+      const literal = literals[0];
+      // A named nested union can share one outer tag while selecting its own variants.
+      if (literal === undefined || literals.some((value) => value !== literal)) {
         return undefined;
       }
-      const caseName = swiftUnionCaseName(literal, `case${index + 1}`);
+      const baseCaseName = swiftUnionCaseName(literal, `case${index + 1}`);
+      const occurrence = (caseCounts.get(baseCaseName) ?? 0) + 1;
+      caseCounts.set(baseCaseName, occurrence);
+      const caseName = occurrence === 1 ? baseCaseName : `${baseCaseName}${occurrence}`;
+      // Union cases retain their established structural names; properties use nominal identity.
       const registeredName = namedSchema(branch, true);
       const branchName =
         registeredName ?? `${name}${caseName.charAt(0).toUpperCase()}${caseName.slice(1)}`;
@@ -720,9 +792,30 @@ function emitDiscriminatedUnion(name: string, schema: JsonSchema): string | unde
     const literalType = swiftLiteralTypeName(firstCase.literal);
     if (
       resolvedCases.some((entry) => swiftLiteralTypeName(entry.literal) !== literalType) ||
-      new Set(resolvedCases.map((entry) => String(entry.literal))).size !== resolvedCases.length
+      new Set(resolvedCases.map((entry) => String(entry.literal))).size < 2
     ) {
       continue;
+    }
+    const groups = new Map<string, typeof resolvedCases>();
+    for (const entry of resolvedCases) {
+      const key = swiftLiteralSource(entry.literal);
+      const group = groups.get(key) ?? [];
+      group.push(entry);
+      groups.set(key, group);
+    }
+    const repeatedCases = [...groups.values()].filter((group) => group.length > 1).flat();
+    if (
+      repeatedCases.some(
+        (entry) => entry.branch.type !== "object" || entry.branch.additionalProperties !== false,
+      )
+    ) {
+      continue;
+    }
+    // Shared tags are safe only with strict branch decoders: synthesized Codable
+    // would otherwise accept extra fields and silently choose a different variant.
+    for (const entry of repeatedCases) {
+      entry.registeredName = undefined;
+      entry.branchName = `${name}${entry.caseName.charAt(0).toUpperCase()}${entry.caseName.slice(1)}`;
     }
     const coversAllBoolCases =
       literalType === "Bool" &&
@@ -738,11 +831,40 @@ function emitDiscriminatedUnion(name: string, schema: JsonSchema): string | unde
           `                debugDescription: "Unknown ${name} discriminator value"`,
           "            )",
         ];
+    const decodeCases: string[] = [];
+    for (const [literal, entries] of groups) {
+      if (entries.length === 1) {
+        const entry = entries[0]!;
+        decodeCases.push(
+          `        case ${literal}: self = try .${entry.caseName}(${entry.branchName}(from: decoder))`,
+        );
+        continue;
+      }
+      decodeCases.push(`        case ${literal}:`);
+      for (const entry of entries) {
+        decodeCases.push(
+          `            if let value = try? ${entry.branchName}(from: decoder) {\n                self = .${entry.caseName}(value)\n                return\n            }`,
+        );
+      }
+      decodeCases.push(
+        `            throw DecodingError.dataCorruptedError(\n                forKey: .discriminator,\n                in: container,\n                debugDescription: "No matching ${name} variant"\n            )`,
+      );
+    }
     return [
       // Inline union branches need declarations too; only registered schemas have an external owner.
-      ...resolvedCases.flatMap((entry) =>
-        entry.registeredName ? [] : [emitStruct(entry.branchName, entry.branch, true)],
-      ),
+      ...resolvedCases.flatMap((entry) => {
+        if (entry.registeredName) {
+          return [];
+        }
+        const declaration =
+          entry.branch.type === "object"
+            ? emitStruct(entry.branchName, entry.branch, true)
+            : emitDiscriminatedUnion(entry.branchName, entry.branch);
+        if (!declaration) {
+          throw new Error(`Cannot emit nested Swift union ${entry.branchName}`);
+        }
+        return [declaration];
+      }),
       `public enum ${name}: Codable, Sendable {`,
       ...resolvedCases.map((entry) => `    case ${entry.caseName}(${entry.branchName})`),
       "",
@@ -755,10 +877,7 @@ function emitDiscriminatedUnion(name: string, schema: JsonSchema): string | unde
       "        let container = try decoder.container(keyedBy: CodingKeys.self)",
       `        let discriminator = try container.decode(${literalType}.self, forKey: .discriminator)`,
       "        switch discriminator {",
-      ...resolvedCases.map(
-        (entry) =>
-          `        case ${swiftLiteralSource(entry.literal)}: self = try .${entry.caseName}(${entry.branchName}(from: decoder))`,
-      ),
+      ...decodeCases,
       ...unknownDiscriminatorLines,
       "        }",
       "    }",
@@ -834,9 +953,10 @@ function emitGatewayFrame(): string {
 
 async function generate() {
   const definitions = Object.entries(ProtocolSchemas) as Array<[string, JsonSchema]>;
+  const objectAliases = resolveSchemaObjectAliases(definitions);
 
   for (const [name, schema] of definitions) {
-    registerNamedSchema(name, schema);
+    registerNamedSchema(name, schema, objectAliases.get(schema) ?? name);
   }
 
   const parts: string[] = [];

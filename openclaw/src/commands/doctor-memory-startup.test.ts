@@ -2,12 +2,12 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, assert, beforeEach, describe, expect, it } from "vitest";
 import { resolveApiKeyForProfile } from "../agents/auth-profiles/oauth.js";
-import { loadAuthProfileStoreForSecretsRuntime } from "../agents/auth-profiles/store.js";
+import { loadAuthProfileStoreForSecretsRuntime } from "../agents/auth-profiles/store-runtime.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { ensureMemoryIndexSchema } from "../plugin-sdk/memory-core-host-engine-storage.js";
 import { createPluginStateKeyedStoreForTests } from "../plugin-sdk/plugin-state-test-runtime.js";
 import { createTestPluginApi } from "../plugin-sdk/plugin-test-api.js";
-import { loadBundledPluginPublicSurface } from "../plugin-sdk/test-helpers/public-surface-loader.js";
+import { createPluginRuntimeMock } from "../plugin-sdk/test-helpers/plugin-runtime-mock.js";
 import {
   coercePluginDoctorContractModule,
   type PluginDoctorContractModule,
@@ -17,6 +17,7 @@ import {
   getRegisteredEmbeddingProvider,
   registerEmbeddingProvider,
 } from "../plugins/embedding-providers.js";
+import { resolveNativePluginModelAuth } from "../plugins/loader-runtime-load.js";
 import { createEmptyPluginRegistry } from "../plugins/registry-empty.js";
 import { setActivePluginRegistry } from "../plugins/runtime.js";
 import type { OpenClawPluginDefinition } from "../plugins/types.js";
@@ -26,17 +27,22 @@ import {
   prepareSecretsRuntimeSnapshot,
 } from "../secrets/runtime.js";
 import { writeSecretStoreEntry } from "../secrets/store/secret-store.js";
+import { loadBundledPluginFacade } from "../test-utils/bundled-plugin-public-surface.js";
 import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
 
 beforeEach(async () => {
   setActivePluginRegistry(createEmptyPluginRegistry());
   // The shared loader resolves manifest-owned public artifacts from checkout source, never dist.
-  const { default: openaiPlugin } = await loadBundledPluginPublicSurface<{
+  const { default: openaiPlugin } = await loadBundledPluginFacade<{
     default: OpenClawPluginDefinition;
   }>({ pluginId: "openai", artifactBasename: "index.js" });
   assert(openaiPlugin.register);
   openaiPlugin.register(
-    createTestPluginApi({ registrationMode: "discovery", registerEmbeddingProvider }),
+    createTestPluginApi({
+      registrationMode: "discovery",
+      runtime: createPluginRuntimeMock({ modelAuth: resolveNativePluginModelAuth() }),
+      registerEmbeddingProvider,
+    }),
   );
 });
 
@@ -134,7 +140,7 @@ describe("Memory Core cold startup migrations", () => {
             context,
           };
           const { stateMigrations } = coercePluginDoctorContractModule(
-            await loadBundledPluginPublicSurface<PluginDoctorContractModule>({
+            await loadBundledPluginFacade<PluginDoctorContractModule>({
               pluginId: "memory-core",
               artifactBasename: "doctor-contract-api.js",
             }),

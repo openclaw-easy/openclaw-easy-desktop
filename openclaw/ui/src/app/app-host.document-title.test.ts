@@ -53,7 +53,7 @@ describe("OpenClaw shell document title", () => {
         snapshot: { approvalQueue: Array.from({ length: options.approvalCount ?? 0 }) },
       },
       sessions: {
-        state: { result: options.sessions ? { sessions: options.sessions } : null },
+        presentation: { result: options.sessions ? { sessions: options.sessions } : null },
       },
     } as unknown as ApplicationContext;
   }
@@ -178,7 +178,7 @@ describe("OpenClaw shell document title", () => {
 
     shell.syncDocumentTitle();
 
-    expect(document.title).toBe("(Disconnected · 3 queued) Usage — OpenClaw");
+    expect(document.title).toBe("(Disconnected · 3 in outbox) Usage — OpenClaw");
   });
 
   it("uses the meaningful custodian label without a brand suffix", () => {

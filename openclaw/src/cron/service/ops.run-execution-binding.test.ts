@@ -1,8 +1,8 @@
 // Focused proof that manual cron admission binds exact owner-native rows.
 import { describe, expect, it, vi } from "vitest";
 import {
+  createCronRegressionState,
   createDueIsolatedJob,
-  noopLogger,
   setupCronRegressionFixtures,
 } from "../../../test/helpers/cron/service-regression-fixtures.js";
 import type { AdmittedRunContext } from "../../agents/admitted-run-context.js";
@@ -25,7 +25,6 @@ import {
   prepareCronRunReceiptClaim,
 } from "../store/run-receipt-store.js";
 import { run } from "./ops-run.js";
-import { createCronServiceState } from "./state.js";
 import {
   createCronOwnerExecutionIdentityAdmission,
   tryCreateCronTaskRunHandle,
@@ -54,8 +53,8 @@ describe("cron run execution binding", () => {
           async (params: {
             executionIdentity?: {
               ingress: { kind: string };
-              onPostAdmission?: (context: AdmittedRunContext) => void;
-              onExecutionStarted?: () => void;
+              onPostAdmission?: (context: AdmittedRunContext) => void | Promise<void>;
+              onExecutionStarted?: () => void | Promise<void>;
             };
           }) => {
             const admitted = {
@@ -70,21 +69,17 @@ describe("cron run execution binding", () => {
             expect(tableExists(beforeAdmissionSettles, "execution_owner_lifecycle_bindings")).toBe(
               false,
             );
-            params.executionIdentity?.onPostAdmission?.(admitted);
+            await params.executionIdentity?.onPostAdmission?.(admitted);
             expect(tableExists(beforeAdmissionSettles, "execution_owner_lifecycle_bindings")).toBe(
               false,
             );
-            params.executionIdentity?.onExecutionStarted?.();
+            await params.executionIdentity?.onExecutionStarted?.();
             return { status: "ok" as const };
           },
         );
-        const state = createCronServiceState({
-          cronEnabled: true,
+        const state = createCronRegressionState({
           storePath: store.storePath,
-          log: noopLogger,
           nowMs: () => dueAt,
-          enqueueSystemEvent: vi.fn(),
-          requestHeartbeat: vi.fn(),
           runIsolatedAgentJob,
         });
 
@@ -149,13 +144,9 @@ describe("cron run execution binding", () => {
           agentId: "main",
         };
         await saveCronStore(store.storePath, { version: 1, jobs: [job] });
-        const state = createCronServiceState({
-          cronEnabled: true,
+        const state = createCronRegressionState({
           storePath: store.storePath,
-          log: noopLogger,
           nowMs: () => dueAt,
-          enqueueSystemEvent: vi.fn(),
-          requestHeartbeat: vi.fn(),
           runIsolatedAgentJob: vi.fn(),
         });
         const prepared = prepareCronRunReceiptClaim({
@@ -197,7 +188,7 @@ describe("cron run execution binding", () => {
             now: dueAt,
           }),
         } satisfies AdmittedRunContext;
-        executionIdentity.onPostAdmission?.(admitted);
+        await executionIdentity.onPostAdmission?.(admitted);
         const db = openOpenClawStateDatabase().db;
         db.prepare("UPDATE cron_run_receipts SET owner_pid = ? WHERE receipt_id = ?").run(
           2_147_483_647,
@@ -217,7 +208,7 @@ describe("cron run execution binding", () => {
           }),
         );
 
-        executionIdentity.onExecutionStarted?.();
+        await executionIdentity.onExecutionStarted?.();
         expect(
           tableExists(openOpenClawStateDatabase().db, "execution_owner_lifecycle_bindings"),
         ).toBe(false);

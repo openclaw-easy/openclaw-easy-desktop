@@ -1,11 +1,13 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../../test/helpers/promise.js";
 import {
   closeOpenClawStateDatabaseForTest,
   openOpenClawStateDatabase,
 } from "../../state/openclaw-state-db.js";
+import * as observeBridge from "../desktop/observe-bridge.js";
 import { STALE_WORKER_BUILD_REASON } from "./admission.js";
 import type { WorkerNodeDesktopCarrier } from "./node-desktop-carrier.js";
+import { createWorkerNodePortalCarrier } from "./portal-node-carrier.js";
 import * as support from "./service.test-support.js";
 import { createWorkerEnvironmentStore } from "./store.js";
 import type { WorkerTunnelManager } from "./tunnel.js";
@@ -15,15 +17,22 @@ type WorkerEnvironmentServiceError = support.WorkerEnvironmentServiceError;
 
 describe("worker environment service", () => {
   support.setupWorkerEnvironmentServiceSuite();
+  afterEach(() => vi.restoreAllMocks());
 
   it("drains all tunnel owners before reporting an independent shutdown failure", async () => {
     const shutdownError = new Error("SSH tunnel shutdown failed");
     const nodeShutdown = createDeferred();
+    const portalShutdown = createDeferred();
+    const portalStopStarted = createDeferred();
+    const nodePortalCarrier = createWorkerNodePortalCarrier({ store: support.testState.store });
+    vi.spyOn(nodePortalCarrier, "stopAll").mockImplementation(async () => {
+      portalStopStarted.resolve();
+      await portalShutdown.promise;
+    });
     const tunnelManager = {
       stopAll: vi.fn().mockRejectedValueOnce(shutdownError).mockResolvedValue(undefined),
     } as unknown as WorkerTunnelManager;
     const nodeTunnelManager = {
-      bindWorkspaceBindingResolver: vi.fn(),
       status: () => "stopped" as const,
       start: vi.fn(),
       stop: vi.fn(async () => {}),
@@ -40,6 +49,7 @@ describe("worker environment service", () => {
       tunnelManager,
       nodeTunnelManager,
       nodeDesktopCarrier,
+      nodePortalCarrier,
     });
     const stopping = workerService.stop();
     const settled = vi.fn();
@@ -54,9 +64,16 @@ describe("worker environment service", () => {
       expect(nodeDesktopCarrier.stopAll).toHaveBeenCalledOnce();
 
       nodeShutdown.resolve();
+      await portalStopStarted.promise;
+      await new Promise<void>((resolve) => {
+        setImmediate(resolve);
+      });
+      expect(settled).not.toHaveBeenCalled();
+      portalShutdown.resolve();
       await expect(stopping).rejects.toBe(shutdownError);
     } finally {
       nodeShutdown.resolve();
+      portalShutdown.resolve();
       await stopping.catch(() => undefined);
     }
   });
@@ -110,8 +127,14 @@ describe("worker environment service", () => {
     support.testState.nowMs += 20_000;
     await expect(
       workerService.startTunnel({ environmentId: "worker-tunnel", ownerEpoch: 1 }),
+    ).resolves.toMatchObject({ environmentId: "worker-tunnel", ownerEpoch: 1 });
+    expect(tunnelManager.start).toHaveBeenCalledTimes(2);
+
+    support.testState.store.revokeEnvironmentCredential("worker-tunnel");
+    await expect(
+      workerService.startTunnel({ environmentId: "worker-tunnel", ownerEpoch: 1 }),
     ).rejects.toThrow("owner credential is not current");
-    expect(tunnelManager.start).toHaveBeenCalledOnce();
+    expect(tunnelManager.start).toHaveBeenCalledTimes(2);
 
     await workerService.destroy("worker-tunnel");
     expect(order).toEqual(["tunnel-stop", "provider-destroy"]);
@@ -183,7 +206,6 @@ describe("worker environment service", () => {
         stop: vi.fn(async () => {}),
       };
       const nodeTunnelManager = {
-        bindWorkspaceBindingResolver: vi.fn(),
         status: () => "stopped" as const,
         start: vi.fn(async (request) => ({
           ...nodeHandle,
@@ -208,12 +230,11 @@ describe("worker environment service", () => {
           ensureNodeWorkerBundle: async () => structuredClone(support.BOOTSTRAP_RECEIPT),
         },
       );
-      const environment = await workerService.create(
-        "development",
-        "cloud-node-tunnel-gate",
-        undefined,
+      const environment = await workerService.createWithRequest({
+        profileId: "development",
+        idempotencyKey: "cloud-node-tunnel-gate",
         executionMode,
-      );
+      });
       const credential = await workerService.attachSession({
         environmentId: environment.environmentId,
         ownerEpoch: environment.ownerEpoch,
@@ -279,10 +300,7 @@ describe("worker environment service", () => {
     support.testState.config.cloudWorkers!.profiles!.development!.settings = {
       device: "device-1",
     };
-    let signalStarted!: () => void;
-    const started = new Promise<void>((resolve) => {
-      signalStarted = resolve;
-    });
+    const { promise: started, resolve: signalStarted } = createDeferred();
     const pendingStart = new Promise<never>(() => {});
     const sshStop = vi.fn(async () => {});
     const tunnelManager = {
@@ -292,7 +310,6 @@ describe("worker environment service", () => {
       stopAll: vi.fn(async () => {}),
     } as unknown as WorkerTunnelManager;
     const nodeTunnelManager = {
-      bindWorkspaceBindingResolver: vi.fn(),
       status: () => "connecting" as const,
       start: vi.fn(() => {
         signalStarted();
@@ -316,7 +333,10 @@ describe("worker environment service", () => {
         ensureNodeWorkerBundle: async () => structuredClone(support.BOOTSTRAP_RECEIPT),
       },
     );
-    const environment = await workerService.create("development", "device-tunnel-timeout");
+    const environment = await workerService.createWithRequest({
+      profileId: "development",
+      idempotencyKey: "device-tunnel-timeout",
+    });
     const credential = await workerService.attachSession({
       environmentId: environment.environmentId,
       ownerEpoch: environment.ownerEpoch,
@@ -514,79 +534,169 @@ describe("worker environment service", () => {
     });
   });
 
-  it("acquires a desktop tunnel and mints a one-shot websocket path", async () => {
-    const record = support.seedReadyDesktop("worker-desktop-observe");
-    const desktopPassword = ["desktop", String.fromCharCode(45), "secret"].join("");
-    const acquire = vi.fn(async () => ({
-      attachment: { kind: "unix-socket" as const, socketPath: "/tmp/worker-desktop.sock" },
-      vncPassword: desktopPassword,
-    }));
-    const tunnelManager = {
-      desktop: {
-        acquire,
-        attachObserver: vi.fn(),
+  it.each([true, false, undefined])(
+    "carries provider resize permission %s through SSH observe",
+    async (allowsDesktopResize) => {
+      const mint = vi.spyOn(observeBridge, "mintDesktopObserverToken");
+      const client = { invalidated: false };
+      const requester = {
+        signal: new AbortController().signal,
+        isCurrent: () => !client.invalidated,
+      };
+      const record = support.seedReadyDesktop("worker-desktop-observe");
+      const desktopPassword = ["desktop", String.fromCharCode(45), "secret"].join("");
+      const acquire = vi.fn(async () => ({
+        attachment: { kind: "unix-socket" as const, socketPath: "/tmp/worker-desktop.sock" },
+        vncPassword: desktopPassword,
+      }));
+      const tunnelManager = {
+        desktop: {
+          acquire,
+          attachObserver: vi.fn(),
+          stop: vi.fn(async () => {}),
+          stopAll: vi.fn(async () => {}),
+        },
+        status: () => "stopped" as const,
+        start: vi.fn(),
         stop: vi.fn(async () => {}),
         stopAll: vi.fn(async () => {}),
-      },
-      status: () => "stopped" as const,
-      start: vi.fn(),
-      stop: vi.fn(async () => {}),
-      stopAll: vi.fn(async () => {}),
-    } as unknown as WorkerTunnelManager;
-    const workerService = support.createService(support.createProvider(), { tunnelManager });
+      } as unknown as WorkerTunnelManager;
+      const workerService = support.createService(support.createProvider({ allowsDesktopResize }), {
+        tunnelManager,
+      });
 
-    await expect(
-      workerService.observeDesktop({ environmentId: record.environmentId, control: true }),
-    ).resolves.toMatchObject({
-      transport: "rfb",
-      wsPath: expect.stringMatching(/^\/desktop\/observe\?token=[a-f0-9]{48}$/u),
-      expiresAtMs: support.testState.nowMs + 60_000,
-      control: true,
-      vncPassword: desktopPassword,
-    });
-    expect(acquire).toHaveBeenCalledWith(
-      expect.objectContaining({
+      const observed = await workerService.observeDesktop({
         environmentId: record.environmentId,
-        ownerEpoch: record.ownerEpoch,
-        desktop: support.DESKTOP,
-        ssh: support.SSH_ENDPOINT,
-        resolveIdentity: expect.any(Function),
-      }),
-    );
-  });
+        control: true,
+        requester,
+      });
+      expect(observed).toMatchObject({
+        transport: "rfb",
+        wsPath: expect.stringMatching(/^\/desktop\/observe\?token=[a-f0-9]{48}$/u),
+        expiresAtMs: support.testState.nowMs + 60_000,
+        control: true,
+        vncPassword: desktopPassword,
+      });
+      expect(observed.canResize).toBe(allowsDesktopResize === true ? true : undefined);
+      expect(acquire).toHaveBeenCalledWith(
+        expect.objectContaining({
+          environmentId: record.environmentId,
+          ownerEpoch: record.ownerEpoch,
+          desktop: support.DESKTOP,
+          ssh: support.SSH_ENDPOINT,
+          resolveIdentity: expect.any(Function),
+        }),
+      );
+      const mintedRequester = mint.mock.calls[0]?.[0].requester;
+      expect(mintedRequester).toBe(requester);
+      expect(mintedRequester?.isCurrent()).toBe(true);
+      client.invalidated = true;
+      expect(mintedRequester?.isCurrent()).toBe(false);
+      expect(requester.signal.aborted).toBe(false);
+    },
+  );
 
-  it("routes a node-backed desktop through its durable node carrier without SSH", async () => {
-    const record = support.seedReadyNodeDesktop("worker-node-desktop-access");
-    const order: string[] = [];
+  it.each([
+    { allowsDesktopResize: true, allowsResize: undefined },
+    { allowsDesktopResize: false, allowsResize: undefined },
+    { allowsDesktopResize: undefined, allowsResize: undefined },
+    { allowsDesktopResize: true, allowsResize: false },
+    { allowsDesktopResize: false, allowsResize: true },
+  ])(
+    "carries provider $allowsDesktopResize and endpoint $allowsResize resize permission through node observe",
+    async ({ allowsDesktopResize, allowsResize }) => {
+      const requester = { signal: new AbortController().signal, isCurrent: () => true };
+      const desktop = {
+        ...support.DESKTOP,
+        ...(allowsResize === undefined ? {} : { allowsResize }),
+      };
+      const record = support.seedReadyNodeDesktop("worker-node-desktop-access", desktop);
+      const order: string[] = [];
+      const observe = vi.fn(async () => ({
+        transport: "rfb" as const,
+        wsPath: "/desktop/observe?token=node-carrier",
+        expiresAtMs: support.testState.nowMs + 60_000,
+        control: true,
+      }));
+      const launchApp = vi.fn(async () => {});
+      const stop = vi.fn(async () => {
+        order.push("node-desktop-stop");
+      });
+      const nodeDesktopCarrier = {
+        bindRuntime: vi.fn(),
+        observe,
+        launchApp,
+        stop,
+        stopAll: vi.fn(async () => {}),
+      } as unknown as WorkerNodeDesktopCarrier;
+      const workerService = support.createService(
+        support.createProvider({
+          allowsDesktopResize,
+          destroy: async () => {
+            order.push("provider-destroy");
+          },
+        }),
+        { nodeDesktopCarrier },
+      );
+      expect(workerService.get(record.environmentId)).toMatchObject({
+        desktopAvailable: true,
+        desktopApps: ["browser", "terminal"],
+      });
+
+      await expect(
+        workerService.observeDesktop({
+          environmentId: record.environmentId,
+          control: true,
+          requester,
+        }),
+      ).resolves.toEqual({
+        transport: "rfb",
+        wsPath: "/desktop/observe?token=node-carrier",
+        expiresAtMs: support.testState.nowMs + 60_000,
+        control: true,
+        ...(allowsDesktopResize === true && allowsResize !== false ? { canResize: true } : {}),
+      });
+      expect(observe).toHaveBeenCalledWith({
+        record: expect.objectContaining({
+          environmentId: record.environmentId,
+          nodeDeviceId: record.nodeDeviceId,
+          sshEndpoint: null,
+          desktop,
+        }),
+        control: true,
+        requester,
+      });
+
+      await expect(
+        workerService.launchDesktopApp({ environmentId: record.environmentId, app: "browser" }),
+      ).resolves.toEqual({ app: "browser", status: "ready" });
+      expect(launchApp).toHaveBeenCalledWith({
+        record: expect.objectContaining({ environmentId: record.environmentId }),
+        app: support.DESKTOP.apps![0],
+      });
+
+      await workerService.destroy(record.environmentId);
+      expect(order).toEqual(["node-desktop-stop", "provider-destroy"]);
+    },
+  );
+
+  it("preserves node observation without the provisioning provider and omits resize permission", async () => {
+    const record = support.seedReadyNodeDesktop("worker-node-provider-unavailable");
     const observe = vi.fn(async () => ({
       transport: "rfb" as const,
       wsPath: "/desktop/observe?token=node-carrier",
       expiresAtMs: support.testState.nowMs + 60_000,
       control: true,
     }));
-    const launchApp = vi.fn(async () => {});
-    const stop = vi.fn(async () => {
-      order.push("node-desktop-stop");
-    });
     const nodeDesktopCarrier = {
-      bindRuntime: vi.fn(),
       observe,
-      launchApp,
-      stop,
       stopAll: vi.fn(async () => {}),
     } as unknown as WorkerNodeDesktopCarrier;
     const workerService = support.createService(
-      support.createProvider({
-        destroy: async () => {
-          order.push("provider-destroy");
-        },
-      }),
+      support.createProvider({ allowsDesktopResize: true }),
       { nodeDesktopCarrier },
     );
-    expect(workerService.get(record.environmentId)).toMatchObject({
-      desktopAvailable: true,
-      desktopApps: ["browser", "terminal"],
-    });
+    support.testState.providersEnabled = false;
 
     await expect(
       workerService.observeDesktop({ environmentId: record.environmentId, control: true }),
@@ -596,26 +706,7 @@ describe("worker environment service", () => {
       expiresAtMs: support.testState.nowMs + 60_000,
       control: true,
     });
-    expect(observe).toHaveBeenCalledWith({
-      record: expect.objectContaining({
-        environmentId: record.environmentId,
-        nodeDeviceId: record.nodeDeviceId,
-        sshEndpoint: null,
-        desktop: support.DESKTOP,
-      }),
-      control: true,
-    });
-
-    await expect(
-      workerService.launchDesktopApp({ environmentId: record.environmentId, app: "browser" }),
-    ).resolves.toEqual({ app: "browser", status: "ready" });
-    expect(launchApp).toHaveBeenCalledWith({
-      record: expect.objectContaining({ environmentId: record.environmentId }),
-      app: support.DESKTOP.apps![0],
-    });
-
-    await workerService.destroy(record.environmentId);
-    expect(order).toEqual(["node-desktop-stop", "provider-destroy"]);
+    expect(observe).toHaveBeenCalledOnce();
   });
 
   it("rejects desktop observe for invalid lifecycle gates and a stopped service", async () => {
@@ -706,10 +797,7 @@ describe("worker environment service", () => {
 
   it("does not hold the environment lock while a tunnel is connecting", async () => {
     support.seedReady("worker-tunnel-pending");
-    let rejectStart: ((error: Error) => void) | undefined;
-    const pendingStart = new Promise<never>((_resolve, reject) => {
-      rejectStart = reject;
-    });
+    const { promise: pendingStart, reject: rejectStart } = createDeferred<never>();
     const order: string[] = [];
     const tunnelManager = {
       status: () => "connecting" as const,
@@ -743,14 +831,8 @@ describe("worker environment service", () => {
   it("stops a poisoned tunnel start and returns a typed deadline error", async () => {
     vi.useFakeTimers();
     support.seedReady("worker-tunnel-timeout");
-    let signalStarted!: () => void;
-    const started = new Promise<void>((resolve) => {
-      signalStarted = resolve;
-    });
-    let rejectStart!: (error: Error) => void;
-    const pendingStart = new Promise<never>((_resolve, reject) => {
-      rejectStart = reject;
-    });
+    const { promise: started, resolve: signalStarted } = createDeferred();
+    const { promise: pendingStart, reject: rejectStart } = createDeferred<never>();
     const tunnelManager = {
       status: () => "connecting" as const,
       start: vi.fn(() => {

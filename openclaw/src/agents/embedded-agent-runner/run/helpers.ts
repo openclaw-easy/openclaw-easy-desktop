@@ -38,56 +38,6 @@ export const RUNTIME_AUTH_REFRESH_MARGIN_MS = 5 * 60 * 1000;
 export const RUNTIME_AUTH_REFRESH_RETRY_MS = 60 * 1000;
 export const RUNTIME_AUTH_REFRESH_MIN_DELAY_MS = 5 * 1000;
 
-const DEFAULT_OVERLOAD_FAILOVER_BACKOFF_MS = 0;
-const DEFAULT_MAX_OVERLOAD_PROFILE_ROTATIONS = 1;
-const DEFAULT_MAX_RATE_LIMIT_PROFILE_ROTATIONS = 1;
-
-// Same-model in-place rate_limit retry: provider RPM caps reset on a
-// minute scale, so wait out the current provider/model window before spending
-// a profile rotation or model failover.
-export const MAX_SAME_MODEL_RATE_LIMIT_RETRIES = 3;
-// Linear step: retriesSoFar=0 -> 10s, 1 -> 20s, 2 -> 30s. Total wait across the
-// 3-retry budget is 60s, roughly one RPM window.
-const SAME_MODEL_RATE_LIMIT_BACKOFF_STEP_MS = 10_000;
-const SAME_MODEL_RATE_LIMIT_MAX_BACKOFF_MS = 60_000;
-
-export function resolveOverloadFailoverBackoffMs(): number {
-  return DEFAULT_OVERLOAD_FAILOVER_BACKOFF_MS;
-}
-
-export function resolveOverloadProfileRotationLimit(): number {
-  return DEFAULT_MAX_OVERLOAD_PROFILE_ROTATIONS;
-}
-
-export function resolveRateLimitProfileRotationLimit(): number {
-  return DEFAULT_MAX_RATE_LIMIT_PROFILE_ROTATIONS;
-}
-
-/**
- * Backoff before the next same-model rate_limit retry, given how many such
- * retries already happened. Linear and deterministic (no jitter) so RPM
- * windows clear predictably and tests can assert exact values.
- */
-export function resolveSameModelRateLimitRetryDelayMs(params: {
-  retriesSoFar: number;
-  retryAfterSeconds?: number;
-}): number {
-  const backoffDelayMs =
-    SAME_MODEL_RATE_LIMIT_BACKOFF_STEP_MS * (Math.max(0, params.retriesSoFar) + 1);
-  const backoffMs = Math.min(SAME_MODEL_RATE_LIMIT_MAX_BACKOFF_MS, backoffDelayMs);
-  const retryAfterMs = Number.isFinite(params.retryAfterSeconds)
-    ? Math.ceil(Math.max(0, params.retryAfterSeconds ?? 0) * 1000)
-    : 0;
-  return Math.max(backoffMs, Math.min(SAME_MODEL_RATE_LIMIT_MAX_BACKOFF_MS, retryAfterMs));
-}
-
-export function resolveNextSameModelRateLimitRetryCount(params: {
-  retriesSoFar: number;
-  retriedSameModelRateLimit: boolean;
-}): number {
-  return params.retriedSameModelRateLimit ? Math.max(0, params.retriesSoFar) + 1 : 0;
-}
-
 const ANTHROPIC_MAGIC_STRING_TRIGGER_REFUSAL = "ANTHROPIC_MAGIC_STRING_TRIGGER_REFUSAL";
 const ANTHROPIC_MAGIC_STRING_REPLACEMENT = "[redacted]";
 
@@ -122,8 +72,6 @@ const RUN_RETRY_ITERATIONS_PER_PROFILE = 8;
 const MIN_RUN_RETRY_ITERATIONS = 32;
 const MAX_RUN_RETRY_ITERATIONS = 160;
 
-// This per-run bound multiplies whole-turn overload replays in
-// auto-reply/reply/agent-runner-error-handler.ts; keep their product test aligned.
 // Defensive guard for the outer run loop across all retry branches.
 export function resolveMaxRunRetryIterations(profileCandidateCount: number): number {
   const scaled =
@@ -141,20 +89,6 @@ export function resolveActiveErrorContext(params: {
   model: string;
 } {
   return resolveReportedModelRef(params);
-}
-
-export function isAssistantForModelRef(
-  assistant: { provider?: string; model?: string } | undefined,
-  ref: { provider: string; model: string },
-): boolean {
-  if (!assistant) {
-    return false;
-  }
-  const resolved = resolveReportedModelRef({
-    ...ref,
-    assistant,
-  });
-  return resolved.provider === ref.provider && resolved.model === ref.model;
 }
 
 function isEmbeddedHarnessProvider(provider: string): boolean {

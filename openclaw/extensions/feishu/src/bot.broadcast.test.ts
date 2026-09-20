@@ -1,10 +1,11 @@
 // Feishu tests cover bot.broadcast plugin behavior.
 import { buildChannelInboundEventContext } from "openclaw/plugin-sdk/channel-inbound";
+import { closeOpenClawStateDatabaseAsync } from "openclaw/plugin-sdk/sqlite-runtime-testing";
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ClawdbotConfig, PluginRuntime } from "../runtime-api.js";
 import { feishuGroupNameCache } from "./bot-group-name-state.js";
 import type { FeishuMessageEvent } from "./bot.js";
-import { handleFeishuMessage } from "./bot.js";
+import { handleFeishuMessage as handleFeishuMessageImpl } from "./bot.js";
 import { feishuDedupeState } from "./dedup-state.js";
 import type { FeishuMessageProcessingClaim } from "./dedup.js";
 import type { FeishuIngressLifecycle } from "./feishu-ingress.js";
@@ -143,7 +144,11 @@ describe("broadcast dispatch", () => {
     path: "/tmp/inbound-clip.mp4",
     contentType: "video/mp4",
   });
+  const mockCurrentConfig = vi.fn(() => createBroadcastConfig());
   const runtimeStub = {
+    config: {
+      current: mockCurrentConfig,
+    },
     system: {
       enqueueSystemEvent: vi.fn(),
     },
@@ -220,6 +225,11 @@ describe("broadcast dispatch", () => {
       detectMime: vi.fn(async () => "application/octet-stream"),
     },
   } as unknown as PluginRuntime;
+
+  async function handleFeishuMessage(params: Parameters<typeof handleFeishuMessageImpl>[0]) {
+    mockCurrentConfig.mockReturnValue(params.cfg);
+    await handleFeishuMessageImpl(params);
+  }
 
   afterAll(() => {
     vi.doUnmock("./reply-dispatcher.js");
@@ -318,7 +328,8 @@ describe("broadcast dispatch", () => {
     setFeishuRuntime(runtimeStub);
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    await closeOpenClawStateDatabaseAsync();
     vi.restoreAllMocks();
     feishuDedupeState.reset();
   });

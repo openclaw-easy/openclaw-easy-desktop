@@ -1,27 +1,28 @@
 import syncFs from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
-import {
-  openRootFileFollowingParents,
-  type RootFileOpenResult,
-} from "../infra/boundary-file-read.js";
+import { openRootFile, type RootFileOpenResult } from "../infra/boundary-file-read.js";
 import {
   canonicalPathFromExistingAncestor,
   FsSafeError,
   root as fsRoot,
 } from "../infra/fs-safe.js";
+import { captureAgentToolSourceExecutionGuard } from "./agent-tool-source-execution-guard.js";
 import { writeHostFile } from "./host-file-write.js";
 import {
   type MemoryWriteProvenanceObserver,
   withMemoryWriteProvenance,
 } from "./memory-write-provenance.js";
 import { toRelativeSandboxPath } from "./path-policy.js";
+import { isPathBoundaryEscapeError, markHostRootEscape } from "./sandbox-paths.js";
 import type { SandboxFsBridge } from "./sandbox/fs-bridge.js";
 import { decodeUtf8File } from "./utf8-file.js";
 
 export type SandboxApplyPatchConfig = {
   root: string;
   bridge: SandboxFsBridge;
+  /** Prepared workspace admission mappings; legacy SDK bridges may omit them. */
+  workspaceMounts?: readonly { containerRoot: string; hostRoot: string }[];
 };
 
 export type ApplyPatchFileOptions = {
@@ -60,6 +61,7 @@ export async function createPatchTarget(params: {
 }
 
 export async function resolvePatchFileOps(options: ApplyPatchFileOptions): Promise<PatchFileOps> {
+  const assertCurrent = captureAgentToolSourceExecutionGuard(options.signal);
   if (options.sandbox) {
     const { root, bridge } = options.sandbox;
     return withPatchMemoryWriteProvenance({
@@ -70,7 +72,7 @@ export async function resolvePatchFileOps(options: ApplyPatchFileOptions): Promi
           return decodeUtf8File(buf, filePath);
         },
         writeFile: (filePath, content) => {
-          options.signal?.throwIfAborted();
+          assertCurrent();
           return bridge.writeFile({ filePath, cwd: root, data: content, signal: options.signal });
         },
         createFileExclusive: (filePath, content) => {
@@ -79,7 +81,7 @@ export async function resolvePatchFileOps(options: ApplyPatchFileOptions): Promi
               "Sandbox filesystem bridge does not support atomic file creation; refusing to overwrite an existing path.",
             );
           }
-          options.signal?.throwIfAborted();
+          assertCurrent();
           return bridge.createFileExclusive({
             filePath,
             cwd: root,
@@ -88,11 +90,11 @@ export async function resolvePatchFileOps(options: ApplyPatchFileOptions): Promi
           });
         },
         remove: (filePath) => {
-          options.signal?.throwIfAborted();
+          assertCurrent();
           return bridge.remove({ filePath, cwd: root, force: false, signal: options.signal });
         },
         mkdirp: (dir) => {
-          options.signal?.throwIfAborted();
+          assertCurrent();
           return bridge.mkdirp({ filePath: dir, cwd: root, signal: options.signal });
         },
       },
@@ -109,7 +111,7 @@ export async function resolvePatchFileOps(options: ApplyPatchFileOptions): Promi
         },
         createFileExclusive: async (filePath, content) => {
           try {
-            options.signal?.throwIfAborted();
+            assertCurrent();
             await fs.writeFile(filePath, content, { encoding: "utf8", flag: "wx" });
             return "created";
           } catch (error) {
@@ -120,11 +122,11 @@ export async function resolvePatchFileOps(options: ApplyPatchFileOptions): Promi
           }
         },
         remove: (filePath) => {
-          options.signal?.throwIfAborted();
+          assertCurrent();
           return fs.rm(filePath);
         },
         mkdirp: async (dir) => {
-          options.signal?.throwIfAborted();
+          assertCurrent();
           await fs.mkdir(dir, { recursive: true });
         },
       },
@@ -149,16 +151,22 @@ export async function resolvePatchFileOps(options: ApplyPatchFileOptions): Promi
       // Keep the lexical path; the containment check below owns the failure.
     }
     const canonicalRoot = await fs.realpath(containmentRoot).catch(() => containmentRoot);
-    return toRelativeSandboxPath(canonicalRoot, canonicalAbsolute, pathOptions);
+    try {
+      return toRelativeSandboxPath(canonicalRoot, canonicalAbsolute, pathOptions);
+    } catch (error) {
+      // Resolved strings reach this pure host boundary check after awaited work.
+      throw markHostRootEscape(error);
+    }
   };
   return withPatchMemoryWriteProvenance({
     observer: options.memoryWriteProvenance,
     operations: {
       readFile: async (filePath) => {
-        const opened = await openRootFileFollowingParents({
+        const opened = await openRootFile({
           absolutePath: filePath,
           rootPath: containmentRoot,
           boundaryLabel: "workspace root",
+          symlinks: "follow-parents-within-root",
         });
         assertBoundaryRead(opened, filePath);
         try {
@@ -169,13 +177,13 @@ export async function resolvePatchFileOps(options: ApplyPatchFileOptions): Promi
       },
       writeFile: async (filePath, content) => {
         const relative = await toCanonicalMutationRelative(filePath);
-        options.signal?.throwIfAborted();
+        assertCurrent();
         await root.write(relative, content, { encoding: "utf8" });
       },
       createFileExclusive: async (filePath, content) => {
         const relative = await toCanonicalMutationRelative(filePath);
         try {
-          options.signal?.throwIfAborted();
+          assertCurrent();
           await root.create(relative, content, { encoding: "utf8" });
           return "created";
         } catch (error) {
@@ -193,12 +201,12 @@ export async function resolvePatchFileOps(options: ApplyPatchFileOptions): Promi
       },
       remove: async (filePath) => {
         const relative = await toCanonicalMutationRelative(filePath);
-        options.signal?.throwIfAborted();
+        assertCurrent();
         await root.remove(relative);
       },
       mkdirp: async (dir) => {
         const relative = await toCanonicalMutationRelative(dir, { allowRoot: true });
-        options.signal?.throwIfAborted();
+        assertCurrent();
         if (relative === "" || relative === ".") {
           await root.ensureRoot();
           return;
@@ -215,18 +223,19 @@ function withPatchMemoryWriteProvenance(params: {
   operations: PatchFileOps;
   observer: MemoryWriteProvenanceObserver | undefined;
 }): PatchFileOps {
-  const operations = withMemoryWriteProvenance(params.operations, params.observer);
-  if (!params.observer) {
+  const observer = params.observer;
+  const operations = withMemoryWriteProvenance(params.operations, observer);
+  if (!observer) {
     return operations;
   }
   return {
     ...operations,
     createFileExclusive: async (filePath, content) => {
-      if (!params.observer?.classifies(filePath)) {
+      if (!(await observer.classifies(filePath))) {
         return params.operations.createFileExclusive(filePath, content);
       }
       try {
-        await params.observer.write({
+        await observer.write({
           absolutePath: filePath,
           contentBefore: "",
           contentAfter: content,
@@ -265,6 +274,13 @@ function assertBoundaryRead(
   if (sourceCode === "ENOENT" || sourceCode === "ENOTDIR") {
     // Preserve the producer's classification so provenance observers do not parse messages.
     error.code = sourceCode;
+  }
+  if (
+    opened.reason === "validation" &&
+    ((opened.error instanceof FsSafeError && opened.error.code === "outside-workspace") ||
+      isPathBoundaryEscapeError(opened.error, "workspace root"))
+  ) {
+    markHostRootEscape(error);
   }
   throw error;
 }

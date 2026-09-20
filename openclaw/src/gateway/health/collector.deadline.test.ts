@@ -1,8 +1,11 @@
 import path from "node:path";
+import { setImmediate as flushImmediate } from "node:timers/promises";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { createTempDirTracker } from "../../../test/helpers/temp-dir.js";
 import type { ChannelPlugin } from "../../channels/plugins/types.plugin.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import { AsyncWorkScope } from "../../shared/async-work-scope.js";
+import { createDeferredCore } from "../../shared/deferred.js";
 
 type DeadlineAccount = {
   accountId: string;
@@ -14,7 +17,11 @@ let testConfig: OpenClawConfig = {};
 let healthPluginsForTest: ChannelPlugin[] = [];
 const tempDirs = createTempDirTracker();
 let sessionStorePath: string;
-const listSessionEntriesReadOnly = vi.fn(() => []);
+const readSessionStoreSummaryReadOnly = vi.fn(() => ({
+  count: 0,
+  recent: [],
+  byAgent: new Map(),
+}));
 let collectGatewayHealthSnapshot: typeof import("./collector.js").collectGatewayHealthSnapshot;
 let createChannelTestPluginBase: typeof import("../../test-utils/channel-plugins.js").createChannelTestPluginBase;
 
@@ -54,6 +61,12 @@ async function collectDeadlineSnapshot(params: {
   });
 }
 
+async function flushHealthPreparation() {
+  await vi.advanceTimersByTimeAsync(0);
+  // The fake deadline clock does not drive the real yield after a session read.
+  await flushImmediate();
+}
+
 describe("gateway health collection deadline", () => {
   beforeAll(async () => {
     vi.doMock("../../config/config.js", () => ({
@@ -65,7 +78,7 @@ describe("gateway health collection deadline", () => {
       resolveSessionStorePathCore: () => sessionStorePath,
     }));
     vi.doMock("../../config/sessions/session-accessor.js", () => ({
-      listSessionEntriesReadOnly,
+      readSessionStoreSummaryReadOnly,
     }));
     vi.doMock("../../channels/plugins/read-only.js", () => ({
       listReadOnlyChannelPluginsForConfig: () => healthPluginsForTest,
@@ -83,7 +96,7 @@ describe("gateway health collection deadline", () => {
       tempDirs.make("openclaw-health-deadline-sessions-"),
       "sessions.json",
     );
-    listSessionEntriesReadOnly.mockReset();
+    readSessionStoreSummaryReadOnly.mockReset();
     testConfig = {};
     healthPluginsForTest = [];
     await collectGatewayHealthSnapshot({ audience: "admin", probe: false, timeoutMs: 50 });
@@ -98,9 +111,9 @@ describe("gateway health collection deadline", () => {
     vi.useFakeTimers();
     const probe = vi.fn(async () => ({ ok: true }));
     healthPluginsForTest = [createDeadlinePlugin({ accountIds: ["default"], probe })];
-    listSessionEntriesReadOnly.mockImplementationOnce(() => {
+    readSessionStoreSummaryReadOnly.mockImplementationOnce(() => {
       vi.advanceTimersByTime(50);
-      return [];
+      return { count: 0, recent: [], byAgent: new Map() };
     });
 
     const snap = await collectDeadlineSnapshot({ timeoutMs: 50 });
@@ -114,13 +127,16 @@ describe("gateway health collection deadline", () => {
     expect(probe).not.toHaveBeenCalled();
   }, 1_000);
 
-  it("preserves healthy accounts when one probe never settles", async () => {
+  it("preserves healthy accounts at the deadline and retains unfinished probe work", async () => {
     vi.useFakeTimers();
+    const scope = new AsyncWorkScope();
+    const slowProbe = createDeferredCore<Record<string, unknown>>();
     const accountIds = ["default", "fast-1", "fast-2", "fast-3", "fast-4", "fast-5"];
     const started: string[] = [];
-    let releaseSlowProbe: (() => void) | undefined;
     let active = 0;
     let maxActive = 0;
+    let snapshotPromise: ReturnType<typeof collectDeadlineSnapshot> | undefined;
+    let draining: Promise<void> | undefined;
     healthPluginsForTest = [
       createDeadlinePlugin({
         accountIds,
@@ -129,12 +145,11 @@ describe("gateway health collection deadline", () => {
           active += 1;
           maxActive = Math.max(maxActive, active);
           if (account.accountId === "default") {
-            return await new Promise<Record<string, unknown>>((resolve) => {
-              releaseSlowProbe = () => {
-                active -= 1;
-                resolve({ ok: true });
-              };
-            });
+            try {
+              return await slowProbe.promise;
+            } finally {
+              active -= 1;
+            }
           }
           await Promise.resolve();
           active -= 1;
@@ -143,20 +158,34 @@ describe("gateway health collection deadline", () => {
       }),
     ];
 
-    const snapshotPromise = collectDeadlineSnapshot({ timeoutMs: 50 });
-    await vi.advanceTimersByTimeAsync(0);
-    await vi.advanceTimersByTimeAsync(50);
-    const snap = await snapshotPromise;
-    const channel = snap.channels["deadline-test"];
+    try {
+      snapshotPromise = scope.track(() => collectDeadlineSnapshot({ timeoutMs: 50 }));
+      await flushHealthPreparation();
+      await vi.advanceTimersByTimeAsync(50);
+      const snap = await snapshotPromise;
+      const channel = snap.channels["deadline-test"];
 
-    expect(started).toEqual(accountIds);
-    expect(maxActive).toBeLessThanOrEqual(5);
-    expect(channel?.probe).toMatchObject({ ok: false, timedOut: true });
-    for (const accountId of accountIds.slice(1)) {
-      expect(channel?.accounts?.[accountId]?.probe).toMatchObject({ ok: true });
+      expect(started).toEqual(accountIds);
+      expect(maxActive).toBeLessThanOrEqual(5);
+      expect(channel?.probe).toMatchObject({ ok: false, timedOut: true });
+      for (const accountId of accountIds.slice(1)) {
+        expect(channel?.accounts?.[accountId]?.probe).toMatchObject({ ok: true });
+      }
+      let drained = false;
+      draining = scope.drain().then(() => {
+        drained = true;
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(drained).toBe(false);
+      slowProbe.resolve({ ok: true });
+      await draining;
+      expect(active).toBe(0);
+    } finally {
+      slowProbe.resolve({ ok: true });
+      await Promise.allSettled([snapshotPromise, slowProbe.promise]);
+      await (draining ?? scope.drain());
+      await vi.advanceTimersByTimeAsync(0);
     }
-    releaseSlowProbe?.();
-    await vi.advanceTimersByTimeAsync(0);
   }, 1_000);
 
   it("does not start queued probes after the aggregate deadline", async () => {
@@ -185,7 +214,7 @@ describe("gateway health collection deadline", () => {
     ];
 
     const snapshotPromise = collectDeadlineSnapshot({ timeoutMs: 50, audience: "public" });
-    await vi.advanceTimersByTimeAsync(0);
+    await flushHealthPreparation();
     expect(started).toEqual(accountIds.slice(0, 5));
     await vi.advanceTimersByTimeAsync(50);
     const snap = await snapshotPromise;
@@ -229,13 +258,13 @@ describe("gateway health collection deadline", () => {
     ];
 
     const firstSnapshot = collectDeadlineSnapshot({ timeoutMs: 50 });
-    await vi.advanceTimersByTimeAsync(0);
+    await flushHealthPreparation();
     expect(started).toEqual(accountIds);
     await vi.advanceTimersByTimeAsync(50);
     await firstSnapshot;
 
     const secondSnapshot = collectDeadlineSnapshot({ timeoutMs: 50 });
-    await vi.advanceTimersByTimeAsync(0);
+    await flushHealthPreparation();
     expect(started).toEqual(accountIds);
     await vi.advanceTimersByTimeAsync(50);
     const second = await secondSnapshot;

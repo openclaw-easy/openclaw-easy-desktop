@@ -87,20 +87,6 @@ export async function prepareAgentRequestRouting(params: {
       ? requestedToRaw
       : undefined;
   const requestedSessionKeyRaw = requestedSessionKeyParam ?? sessionKeyFromTo;
-  if (
-    requestedSessionKeyRaw &&
-    classifySessionKeyShape(requestedSessionKeyRaw) === "malformed_agent"
-  ) {
-    params.respond(
-      false,
-      undefined,
-      errorShape(
-        ErrorCodes.INVALID_REQUEST,
-        `invalid agent params: malformed session key "${requestedSessionKeyRaw}"`,
-      ),
-    );
-    return undefined;
-  }
   if (requestedSessionKeyRaw) {
     const requestedSessionAgent = resolveRequestedSessionAgentId(
       params.cfg,
@@ -232,6 +218,7 @@ export async function prepareAgentRequestRouting(params: {
     ? loadSessionEntry(requestedSessionKey, {
         ...(agentId ? { agentId } : {}),
         clone: false,
+        projection: "list",
       })
     : undefined;
   return {
@@ -278,6 +265,7 @@ function dropReboundExecApprovalFollowup(params: {
       loadSessionEntry(params.requestedSessionKeyRaw, {
         ...(params.agentId ? { agentId: params.agentId } : {}),
         clone: false,
+        projection: "list",
       }).entry?.sessionId,
     );
   } catch {

@@ -9,6 +9,28 @@ import { createGatewayHarness, createSessions, mountSidebar } from "../app-sideb
 import "../../components/app-sidebar.ts";
 
 describe("AppSidebar footer identity menu", () => {
+  it("opens Profile from the Owner header without a self user", async () => {
+    const { sidebar } = await mountSidebar(
+      createGatewayHarness({ instanceId: "self-instance" } as GatewayBrowserClient).gateway,
+      createSessions("main", ["agent:main:main"]),
+    );
+    sidebar.onNavigate = vi.fn();
+    sidebar.querySelector<HTMLButtonElement>(".sidebar-identity-card")?.click();
+    await sidebar.updateComplete;
+
+    const menu = sidebar.querySelector<HTMLElement>(".sidebar-identity-menu");
+    const header = menu?.querySelector<HTMLElement>('wa-dropdown-item[value="command:profile"]');
+    expect(header?.querySelector(".sidebar-identity-menu__name")?.textContent?.trim()).toBe(
+      "Owner",
+    );
+    expect(header?.querySelector('[data-viewer-id="owner"]')?.textContent).toContain("O");
+    menu?.dispatchEvent(new CustomEvent("wa-select", { detail: { item: header }, bubbles: true }));
+    await sidebar.updateComplete;
+    expect(sidebar.onNavigate).toHaveBeenCalledWith("profile", {
+      hash: "#settings-profile-identity",
+    });
+  });
+
   it("keeps a dismissed update as a discreet account-menu chip", async () => {
     const gatewayHarness = createGatewayHarness({
       instanceId: "self-instance",
@@ -90,23 +112,21 @@ describe("AppSidebar footer identity menu", () => {
     sidebar.connected = true;
     sidebar.canPairDevice = false;
     sidebar.onNavigate = onNavigate;
-    gatewayHarness.publishEvent("presence", {
-      presence: [
-        {
-          instanceId: "self-instance",
-          user: {
-            id: "self",
-            name: fullName,
-            email: "ada.with.a.deliberately.long.address@example.test",
-            avatarUrl: "/api/users/self/avatar?v=1",
-          },
-        },
-      ],
+    gatewayHarness.publish({
+      selfUser: {
+        id: "self",
+        name: fullName,
+        email: "ada.with.a.deliberately.long.address@example.test",
+        avatarUrl: "/api/users/self/avatar?v=1",
+      },
     });
     await sidebar.updateComplete;
 
     const identity = sidebar.querySelector<HTMLButtonElement>(".sidebar-identity-card");
     expect(identity?.getAttribute("aria-haspopup")).toBe("menu");
+    expect(identity?.getAttribute("aria-expanded")).toBe("false");
+    expect(identity?.getAttribute("aria-label")).toContain(fullName);
+    expect(identity?.querySelector("[title], [data-tooltip], openclaw-tooltip")).toBeNull();
     vi.spyOn(identity!, "getBoundingClientRect").mockReturnValue({
       left: 12,
       right: 224,
@@ -134,7 +154,7 @@ describe("AppSidebar footer identity menu", () => {
     const footerName = identity?.querySelector(".sidebar-identity-card__name");
     const menuName = menu?.querySelector(".sidebar-identity-menu__name");
     expect(footerName?.textContent?.trim()).toBe(fullName);
-    expect(footerName?.getAttribute("title")).toBe(fullName);
+    expect(footerName?.hasAttribute("title")).toBe(false);
     expect(menuName?.textContent?.trim()).toBe(fullName);
     expect(menuName?.getAttribute("title")).toBe(fullName);
     const menuEmail = menu?.querySelector(".sidebar-identity-menu__email");
@@ -214,7 +234,7 @@ describe("AppSidebar footer identity menu", () => {
       );
       sidebar.connected = true;
       sidebar.canPairDevice = false;
-      sidebar.offline = offline;
+      sidebar.connectionStatus = offline ? "reconnecting" : null;
       await sidebar.updateComplete;
 
       const identity = sidebar.querySelector<HTMLButtonElement>(".sidebar-identity-card");

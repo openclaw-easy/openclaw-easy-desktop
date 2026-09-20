@@ -64,7 +64,7 @@ Per-agent override (optional, at `agents.entries.*.tools.loopDetection`):
 
 The per-agent setting overrides the global setting.
 
-You can also enable the global rolling-history detectors in **Settings -> Labs** in the Control UI.
+You can also enable the global rolling-history detectors in **Settings → Agent Defaults → Tools** in the Control UI. Reset the setting to its default to disable the rolling detectors while keeping the post-compaction guard; explicitly turning it off disables both.
 
 ### Field behavior
 
@@ -138,7 +138,11 @@ When a loop is detected, OpenClaw logs a loop event and either warns or blocks
 the next tool-cycle depending on severity, protecting against runaway token
 spend and lockups while preserving normal tool access.
 
-- Warnings come first.
+- Warnings come first. On OpenClaw-executed tool calls, a short system note is
+  appended to the affected tool result so the model can change approach before
+  a critical block. Warnings share the diagnostic log's rate limit, rather than
+  appearing on every repeated call. The raw outcome is recorded before the note
+  is added, so warning text does not count as progress.
 - Blocking follows once a pattern persists past the warning threshold.
 - In the embedded agent loop, the first critical loop blocks the whole tool
   batch before any tool in that batch runs. The model then gets one more

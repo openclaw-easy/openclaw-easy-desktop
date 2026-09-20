@@ -2,6 +2,8 @@ import path from "node:path";
 import { afterEach, expect, it, vi } from "vitest";
 import type { RealtimeVoiceBridgeCreateRequest } from "../../src/talk/provider-types.js";
 
+const backend = vi.hoisted(() => ({ onFirstAudio: () => {} }));
+
 const browser = vi.hoisted(() => ({
   close: vi.fn(async () => {}),
   contextClose: vi.fn(async () => {}),
@@ -34,6 +36,7 @@ vi.mock("playwright", () => ({
 vi.mock("../../extensions/openai/realtime-voice-provider.ts", () => ({
   buildOpenAIRealtimeVoiceProvider: () => ({
     createBridge: (options: RealtimeVoiceBridgeCreateRequest) => {
+      const onFirstAudio = backend.onFirstAudio;
       let responded = false;
       return {
         connect: async () => {},
@@ -44,6 +47,7 @@ vi.mock("../../extensions/openai/realtime-voice-provider.ts", () => ({
             return;
           }
           responded = true;
+          onFirstAudio();
           options.onAudio(Buffer.alloc(1024));
           options.onTranscript?.("user", "glacier", true);
           options.onTranscript?.("assistant", "glacier", true);
@@ -68,8 +72,12 @@ const originalArgv = process.argv;
 const originalExitCode = process.exitCode;
 
 afterEach(() => {
+  vi.useRealTimers();
+  backend.onFirstAudio = () => {};
   process.argv = originalArgv;
-  process.exitCode = originalExitCode;
+  // oxlint-disable-next-line no-warning-comments -- remove after the upstream Bun exitCode fix ships.
+  // TODO(bun): Bun does not currently clear a nonzero process.exitCode when assigned undefined.
+  process.exitCode = originalExitCode ?? 0;
   vi.unstubAllEnvs();
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
@@ -153,9 +161,23 @@ it.each([
       path.resolve("scripts/dev/realtime-talk-live-smoke.ts"),
       "--openai-only",
     ];
-    process.exitCode = undefined;
+    process.exitCode = 0;
 
-    await import("../../scripts/dev/realtime-talk-live-smoke.ts");
+    const firstAudio = new Promise<void>((resolve) => {
+      backend.onFirstAudio = () => resolve();
+    });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const command = import("../../scripts/dev/realtime-talk-live-smoke.ts");
+    // Let imports reach streaming before advancing the pacing and close-observation timers.
+    await Promise.race([
+      firstAudio,
+      command.then(() => {
+        throw new Error("Smoke command completed before sending backend audio");
+      }),
+    ]);
+    await vi.runAllTimersAsync();
+    await command;
+    expect(vi.getTimerCount()).toBe(0);
 
     expect(output).toHaveBeenCalledWith("openai-backend-bridge: ok", expect.any(Object));
     expect(output).toHaveBeenCalledWith("openai-backend-audio-roundtrip: ok", expect.any(Object));
@@ -163,7 +185,7 @@ it.each([
       `openai-webrtc-browser: ${ok ? "ok" : "failed"}`,
       expect.objectContaining({ protocol: "ga-realtime" }),
     );
-    expect(process.exitCode).toBe(ok ? undefined : 1);
+    expect(process.exitCode).toBe(ok ? 0 : 1);
     expect(browser.contextClose).toHaveBeenCalledOnce();
     expect(browser.close).toHaveBeenCalledOnce();
   },

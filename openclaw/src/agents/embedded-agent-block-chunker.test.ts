@@ -27,6 +27,315 @@ function expectChunksWithinLength(chunks: string[], maxLength: number) {
 }
 
 describe("EmbeddedBlockChunker", () => {
+  it.each([
+    { breakPreference: "paragraph", suffix: "ready\n\nTail", expected: "First line is ready" },
+    { breakPreference: "newline", suffix: "ready\nTail", expected: "First line is ready" },
+    { breakPreference: "sentence", suffix: "ready. Tail", expected: "First line is ready." },
+  ] as const)(
+    "waits for a $breakPreference boundary before falling back to whitespace",
+    ({ breakPreference, suffix, expected }) => {
+      const chunker = new EmbeddedBlockChunker({
+        minChars: 8,
+        maxChars: 30,
+        breakPreference,
+        flushOnParagraph: false,
+      });
+
+      for (const character of "First line is ") {
+        chunker.append(character);
+        expect(drainChunks(chunker)).toEqual([]);
+      }
+      chunker.append(suffix);
+
+      expect(drainChunks(chunker)).toEqual([expected]);
+      expect(drainChunks(chunker, true)).toEqual(["Tail"]);
+      expect(chunker.bufferedText).toBe("");
+    },
+  );
+
+  it.each([
+    {
+      breakPreference: "paragraph",
+      text: "Aaaa\n\nBbbb\n\nCccc",
+      normal: [{ chunk: "Aaaa\n\nBbbb", sourceText: "Aaaa\n\nBbbb\n\n" }],
+      forced: [
+        { chunk: "Aaaa", sourceText: "Aaaa\n\n" },
+        { chunk: "Bbbb", sourceText: "Bbbb\n\n" },
+        { chunk: "Cccc", sourceText: "Cccc" },
+      ],
+      tail: "Cccc",
+    },
+    {
+      breakPreference: "newline",
+      text: "Aaaa\nBbbb\nCccc",
+      normal: [{ chunk: "Aaaa\nBbbb", sourceText: "Aaaa\nBbbb\n" }],
+      forced: [
+        { chunk: "Aaaa", sourceText: "Aaaa\n" },
+        { chunk: "Bbbb", sourceText: "Bbbb\n" },
+        { chunk: "Cccc", sourceText: "Cccc" },
+      ],
+      tail: "Cccc",
+    },
+    {
+      breakPreference: "sentence",
+      text: "Aaaa. Bbbb. Tail",
+      normal: [{ chunk: "Aaaa. Bbbb.", sourceText: "Aaaa. Bbbb. " }],
+      forced: [
+        { chunk: "Aaaa. Bbbb.", sourceText: "Aaaa. Bbbb. " },
+        { chunk: "Tail", sourceText: "Tail" },
+      ],
+      tail: "Tail",
+    },
+  ] as const)(
+    "preserves $breakPreference selection and source cursors across a forced tail",
+    ({ breakPreference, text, normal, forced, tail }) => {
+      for (const force of [false, true]) {
+        const prefix = force ? `${"x".repeat(20)}\n` : "";
+        const source = prefix + text;
+        const chunker = new EmbeddedBlockChunker({ minChars: 3, maxChars: 20, breakPreference });
+        const emitted: Array<{ chunk: string; sourceText: string | undefined }> = [];
+        const emit = (chunk: string, options?: { sourceText: string }) =>
+          emitted.push({ chunk, sourceText: options?.sourceText });
+        chunker.append(source);
+        chunker.drain({ force, emit });
+        expect(emitted).toEqual(
+          force ? [{ chunk: "x".repeat(20), sourceText: prefix }, ...forced] : normal,
+        );
+        expect(chunker.bufferedText).toBe(force ? "" : tail);
+        expect(chunker.hasBuffered()).toBe(!force);
+        expect(chunker.consumedLength).toBe(source.length - (force ? 0 : tail.length));
+        expect(chunker.sourceLength).toBe(source.length);
+        emitted.length = 0;
+        chunker.drain({ force: true, emit });
+        expect(emitted).toEqual(force ? [] : [{ chunk: tail, sourceText: tail }]);
+        expect(chunker.bufferedText).toBe("");
+        expect(chunker.hasBuffered()).toBe(false);
+        expect(chunker.consumedLength).toBe(source.length);
+        expect(chunker.sourceLength).toBe(source.length);
+        expect(drainChunks(chunker, true)).toEqual([]);
+      }
+    },
+  );
+
+  it("balances an unfinished fence at the exact cap and retains its later continuation", () => {
+    const chunker = new EmbeddedBlockChunker({
+      minChars: 8,
+      maxChars: 20,
+      breakPreference: "paragraph",
+    });
+    chunker.append("```ts\nabcdefghijklm");
+    expect(drainChunks(chunker)).toEqual([]);
+
+    chunker.append("n");
+    expect(drainChunks(chunker)).toEqual(["```ts\nabcdefghij\n```"]);
+    expect(chunker.bufferedText).toBe("```ts\nklmn");
+
+    chunker.append("op\n```");
+    expect(drainChunks(chunker)).toEqual([]);
+    expect(drainChunks(chunker, true)).toEqual(["```ts\nklmnop\n```"]);
+    expect(chunker.bufferedText).toBe("");
+  });
+
+  it.each([
+    { text: "```ts\nabcdefg.", expected: [] },
+    { text: "```ts\nabcdefghijklm.", expected: ["```ts\nabcdefghij\n```"] },
+  ])("keeps terminal code punctuation inside its unfinished fence: $text", ({ text, expected }) => {
+    const chunker = new EmbeddedBlockChunker({
+      minChars: 8,
+      maxChars: 20,
+      breakPreference: "paragraph",
+    });
+    chunker.append(text);
+
+    expect(drainChunks(chunker)).toEqual(expected);
+  });
+
+  it("keeps a genuinely closed fence at the exact cap without reopening it", () => {
+    const chunker = new EmbeddedBlockChunker({
+      minChars: 8,
+      maxChars: 20,
+      breakPreference: "paragraph",
+    });
+    chunker.append("```ts\nabcdefghij\n");
+    expect(drainChunks(chunker)).toEqual([]);
+
+    chunker.append("```");
+    expect(drainChunks(chunker)).toEqual(["```ts\nabcdefghij\n```"]);
+    expect(drainChunks(chunker, true)).toEqual([]);
+
+    chunker.append("Tail");
+    expect(drainChunks(chunker, true)).toEqual(["Tail"]);
+  });
+
+  it.each([false, true])(
+    "reports original source across synthetic wrappers with a preserved break: %s",
+    (preserveBreak) => {
+      const chunker = new EmbeddedBlockChunker({ minChars: 1, maxChars: 20 });
+      const delivered: Array<{ text: string; sourceText?: string }> = [];
+      const fenced = "```txt\nabcdefghijklmnopqr\n```\n\n";
+      if (preserveBreak) {
+        chunker.reset([fenced.length]);
+      }
+      chunker.append(`${fenced}Tail`);
+      chunker.drain({
+        force: true,
+        emit: (text, options) => delivered.push({ text, sourceText: options?.sourceText }),
+      });
+
+      expect(delivered).toEqual([
+        { text: "```txt\nabcdefghi\n```", sourceText: "```txt\nabcdefghi" },
+        { text: "```txt\njklmnopqr\n```", sourceText: "jklmnopqr\n```\n\n" },
+        { text: "Tail", sourceText: "Tail" },
+      ]);
+    },
+  );
+
+  it.each([
+    { name: "below the cap", suffix: "Unchanged paragraph follows.\n", ready: false },
+    { name: "at the cap", suffix: "Unchanged prose remains for this case. ", ready: true },
+  ])(
+    "drains a preserved short prefix $name and on force without merging its suffix",
+    ({ suffix, ready }) => {
+      const chunker = new EmbeddedBlockChunker({
+        minChars: 12,
+        maxChars: 50,
+        breakPreference: "newline",
+      });
+      const prefix = "Corrected. ";
+      chunker.reset([prefix.length]);
+      chunker.append(prefix + suffix);
+
+      expect(drainChunks(chunker)).toEqual(ready ? [prefix] : []);
+      expect(chunker.bufferedText).toBe(ready ? suffix : prefix + suffix);
+      expect(drainChunks(chunker, true)).toEqual(ready ? [suffix] : [prefix, suffix]);
+      expect(chunker.bufferedText).toBe("");
+    },
+  );
+
+  it("replaces a pending preserved boundary before introducing a code fence", () => {
+    const chunker = new EmbeddedBlockChunker({ minChars: 1, maxChars: 50 });
+    const prefix = "Corrected. ";
+    chunker.reset([prefix.length]);
+    chunker.append(`${prefix}Unchanged prose follows.`);
+    const replacement = "```txt\nA revised fenced answer.\n```";
+
+    chunker.replace(replacement);
+
+    expect(drainChunks(chunker, true)).toEqual([replacement]);
+    expect(chunker.bufferedText).toBe("");
+  });
+
+  it.each([
+    { tail: "Tail", changed: false, expected: ["Tail"] },
+    { tail: "", changed: true, expected: [] },
+    { tail: "Fixed tail", changed: true, expected: ["Fixed tail"] },
+  ])(
+    "reconciles pending '$tail' without replaying drained source",
+    ({ tail, changed, expected }) => {
+      const chunker = new EmbeddedBlockChunker({
+        minChars: 10,
+        maxChars: 16,
+        breakPreference: "sentence",
+      });
+      for (const sentence of ["Hello world.", "Next sentence."]) {
+        chunker.append(`${sentence} `);
+        expect(drainChunks(chunker)).toEqual([sentence]);
+      }
+      chunker.append("Tail");
+      expect(chunker.consumedLength).toBe("Hello world. Next sentence. ".length);
+      const snapshot = `Hello world. Next sentence.${tail ? ` ${tail}` : ""}`;
+
+      expect(chunker.replace(snapshot)).toBe(changed);
+      expect(chunker.sourceLength).toBe(snapshot.length);
+      expect(drainChunks(chunker, true)).toEqual(expected);
+      expect(chunker.consumedLength).toBe(snapshot.length);
+      expect(chunker.replace(snapshot)).toBe(false);
+      expect(drainChunks(chunker, true)).toEqual([]);
+    },
+  );
+
+  it("buffers without chunking and replaces a native source suffix before or after a drain", () => {
+    const chunker = new EmbeddedBlockChunker();
+    chunker.append("Earlier ");
+    const sourceOffset = chunker.sourceLength;
+    chunker.append("Draft");
+    expect(drainChunks(chunker)).toEqual([]);
+    expect(chunker.replace("Fixed", sourceOffset)).toBe(true);
+    expect(drainChunks(chunker, true)).toEqual(["Earlier Fixed"]);
+    expect(chunker.consumedLength).toBe("Earlier Fixed".length);
+
+    const nextOffset = chunker.sourceLength;
+    chunker.append("Draft");
+    expect(chunker.replace("Later", nextOffset)).toBe(true);
+    expect(drainChunks(chunker, true)).toEqual(["Later"]);
+    chunker.reset();
+    expect(chunker.sourceLength).toBe(0);
+    expect(chunker.consumedLength).toBe(0);
+    chunker.append(" \n");
+    expect(drainChunks(chunker, true)).toEqual([" \n"]);
+  });
+
+  it.each(
+    [
+      {
+        name: "regular",
+        header: "```txt\n",
+        renderedHeader: "```txt\n",
+        body: "x".repeat(9),
+        tail: "xxx😀tail",
+        maxChars: 20,
+      },
+      {
+        name: "long-language",
+        header: "```very-long-language-name\n",
+        renderedHeader: "```\n",
+        body: "q".repeat(22),
+        tail: "qqqq\nold\n```",
+        maxChars: 30,
+      },
+    ].flatMap((fixture) =>
+      ["NEW", ""].map((replacement) => Object.assign({}, fixture, { replacement })),
+    ),
+  )(
+    "reconciles $name fenced source with '$replacement' pending code",
+    ({ header, renderedHeader, body, tail, maxChars, replacement }) => {
+      const chunker = new EmbeddedBlockChunker({
+        minChars: 10,
+        maxChars,
+        breakPreference: "paragraph",
+      });
+      chunker.append(`${header}${body}${tail}`);
+      expect(drainChunks(chunker)).toEqual([`${renderedHeader}${body}\n\`\`\``]);
+      expect(chunker.consumedLength).toBe(header.length + body.length);
+
+      const snapshot = `${header}${body}${replacement}\n\`\`\``;
+      expect(chunker.replace(snapshot)).toBe(true);
+      expect(chunker.sourceLength).toBe(snapshot.length);
+      expect(chunker.bufferedText).toBe(`${renderedHeader}${replacement}\n\`\`\``);
+      expect(drainChunks(chunker, true)).toEqual(
+        replacement ? [`${renderedHeader}${replacement}\n\`\`\``] : [],
+      );
+      expect(chunker.consumedLength).toBe(snapshot.length);
+    },
+  );
+
+  it("counts the source closing fence and skipped paragraph separator before replacing prose", () => {
+    const chunker = new EmbeddedBlockChunker({
+      minChars: 1,
+      maxChars: 30,
+      breakPreference: "paragraph",
+    });
+    const prefix = `\`\`\`txt\n${"q".repeat(32)}\n\`\`\`\n\n`;
+    chunker.append(`${prefix}Tail`);
+    expect(drainChunks(chunker)).toEqual([
+      `\`\`\`txt\n${"q".repeat(19)}\n\`\`\``,
+      `\`\`\`txt\n${"q".repeat(13)}\n\`\`\``,
+    ]);
+    expect(chunker.consumedLength).toBe(prefix.length);
+    expect(chunker.replace(`${prefix}Fixed`)).toBe(true);
+    expect(drainChunks(chunker, true)).toEqual(["Fixed"]);
+  });
+
   it("breaks at paragraph boundary right after fence close", () => {
     // A closed fence is a safe boundary; splitting before it would corrupt
     // markdown rendered by downstream clients.
@@ -171,9 +480,9 @@ describe("EmbeddedBlockChunker", () => {
     expect(chunker.bufferedText).toBe("After fence");
   });
 
-  it("parses fence spans once per drain call for long fenced buffers", () => {
+  it("scans fence spans once per drain call for long fenced buffers", () => {
     // Long streaming buffers should not rescan fences for every emitted chunk.
-    const parseSpy = vi.spyOn(fences, "parseFenceSpans");
+    const scanSpy = vi.spyOn(fences, "scanFenceSpans");
     const chunker = new EmbeddedBlockChunker({
       minChars: 20,
       maxChars: 80,
@@ -184,9 +493,76 @@ describe("EmbeddedBlockChunker", () => {
     const chunks = drainChunks(chunker);
 
     expect(chunks.length).toBeGreaterThan(2);
-    expect(parseSpy).toHaveBeenCalledTimes(1);
-    parseSpy.mockRestore();
+    expect(scanSpy).toHaveBeenCalledTimes(1);
+    scanSpy.mockRestore();
   });
+
+  it.each(["open", "closed"])(
+    "bounds paragraph candidate scans while streaming a long %s fence",
+    (kind) => {
+      const maxChars = 1_200;
+      const chunker = new EmbeddedBlockChunker({
+        minChars: 1,
+        maxChars,
+        breakPreference: "newline",
+        flushOnParagraph: true,
+      });
+      const code = "code\n\n".repeat(600);
+      const closing = "```\n\nAfter";
+      const initial = `\`\`\`txt\n${code}${kind === "closed" ? closing : ""}`;
+      const completed = `\`\`\`txt\n${code}${closing}`;
+      const chunks: string[] = [];
+      const sources: string[] = [];
+      const emit = (chunk: string, options?: { sourceText: string }) => {
+        chunks.push(chunk);
+        sources.push(options?.sourceText ?? "");
+      };
+      chunker.append(initial);
+      let candidates = 0;
+      // Capture before spying; every invocation explicitly supplies the original RegExp receiver.
+      // oxlint-disable-next-line typescript/unbound-method
+      const nativeExec = RegExp.prototype.exec;
+      const paragraphPattern = /\n[\t ]*\n+/g;
+      const spy = vi.spyOn(RegExp.prototype, "exec").mockImplementation(function (
+        this: RegExp,
+        text: string,
+      ) {
+        const result = nativeExec.call(this, text);
+        if (result && this.source === paragraphPattern.source && this.flags === "g") {
+          candidates++;
+        }
+        return result;
+      });
+      try {
+        chunker.drain({ force: false, emit });
+      } finally {
+        spy.mockRestore();
+      }
+      const streamedCount = chunks.length;
+      expect(streamedCount).toBeGreaterThan(1);
+      expect(chunker.sourceLength).toBe(initial.length);
+      if (kind === "open") {
+        chunker.append(closing);
+      }
+      chunker.drain({ force: true, emit });
+
+      expect(sources.join("")).toBe(completed);
+      expect(chunker.consumedLength).toBe(completed.length);
+      expect(chunker.sourceLength).toBe(completed.length);
+      expect(chunker.bufferedText).toBe("");
+      expectChunksWithinLength(chunks, maxChars);
+      for (const chunk of chunks.filter((text) => text.startsWith("```"))) {
+        expect(chunk.startsWith("```txt\n")).toBe(true);
+        expect(chunk.trimEnd().endsWith("```")).toBe(true);
+      }
+      const rendered = chunks
+        .flatMap((chunk) => chunk.split("\n").filter((line) => !line.startsWith("```")))
+        .join("")
+        .replace(/\s/g, "");
+      expect(rendered).toBe(`${"code".repeat(600)}After`);
+      expect(candidates).toBeLessThanOrEqual(3 * (streamedCount + 1));
+    },
+  );
 
   it("does not split inside the closing fence marker when clamping at maxChars", () => {
     // Clamp-based splitting rewraps fenced chunks so no partial closing marker

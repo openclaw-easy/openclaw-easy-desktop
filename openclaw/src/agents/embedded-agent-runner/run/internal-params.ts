@@ -1,7 +1,9 @@
 import type { SessionTranscriptRuntimeTarget } from "../../../config/sessions/session-accessor.js";
 import type { InternalSessionEntry } from "../../../config/sessions/types.js";
 import type { AgentExecutionAuthBinding } from "../../execution-auth-binding.js";
+import type { ModelFallbackRouteResolution } from "../../model-fallback.types.js";
 import type { PreparedModelRuntimePluginGeneration } from "../../prepared-model-runtime.types.js";
+import type { CompactionRequestBudget } from "../../sessions/compaction/request-budget.js";
 import type { SystemAgentToolOptions } from "../../tools/system-agent-tool.js";
 import type { DeferredEmbeddedRunLifecycleOwner } from "./deferred-lifecycle-owner.js";
 import type { RunEmbeddedAgentParams } from "./params.js";
@@ -21,12 +23,26 @@ export type EmbeddedContextAccountingEvent = Readonly<
 /** Writer custody is independent of telemetry; an absent snapshot is not observed unknown context. */
 export type CompactionAccountingFact = Readonly<
   { count: number; currentContextSnapshot?: { tokens: number | undefined } } & (
-    | { kind: "durable"; target: CompactionAccountingTarget }
+    | {
+        kind: "durable";
+        target: CompactionAccountingTarget;
+        /** Present only when the host committed a successor session rotation. */
+        previousSessionId?: string;
+      }
     | { kind: "presentation-only" }
   )
 >;
 
 export type RunEmbeddedAgentInternalParams = RunEmbeddedAgentParams & {
+  /** Reset deferred terminal facts when the host admits a new attempt, before preparation. */
+  onAttemptStart?: () => void;
+  /** Keep a bounded auxiliary tool set directly visible after runtime admission. */
+  disableToolSearch?: true;
+  /** Restrict history/search to an explicitly observed session, not this run's store key. */
+  sessionReadScopeKey?: string;
+  /** Candidate producers have already resolved the model against their captured metadata. */
+  requestedRouteResolution?: ModelFallbackRouteResolution;
+  onCompactionRequestBudget?: (budget: CompactionRequestBudget | undefined) => void;
   onCompactionAccounting?: (fact: CompactionAccountingFact | undefined) => void;
   /** Attempt-local context observer, installed by the host loop before dispatch. */
   onContextAccountingEvent?: (event: EmbeddedContextAccountingEvent) => void;
@@ -42,14 +58,22 @@ export type RunEmbeddedAgentInternalParams = RunEmbeddedAgentParams & {
   systemAgentTool?: SystemAgentToolOptions;
   /** Gateway-private lifecycle generation selected before command admission. */
   pluginGeneration?: PreparedModelRuntimePluginGeneration;
+  /** Re-admit from the committed transcript without persisting the original prompt again. */
+  pluginRuntimeRefreshContinuation?: true;
+  pluginRuntimeRefreshMessages?: EmbeddedRunAttemptParams["pluginRuntimeRefreshMessages"];
   /** Host-only transfer of attempt terminal resources to the logical turn. */
   onDeferredLifecycleOwner?: (owner: DeferredEmbeddedRunLifecycleOwner) => void;
   /** Aborts the logical turn when its retained embedded handle is cancelled. */
   onDeferredLifecycleAbort?: (reason?: "user_abort" | "restart" | "superseded") => void;
+  /** Protects an admitted provider wait through the retained logical-turn owner. */
+  onRetryWait?: (
+    deadlineAtMs: number,
+    signal?: AbortSignal,
+  ) => ((completed?: boolean) => void) | undefined;
 };
 
 export type EmbeddedRunAttemptInternalParams = EmbeddedRunAttemptParams &
-  Pick<RunEmbeddedAgentInternalParams, "onContextAccountingEvent"> & {
+  Pick<RunEmbeddedAgentInternalParams, "onContextAccountingEvent" | "onCompactionRequestBudget"> & {
     compactionCountOwner?: "subscription" | "caller";
   };
 

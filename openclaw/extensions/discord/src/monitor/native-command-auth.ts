@@ -1,14 +1,13 @@
-// Discord plugin module implements native command auth behavior.
 import { resolveCommandAuthorizedFromAuthorizers } from "openclaw/plugin-sdk/command-auth-native";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { isDangerousNameMatchingEnabled } from "openclaw/plugin-sdk/dangerous-name-runtime";
 import { resolveOpenProviderRuntimeGroupPolicy } from "openclaw/plugin-sdk/runtime-group-policy";
 import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { resolveDiscordAccountAllowFrom, resolveDiscordAccountDmPolicy } from "../accounts.js";
+import { resolveDiscordCommandOwnerAllowFrom } from "../command-owners.js";
 import type { AutocompleteInteraction, Guild } from "../internal/discord.js";
 import {
   normalizeDiscordAllowList,
-  resolveDiscordCommandOwnerAllowFrom,
   resolveDiscordAllowListMatch,
   resolveDiscordChannelConfigWithFallback,
   resolveDiscordChannelPolicyCommandAuthorizer,
@@ -205,6 +204,7 @@ export function resolveDiscordNativeGroupDmAccess(params: {
 }
 
 export async function resolveDiscordNativeAutocompleteAuthorized(params: {
+  isPolicyCurrent?: () => boolean;
   interaction: AutocompleteInteraction;
   cfg: OpenClawConfig;
   discordConfig: DiscordConfig;
@@ -231,8 +231,11 @@ export async function resolveDiscordNativeAutocompleteAuthorized(params: {
     channel: interaction.channel,
     client: interaction.client,
     hasGuild: Boolean(interaction.guild),
-    channelIdFallback: "",
+    channelIdFallback: interaction.rawData.channel_id ?? "",
   });
+  if (params.isPolicyCurrent?.() === false) {
+    return false;
+  }
   const memberRoleIds = Array.isArray(interaction.rawData.member?.roles)
     ? interaction.rawData.member.roles.map((roleId: string) => roleId)
     : [];
@@ -308,7 +311,7 @@ export async function resolveDiscordNativeAutocompleteAuthorized(params: {
       cfg,
       rest: interaction.client.rest,
     });
-    if (dmAccess.senderAccess.decision !== "allow") {
+    if (params.isPolicyCurrent?.() === false || dmAccess.senderAccess.decision !== "allow") {
       return false;
     }
   }
@@ -341,7 +344,7 @@ export async function resolveDiscordNativeAutocompleteAuthorized(params: {
     }
   }
   if (!isDirectMessage) {
-    return resolveDiscordGuildNativeCommandAuthorized({
+    const authorized = await resolveDiscordGuildNativeCommandAuthorized({
       cfg,
       accountId,
       discordConfig,
@@ -355,6 +358,7 @@ export async function resolveDiscordNativeAutocompleteAuthorized(params: {
       ownerAllowListConfigured: ownerAllowList != null,
       ownerAllowed: ownerOk,
     });
+    return authorized && params.isPolicyCurrent?.() !== false;
   }
-  return true;
+  return params.isPolicyCurrent?.() !== false;
 }

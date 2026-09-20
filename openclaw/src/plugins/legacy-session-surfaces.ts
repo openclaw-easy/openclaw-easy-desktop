@@ -19,10 +19,8 @@ import {
 } from "./manifest-owner-policy.js";
 import { unwrapDefaultModuleExport } from "./module-export.js";
 import { getCachedPluginModuleLoader } from "./plugin-module-loader-cache.js";
-import {
-  resolveCanonicalDistRuntimeSource,
-  resolvePluginRuntimeArtifact,
-} from "./plugin-runtime-artifact-resolution.js";
+import { resolvePluginRuntimeArtifact } from "./plugin-runtime-artifact-resolution.js";
+import { resolvePluginRuntimeExecutionArtifact } from "./plugin-runtime-artifact-selection.js";
 import { createEmptyPluginRegistry } from "./registry-empty.js";
 import type { PluginRuntimeLoadContext } from "./runtime/load-context.js";
 import { resolvePluginRuntimeLoadContext } from "./runtime/load-context.resolve.js";
@@ -107,18 +105,18 @@ function loadLegacySessionSurface(params: {
   env: NodeJS.ProcessEnv;
   artifactRegistry: ReturnType<typeof createEmptyPluginRegistry>;
 }): BundledChannelLegacySessionSurface {
-  const setupEntry = resolvePluginRuntimeArtifact({
-    pluginId: params.record.id,
-    entryKind: "setup",
-    source: params.record.setupSource,
-    rootDir: params.record.rootDir,
-    origin: params.record.origin,
-    preferBuiltPluginArtifacts: false,
-    packageManifest: params.record.packageManifest,
-    registry: params.artifactRegistry,
-  });
-  const moduleSource = resolveCanonicalDistRuntimeSource(setupEntry.source);
-  const moduleRoot = resolveCanonicalDistRuntimeSource(setupEntry.rootDir);
+  const { source: moduleSource, rootDir: moduleRoot } = resolvePluginRuntimeExecutionArtifact(
+    resolvePluginRuntimeArtifact({
+      pluginId: params.record.id,
+      entryKind: "setup",
+      source: params.record.setupSource,
+      rootDir: params.record.rootDir,
+      origin: params.record.origin,
+      preferBuiltPluginArtifacts: false,
+      packageManifest: params.record.packageManifest,
+      registry: params.artifactRegistry,
+    }),
+  );
   const opened = openRootFileSync({
     absolutePath: moduleSource,
     rootPath: moduleRoot,
@@ -144,7 +142,6 @@ function loadLegacySessionSurface(params: {
   fs.closeSync(opened.fd);
   const moduleExport = getCachedPluginModuleLoader({
     modulePath: safeSource,
-    rootDir: moduleRoot,
     importerUrl: import.meta.url,
     loaderFilename: import.meta.url,
   })(safeSource);
@@ -163,7 +160,9 @@ export function prepareLegacySessionSurfaces(params: {
       config: params.config,
       env: params.env,
     });
-  const manifestRecords = context.manifestRegistry?.plugins ?? [];
+  const manifestRecords = (context.manifestRegistry?.plugins ?? []).filter(
+    (record) => record.packageManifest?.setupFeatures?.legacySessionSurfaces === true,
+  );
   const selectedPluginIds = new Set(
     resolveConfiguredChannelPluginIds({
       config: context.config,
@@ -174,22 +173,14 @@ export function prepareLegacySessionSurfaces(params: {
     }),
   );
   const normalizedConfig = normalizePluginsConfig(context.activationSourceConfig.plugins);
-  for (const record of manifestRecords) {
-    if (
-      record.packageManifest?.setupFeatures?.legacySessionSurfaces === true &&
+  const declaringRecords = manifestRecords.filter(
+    (record) =>
+      selectedPluginIds.has(record.id) ||
       isEnabledLegacySurfaceOwner({
         record,
         config: context.activationSourceConfig,
         normalizedConfig,
-      })
-    ) {
-      selectedPluginIds.add(record.id);
-    }
-  }
-  const declaringRecords = manifestRecords.filter(
-    (record) =>
-      selectedPluginIds.has(record.id) &&
-      record.packageManifest?.setupFeatures?.legacySessionSurfaces === true,
+      }),
   );
   if (declaringRecords.length === 0) {
     return EMPTY_LEGACY_SESSION_SURFACES;

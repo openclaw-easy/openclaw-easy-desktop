@@ -8,14 +8,13 @@ import {
   deferGatewayRestartUntilIdle,
   type RestartDeferralHandle,
   resolveGatewayRestartDeferralTimeoutMs,
-  setGatewaySigusr1RestartPolicy,
+  setGatewayRestartPolicy,
 } from "../infra/restart.js";
 import { runWithGatewayIndependentRootWorkAdmission } from "../process/gateway-work-admission.js";
 import { createAppliedConfigHashPublisher } from "./applied-config-hash-publisher.js";
 import type { GatewayReloadPlan } from "./config-reload.js";
 import {
   GatewayConfigReloadSupersededError,
-  isCurrentGatewayReloadGeneration,
   type AcceptedRestartTarget,
   type AcceptedRestartTargetOwnership,
   type GatewayReloadHandlerParams,
@@ -23,6 +22,7 @@ import {
   type GatewayRestartTransactionResult,
   type GatewayRestartTransactionState,
 } from "./server-reload-contracts.js";
+import { isCurrentGatewayReloadGeneration } from "./server-reload-generation.js";
 
 const RESTART_EMISSION_RETRY_MS = 1_000;
 
@@ -371,7 +371,7 @@ class GatewayRestartTransaction {
         if (!emitResult || emitResult.status === "failed") {
           this.scheduleEmissionRetry(retry);
         }
-      }).catch((err: unknown) => {
+      }, "reload:restart").catch((err: unknown) => {
         if (this.isCurrentRequest(retry.requestGeneration)) {
           this.options.params.logReload.warn(
             `gateway restart recovery retry stopped: ${String(err)}`,
@@ -408,7 +408,7 @@ class GatewayRestartTransaction {
     let emissionPrepared = true;
     const prepareForEmit = async () => {
       try {
-        await params.assertRestartReady?.();
+        await params.assertRestartReady?.(nextConfig);
         if (!this.isCurrentRequest(requestGeneration)) {
           return false;
         }
@@ -419,7 +419,7 @@ class GatewayRestartTransaction {
           return false;
         }
         emissionPrepared = true;
-        setGatewaySigusr1RestartPolicy({ allowExternal: isRestartEnabled(preparedConfig) });
+        setGatewayRestartPolicy({ allowExternal: isRestartEnabled(preparedConfig) });
         return this.isCurrentRequest(requestGeneration);
       } catch (err) {
         emissionPrepared = false;
@@ -455,6 +455,8 @@ class GatewayRestartTransaction {
       }
 
       let failedEmission: { reason: string; intent?: GatewayRestartIntent } | undefined;
+      // Timeout and failed checks leave a live deferral owned by this request.
+      this.restartDeferral?.cancel();
       this.restartDeferral = deferGatewayRestartUntilIdle({
         getPendingCount: () => this.options.getActiveCounts().totalActive,
         maxWaitMs: resolveGatewayRestartDeferralTimeoutMs(undefined),
@@ -509,22 +511,20 @@ class GatewayRestartTransaction {
             );
           },
           onTimeout: (_pending, elapsedMs) => {
+            // Keep the handle until delivery or cancellation; forced attempts may retry.
             this.restartPending = false;
-            this.restartDeferral = null;
             params.logReload.warn(
               `restart timeout after ${elapsedMs}ms with ${this.options.formatDeferredWorkStatus("still active")}; forcing restart`,
             );
           },
           onCheckError: (err) => {
-            this.restartPending = false;
-            this.restartDeferral = null;
             params.logReload.warn(
-              `restart deferral check failed (${String(err)}); restarting gateway now`,
+              `restart deferral check failed (${String(err)}); pending work is unknown, deferring and retrying`,
             );
           },
         },
       });
-      setGatewaySigusr1RestartPolicy({ allowExternal: isRestartEnabled(nextConfig) });
+      setGatewayRestartPolicy({ allowExternal: isRestartEnabled(nextConfig) });
       return true;
     }
     // No active operations or pending replies, restart immediately
@@ -550,7 +550,7 @@ class GatewayRestartTransaction {
     if (emitResult.status === "coalesced") {
       params.logReload.info("gateway restart already scheduled; skipping duplicate signal");
     }
-    setGatewaySigusr1RestartPolicy({ allowExternal: isRestartEnabled(nextConfig) });
+    setGatewayRestartPolicy({ allowExternal: isRestartEnabled(nextConfig) });
     return true;
   }
 }

@@ -1,5 +1,3 @@
-// Line plugin module implements bot behavior.
-import type { webhook } from "@line/bot-sdk";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { DEFAULT_GROUP_HISTORY_LIMIT, type HistoryEntry } from "openclaw/plugin-sdk/reply-history";
 import {
@@ -41,7 +39,7 @@ interface LineBotOptions {
 }
 
 interface LineBot {
-  handleWebhook: (body: webhook.CallbackRequest) => Promise<void>;
+  handleWebhook: ReturnType<typeof createLineWebhookSpool>["accept"];
   account: ResolvedLineAccount;
   stop: () => Promise<void>;
 }
@@ -94,9 +92,9 @@ export function createLineBot(opts: LineBotOptions): LineBot {
   const spool = createLineWebhookSpool({
     accountId: account.accountId,
     runtime,
-    deliver: async (event, _destination, control) => {
+    deliver: async (events, _destination, control) => {
       const cfg = resolveTurnConfig();
-      await handleLineWebhookEvents([event], {
+      await handleLineWebhookEvents([...events], {
         cfg,
         account,
         runtime,
@@ -106,6 +104,7 @@ export function createLineBot(opts: LineBotOptions): LineBot {
         ...(control.turnAdoptionLifecycle
           ? { turnAdoptionLifecycle: control.turnAdoptionLifecycle }
           : {}),
+        ...(control.missingParts === undefined ? {} : { missingParts: control.missingParts }),
         groupHistories,
         historyLimit:
           account.config.historyLimit ??

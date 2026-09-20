@@ -1,4 +1,3 @@
-// Mattermost plugin module implements channel behavior.
 import {
   jsonResult,
   readPositiveIntegerParam,
@@ -6,7 +5,6 @@ import {
   readStringParam,
   withNormalizedTimestamp,
 } from "openclaw/plugin-sdk/channel-actions";
-import { adaptScopedAccountAccessor } from "openclaw/plugin-sdk/channel-config-helpers";
 import type {
   ChannelMessageActionAdapter,
   ChannelMessageActionName,
@@ -55,6 +53,10 @@ import {
   normalizeMattermostAllowEntry as normalizeAllowEntry,
   resolveMattermostGatewayAuthBypassPaths,
 } from "./channel-config-shared.js";
+import {
+  createMattermostDeliveryProgressReporter,
+  toMattermostOutboundResult,
+} from "./channel-send-result.js";
 import { MattermostChannelConfigSchema } from "./config-surface.js";
 import { mattermostDoctor } from "./doctor.js";
 import { resolveMattermostGroupRequireMention } from "./group-mentions.js";
@@ -69,7 +71,6 @@ import {
 } from "./mattermost/accounts.js";
 import { normalizeMattermostEmojiName } from "./mattermost/emoji.js";
 import { mattermostIngressIdentity } from "./mattermost/ingress-identity.js";
-import type { MattermostSendResult } from "./mattermost/send.js";
 import {
   looksLikeMattermostTargetId,
   normalizeMattermostMessagingTarget,
@@ -226,36 +227,6 @@ function extractMattermostToolSend(args: Record<string, unknown>): ChannelToolSe
   };
 }
 
-function extractMattermostToolSendResult(
-  result: unknown,
-  send: ChannelToolSend,
-): ChannelToolSend | null {
-  if (!result || typeof result !== "object") {
-    return null;
-  }
-  const details = (result as { details?: unknown }).details;
-  if (!details || typeof details !== "object") {
-    return null;
-  }
-  const toolSend = (details as { toolSend?: unknown }).toolSend;
-  if (!toolSend || typeof toolSend !== "object") {
-    return null;
-  }
-  const record = toolSend as Record<string, unknown>;
-  const to = normalizeOptionalString(record.to);
-  if (!to) {
-    return null;
-  }
-  const threadId = normalizeOptionalString(record.threadId);
-  const originalTarget = normalizeOptionalString(send.to);
-  const preserveOriginalTarget =
-    originalTarget?.startsWith("user:") === true || originalTarget?.startsWith("@") === true;
-  return {
-    to: preserveOriginalTarget ? originalTarget : to,
-    ...(threadId ? { threadId } : {}),
-  };
-}
-
 function resolveMattermostAutoThreadId(params: {
   to: string;
   replyToId?: string | null;
@@ -369,9 +340,9 @@ async function listMattermostDirectoryPeers(params: MattermostDirectoryListParam
 
 const mattermostMessageActions: ChannelMessageActionAdapter = {
   providerOwnedReadGates: ["read"],
+  readAuthorityActions: ["read"],
   describeMessageTool: describeMattermostMessageTool,
   extractToolSend: ({ args }) => extractMattermostToolSend(args),
-  extractToolSendResult: ({ result, send }) => extractMattermostToolSendResult(result, send),
   prepareSendPayload: ({ ctx, payload }) => {
     if (ctx.action !== "send") {
       return null;
@@ -397,16 +368,13 @@ const mattermostMessageActions: ChannelMessageActionAdapter = {
     };
   },
   supportsAction: ({ action }) => {
-    return action === "send" || action === "react" || action === "read";
+    return action === "react" || action === "read";
   },
   handleAction: async ({
     action,
     params,
     cfg,
     accountId,
-    mediaAccess,
-    mediaLocalRoots,
-    mediaReadFile,
     conversationReadOrigin,
     requesterAccountId,
     toolContext,
@@ -490,31 +458,11 @@ const mattermostMessageActions: ChannelMessageActionAdapter = {
       // The runner preserves the caller's spelling in `target` and puts the
       // directory-resolved provider destination in `to` before dispatch.
       const authorizedTarget = normalizeOptionalString(params.to);
-      if (remove) {
-        const result = await (
-          await loadMattermostChannelRuntime()
-        ).removeMattermostReaction({
-          cfg,
-          postId,
-          emojiName,
-          accountId: resolvedAccountId,
-          authorizedTarget,
-          conversationReadOrigin,
-        });
-        if (!result.ok) {
-          throw new Error(result.error);
-        }
-        return {
-          content: [
-            { type: "text" as const, text: `Removed reaction :${emojiName}: from ${postId}` },
-          ],
-          details: {},
-        };
-      }
-
-      const result = await (
-        await loadMattermostChannelRuntime()
-      ).addMattermostReaction({
+      const runtime = await loadMattermostChannelRuntime();
+      const mutateReaction = remove
+        ? runtime.removeMattermostReaction
+        : runtime.addMattermostReaction;
+      const result = await mutateReaction({
         cfg,
         postId,
         emojiName,
@@ -527,74 +475,19 @@ const mattermostMessageActions: ChannelMessageActionAdapter = {
       }
 
       return {
-        content: [{ type: "text" as const, text: `Reacted with :${emojiName}: on ${postId}` }],
+        content: [
+          {
+            type: "text" as const,
+            text: remove
+              ? `Removed reaction :${emojiName}: from ${postId}`
+              : `Reacted with :${emojiName}: on ${postId}`,
+          },
+        ],
         details: {},
       };
     }
 
-    if (action !== "send") {
-      throw new Error(`Unsupported Mattermost action: ${action}`);
-    }
-
-    // Send action with optional interactive buttons
-    const to =
-      typeof params.to === "string"
-        ? params.to.trim()
-        : typeof params.target === "string"
-          ? params.target.trim()
-          : "";
-    if (!to) {
-      throw new Error("Mattermost send requires a target (to).");
-    }
-
-    const { text: message, buttons } = resolveMattermostPresentation({
-      text: typeof params.message === "string" ? params.message : undefined,
-      presentation: params.presentation,
-    });
-    // Mattermost post root_id is the thread root. A generic replyTo can name
-    // the current child post, so prefer threadId unless the caller supplied the
-    // Mattermost-specific replyToId root directly.
-    const replyToId =
-      normalizeOptionalString(params.replyToId) ??
-      normalizeOptionalString(params.threadId) ??
-      normalizeOptionalString(params.replyTo);
-    const resolvedAccountId = accountId || undefined;
-
-    const mediaUrl = resolveMattermostSendAttachmentMedia(params);
-    const result = await (
-      await loadMattermostChannelRuntime()
-    ).sendMessageMattermost(to, message, {
-      cfg,
-      accountId: resolvedAccountId,
-      replyToId,
-      buttons: buttons.length > 0 ? buttons : undefined,
-      attachmentText: typeof params.attachmentText === "string" ? params.attachmentText : undefined,
-      mediaUrl,
-      mediaLocalRoots: mediaLocalRoots ?? mediaAccess?.localRoots,
-      mediaReadFile: mediaReadFile ?? mediaAccess?.readFile,
-      ...(mediaAccess?.workspaceDir ? { workspaceDir: mediaAccess.workspaceDir } : {}),
-      requireMediaUpload: requiresMattermostMediaUpload(mediaUrl) ? true : undefined,
-    });
-
-    return {
-      content: [
-        {
-          type: "text" as const,
-          text: JSON.stringify({
-            ok: true,
-            channel: "mattermost",
-            messageId: result.messageId,
-            channelId: result.channelId,
-          }),
-        },
-      ],
-      details: {
-        toolSend: {
-          to: `channel:${result.channelId}`,
-          ...(replyToId ? { threadId: replyToId } : {}),
-        },
-      },
-    };
+    throw new Error(`Unsupported Mattermost action: ${action}`);
   },
 };
 
@@ -657,25 +550,6 @@ function resolveMattermostSendAttachmentMedia(params: Record<string, unknown>): 
   return mediaUrls[0];
 }
 
-type MattermostOutboundContext = Parameters<NonNullable<ChannelOutboundAdapter["sendText"]>>[0];
-
-function toMattermostOutboundResult(result: MattermostSendResult) {
-  const { channelId, ...delivery } = result;
-  return { ...delivery, target: { kind: "channel" as const, id: channelId } };
-}
-
-function createMattermostDeliveryProgressReporter(
-  onDeliveryResult: MattermostOutboundContext["onDeliveryResult"],
-) {
-  return onDeliveryResult
-    ? async (result: MattermostSendResult) => {
-        await onDeliveryResult(
-          attachChannelToResult("mattermost", toMattermostOutboundResult(result)),
-        );
-      }
-    : undefined;
-}
-
 const mattermostOutbound: ChannelOutboundAdapter = {
   deliveryMode: "direct",
   chunker: chunkTextForOutbound,
@@ -697,7 +571,11 @@ const mattermostOutbound: ChannelOutboundAdapter = {
     if (payload.mediaUrls && payload.mediaUrls.length > 1) {
       return null;
     }
-    const { text, buttons } = resolveMattermostPresentation({ text: payload.text, presentation });
+    const { text, buttons } = resolveMattermostPresentation({
+      text: payload.text,
+      presentation,
+      channelData: payload.channelData,
+    });
     if (!buttons.length && !hasMattermostPresentationNavigation(presentation)) {
       return null;
     }
@@ -741,6 +619,8 @@ const mattermostOutbound: ChannelOutboundAdapter = {
         replyToId: ctx.replyToId ?? (ctx.threadId != null ? String(ctx.threadId) : undefined),
         buttons: buttons?.length ? buttons : undefined,
         attachmentText,
+        assertDirectAdapterHandoff: ctx.assertDirectAdapterHandoff,
+        onPlatformSendDispatch: ctx.onPlatformSendDispatch,
         onDeliveryResult: createMattermostDeliveryProgressReporter(ctx.onDeliveryResult),
       });
       return attachChannelToResult("mattermost", toMattermostOutboundResult(result));
@@ -761,15 +641,17 @@ const mattermostOutbound: ChannelOutboundAdapter = {
   },
   ...createAttachedChannelResultAdapter({
     channel: "mattermost",
-    sendText: async ({ cfg, to, text, accountId, replyToId, threadId, onDeliveryResult }) =>
+    sendText: async (ctx) =>
       toMattermostOutboundResult(
         await (
           await loadMattermostChannelRuntime()
-        ).sendMessageMattermost(to, text, {
-          cfg,
-          accountId: accountId ?? undefined,
-          replyToId: replyToId ?? (threadId != null ? String(threadId) : undefined),
-          onDeliveryResult: createMattermostDeliveryProgressReporter(onDeliveryResult),
+        ).sendMessageMattermost(ctx.to, ctx.text, {
+          cfg: ctx.cfg,
+          accountId: ctx.accountId ?? undefined,
+          replyToId: ctx.replyToId ?? (ctx.threadId != null ? String(ctx.threadId) : undefined),
+          assertDirectAdapterHandoff: ctx.assertDirectAdapterHandoff,
+          onPlatformSendDispatch: ctx.onPlatformSendDispatch,
+          onDeliveryResult: createMattermostDeliveryProgressReporter(ctx.onDeliveryResult),
         }),
       ),
     sendMedia: async ({
@@ -783,6 +665,8 @@ const mattermostOutbound: ChannelOutboundAdapter = {
       accountId,
       replyToId,
       threadId,
+      assertDirectAdapterHandoff,
+      onPlatformSendDispatch,
       onDeliveryResult,
     }) =>
       toMattermostOutboundResult(
@@ -797,6 +681,8 @@ const mattermostOutbound: ChannelOutboundAdapter = {
           ...(mediaAccess?.workspaceDir ? { workspaceDir: mediaAccess.workspaceDir } : {}),
           requireMediaUpload: requiresMattermostMediaUpload(mediaUrl) ? true : undefined,
           replyToId: replyToId ?? (threadId != null ? String(threadId) : undefined),
+          assertDirectAdapterHandoff,
+          onPlatformSendDispatch,
           onDeliveryResult: createMattermostDeliveryProgressReporter(onDeliveryResult),
         }),
       ),
@@ -842,6 +728,7 @@ export const mattermostPlugin: ChannelPlugin<ResolvedMattermostAccount> = create
     },
     reload: {
       configPrefixes: ["channels.mattermost"],
+      noopPrefixes: ["messages.inbound"],
       /**
        * accounts.default is promoted; named resolution merges only channel-wide fields
        * plus the selected account. Monitor debounce and durable ingress use accountId.
@@ -851,7 +738,6 @@ export const mattermostPlugin: ChannelPlugin<ResolvedMattermostAccount> = create
     configSchema: MattermostChannelConfigSchema,
     config: {
       ...mattermostConfigAdapter,
-      inspectAccount: adaptScopedAccountAccessor(inspectMattermostAccount),
       isConfigured: isMattermostConfigured,
       describeAccount: describeMattermostAccount,
     },

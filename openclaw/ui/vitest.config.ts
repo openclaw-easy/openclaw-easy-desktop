@@ -5,14 +5,25 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { playwright } from "@vitest/browser-playwright";
 import { chromium } from "playwright";
-import { defineConfig, defineProject } from "vitest/config";
+import { defineConfig, defineProject, type ViteUserConfig } from "vitest/config";
+import { intersectIncludePatterns } from "../test/vitest/vitest.include-patterns.ts";
+import {
+  loadPatternListFromEnv,
+  matchesVitestGlob,
+  relativizeScopedPatterns,
+} from "../test/vitest/vitest.pattern-file.ts";
+import { loadVitestPerformanceConfig } from "../test/vitest/vitest.performance-config.ts";
+import { createRedactingReporterPlugin } from "../test/vitest/vitest.reporters.ts";
 import {
   jsdomOptimizedDeps,
   nonIsolatedRunnerPath,
-  resolveDefaultVitestPool,
   sharedVitestConfig,
 } from "../test/vitest/vitest.shared.config.ts";
 import { uiIsolatedTestFiles } from "../test/vitest/vitest.ui-isolated-paths.mjs";
+import {
+  uiNodeDrivenBrowserTestFiles,
+  uiTimingTestFiles,
+} from "../test/vitest/vitest.ui-paths.mjs";
 import { controlUiLocaleModulesPlugin } from "./config/control-ui-locales.ts";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -38,10 +49,9 @@ const workspaceSourceAliases = [
     find: "../logging/redact.js",
     replacement: path.resolve(here, "src/lib/browser-redact.ts"),
   },
-  {
-    find: "openclaw/plugin-sdk/test-fixtures",
-    replacement: path.resolve(repoRoot, "src/plugin-sdk/test-fixtures.ts"),
-  },
+  ...sharedVitestConfig.resolve.alias.filter(
+    (alias) => typeof alias.find === "string" && alias.find.startsWith("openclaw/plugin-sdk/"),
+  ),
   {
     find: /^@openclaw\/model-catalog-core\/(.+)$/u,
     replacement: path.resolve(repoRoot, "packages/model-catalog-core/src/$1.ts"),
@@ -75,6 +85,10 @@ const workspaceSourceAliases = [
     replacement: path.resolve(repoRoot, "packages/session-url-contract/src/share-build.ts"),
   },
   {
+    find: "@openclaw/session-url-contract/public-share",
+    replacement: path.resolve(repoRoot, "packages/session-url-contract/src/public-share.ts"),
+  },
+  {
     find: "@openclaw/session-url-contract",
     replacement: path.resolve(repoRoot, "packages/session-url-contract/src/index.ts"),
   },
@@ -91,35 +105,29 @@ const workspaceSourceAliases = [
     replacement: path.resolve(repoRoot, "packages/net-policy/src/index.ts"),
   },
 ];
+function includeUiTests(patterns: string[], env = process.env): string[] {
+  const selected = intersectIncludePatterns(
+    patterns.map((pattern) => path.posix.normalize(`ui/${pattern}`)),
+    loadPatternListFromEnv("OPENCLAW_VITEST_INCLUDE_FILE", env),
+    matchesVitestGlob,
+  );
+  return selected ? selected.map((pattern) => path.posix.relative("ui", pattern)) : patterns;
+}
+
 const sharedUiTestConfig = {
+  ...loadVitestPerformanceConfig(process.env, process.platform, here),
+  // Preserve calls recorded during shared setup and beforeAll hooks.
+  clearMocks: false,
   isolate: false,
-  pool: resolveDefaultVitestPool(),
+  pool: "threads",
   // Real-Chromium layout tests exceed Vitest's 5s default on 4vcpu CI runners;
   // without this the checks-ui lane flakes on cold hover/interaction tests.
   testTimeout: 60_000,
   hookTimeout: 60_000,
 } as const;
-const nodeDrivenBrowserLayoutTests = [
-  "src/ui/chat/sidebar-session-picker.browser.test.ts",
-  "src/pages/chat/chat-responsive.browser.test.ts",
-  "src/pages/chat/chat-working-indicator.browser.test.ts",
-  "src/pages/chat/chat-composer-undo-redo.browser.test.ts",
-  "src/pages/chat/components/chat-swarm-progress.browser.test.ts",
-  "src/components/form-controls.browser.test.ts",
-  "src/components/sidebar-footer-layout.browser.test.ts",
-  "src/pages/sessions/view.browser.test.ts",
-  "src/styles/corner-shape.browser.test.ts",
-  "src/styles/cursor-policy.browser.test.ts",
-  "src/styles/chat-file-link-presentation.browser.test.ts",
-  "src/styles/chat-github-link-presentation.browser.test.ts",
-  "src/styles/shimmer.browser.test.ts",
-  "src/styles/sr-only.browser.test.ts",
-] as const;
-const mockRegistryUnitTests = [
-  ...uiIsolatedTestFiles.map((testFile) => testFile.slice("ui/".length)),
-  "src/components/mcp-app-view.test.ts",
-  "src/pages/chat/chat-page.test.ts",
-] as const;
+const nodeDrivenBrowserLayoutTests = relativizeScopedPatterns(uiNodeDrivenBrowserTestFiles, "ui");
+const timingTests = relativizeScopedPatterns(uiTimingTestFiles, "ui");
+const mockRegistryUnitTests = uiIsolatedTestFiles.map((testFile) => testFile.slice("ui/".length));
 const chromiumExecutableOverrideEnvKey = "PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH";
 const systemChromiumExecutableCandidates = [
   "/snap/bin/chromium",
@@ -153,15 +161,99 @@ function resolveChromiumLaunchOptions(): { executablePath: string } | undefined 
 
 const chromiumLaunchOptions = resolveChromiumLaunchOptions();
 
+export function createUiBrowserVitestConfig(env = process.env): ViteUserConfig {
+  return defineProject({
+    root: here,
+    plugins: [controlUiLocaleModulesPlugin(), createRedactingReporterPlugin()],
+    optimizeDeps: {
+      include: [
+        // These controls share wa-popup's eager registration. Optimize them together
+        // so later test imports cannot re-register a rebuilt common chunk.
+        // Sidebar fixtures also load lazy dialogs, tabs, and narration. Prepare their
+        // dependency graph before tests rather than reloading the active Lit registry.
+        "@awesome.me/webawesome/dist/components/dialog/dialog.js",
+        "@awesome.me/webawesome/dist/components/tab-group/tab-group.js",
+        "@awesome.me/webawesome/dist/components/tab-panel/tab-panel.js",
+        "@awesome.me/webawesome/dist/components/tab/tab.js",
+        "@awesome.me/webawesome/dist/components/dropdown/dropdown.js",
+        "@awesome.me/webawesome/dist/components/dropdown-item/dropdown-item.js",
+        "@awesome.me/webawesome/dist/components/popover/popover.js",
+        "@awesome.me/webawesome/dist/components/popup/popup.js",
+        "@lit/context",
+        "@lit/task",
+        "@noble/ed25519",
+        "@noble/hashes/sha2.js",
+        "@openclaw/uirouter",
+        "dompurify",
+        "file-type",
+        "highlight.js/lib/core",
+        "highlight.js/lib/languages/{bash,cpp,css,diff,java,javascript,json,markdown,python,rust,typescript,xml,yaml}",
+        "ipaddr.js",
+        "json5",
+        "lit/async-directive.js",
+        "lit/directive.js",
+        "lit/directives/if-defined.js",
+        "lit/directives/keyed.js",
+        "lit/directives/ref.js",
+        "lit/directives/repeat.js",
+        "lit/directives/style-map.js",
+        "lit/directives/unsafe-html.js",
+        "lit/static-html.js",
+        "markdown-it",
+        "markdown-it-task-lists",
+        "mdast-util-from-markdown",
+        "mdast-util-gfm-table",
+        "micromark-extension-gfm-table",
+        "pretty-ms",
+        "remend",
+        "typebox/compile",
+        "typebox/guard",
+        "typebox/value",
+        "zod",
+      ],
+    },
+    resolve: {
+      alias: workspaceSourceAliases,
+    },
+    test: {
+      ...sharedUiTestConfig,
+      // File-project loading overrides Vite's root with the config directory.
+      // Keep discovery and setup paths rooted in the UI in every entrypoint.
+      root: here,
+      name: "browser",
+      // No cleanup runner: it imports node:fs and repo server modules, which
+      // cannot load in browser mode. Browser files own their own teardown.
+      include: includeUiTests(
+        ["src/**/*.browser.test.ts", "../extensions/*/browser/**/*.browser.test.ts"],
+        env,
+      ),
+      exclude: [...nodeDrivenBrowserLayoutTests],
+      setupFiles: ["./src/test-helpers/lit-warnings.setup.ts"],
+      browser: {
+        enabled: true,
+        provider: playwright(chromiumLaunchOptions ? { launchOptions: chromiumLaunchOptions } : {}),
+        instances: [{ browser: "chromium", name: "chromium" }],
+        headless: true,
+        ui: false,
+      },
+    },
+  });
+}
+
 export default defineConfig({
+  root: here,
+  plugins: [createRedactingReporterPlugin()],
   resolve: {
     alias: workspaceSourceAliases,
   },
   test: {
     ...sharedUiTestConfig,
+    maxWorkers: sharedVitestConfig.test.maxWorkers,
     reporters: sharedVitestConfig.test.reporters,
+    // These projects already own their complete plugins, aliases, and test config.
     projects: [
-      defineProject({
+      {
+        extends: false,
         plugins: [controlUiLocaleModulesPlugin()],
         resolve: {
           alias: workspaceSourceAliases,
@@ -176,18 +268,22 @@ export default defineConfig({
           // The cleanup runner retires that state per file; without it the lane
           // fails whichever sibling the size sequencer happens to pack together.
           runner: nonIsolatedRunnerPath,
-          include: ["src/**/*.test.ts"],
+          include: includeUiTests(["src/**/*.test.ts", "../extensions/*/browser/**/*.test.ts"]),
           exclude: [
             "src/**/*.browser.test.ts",
             "src/**/*.e2e.test.ts",
             "src/**/*.node.test.ts",
+            "../extensions/*/browser/**/*.browser.test.ts",
+            "../extensions/*/browser/**/*.e2e.test.ts",
+            "../extensions/*/browser/**/*.node.test.ts",
             ...mockRegistryUnitTests,
           ],
           environment: "jsdom",
           setupFiles: ["./src/test-helpers/lit-warnings.setup.ts"],
         },
-      }),
-      defineProject({
+      },
+      {
+        extends: false,
         plugins: [controlUiLocaleModulesPlugin()],
         resolve: {
           alias: workspaceSourceAliases,
@@ -199,12 +295,13 @@ export default defineConfig({
           isolate: true,
           deps: jsdomOptimizedDeps,
           name: "unit-mock-registry",
-          include: [...mockRegistryUnitTests],
+          include: includeUiTests([...mockRegistryUnitTests]),
           environment: "jsdom",
           setupFiles: ["./src/test-helpers/lit-warnings.setup.ts"],
         },
-      }),
-      defineProject({
+      },
+      {
+        extends: false,
         plugins: [controlUiLocaleModulesPlugin()],
         resolve: {
           alias: workspaceSourceAliases,
@@ -213,38 +310,36 @@ export default defineConfig({
           ...sharedUiTestConfig,
           deps: jsdomOptimizedDeps,
           name: "unit-node",
+          exclude: timingTests,
           // No cleanup runner: this project also carries the Playwright-driven
           // layout tests, whose browser lives in module scope. Resetting the
           // module graph between files churns that browser and flakes them.
-          include: ["src/**/*.node.test.ts", ...nodeDrivenBrowserLayoutTests],
+          include: includeUiTests([
+            "src/**/*.node.test.ts",
+            "../extensions/*/browser/**/*.node.test.ts",
+            ...nodeDrivenBrowserLayoutTests,
+          ]),
           environment: "jsdom",
           setupFiles: ["./src/test-helpers/lit-warnings.setup.ts"],
         },
-      }),
-      defineProject({
+      },
+      { ...createUiBrowserVitestConfig(), extends: false },
+      {
+        extends: false,
         plugins: [controlUiLocaleModulesPlugin()],
-        resolve: {
-          alias: workspaceSourceAliases,
-        },
+        resolve: { alias: workspaceSourceAliases },
         test: {
           ...sharedUiTestConfig,
-          name: "browser",
-          // No cleanup runner: it imports node:fs and repo server modules, which
-          // cannot load in browser mode. Browser files own their own teardown.
-          include: ["src/**/*.browser.test.ts"],
-          exclude: [...nodeDrivenBrowserLayoutTests],
+          deps: jsdomOptimizedDeps,
+          name: "unit-timing",
+          isolate: true,
+          // Finish other UI tests before measuring full-render wall time.
+          sequence: { groupOrder: 1 },
+          include: includeUiTests(timingTests),
+          environment: "jsdom",
           setupFiles: ["./src/test-helpers/lit-warnings.setup.ts"],
-          browser: {
-            enabled: true,
-            provider: playwright(
-              chromiumLaunchOptions ? { launchOptions: chromiumLaunchOptions } : {},
-            ),
-            instances: [{ browser: "chromium", name: "chromium" }],
-            headless: true,
-            ui: false,
-          },
         },
-      }),
+      },
     ],
   },
 });

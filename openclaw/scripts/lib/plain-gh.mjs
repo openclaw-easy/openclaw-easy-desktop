@@ -1,5 +1,7 @@
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import fs from "node:fs";
+import path from "node:path";
+import { promisify } from "node:util";
 
 /** @typedef {import("node:child_process").ExecFileSyncOptions} ExecFileSyncOptions */
 /** @typedef {import("node:child_process").ExecFileSyncOptionsWithBufferEncoding} ExecFileSyncOptionsWithBufferEncoding */
@@ -13,6 +15,7 @@ import fs from "node:fs";
  */
 
 const PLAIN_GH_MAX_BUFFER_BYTES = 32 * 1024 * 1024;
+const execFileAsync = promisify(execFile);
 
 /**
  * @param {string} filePath
@@ -92,14 +95,35 @@ export function plainGhEnv(env = process.env) {
 
 /**
  * @param {NodeJS.ProcessEnv} [env]
+ * @param {string} [cwd]
  * @returns {string}
  */
-export function resolvePlainGhBin(env = process.env) {
+export function resolvePlainGhBin(env = process.env, cwd = process.cwd()) {
   if (env.OPENCLAW_GH_BIN) {
     if (isExecutable(env.OPENCLAW_GH_BIN)) {
       return env.OPENCLAW_GH_BIN;
     }
     throw new Error(`OPENCLAW_GH_BIN is not executable: ${env.OPENCLAW_GH_BIN}`);
+  }
+
+  if (process.versions.bun) {
+    // oxlint-disable-next-line no-warning-comments -- remove after the upstream Bun PATH fix ships.
+    // TODO(bun): remove this once Bun resolves empty PATH entries against the child cwd.
+    const names =
+      process.platform === "win32"
+        ? (env.PATHEXT ?? ".EXE;.CMD;.BAT;.COM")
+            .split(";")
+            .filter(Boolean)
+            .map((extension) => `gh${extension.toLowerCase()}`)
+        : ["gh"];
+    for (const entry of (env.PATH ?? "").split(path.delimiter)) {
+      for (const name of names) {
+        const candidate = path.resolve(cwd, entry || ".", name);
+        if (isExecutable(candidate)) {
+          return candidate;
+        }
+      }
+    }
   }
 
   // child_process resolves PATH in the child cwd, including relative and empty entries.
@@ -131,7 +155,7 @@ export function resolvePlainGhBin(env = process.env) {
  */
 export function execPlainGh(args, options = {}) {
   const env = plainGhAuthenticatedEnv(options.env ?? process.env);
-  const ghBin = resolvePlainGhBin(env);
+  const ghBin = resolvePlainGhBin(env, options.cwd ?? process.cwd());
   return execFileSync(ghBin, args, {
     ...options,
     env,
@@ -167,15 +191,35 @@ export function execPlainGh(args, options = {}) {
  * @returns {string | Uint8Array<ArrayBuffer>}
  */
 export function execGhRead(args, options = {}, params = {}) {
-  const env = plainGhEnv(options.env ?? process.env);
-  // Cache-aware reads stay on PATH even when another caller selects an explicit binary.
-  delete env.OPENCLAW_GH_BIN;
   const execFileSyncImpl = params.execFileSyncImpl ?? execFileSync;
   return execFileSyncImpl("gh", args, {
     ...options,
-    env,
+    env: ghReadEnv(options.env),
     maxBuffer: options.maxBuffer ?? PLAIN_GH_MAX_BUFFER_BYTES,
   });
+}
+
+/** @param {NodeJS.ProcessEnv} [env] */
+function ghReadEnv(env) {
+  const next = plainGhEnv(env);
+  // Cache-aware reads stay on PATH even when another caller selects an explicit binary.
+  delete next.OPENCLAW_GH_BIN;
+  return next;
+}
+
+/**
+ * @param {readonly string[]} args
+ * @param {import("node:child_process").ExecFileOptions} [options]
+ * @returns {Promise<string>}
+ */
+export async function execGhReadAsync(args, options = {}) {
+  const { stdout } = await execFileAsync("gh", args, {
+    ...options,
+    encoding: "utf8",
+    env: ghReadEnv(options.env),
+    maxBuffer: options.maxBuffer ?? PLAIN_GH_MAX_BUFFER_BYTES,
+  });
+  return stdout;
 }
 
 /**

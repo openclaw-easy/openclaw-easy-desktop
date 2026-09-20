@@ -6,10 +6,7 @@ import {
   renderMarkdownWithMarkers,
 } from "openclaw/plugin-sdk/text-chunking";
 import { truncateUtf16Safe } from "openclaw/plugin-sdk/text-utility-runtime";
-import {
-  readNextcloudTalkErrorBody,
-  releaseNextcloudTalkGuardedResponse,
-} from "./guarded-response.js";
+import { readNextcloudTalkErrorBody } from "./guarded-response.js";
 import { stripNextcloudTalkTargetPrefix } from "./normalize.js";
 import {
   convertMarkdownTables,
@@ -144,7 +141,10 @@ function createNextcloudTalkSendReceipt(params: {
 export async function sendMessageNextcloudTalk(
   to: string,
   text: string,
-  opts: NextcloudTalkSendOpts,
+  opts: NextcloudTalkSendOpts & {
+    onPlatformSendDispatch?: () => Promise<void>;
+    assertDirectAdapterHandoff?: () => void;
+  },
 ): Promise<NextcloudTalkSendResult> {
   const { cfg, account, baseUrl, secret } = resolveNextcloudTalkSendContext(opts);
   const roomToken = normalizeRoomToken(to);
@@ -179,8 +179,10 @@ export async function sendMessageNextcloudTalk(
 
   const url = `${baseUrl}/ocs/v2.php/apps/spreed/api/v1/bot/${roomToken}/message`;
 
+  await opts.onPlatformSendDispatch?.();
   const { response, release } = await fetchWithSsrFGuard({
     url,
+    beforeRequest: opts.assertDirectAdapterHandoff,
     init: {
       method: "POST",
       headers: {
@@ -257,7 +259,7 @@ export async function sendMessageNextcloudTalk(
       timestamp,
     };
   } finally {
-    await releaseNextcloudTalkGuardedResponse({ response, release });
+    await release();
   }
 }
 
@@ -304,6 +306,6 @@ export async function sendReactionNextcloudTalk(
 
     return { ok: true };
   } finally {
-    await releaseNextcloudTalkGuardedResponse({ response, release });
+    await release();
   }
 }

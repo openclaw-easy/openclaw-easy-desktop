@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
+import { toUSVString } from "node:util";
 import type { Selectable } from "kysely";
 import type { AdmittedRunContext } from "../../agents/admitted-run-context.js";
 import {
@@ -22,6 +23,7 @@ import {
   type OpenClawStateDatabaseOptions,
 } from "../../state/openclaw-state-db.js";
 import { OPENCLAW_STATE_SCHEMA_SQL } from "../../state/openclaw-state-schema.js";
+import { describeUnavailableCronAgent } from "../agent-availability.js";
 import { resolveCronJobConfigRevision } from "../config-revision.js";
 import type { CronJob } from "../types.js";
 import { cronStoreKey } from "./key.js";
@@ -45,6 +47,8 @@ import { loadedCronStoreFromRows, loadCronRows } from "./row-codec.js";
 
 type CronRunReceiptDatabase = Pick<OpenClawStateDatabase, "cron_run_receipts">;
 type CronRunReceiptRow = Selectable<CronRunReceiptDatabase["cron_run_receipts"]>;
+
+export type CronRunReceiptSettlementDisposition = "owner-unavailable";
 
 export type CronRunReceiptStatus =
   | "running"
@@ -276,11 +280,8 @@ function receiptFromRow(row: CronRunReceiptRow): CronRunReceipt {
 }
 
 function currentJob(database: DatabaseSync, storeKey: string, jobId: string): CronJob | undefined {
-  const rows = loadCronRows(database, storeKey);
-  if (rows.length === 0) {
-    return undefined;
-  }
-  return loadedCronStoreFromRows(rows).store.jobs.find((job) => job.id === jobId);
+  const rows = loadCronRows(database, storeKey, new Set([jobId]));
+  return loadedCronStoreFromRows(rows).store.jobs[0];
 }
 
 function sameOwner(left: CronRunReceiptRow, right: CronRunReceiptOwnerObservation): boolean {
@@ -348,19 +349,36 @@ function receiptHandle(receipt: CronRunReceipt): CronRunReceiptHandle {
   };
 }
 
-function pruneTerminalReceipts(database: DatabaseSync, storeKey: string, jobId: string): void {
+function pruneTerminalReceipts(
+  database: DatabaseSync,
+  storeKey: string,
+  jobId: string,
+  job: CronJob | undefined,
+): void {
+  const pendingReceiptId =
+    job?.state.runningAtMs === undefined ? undefined : job.state.runningReceiptId;
+  let terminalQuery = query(database)
+    .selectFrom("cron_run_receipts")
+    .select("receipt_id")
+    .where("store_key", "=", storeKey)
+    .where("job_id", "=", jobId)
+    .where("status", "!=", "running");
+  // JSON state must match SQLite TEXT without coercion or surrogate replacement.
+  if (typeof pendingReceiptId === "string" && toUSVString(pendingReceiptId) === pendingReceiptId) {
+    terminalQuery = terminalQuery.orderBy(
+      (eb) => eb.case().when("receipt_id", "=", pendingReceiptId).then(1).else(0).end(),
+      "desc",
+    );
+  }
   const terminalIds = executeSqliteQuerySync(
     database,
-    query(database)
-      .selectFrom("cron_run_receipts")
-      .select("receipt_id")
-      .where("store_key", "=", storeKey)
-      .where("job_id", "=", jobId)
-      .where("status", "!=", "running")
+    terminalQuery
       .orderBy("finished_at_ms", "desc")
       .orderBy("started_at_ms", "desc")
-      .orderBy("receipt_id", "desc"),
-  ).rows.slice(CRON_RUN_RECEIPT_TERMINAL_RETENTION);
+      .orderBy("receipt_id", "desc")
+      .limit(-1)
+      .offset(CRON_RUN_RECEIPT_TERMINAL_RETENTION),
+  ).rows;
   for (let index = 0; index < terminalIds.length; index += CRON_RUN_RECEIPT_DELETE_BATCH_SIZE) {
     const receiptIds = terminalIds
       .slice(index, index + CRON_RUN_RECEIPT_DELETE_BATCH_SIZE)
@@ -486,12 +504,12 @@ export function claimCronRunReceiptInDatabase(params: {
     prepared: params.prepared,
     finishedAtMs: handle.startedAtMs,
   });
-  pruneTerminalReceipts(params.database, handle.storeKey, handle.jobId);
-  validateCurrentJob({
+  const job = validateCurrentJob({
     database: params.database,
     handle,
     resolveAgentId: params.resolveAgentId,
   });
+  pruneTerminalReceipts(params.database, handle.storeKey, handle.jobId, job);
   executeSqliteQuerySync(
     params.database,
     query(params.database)
@@ -532,23 +550,6 @@ export function listActiveCronRunReceiptJobIdsInDatabase(
   storePath: string,
 ) {
   return new Set(activeRow(database, cronStoreKey(storePath)).map((row) => row.job_id));
-}
-
-export function inspectActiveCronRunReceipt(params: {
-  storePath: string;
-  jobId: string;
-  env?: NodeJS.ProcessEnv;
-}): CronRunReceiptRecoveryCandidate | undefined {
-  return withReceiptWrite(
-    "cron.run-receipt.recovery-inspect",
-    params.env ? { env: params.env } : {},
-    (database) =>
-      findActiveCronRunReceiptInDatabase({
-        database,
-        storePath: params.storePath,
-        jobId: params.jobId,
-      }),
-  );
 }
 
 export function isCronRunReceiptOwnerStale(
@@ -610,29 +611,35 @@ export function activateCronRunReceiptInDatabase(params: {
   return { ...params.handle, startedAtMs: params.startedAtMs };
 }
 
-export function assertCronRunReceiptCurrent(params: {
+/** Reads the canonical definition under the same exact receipt check used by execution. */
+export function readCronRunReceiptCurrentJob(params: {
   handle: CronRunReceiptHandle;
   resolveAgentId: ResolveReceiptAgentId;
   isAgentAvailable?: (agentId: string) => boolean;
+  allowMissingJob?: boolean;
   env?: NodeJS.ProcessEnv;
-}): void {
+}): CronJob | undefined {
   if (params.isAgentAvailable && !params.isAgentAvailable(params.handle.agentId)) {
     throw new CronRunReceiptRevisionError(
       params.handle.receiptId,
-      `cron job agent is unavailable: ${params.handle.agentId}`,
+      describeUnavailableCronAgent(params.handle.agentId, params.env),
       "owner-unavailable",
     );
   }
-  withReceiptWrite(
+  return withReceiptWrite(
     "cron.run-receipt.assert-current",
     params.env ? { env: params.env } : {},
-    (database) =>
-      assertCronRunReceiptCurrentInDatabase({
-        database,
-        handle: params.handle,
-        resolveAgentId: params.resolveAgentId,
-      }),
+    (database) => {
+      assertCronRunReceiptOwnedInDatabase({ database, handle: params.handle });
+      return params.allowMissingJob ? undefined : validateCurrentJob({ database, ...params });
+    },
   );
+}
+
+export function assertCronRunReceiptCurrent(
+  params: Parameters<typeof readCronRunReceiptCurrentJob>[0],
+): void {
+  readCronRunReceiptCurrentJob(params);
 }
 
 /** Keeps the durable lease live when timeout/cancel returns before the runner. */
@@ -755,7 +762,12 @@ export function finishCronRunReceiptInDatabase(params: {
       .where("status", "=", "running")
       .where("owner_pid", "=", params.handle.ownerPid),
   );
-  pruneTerminalReceipts(params.database, params.handle.storeKey, params.handle.jobId);
+  pruneTerminalReceipts(
+    params.database,
+    params.handle.storeKey,
+    params.handle.jobId,
+    currentJob(params.database, params.handle.storeKey, params.handle.jobId),
+  );
   const row = executeSqliteQueryTakeFirstSync(
     params.database,
     query(params.database)

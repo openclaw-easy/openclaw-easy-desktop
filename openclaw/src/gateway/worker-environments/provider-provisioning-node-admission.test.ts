@@ -29,7 +29,10 @@ describe("worker environment node provisioning", () => {
       { ensureNodeWorkerBundle: async () => workerBuild, placementStore: placementGate },
     );
 
-    const result = await workerService.create("development", "request-device");
+    const result = await workerService.createWithRequest({
+      profileId: "development",
+      idempotencyKey: "request-device",
+    });
 
     expect(result).toMatchObject({
       state: "ready",
@@ -39,7 +42,7 @@ describe("worker environment node provisioning", () => {
       sharedHost: true,
       ownerEpoch: 1,
     });
-    expect(support.testState.prepareInstallation).not.toHaveBeenCalled();
+    expect(support.testState.prepareInstallation).toHaveBeenCalledExactlyOnceWith("bundle");
     expect(support.testState.bootstrapWorker).not.toHaveBeenCalled();
     const credential = workerService.takeMintedCredential({
       environmentId: result.environmentId,

@@ -6,7 +6,12 @@ import {
   normalizeOptionalString,
 } from "@openclaw/normalization-core/string-coerce";
 import { sliceUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
-import { validateNodePresenceActivityPayload } from "../../packages/gateway-protocol/src/index.js";
+import { Value } from "typebox/value";
+import {
+  validateNodeHostStatsPayload,
+  validateNodePresenceActivityPayload,
+} from "../../packages/gateway-protocol/src/index.js";
+import { DesktopAvailabilitySchema } from "../../packages/gateway-protocol/src/schema/environments.js";
 import { resolveSessionAgentId as defaultResolveSessionAgentId } from "../agents/agent-scope.js";
 import { sendDurableMessageBatchCore } from "../channels/message/runtime.js";
 import { normalizeChannelId as defaultNormalizeChannelId } from "../channels/plugins/index.js";
@@ -40,9 +45,13 @@ import { enqueueSystemEvent as defaultEnqueueSystemEvent } from "../infra/system
 import type { PromptImageOrderEntry } from "../media/prompt-image-order.js";
 import { deleteMediaBuffer } from "../media/store.js";
 import { runWithGatewayIndependentRootWorkContinuation } from "../process/gateway-work-admission.js";
-import { normalizeMainKey as defaultNormalizeMainKey } from "../routing/session-key.js";
+import {
+  isUnscopedSessionKeySentinel,
+  normalizeMainKey as defaultNormalizeMainKey,
+} from "../routing/session-key.js";
 import { defaultRuntime } from "../runtime.js";
 import { resolveAgentHarnessSessionContextError } from "../sessions/agent-harness-session-key.js";
+import { NODE_HOST_STATS_EVENT } from "../shared/node-host-stats.js";
 import {
   NODE_PRESENCE_ALIVE_EVENT,
   NODE_PRESENCE_ACTIVITY_EVENT,
@@ -155,7 +164,7 @@ function dispatchNodeAgentCommand(
       return;
     }
     await dependencies.agentCommandFromIngress(input, dependencies.defaultRuntime, ctx.deps);
-  }).catch((err: unknown) => {
+  }, "node-events:agent-turn").catch((err: unknown) => {
     ctx.logGateway.warn(`agent failed node=${nodeId}: ${dependencies.formatForLog(err)}`);
   });
 }
@@ -344,7 +353,7 @@ function dispatchReservedVoiceAgentCommand(params: {
       return;
     }
     await admission.work;
-  }).catch((err: unknown) => {
+  }, "node-events:voice-turn").catch((err: unknown) => {
     params.reservation.reject();
     params.ctx.logGateway.warn(
       `agent failed node=${params.nodeId}: ${params.dependencies.formatForLog(err)}`,
@@ -402,27 +411,12 @@ function pruneBoundedTimestampMap(
   pruneMapToMaxSize(map, params.maxEntries);
 }
 
-function compactExecEventOutput(raw: string) {
+function compactNodeEventText(raw: string, maxChars: number) {
   const normalized = raw.replace(/\s+/g, " ").trim();
-  if (!normalized) {
-    return "";
-  }
-  if (normalized.length <= MAX_EXEC_EVENT_OUTPUT_CHARS) {
+  if (normalized.length <= maxChars) {
     return normalized;
   }
-  const safe = Math.max(1, MAX_EXEC_EVENT_OUTPUT_CHARS - 1);
-  return `${sliceUtf16Safe(normalized, 0, safe)}…`;
-}
-
-function compactNotificationEventText(raw: string) {
-  const normalized = raw.replace(/\s+/g, " ").trim();
-  if (!normalized) {
-    return "";
-  }
-  if (normalized.length <= MAX_NOTIFICATION_EVENT_TEXT_CHARS) {
-    return normalized;
-  }
-  const safe = Math.max(1, MAX_NOTIFICATION_EVENT_TEXT_CHARS - 1);
+  const safe = Math.max(1, maxChars - 1);
   return `${sliceUtf16Safe(normalized, 0, safe)}…`;
 }
 
@@ -483,7 +477,7 @@ function queueSessionStoreTouch(params: {
       now: params.now,
       dependencies: params.dependencies,
     });
-  }).catch((err: unknown) => {
+  }, "node-events:voice-persist").catch((err: unknown) => {
     params.ctx.logGateway.warn(
       "voice session-store update failed: " + params.dependencies.formatForLog(err),
     );
@@ -521,21 +515,6 @@ async function cleanupNodeEventMedia(
       );
     }
   }
-}
-
-function parseSessionKeyFromPayloadJSON(payloadJSON: string): string | null {
-  let payload: unknown;
-  try {
-    payload = JSON.parse(payloadJSON) as unknown;
-  } catch {
-    return null;
-  }
-  if (typeof payload !== "object" || payload === null) {
-    return null;
-  }
-  const obj = payload as Record<string, unknown>;
-  const sessionKey = normalizeOptionalString(obj.sessionKey) ?? "";
-  return sessionKey.length > 0 ? sessionKey : null;
 }
 
 function parsePayloadObject(payloadJSON?: string | null): Record<string, unknown> | null {
@@ -631,6 +610,26 @@ export const handleNodeEvent = async (
     return pairingChangedResult(evt.event);
   }
   switch (evt.event) {
+    case "node.desktop.availability": {
+      const availability = parsePayloadObject(evt.payloadJSON);
+      if (!Value.Check(DesktopAvailabilitySchema, availability)) {
+        return { ok: true, event: evt.event, handled: false, reason: "invalid_payload" };
+      }
+      const updated = ctx.updateNodeDesktopAvailability?.({
+        nodeId,
+        connId: opts?.connId,
+        availability,
+      });
+      if (updated === null || updated === undefined) {
+        return { ok: true, event: evt.event, handled: false, reason: "stale_connection" };
+      }
+      return {
+        ok: true,
+        event: evt.event,
+        handled: true,
+        reason: updated ? "updated" : "unchanged",
+      };
+    }
     case "voice.transcript": {
       const obj = parsePayloadObject(evt.payloadJSON);
       if (!obj) {
@@ -918,7 +917,7 @@ export const handleNodeEvent = async (
             to: deliveryTo,
             text: receiptText,
           });
-        }).catch((err: unknown) => {
+        }, "node-events:delivery").catch((err: unknown) => {
           ctx.logGateway.warn(`agent receipt failed node=${nodeId}: ${formatForLog(err)}`);
         });
       } else if (wantsReceipt) {
@@ -989,15 +988,26 @@ export const handleNodeEvent = async (
         );
         return undefined;
       }
-      const sessionKeyRaw = target.sessionKey;
-      const { canonicalKey: sessionKey, entry } = loadSessionEntry(sessionKeyRaw);
+      const {
+        canonicalKey: sessionKey,
+        entry,
+        agentId,
+      } = loadSessionEntry(target.sessionKey, {
+        agentId: target.agentId,
+      });
       if (resolveAgentHarnessSessionContextError(sessionKey, entry)) {
         return undefined;
       }
       const packageNameRaw = normalizeOptionalString(obj.packageName);
       const packageName = packageNameRaw ?? null;
-      const title = compactNotificationEventText(normalizeOptionalString(obj.title) ?? "");
-      const text = compactNotificationEventText(normalizeOptionalString(obj.text) ?? "");
+      const title = compactNodeEventText(
+        normalizeOptionalString(obj.title) ?? "",
+        MAX_NOTIFICATION_EVENT_TEXT_CHARS,
+      );
+      const text = compactNodeEventText(
+        normalizeOptionalString(obj.text) ?? "",
+        MAX_NOTIFICATION_EVENT_TEXT_CHARS,
+      );
 
       let summary = `Notification ${change} (node=${nodeId} key=${key}`;
       if (packageName) {
@@ -1011,30 +1021,23 @@ export const handleNodeEvent = async (
         }
       }
 
-      const eventOptions = {
-        sessionKey,
-        contextKey: `notification:${keyRaw}`,
-      };
       const queued = enqueueSystemEvent(
         summary,
-        target.agentId ? withSystemEventOwner(eventOptions, target.agentId) : eventOptions,
+        withSystemEventOwner({ sessionKey, contextKey: `notification:${keyRaw}` }, agentId),
       );
       if (queued) {
         requestHeartbeat({
           source: "notifications-event",
           intent: "event",
           reason: "notifications-event",
-          ...(target.agentId ? { agentId: target.agentId } : {}),
+          agentId,
           sessionKey,
         });
       }
       return undefined;
     }
     case "chat.subscribe": {
-      if (!evt.payloadJSON) {
-        return undefined;
-      }
-      const sessionKey = parseSessionKeyFromPayloadJSON(evt.payloadJSON);
+      const sessionKey = normalizeOptionalString(parsePayloadObject(evt.payloadJSON)?.sessionKey);
       if (!sessionKey) {
         return undefined;
       }
@@ -1044,10 +1047,7 @@ export const handleNodeEvent = async (
       return undefined;
     }
     case "chat.unsubscribe": {
-      if (!evt.payloadJSON) {
-        return undefined;
-      }
-      const sessionKey = parseSessionKeyFromPayloadJSON(evt.payloadJSON);
+      const sessionKey = normalizeOptionalString(parsePayloadObject(evt.payloadJSON)?.sessionKey);
       if (!sessionKey) {
         return undefined;
       }
@@ -1063,10 +1063,7 @@ export const handleNodeEvent = async (
         return undefined;
       }
       const sessionKeyRaw = normalizeOptionalString(obj.sessionKey) ?? `node-${nodeId}`;
-      if (!sessionKeyRaw) {
-        return undefined;
-      }
-      const { canonicalKey: sessionKey } = loadSessionEntry(sessionKeyRaw);
+      const { canonicalKey: sessionKey, agentId } = loadSessionEntry(sessionKeyRaw);
 
       const cfg = getRuntimeConfig();
       const runId = normalizeOptionalString(obj.runId) ?? "";
@@ -1106,10 +1103,6 @@ export const handleNodeEvent = async (
           : undefined;
       const timedOut = obj.timedOut === true;
       const output = normalizeOptionalString(obj.output) ?? "";
-      // Strip parens from the raw reason: the `Exec denied (node=..., <reason>): cmd`
-      // wire format is parsed by matching the first balanced `(...)`, and stray
-      // parens in user-supplied input would break the metadata/body boundary.
-      const reason = (normalizeOptionalString(obj.reason) ?? "").replace(/[()]/g, "");
 
       let text;
       if (evt.event === "exec.started") {
@@ -1117,9 +1110,9 @@ export const handleNodeEvent = async (
         if (command) {
           text += `: ${command}`;
         }
-      } else if (evt.event === "exec.finished") {
+      } else {
         const exitLabel = timedOut ? "timeout" : `code ${exitCode ?? "?"}`;
-        const compactOutput = compactExecEventOutput(output);
+        const compactOutput = compactNodeEventText(output, MAX_EXEC_EVENT_OUTPUT_CHARS);
         const shouldNotify = timedOut || exitCode !== 0 || compactOutput.length > 0;
         if (!shouldNotify) {
           return undefined;
@@ -1138,22 +1131,21 @@ export const handleNodeEvent = async (
         if (compactOutput) {
           text += `\n${compactOutput}`;
         }
-      } else {
-        text = `Exec denied (node=${nodeId}${runId ? ` id=${runId}` : ""}${reason ? `, ${reason}` : ""})`;
-        if (command) {
-          text += `: ${command}`;
-        }
       }
 
       const eventRouting = resolveEventSessionRoutingPolicy({ cfg, sessionKey });
-      const queued = enqueueSystemEvent(text, {
-        sessionKey: resolveEventSessionKeyForPolicy(sessionKey, eventRouting),
-        contextKey: runId ? `exec:${runId}` : "exec",
-      });
+      const queued = enqueueSystemEvent(
+        text,
+        withSystemEventOwner(
+          {
+            sessionKey: resolveEventSessionKeyForPolicy(sessionKey, eventRouting),
+            contextKey: runId ? `exec:${runId}` : "exec",
+          },
+          agentId,
+        ),
+      );
       if (queued) {
-        // Scope wakes only for canonical agent sessions. Synthetic node-* fallback
-        // keys should keep legacy unscoped behavior so enabled non-main heartbeat
-        // agents still run when no explicit agent session is provided.
+        // Global keys retain the loaded owner; synthetic node-* keys keep unscoped wakes.
         requestHeartbeat(
           scopedHeartbeatWakeOptionsForPolicy(
             sessionKey,
@@ -1162,6 +1154,7 @@ export const handleNodeEvent = async (
               intent: "event",
               reason: "exec-event",
               coalesceMs: 0,
+              ...(isUnscopedSessionKeySentinel(sessionKey) ? { agentId } : {}),
             },
             eventRouting,
           ),
@@ -1228,6 +1221,18 @@ export const handleNodeEvent = async (
       }
       return undefined;
     }
+    case NODE_HOST_STATS_EVENT: {
+      const obj = parsePayloadObject(evt.payloadJSON);
+      if (!obj || !validateNodeHostStatsPayload(obj)) {
+        return { ok: true, event: evt.event, handled: false, reason: "invalid_payload" };
+      }
+      const hostStats = ctx.updateNodeHostStats?.({ nodeId, connId: opts?.connId, stats: obj });
+      if (!hostStats) {
+        return { ok: true, event: evt.event, handled: false, reason: "stale_connection" };
+      }
+      ctx.broadcast("node.hostStats", { nodeId, hostStats }, { dropIfSlow: true });
+      return { ok: true, event: evt.event, handled: true, reason: "updated" };
+    }
     case NODE_PRESENCE_ACTIVITY_EVENT: {
       const obj = parsePayloadObject(evt.payloadJSON);
       if (!obj || !validateNodePresenceActivityPayload(obj)) {
@@ -1252,14 +1257,13 @@ export const handleNodeEvent = async (
           reason: cleared ? "cleared" : "already_clear",
         };
       }
-      if (opts?.presenceAllowed !== true) {
+      if (obj.source !== "app" && opts?.presenceAllowed !== true) {
         return { ok: true, event: evt.event, handled: false, reason: "permission_required" };
       }
       const updated = ctx.updateNodePresenceActivity?.({
         nodeId,
-        connId: opts.connId,
-        idleSeconds: obj.idleSeconds,
-        ...(obj.saturated === true ? { saturated: true } : {}),
+        connId: opts?.connId,
+        ...obj,
       });
       if (!updated) {
         return { ok: true, event: evt.event, handled: false, reason: "stale_connection" };

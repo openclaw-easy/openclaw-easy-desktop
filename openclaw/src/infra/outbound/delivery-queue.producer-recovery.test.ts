@@ -108,7 +108,7 @@ describe("exhausted delivery producer recovery", () => {
       now += 1;
       await enqueue("later-control");
       await queueStorage.reserveDeliveryAttempt("later-control", 1, tmpDir());
-      now += 30_000;
+      now += 60_000;
       closeOpenClawStateDatabaseForTest();
 
       const log = await recover(mode);
@@ -136,7 +136,7 @@ describe("exhausted delivery producer recovery", () => {
     "%s cannot terminalize a replacement producer acquired during recovery admission",
     async (mode) => {
       const originalClaim = await reserveProducer("replaced-producer");
-      now += 30_001;
+      now += 60_001;
       let replacementClaim: string | undefined;
       resolveAdapter.mockReturnValue({
         durableFinal: {
@@ -199,7 +199,7 @@ describe("exhausted delivery producer recovery", () => {
       const id = "unfinished-owner-settlement";
       const completion = await preparePendingFinal(id);
       const fault = vi
-        .spyOn(sessionAccessor, "updateSessionEntry")
+        .spyOn(sessionAccessor, "patchSessionEntryCore")
         .mockRejectedValueOnce(new Error("synthetic owner storage unavailable"));
 
       await recover(mode);
@@ -228,6 +228,44 @@ describe("exhausted delivery producer recovery", () => {
       expect(readQueuedEntry(tmpDir(), id)).not.toHaveProperty("deliveryCompletion");
     },
   );
+  it.each(["startup", "recurring"] as const)(
+    "%s settles a producer-claimed entry whose durable completion has gone stale",
+    async (mode) => {
+      const id = "stale-producer-claimed";
+      const completion = {
+        kind: "pending-final" as const,
+        deliveryId: id,
+        intentId: "stale-intent",
+        sessionId: "stale-session",
+        sessionKey: "agent:main:directchat:direct:recipient",
+        storePath: path.join(tmpDir(), "sessions.json"),
+      };
+      await sessionAccessor.replaceSessionEntry(completion, {
+        sessionId: completion.sessionId,
+        updatedAt: now,
+        pendingFinalDelivery: {
+          kind: "replayable",
+          text: "pending final",
+          context: { channel: "directchat", to: "recipient" },
+          createdAt: now,
+          intentId: completion.intentId,
+          deliveries: [],
+        },
+      });
+      // Keep the attempt budget unused to reach completed-owner acknowledgement.
+      await enqueue(id, true, completion);
+      const claimId = await queueStorage.claimDeliveryPlatformSendAttempt(id, tmpDir());
+      if (!claimId) {
+        throw new Error("Expected producer custody");
+      }
+      now += 60_001;
+
+      await recover(mode);
+
+      expect(queueStatus(id)).toBeUndefined();
+    },
+  );
+
   it("preserves suppressed payload outcomes when a rejected delivery resumes owner settlement", async () => {
     const id = "rejected-batch-settlement";
     const completion = await preparePendingFinal(
@@ -248,7 +286,7 @@ describe("exhausted delivery producer recovery", () => {
           status: "suppressed",
           reason: "no_visible_payload",
         });
-        vi.spyOn(sessionAccessor, "updateSessionEntry").mockRejectedValueOnce(
+        vi.spyOn(sessionAccessor, "patchSessionEntryCore").mockRejectedValueOnce(
           new Error("synthetic rejection projection failure"),
         );
         throw new PlatformMessageNotDispatchedError("synthetic permanent rejection", {
@@ -297,7 +335,7 @@ describe("exhausted delivery producer recovery", () => {
       const load = queueStorage.loadUnfinishedDelivery;
       vi.spyOn(queueStorage, "loadUnfinishedDelivery").mockImplementationOnce(async (...args) => {
         const snapshot = await load(...args);
-        now += 29_999;
+        now += 59_999;
         expect(await renewDeliveryPlatformSendLease(id, tmpDir(), claimId)).toBeGreaterThan(now);
         now += 2;
         return snapshot;
@@ -306,7 +344,7 @@ describe("exhausted delivery producer recovery", () => {
       expect(await queueStorage.loadPendingDelivery(id, tmpDir())).toMatchObject({
         recoveryState: "send_attempt_started",
         platformSendAttemptId: claimId,
-        availableAt: startTime + 59_999,
+        availableAt: startTime + 119_999,
       });
     },
   );
@@ -338,8 +376,8 @@ describe("exhausted delivery producer recovery", () => {
     await preparePendingFinal(id);
     const entered = createDeferred();
     const release = createDeferred();
-    const update = sessionAccessor.updateSessionEntry;
-    vi.spyOn(sessionAccessor, "updateSessionEntry").mockImplementationOnce(async (...args) => {
+    const update = sessionAccessor.patchSessionEntryCore;
+    vi.spyOn(sessionAccessor, "patchSessionEntryCore").mockImplementationOnce(async (...args) => {
       entered.resolve();
       await release.promise;
       return update(...args);
@@ -375,7 +413,7 @@ describe("exhausted delivery producer recovery", () => {
     await fs.writeFile(artifact, "audio-bytes");
     const completion = await preparePendingFinal(id, [{ text: "reply", mediaUrl: artifact }]);
     const fault = vi
-      .spyOn(sessionAccessor, "updateSessionEntry")
+      .spyOn(sessionAccessor, "patchSessionEntryCore")
       .mockRejectedValueOnce(new Error("synthetic owner fault"));
     await recover("startup");
     const database = openOpenClawStateDatabase({

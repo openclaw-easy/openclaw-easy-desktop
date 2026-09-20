@@ -3,6 +3,32 @@ import { markdownToIR } from "./ir.js";
 import { renderMarkdownWithMarkers } from "./render.js";
 
 describe("renderMarkdownWithMarkers crossing spans", () => {
+  it("prepares independent link copies before invoking callbacks", () => {
+    const first = { start: 0, end: 3, href: "first" };
+    const second = { start: 4, end: 7, href: "second" };
+    const seen: string[] = [];
+
+    renderMarkdownWithMarkers(
+      { text: "one two", styles: [], links: [first, second] },
+      {
+        styleMarkers: {},
+        escapeText: (text) => text,
+        buildLink: (link) => {
+          seen.push(link.href);
+          if (link.start === 0) {
+            second.href = "changed by earlier callback";
+          }
+          link.href = "changed on callback copy";
+          return null;
+        },
+      },
+    );
+
+    expect(seen).toEqual(["first", "second"]);
+    expect(first.href).toBe("first");
+    expect(second.href).toBe("changed by earlier callback");
+  });
+
   it.each([
     {
       name: "a style ending inside a spoiler",
@@ -33,6 +59,79 @@ describe("renderMarkdownWithMarkers crossing spans", () => {
           italic: { open: "<i>", close: "</i>" },
           spoiler: { open: "<tg-spoiler>", close: "</tg-spoiler>" },
         },
+        escapeText: (text) => text,
+        buildLink: (link) => ({
+          start: link.start,
+          end: link.end,
+          open: `<a href="${link.href}">`,
+          close: "</a>",
+        }),
+      }),
+    ).toBe(html);
+  });
+
+  it("keeps marker callback order and link nesting for unsorted same-start styles", () => {
+    let opened = 0;
+    const marker = (tag: string) => ({
+      open: () => `<${tag} data-open="${++opened}">`,
+      close: `</${tag}>`,
+    });
+
+    expect(
+      renderMarkdownWithMarkers(
+        {
+          text: "abcd 🌍",
+          styles: [
+            { start: 0, end: 2, style: "italic" },
+            { start: 0, end: 7, style: "italic" },
+            { start: 0, end: 7, style: "bold" },
+            { start: 0, end: 2, style: "bold" },
+            { start: 0, end: 7, style: "blockquote" },
+          ],
+          links: [{ start: 0, end: 7, href: "https://example.com" }],
+        },
+        {
+          styleMarkers: {
+            bold: marker("b"),
+            italic: marker("i"),
+            blockquote: marker("blockquote"),
+          },
+          escapeText: (text) => text,
+          buildLink: (link) => ({
+            start: link.start,
+            end: link.end,
+            open: `<a href="${link.href}">`,
+            close: "</a>",
+          }),
+        },
+      ),
+    ).toBe(
+      '<blockquote data-open="1"><a href="https://example.com"><b data-open="2"><i data-open="3"><b data-open="4"><i data-open="5">ab</i></b>cd 🌍</i></b></a></blockquote>',
+    );
+  });
+});
+
+describe("renderMarkdownWithMarkers code content", () => {
+  it.each([
+    {
+      name: "terminal inline code",
+      markdown: "Copy `name `",
+      html: "Copy <code>name </code>",
+    },
+    {
+      name: "terminal inline code in a link label",
+      markdown: "[`name `](https://example.com)",
+      html: '<a href="https://example.com"><code>name </code></a>',
+    },
+    {
+      name: "inline code followed by prose",
+      markdown: "Copy `name ` next",
+      html: "Copy <code>name </code> next",
+    },
+  ])("renders authored code whitespace: $name", ({ markdown, html }) => {
+    expect(
+      renderMarkdownWithMarkers(markdownToIR(markdown), {
+        styleMarkers: { code: { open: "<code>", close: "</code>" } },
         escapeText: (text) => text,
         buildLink: (link) => ({
           start: link.start,

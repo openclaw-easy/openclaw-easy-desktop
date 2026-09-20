@@ -1,21 +1,29 @@
+import { DatabaseSync, StatementSync } from "node:sqlite";
 import { describe, expect, it, vi } from "vitest";
+import { createDeferred } from "../../../test/helpers/promise.js";
 import { trackSqliteStatementExecutions } from "../../../test/helpers/sqlite-statement-execution-counter.js";
+import { requireNodeSqlite } from "../../infra/node-sqlite.js";
+import { getActiveGatewayRootWorkCount } from "../../process/gateway-work-admission.js";
 import {
+  closeOpenClawStateDatabaseAsync,
   openOpenClawStateDatabase,
   runOpenClawStateWriteTransaction,
 } from "../../state/openclaw-state-db.js";
+import * as stateWorker from "../../state/openclaw-state-worker-store.js";
 import { setupCronServiceSuite, writeCronStoreSnapshot } from "../service.test-harness.js";
-import { loadCronStore } from "../store.js";
+import { loadCronStore, saveCronJobsStore } from "../store.js";
 import {
   claimCronRunReceiptInDatabase,
   finishCronRunReceipt,
   finishCronRunReceiptInDatabase,
-  inspectActiveCronRunReceipt,
   prepareCronRunReceiptClaim,
   releaseLocalCronRunReceiptOwnership,
   type CronRunReceiptHandle,
 } from "../store/run-receipt-store.js";
-import { saveCronJobsStoreWithTransactionHooks } from "../store/transaction-hooks.js";
+import {
+  inspectActiveCronRunReceipt,
+  makeCronRecoveryJob as makeJob,
+} from "../store/run-receipt-store.test-support.js";
 import type { CronJob } from "../types.js";
 import { start, stop } from "./ops-lifecycle.js";
 import {
@@ -30,6 +38,7 @@ import {
   tryFinishCronTaskRun,
   tryFinishCronTaskRunWithoutHistory,
 } from "./task-runs.js";
+import { onTimer } from "./timer.test-support.js";
 
 function tryCreateCronTaskRun(
   params: Parameters<typeof tryCreateCronTaskRunHandle>[0],
@@ -38,22 +47,6 @@ function tryCreateCronTaskRun(
 }
 
 const { logger, makeStorePath } = setupCronServiceSuite({ prefix: "cron-run-recovery-" });
-
-function makeJob(id: string, startedAtMs: number): CronJob {
-  return {
-    id,
-    agentId: "alpha",
-    name: id,
-    enabled: true,
-    createdAtMs: startedAtMs - 1,
-    updatedAtMs: startedAtMs - 1,
-    schedule: { kind: "every", everyMs: 60_000, anchorMs: startedAtMs },
-    sessionTarget: "isolated",
-    wakeMode: "next-heartbeat",
-    payload: { kind: "command", argv: ["true"] },
-    state: { runningAtMs: startedAtMs, nextRunAtMs: startedAtMs },
-  };
-}
 
 type RecoveryStateOverrides = Partial<
   Pick<
@@ -97,18 +90,19 @@ async function commitCompletedJob(params: {
   receipt: CronRunReceiptHandle;
   finishedAtMs: number;
 }) {
-  await saveCronJobsStoreWithTransactionHooks(
+  await saveCronJobsStore(
     params.storePath,
     { version: 1, jobs: params.jobs },
-    undefined,
     {
-      afterWrite: (database) => {
-        finishCronRunReceiptInDatabase({
-          database,
-          handle: params.receipt,
-          status: "ok",
-          finishedAtMs: params.finishedAtMs,
-        });
+      transactionHooks: {
+        afterWrite: (database) => {
+          finishCronRunReceiptInDatabase({
+            database,
+            handle: params.receipt,
+            status: "ok",
+            finishedAtMs: params.finishedAtMs,
+          });
+        },
       },
     },
   );
@@ -116,6 +110,158 @@ async function commitCompletedJob(params: {
 }
 
 describe("atomic cron run recovery", () => {
+  it.each(["startup", "timer"] as const)(
+    "retires a delayed %s recovery proposal across stop and restart",
+    async (source) => {
+      const { storePath } = await makeStorePath();
+      const startedAtMs = Date.now();
+      const job = makeJob(`retired-${source}-proposal`, startedAtMs);
+      job.enabled = false;
+      await writeCronStoreSnapshot({ storePath, jobs: [job] });
+      const receipt = claimReceipt(storePath, job, startedAtMs);
+      job.state.runningReceiptId = receipt.receiptId;
+      await writeCronStoreSnapshot({ storePath, jobs: [job] });
+      releaseLocalCronRunReceiptOwnership(receipt);
+      const before = await loadCronStore(storePath);
+      const onEvent = vi.fn();
+      const runCommandJob = vi.fn(async () => ({ status: "ok" as const }));
+      const reaperDiscovery = vi.fn(() => []);
+      const state = createCronServiceState({
+        ...makeState(storePath, startedAtMs + 1).deps,
+        onEvent,
+        runCommandJob,
+        resolveSessionStoreAgentIds: reaperDiscovery,
+        resolveSessionStorePath: () => `${storePath}.sessions`,
+      });
+      const barriers = [
+        { entered: createDeferred(), release: createDeferred() },
+        { entered: createDeferred(), release: createDeferred() },
+      ];
+      let proposalCount = 0;
+      const execute = stateWorker.executeOpenClawStateWorker;
+      const delayed = vi
+        .spyOn(stateWorker, "executeOpenClawStateWorker")
+        .mockImplementation(async (context, command) => {
+          const result = await execute(context, command);
+          if (command.type === "cron.proposeRunRecovery") {
+            const barrier = barriers[proposalCount++];
+            if (barrier) {
+              barrier.entered.resolve();
+              await barrier.release.promise;
+            }
+          }
+          return result;
+        });
+      const rootWorkBefore = getActiveGatewayRootWorkCount();
+      const retired = source === "startup" ? start(state) : onTimer(state);
+      let restarted: Promise<void> | undefined;
+      try {
+        await barriers[0]!.entered.promise;
+        stop(state);
+        restarted = start(state);
+        expect(state.stopped).toBe(false);
+        barriers[0]!.release.resolve();
+        await retired;
+
+        // The replacement is also held, so only the retired operation could repair these rows.
+        expect(await loadCronStore(storePath)).toEqual(before);
+        expect(inspectActiveCronRunReceipt({ storePath, jobId: job.id })).toEqual(receipt);
+        expect(onEvent).not.toHaveBeenCalled();
+        expect(runCommandJob).not.toHaveBeenCalled();
+        expect(reaperDiscovery).not.toHaveBeenCalled();
+        expect(state.activeTimerTicks).toBe(0);
+        expect(state.queuedRunReservationsByJobId.size).toBe(0);
+        expect(getActiveGatewayRootWorkCount()).toBe(rootWorkBefore);
+
+        await barriers[1]!.entered.promise;
+        barriers[1]!.release.resolve();
+        await restarted;
+        expect(inspectActiveCronRunReceipt({ storePath, jobId: job.id })).toBeUndefined();
+        expect((await loadCronStore(storePath)).jobs[0]?.state).toMatchObject({
+          lastRunStatus: "error",
+          lastError: "cron: job interrupted by gateway restart",
+        });
+        expect(onEvent.mock.calls.filter(([event]) => event.action === "finished")).toHaveLength(1);
+        expect(runCommandJob).not.toHaveBeenCalled();
+      } finally {
+        for (const barrier of barriers) {
+          barrier.release.resolve();
+        }
+        await Promise.allSettled([retired, ...(restarted ? [restarted] : [])]);
+        delayed.mockRestore();
+        stop(state);
+      }
+    },
+  );
+
+  it("observes a cold receipt and its running association off the host", async () => {
+    const { storePath } = await makeStorePath();
+    const startedAtMs = Date.now();
+    const job = makeJob("proposal-placement", startedAtMs);
+    await writeCronStoreSnapshot({ storePath, jobs: [job] });
+    const receipt = claimReceipt(storePath, job, startedAtMs);
+    job.state.runningReceiptId = receipt.receiptId;
+    await writeCronStoreSnapshot({ storePath, jobs: [job] });
+    await closeOpenClawStateDatabaseAsync();
+    const sqlite = requireNodeSqlite();
+    const originalDatabase = sqlite.DatabaseSync;
+    const construct = vi.fn();
+    Reflect.set(
+      sqlite,
+      "DatabaseSync",
+      new Proxy(originalDatabase, {
+        construct(target, args, newTarget) {
+          construct();
+          return Reflect.construct(target, args, newTarget);
+        },
+      }),
+    );
+    const spies = {
+      construct,
+      prepare: vi.spyOn(DatabaseSync.prototype, "prepare"),
+      exec: vi.spyOn(DatabaseSync.prototype, "exec"),
+      close: vi.spyOn(DatabaseSync.prototype, "close"),
+      get: vi.spyOn(StatementSync.prototype, "get"),
+      all: vi.spyOn(StatementSync.prototype, "all"),
+      run: vi.spyOn(StatementSync.prototype, "run"),
+      iterate: vi.spyOn(StatementSync.prototype, "iterate"),
+    };
+    try {
+      // Calibrate the constructor observer before the cold canonical database read.
+      new sqlite.DatabaseSync(":memory:").close();
+      expect(construct).toHaveBeenCalledOnce();
+      for (const spy of Object.values(spies)) {
+        spy.mockClear();
+      }
+      const state = makeState(storePath, startedAtMs);
+      const proposal = await proposeCronRunRecovery(state, job.id, undefined, startedAtMs);
+      expect(proposal).toEqual({
+        jobId: job.id,
+        runningAtMs: startedAtMs,
+        runningReceiptId: receipt.receiptId,
+        receipt,
+      });
+      expect(
+        Object.fromEntries(Object.entries(spies).map(([key, spy]) => [key, spy.mock.calls.length])),
+      ).toEqual({
+        construct: 0,
+        prepare: 0,
+        exec: 0,
+        close: 0,
+        get: 0,
+        all: 0,
+        run: 0,
+        iterate: 0,
+      });
+    } finally {
+      Reflect.set(sqlite, "DatabaseSync", originalDatabase);
+      for (const spy of Object.values(spies)) {
+        spy.mockRestore();
+      }
+      releaseLocalCronRunReceiptOwnership(receipt);
+    }
+  });
+
   it("repairs a large unowned store with one active-receipt query", async () => {
     const { storePath } = await makeStorePath();
     const nowMs = Date.parse("2026-08-30T12:00:00.000Z");
@@ -178,7 +324,7 @@ describe("atomic cron run recovery", () => {
     const receipt = claimReceipt(storePath, job, startedAtMs);
     releaseLocalCronRunReceiptOwnership(receipt);
     const state = makeState(storePath, startedAtMs);
-    const proposal = proposeCronRunRecovery(state, job.id, undefined, startedAtMs);
+    const proposal = await proposeCronRunRecovery(state, job.id, undefined, startedAtMs);
     const database = openOpenClawStateDatabase().db;
     // Fail the row write after receipt retirement, inside the real transaction.
     database.exec(`
@@ -222,6 +368,89 @@ describe("atomic cron run recovery", () => {
       } finally {
         stop(next);
       }
+    }
+  });
+
+  it("preserves newer one-shot lifecycle state when startup replays finalized task history", async () => {
+    const { storePath } = await makeStorePath();
+    const startedAtMs = Date.parse("2026-08-31T12:00:00.000Z");
+    const endedAtMs = startedAtMs + 2_000;
+    const persistedRetryAtMs = endedAtMs + 120_000;
+    const historyRetryAtMs = endedAtMs + 30_000;
+    const oneShot = (id: string, enabled: boolean, nextRunAtMs?: number) => {
+      const job = makeJob(id, startedAtMs);
+      job.enabled = enabled;
+      job.schedule = { kind: "at", at: new Date(startedAtMs).toISOString() };
+      job.state.nextRunAtMs = nextRunAtMs;
+      return job;
+    };
+    const jobs = [
+      oneShot("persisted-retry-without-history", true, persistedRetryAtMs),
+      oneShot("persisted-retry", true, persistedRetryAtMs),
+      oneShot("history-retry", true, startedAtMs),
+      oneShot("persisted-disable", false),
+      makeJob("recurring-history", startedAtMs),
+    ];
+    const historyNextRunAtMs = new Map<string, number | undefined>([
+      ["persisted-retry-without-history", undefined],
+      ["persisted-retry", historyRetryAtMs],
+      ["history-retry", historyRetryAtMs],
+      ["persisted-disable", historyRetryAtMs],
+      ["recurring-history", historyRetryAtMs],
+    ]);
+    const executionState = makeState(storePath, endedAtMs);
+
+    for (const job of jobs) {
+      const taskRunId = tryCreateCronTaskRun({
+        state: executionState,
+        job,
+        startedAt: startedAtMs,
+      });
+      expect(taskRunId).toBeDefined();
+      tryFinishCronTaskRun(executionState, {
+        taskRunId,
+        job,
+        event: {
+          jobId: job.id,
+          action: "finished",
+          job,
+          status: "error",
+          error: 'Session "agent:alpha:cron:recovery" changed while starting work. Retry.',
+          runAtMs: startedAtMs,
+          durationMs: endedAtMs - startedAtMs,
+          nextRunAtMs: historyNextRunAtMs.get(job.id),
+        },
+      });
+    }
+    // Production finalization writes task history before its newer job row.
+    await writeCronStoreSnapshot({ storePath, jobs });
+
+    const recovered = makeState(storePath, endedAtMs);
+    try {
+      await start(recovered);
+      const persisted = new Map(
+        (await loadCronStore(storePath)).jobs.map((job) => [job.id, job] as const),
+      );
+      expect(persisted.get("persisted-retry-without-history")).toMatchObject({
+        enabled: true,
+        state: { nextRunAtMs: persistedRetryAtMs },
+      });
+      expect(persisted.get("persisted-retry")).toMatchObject({
+        enabled: true,
+        state: { nextRunAtMs: persistedRetryAtMs },
+      });
+      expect(persisted.get("history-retry")).toMatchObject({
+        enabled: true,
+        state: { nextRunAtMs: historyRetryAtMs },
+      });
+      expect(persisted.get("persisted-disable")?.enabled).toBe(false);
+      expect(persisted.get("persisted-disable")?.state.nextRunAtMs).toBeUndefined();
+      expect(persisted.get("recurring-history")).toMatchObject({
+        enabled: true,
+        state: { nextRunAtMs: historyRetryAtMs },
+      });
+    } finally {
+      stop(recovered);
     }
   });
 
@@ -350,7 +579,7 @@ describe("atomic cron run recovery", () => {
       const first = freshState();
       try {
         if (phase === "repair") {
-          const proposal = proposeCronRunRecovery(first, job.id, undefined, startedAtMs);
+          const proposal = await proposeCronRunRecovery(first, job.id, undefined, startedAtMs);
           expect(recoverCronRunProposal(first, proposal, "startup")).toMatchObject({
             kind: "repaired",
           });
@@ -446,7 +675,7 @@ describe("atomic cron run recovery", () => {
     await writeCronStoreSnapshot({ storePath, jobs: [job] });
     const state = makeState(storePath, startedAtMs + 30_000);
     const receipt = claimReceipt(storePath, job, startedAtMs);
-    const proposal = proposeCronRunRecovery(state, job.id, undefined, startedAtMs);
+    const proposal = await proposeCronRunRecovery(state, job.id, undefined, startedAtMs);
     runOpenClawStateWriteTransaction(({ db }) =>
       finishCronRunReceiptInDatabase({
         database: db,
@@ -573,7 +802,7 @@ describe("atomic cron run recovery", () => {
     await writeCronStoreSnapshot({ storePath, jobs: [job] });
     const state = makeState(storePath, startedAtMs + 30_000);
     const receipt = claimReceipt(storePath, job, startedAtMs);
-    const proposal = proposeCronRunRecovery(state, job.id, undefined, startedAtMs);
+    const proposal = await proposeCronRunRecovery(state, job.id, undefined, startedAtMs);
     const taskRunId = tryCreateCronTaskRun({
       state,
       job,
@@ -633,7 +862,7 @@ describe("atomic cron run recovery", () => {
       finishedAtMs: startedAtMs + 1,
     });
     const receipt = claimReceipt(storePath, job, startedAtMs);
-    const proposal = proposeCronRunRecovery(state, job.id, undefined, startedAtMs);
+    const proposal = await proposeCronRunRecovery(state, job.id, undefined, startedAtMs);
     releaseLocalCronRunReceiptOwnership(receipt);
 
     expect(recoverCronRunProposal(state, proposal)).toMatchObject({ kind: "repaired" });
@@ -669,7 +898,7 @@ describe("atomic cron run recovery", () => {
         durationMs: 1,
       },
     });
-    const proposal = proposeCronRunRecovery(state, job.id, undefined, startedAtMs);
+    const proposal = await proposeCronRunRecovery(state, job.id, undefined, startedAtMs);
     releaseLocalCronRunReceiptOwnership(receipt);
 
     expect(recoverCronRunProposal(state, proposal)).toMatchObject({ kind: "repaired" });
@@ -686,7 +915,7 @@ describe("atomic cron run recovery", () => {
     await writeCronStoreSnapshot({ storePath, jobs: [job] });
     const state = makeState(storePath, startedAtMs + 30_000);
     const receipt = claimReceipt(storePath, job, startedAtMs);
-    const proposal = proposeCronRunRecovery(state, job.id, undefined, startedAtMs);
+    const proposal = await proposeCronRunRecovery(state, job.id, undefined, startedAtMs);
     const completed = structuredClone(job);
     delete completed.state.runningAtMs;
     completed.state.lastRunAtMs = startedAtMs;
@@ -716,7 +945,7 @@ describe("atomic cron run recovery", () => {
     job.state.queuedAtMs = queuedAtMs;
     await writeCronStoreSnapshot({ storePath, jobs: [job] });
     const state = makeState(storePath, queuedAtMs + 1);
-    const proposal = proposeCronRunRecovery(state, job.id, queuedAtMs, undefined);
+    const proposal = await proposeCronRunRecovery(state, job.id, queuedAtMs, undefined);
     const running = structuredClone(job);
     delete running.state.queuedAtMs;
     running.state.runningAtMs = queuedAtMs + 1;
@@ -737,7 +966,7 @@ describe("atomic cron run recovery", () => {
     await writeCronStoreSnapshot({ storePath, jobs: [job] });
     const state = makeState(storePath, startedAtMs + 30_000);
     const first = claimReceipt(storePath, job, startedAtMs);
-    const proposal = proposeCronRunRecovery(state, job.id, undefined, startedAtMs);
+    const proposal = await proposeCronRunRecovery(state, job.id, undefined, startedAtMs);
 
     finishCronRunReceipt({
       handle: first,
@@ -777,8 +1006,13 @@ describe("atomic cron run recovery", () => {
     releaseLocalCronRunReceiptOwnership(firstReceipt);
     releaseLocalCronRunReceiptOwnership(secondReceipt);
     const firstState = makeState(storePath, startedAtMs + 30_000);
-    const firstProposal = proposeCronRunRecovery(firstState, firstJob.id, undefined, startedAtMs);
-    const secondProposal = proposeCronRunRecovery(
+    const firstProposal = await proposeCronRunRecovery(
+      firstState,
+      firstJob.id,
+      undefined,
+      startedAtMs,
+    );
+    const secondProposal = await proposeCronRunRecovery(
       firstState,
       secondJob.id,
       undefined,

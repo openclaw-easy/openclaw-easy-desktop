@@ -1,7 +1,7 @@
 import { once } from "node:events";
 import { rawDataToString } from "openclaw/plugin-sdk/webhook-ingress";
+import { WebSocketServer } from "openclaw/plugin-sdk/websocket-runtime";
 import { afterEach, expect, it } from "vitest";
-import { WebSocketServer } from "ws";
 import { relayTestKey } from "../../../chrome-extension/relay-key.test-support.js";
 import { randomRelayId } from "./auth-v2-crypto.js";
 import {
@@ -41,7 +41,7 @@ it.each(["port", "profile", "owner", "key"] as const)(
     const observed: string[] = [];
     server.on("connection", (ws, request) => {
       observed.push(JSON.stringify({ url: request.url, headers: request.headers }));
-      authority.registerPendingConnection(ws, () => ws.terminate());
+      authority.registerPendingConnection(ws, () => ws.terminate(), "127.0.0.1");
       ws.on("message", (raw) => {
         observed.push(rawDataToString(raw));
         const hello = parseRelayAuthHello(parseStrictJsonObject(rawDataToString(raw)));

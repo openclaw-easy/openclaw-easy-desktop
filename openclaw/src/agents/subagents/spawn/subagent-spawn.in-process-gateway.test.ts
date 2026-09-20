@@ -1,23 +1,18 @@
+import "./subagent-spawn-model.mocks.shared.js";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { expectDefined } from "@openclaw/normalization-core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createExecutionIdentityAdmissionToken } from "../../../audit/execution-identity-admission.js";
-import {
-  clearConfigCache,
-  clearRuntimeConfigSnapshot,
-  getRuntimeConfig,
-} from "../../../config/config.js";
+import { clearConfigCache, clearRuntimeConfigSnapshot } from "../../../config/config.js";
 import { readAgentRuntimeExecutionLineage } from "../../../gateway/agent-runtime-execution-lineage.js";
 import type { AgentRuntimeIdentity } from "../../../gateway/agent-runtime-identity-token.js";
 import { prepareAgentRequestPreflight } from "../../../gateway/agent-turn/agent-request-preflight.js";
 import { createAgentTurnIo } from "../../../gateway/agent-turn/io.js";
 import { readInProcessAgentRuntimeIdentity } from "../../../gateway/in-process-agent-runtime-identity.js";
 import { resolveGatewayAgentTaskTrackingMode } from "../../../gateway/server-methods/agent-task-tracking.js";
-import type {
-  GatewayRequestContext,
-  GatewayRequestOptions,
-} from "../../../gateway/server-methods/types.js";
+import type { GatewayRequestOptions } from "../../../gateway/server-methods/types.js";
 import { createSyntheticPluginRuntimeClient } from "../../../gateway/server-plugin-runtime-client.js";
 import type { dispatchGatewayMethodInProcess } from "../../../gateway/server-plugins.js";
 import type { WorkerSessionTurnClaim } from "../../../gateway/worker-environments/placement-record.js";
@@ -43,7 +38,9 @@ import {
   resetDetachedTaskLifecycleRuntimeForTests,
   setDetachedTaskLifecycleRuntime,
 } from "../../../tasks/detached-task-runtime.test-support.js";
+import { findTaskByRunId } from "../../../tasks/runtime-internal.js";
 import { captureEnv, setTestEnvValue } from "../../../test-utils/env.js";
+import { cleanupSessionStateForTest } from "../../../test-utils/session-state-cleanup.js";
 import { createOperationalRunInstanceRef } from "../../admitted-run-context.js";
 import { withGatewayToolCallerIdentity } from "../../tools/gateway-caller-context.js";
 import { subagentRuns } from "../registry/subagent-registry-memory.js";
@@ -56,36 +53,12 @@ import { testing as swarmSchedulerTesting } from "../swarm/swarm-scheduler.test-
 import { withParentExecutionIdentity } from "./execution-identity-spawn-context.js";
 import { buildSubagentExecutionSessionSpawnContext } from "./subagent-spawn-execution-identity.js";
 import { callSubagentGateway } from "./subagent-spawn-gateway.js";
+import { makeGatewayContext } from "./subagent-spawn.in-process-gateway.test-support.js";
 import { spawnSubagentDirect } from "./subagent-spawn.js";
 import { testing as subagentSpawnTesting } from "./subagent-spawn.test-support.js";
 
 const envSnapshot = captureEnv(["OPENCLAW_CONFIG_PATH", "OPENCLAW_STATE_DIR"]);
 let stateDir = "";
-
-function makeGatewayContext(): GatewayRequestContext {
-  return {
-    dedupe: new Map(),
-    addChatRun: vi.fn(),
-    removeChatRun: vi.fn(),
-    chatAbortControllers: new Map(),
-    chatQueuedTurns: new Map(),
-    chatRunBuffers: new Map(),
-    chatDeltaSentAt: new Map(),
-    chatDeltaLastBroadcastLen: new Map(),
-    chatDeltaLastBroadcastText: new Map(),
-    agentDeltaSentAt: new Map(),
-    bufferedAgentEvents: new Map(),
-    chatAbortedRuns: new Map(),
-    clearChatRunState: vi.fn(),
-    agentRunSeq: new Map(),
-    broadcast: vi.fn(),
-    nodeSendToSession: vi.fn(),
-    logGateway: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
-    broadcastToConnIds: vi.fn(),
-    getSessionEventSubscriberConnIds: () => new Set(),
-    getRuntimeConfig,
-  } as unknown as GatewayRequestContext;
-}
 
 function externalCliClient(): GatewayRequestOptions["client"] {
   return {
@@ -220,6 +193,7 @@ describe("spawnSubagentDirect in-process Gateway collector launch", () => {
     resetDetachedTaskLifecycleRuntimeForTests();
     clearRuntimeConfigSnapshot();
     clearConfigCache();
+    await cleanupSessionStateForTest({ stateDir });
     envSnapshot.restore();
     if (stateDir) {
       await rm(stateDir, { recursive: true, force: true });
@@ -311,6 +285,82 @@ describe("spawnSubagentDirect in-process Gateway collector launch", () => {
       }
     });
     expect(subordinateAdmissionStates).toEqual([false, false]);
+  });
+
+  it("gives each selected global agent its own collector capacity", async () => {
+    await writeFile(
+      path.join(stateDir, "openclaw.json"),
+      JSON.stringify({
+        session: { scope: "global" },
+        tools: { swarm: { enabled: true, maxConcurrent: 1 } },
+        agents: {
+          defaults: { workspace: stateDir },
+          entries: {
+            main: { default: true, workspace: stateDir },
+            worker: { workspace: stateDir },
+          },
+        },
+      }),
+    );
+    clearConfigCache();
+    const launched: string[] = [];
+    let releaseLaunch!: () => void;
+    const launchGate = new Promise<void>((resolve) => {
+      releaseLaunch = resolve;
+    });
+    subagentSpawnTesting.setDepsForTest({
+      dispatchGatewayMethodInProcess: async <T>(
+        method: string,
+        params: Record<string, unknown>,
+      ) => {
+        if (method === "agent") {
+          launched.push(params.sessionKey as string);
+          await launchGate;
+        }
+        return { runId: params.idempotencyKey, status: "accepted" } as T;
+      },
+    });
+    const results = await withPluginRuntimeGatewayRequestScope(
+      {
+        context: makeGatewayContext(),
+        client: externalCliClient(),
+        isWebchatConnect: () => false,
+      },
+      () =>
+        Promise.all(
+          ["main", "worker"].map((requesterAgentIdOverride) =>
+            spawnSubagentDirect(
+              {
+                task: "collect independently",
+                collect: true,
+                context: "isolated",
+                lightContext: true,
+                groupId: "shared",
+              },
+              {
+                agentSessionKey: "global",
+                requesterAgentIdOverride,
+                requesterRunId: `parent-${requesterAgentIdOverride}`,
+              },
+            ),
+          ),
+        ),
+    );
+    try {
+      expect(results).toMatchObject([{ status: "accepted" }, { status: "accepted" }]);
+      await waitForAssertion(() =>
+        expect(launched.toSorted()).toEqual(
+          results
+            .map((result) => expectDefined(result.childSessionKey, "accepted child session key"))
+            .toSorted(),
+        ),
+      );
+    } finally {
+      releaseLaunch();
+      await waitForAssertion(() =>
+        expect(subagentRuns.get(results[0]!.runId!)?.swarmLaunchPending).toBe(false),
+      );
+    }
   });
 
   it("consumes the exact private parent token in the child Gateway identity", async () => {
@@ -462,7 +512,11 @@ describe("spawnSubagentDirect in-process Gateway collector launch", () => {
     });
     const requests: Array<{ method: string; params: Record<string, unknown> }> = [];
     let launchCount = 0;
+    const transport = vi.fn(async () => {
+      throw new Error("Hosted collector cleanup must not open a Gateway transport");
+    });
     subagentSpawnTesting.setDepsForTest({
+      callGateway: transport,
       dispatchGatewayMethodInProcess: async <T>(
         method: string,
         params: Record<string, unknown>,
@@ -521,6 +575,11 @@ describe("spawnSubagentDirect in-process Gateway collector launch", () => {
     await waitForAssertion(() => expect(launchCount).toBe(1));
 
     expect(markSubagentRunTerminated({ runId: firstRunId, reason: "manual kill" })).toBe(1);
+    const killedTask = structuredClone(findTaskByRunId(firstRunId!));
+    const killedEntry = expectDefined(subagentRuns.get(firstRunId!), "killed collector");
+    const killedExecution = structuredClone(killedEntry.execution);
+    const killedReconciliation = structuredClone(killedEntry.killReconciliation);
+    expect(killedTask).toMatchObject({ status: "cancelled", endedAt: expect.any(Number) });
     releaseFirstLaunch();
 
     await waitForAssertion(() => {
@@ -530,14 +589,20 @@ describe("spawnSubagentDirect in-process Gateway collector launch", () => {
         ),
       ).toBe(true);
       expect(launchCount).toBe(2);
-      expect(subagentRuns.get(firstRunId!)).toMatchObject({
-        collectorCompletion: { status: "killed" },
+      expect(subagentRuns.get(firstRunId!)?.collectorCompletion).toMatchObject({
+        status: "killed",
       });
+      expect(subagentRuns.get(firstRunId!)?.swarmLaunchPending).toBe(false);
+      expect(subagentRuns.get(firstRunId!)?.queuedLaunch).toBeUndefined();
+      expect(subagentRuns.get(firstRunId!)?.execution).toEqual(killedExecution);
+      expect(subagentRuns.get(firstRunId!)?.killReconciliation).toEqual(killedReconciliation);
+      expect(findTaskByRunId(firstRunId!)).toEqual(killedTask);
       expect(subagentRuns.get("gateway-run-2")).toMatchObject({
         swarmRunId: results[1]!.runId,
         swarmLaunchPending: false,
       });
     });
+    expect(transport).not.toHaveBeenCalled();
   });
 
   it("hands a registered collector launch to Gateway as the host", async () => {
@@ -801,7 +866,7 @@ describe("spawnSubagentDirect in-process Gateway collector launch", () => {
 
   it("keeps the queued registry row when a collector starts out of process", async () => {
     const gatewayContext = makeGatewayContext();
-    const trackingModes: string[] = [];
+    const trackingModes: ReturnType<typeof resolveGatewayAgentTaskTrackingMode>[] = [];
     subagentSpawnTesting.setDepsForTest({
       hasInProcessGatewayContext: () => false,
       callGateway: async <T>(request: { method: string; params?: unknown }) => {
@@ -813,7 +878,7 @@ describe("spawnSubagentDirect in-process Gateway collector launch", () => {
             resolveGatewayAgentTaskTrackingMode({
               client,
               sessionKey: requestParams.sessionKey as string,
-              runId: requestParams.idempotencyKey as string,
+              existingTask: findTaskByRunId(requestParams.idempotencyKey as string),
             }),
           );
         }

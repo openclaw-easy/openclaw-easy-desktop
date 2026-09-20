@@ -1,6 +1,7 @@
 // Verifies process-state persistence across fresh task registry module loads.
 import { importFreshModule } from "openclaw/plugin-sdk/test-fixtures";
 import { describe, expect, it, vi } from "vitest";
+import { createInMemoryTaskRegistryStore } from "../test-utils/task-registry-store.js";
 
 describe("task registry process state", () => {
   it("shares state across duplicate module instances", async () => {
@@ -44,13 +45,13 @@ describe("task registry process state", () => {
     const events = await import("../infra/agent-events.js");
     const firstStore = await import("./task-registry.store.js");
     const store = {
+      ...createInMemoryTaskRegistryStore(),
       loadSnapshot: () => ({ tasks: new Map(), deliveryStates: new Map() }),
-      saveSnapshot: () => {},
     };
     firstStore.configureTaskRegistryRuntime({ store });
     const firstRegistry = await import("./task-registry.js");
-    const firstState = await import("./task-registry-state.js");
-    firstState.resetTaskRegistryListenerState();
+    const firstListener = await import("./task-registry-listener-state.js");
+    firstListener.resetTaskRegistryListenerState();
     events.resetAgentEventsForTest();
     firstRegistry.ensureTaskRegistryReady();
 
@@ -59,7 +60,7 @@ describe("task registry process state", () => {
     const secondStore = await import("./task-registry.store.js");
     secondStore.configureTaskRegistryRuntime({ store });
     const secondRegistry = await import("./task-registry.js");
-    const secondState = await import("./task-registry-state.js");
+    const secondListener = await import("./task-registry-listener-state.js");
 
     try {
       secondRegistry.ensureTaskRegistryReady();
@@ -87,8 +88,8 @@ describe("task registry process state", () => {
       expect(secondRegistry.getTaskById(task!.taskId)?.toolUseCount).toBe(2);
       expect(secondRegistry.getTaskById(task!.taskId)?.lastToolName).toBe("exec");
     } finally {
-      firstState.resetTaskRegistryListenerState();
-      secondState.resetTaskRegistryListenerState();
+      firstListener.resetTaskRegistryListenerState();
+      secondListener.resetTaskRegistryListenerState();
       events.resetAgentEventsForTest();
       firstStore.resetTaskRegistryRuntimeForTests();
       secondStore.resetTaskRegistryRuntimeForTests();

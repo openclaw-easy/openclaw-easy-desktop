@@ -7,6 +7,7 @@ import {
 } from "../../../packages/gateway-protocol/src/index.js";
 import { normalizeAgentId } from "../../routing/session-key.js";
 import { parseAgentSessionKey } from "../../sessions/session-key-utils.js";
+import { createChatAbortOps } from "../chat-abort-ops.js";
 import { abortChatRunById, type ChatAbortControllerEntry } from "../chat-abort.js";
 import { abortQueuedChatTurnById, type QueuedChatTurnEntry } from "../chat-queued-turns.js";
 import { chatRunBelongsToAgent } from "../chat-run-owner.js";
@@ -28,7 +29,6 @@ import {
 import {
   abortChatRunsForSessionKeyWithPartials,
   cancelWorkerInferenceForSession,
-  createChatAbortOps,
   abortControlledSubagents,
   descendantAbortError,
 } from "./chat-abort-runtime.js";
@@ -42,6 +42,7 @@ import { assertValidParams } from "./validation.js";
 
 type ChatAbortLifecycle = {
   onAuthorizedAfterQueuedAbort?: () => boolean;
+  onDescendantsCancelled?: () => void;
   excludeRunIds?: ReadonlySet<string>;
   cascadeDescendants?: true;
 };
@@ -168,6 +169,9 @@ export async function handleChatAbortRequestWithLifecycle(
     if (res.unauthorized) {
       respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, "unauthorized"));
       return;
+    }
+    if (res.descendants?.killed) {
+      lifecycle.onDescendantsCancelled?.();
     }
     const error = res.error ?? descendantAbortError(res.descendants, "Session");
     if (error) {

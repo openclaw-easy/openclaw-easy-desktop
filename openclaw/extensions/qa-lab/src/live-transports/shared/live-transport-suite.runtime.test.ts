@@ -7,18 +7,26 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const runQaSuiteCommand = vi.hoisted(() => vi.fn());
 const loadMatrixQaE2eeRuntime = vi.hoisted(() => vi.fn());
+const resolveLiveTransportQaScenarioIds = vi.hoisted(() => vi.fn());
 const runFlowWorkers = vi.hoisted(() => vi.fn());
 
 vi.mock("../../cli.runtime.js", () => ({ runQaSuiteCommand }));
 vi.mock("../matrix/substrate/e2ee-client.js", () => ({ loadMatrixQaE2eeRuntime }));
 vi.mock("../../suite-run-standard.js", () => ({ runQaFlowSuiteStandard: runFlowWorkers }));
 vi.mock("../../suite-run-isolated.js", () => ({ runQaFlowSuiteIsolated: runFlowWorkers }));
+vi.mock("./scenario-selection.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./scenario-selection.js")>()),
+  resolveLiveTransportQaScenarioIds,
+}));
 
 import { runQaSuite } from "../../suite-launch.runtime.js";
 import type { QaSuiteResolvedRunContext } from "../../suite-types.js";
 import type { QaSuiteRunParams } from "../../suite.js";
 import { matrixQaCliRegistration } from "../matrix/cli.js";
-import { runLiveTransportQaSuiteCommand } from "./live-transport-suite.runtime.js";
+import {
+  runLiveTransportQaSuiteCommand,
+  runStandardLiveTransportQaSuiteCommand,
+} from "./live-transport-suite.runtime.js";
 
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 
@@ -28,6 +36,7 @@ describe("live transport suite runtime", () => {
     vi.clearAllMocks();
     runQaSuiteCommand.mockReset();
     loadMatrixQaE2eeRuntime.mockReset();
+    resolveLiveTransportQaScenarioIds.mockReset();
     runFlowWorkers.mockReset();
   });
 
@@ -256,6 +265,44 @@ describe("live transport suite runtime", () => {
     });
   });
 
+  it.each([
+    { channelId: "discord", scenarioId: "discord-canary" },
+    { channelId: "slack", scenarioId: "slack-canary" },
+    { channelId: "whatsapp", scenarioId: "whatsapp-canary" },
+  ])(
+    "propagates the exact $channelId selection context through the standard suite owner",
+    async ({ channelId, scenarioId }) => {
+      resolveLiveTransportQaScenarioIds.mockReturnValueOnce([scenarioId]);
+
+      await runStandardLiveTransportQaSuiteCommand({
+        channelId,
+        options: {
+          primaryModel: "openai/custom-selection-model",
+          profile: "all",
+          providerMode: "mock-openai",
+          scenarioIds: [scenarioId, scenarioId],
+        },
+      });
+
+      expect(resolveLiveTransportQaScenarioIds).toHaveBeenLastCalledWith({
+        channelId,
+        primaryModel: "openai/custom-selection-model",
+        profile: "all",
+        providerMode: "mock-openai",
+        scenarioIds: [scenarioId, scenarioId],
+        supportsModuleFlows: true,
+      });
+      expect(runQaSuiteCommand).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          channel: channelId,
+          primaryModel: "openai/custom-selection-model",
+          providerMode: "mock-openai",
+          scenarioIds: [scenarioId],
+        }),
+      );
+    },
+  );
+
   it("preserves explicit scenario selection after resolving defaults", async () => {
     await runLiveTransportQaSuiteCommand({
       channelId: "whatsapp",
@@ -270,6 +317,55 @@ describe("live transport suite runtime", () => {
         scenarioIds: ["whatsapp-help-command"],
       }),
     );
+  });
+
+  it("routes dedicated Discord through Crabline without channel credential inputs", async () => {
+    await runStandardLiveTransportQaSuiteCommand({
+      channelId: "discord",
+      options: {
+        channelDriver: "crabline",
+        providerMode: "mock-openai",
+        scenarioIds: ["discord-crabline-roundtrip"],
+      },
+    });
+
+    expect(runQaSuiteCommand).toHaveBeenCalledWith(
+      expect.objectContaining({
+        channel: "discord",
+        channelDriver: "crabline",
+        scenarioIds: ["discord-crabline-roundtrip"],
+      }),
+    );
+    expect(runQaSuiteCommand.mock.calls.at(-1)?.[0]).not.toHaveProperty("credentialFile");
+
+    for (const options of [
+      { credentialFile: "/tmp/not-used.json" },
+      { credentialSource: "env" },
+      { credentialRole: "ci" },
+    ]) {
+      await expect(
+        runStandardLiveTransportQaSuiteCommand({
+          channelId: "discord",
+          options: { channelDriver: "crabline", ...options },
+        }),
+      ).rejects.toThrow(/Crabline channel drivers do not use/u);
+    }
+  });
+
+  it.each([
+    ["discord-voice-autojoin", "mock-openai"],
+    ["discord-transcripts-voice-authorization", "live-frontier"],
+  ] as const)("keeps %s on the live Discord transport", async (scenarioId, providerMode) => {
+    await expect(
+      runStandardLiveTransportQaSuiteCommand({
+        channelId: "discord",
+        options: {
+          channelDriver: "crabline",
+          providerMode,
+          scenarioIds: [scenarioId],
+        },
+      }),
+    ).rejects.toThrow(/channelDriver=live/u);
   });
 
   it("normalizes the shared credential source environment override", async () => {

@@ -1,10 +1,17 @@
-import { fileURLToPath } from "node:url";
+import { documentExtractorWorkerEntrypoint } from "../../extensions/document-extract/document-extractor-worker-entrypoint.ts";
+import { memoryCpuProcessEntrypoints } from "../../extensions/memory-core/src/memory/manager-cpu-entrypoints.ts";
 import { vectorKnnProcessEntrypoint } from "../../extensions/memory-core/src/memory/manager-search-knn-entrypoint.ts";
-import { runtimeProcessEntrypoints } from "../../src/infra/runtime-process-entrypoints.ts";
+import {
+  createRuntimeProcessBuildEntries,
+  runtimeProcessCoreEntrypoints,
+} from "./runtime-process-core-build-entries.mts";
 
-export const runtimeProcessBuildEntries = Object.fromEntries(
-  [...Object.values(runtimeProcessEntrypoints), vectorKnnProcessEntrypoint].map((entry) => [
-    entry.distWorkerPath.replace(/\.js$/u, ""),
-    fileURLToPath(new URL(`./${entry.sourceWorkerName}.ts`, entry.currentModuleUrl)),
-  ]),
+export const runtimeProcessBuildEntrypoints = [
+  ...runtimeProcessCoreEntrypoints,
+  vectorKnnProcessEntrypoint,
+  documentExtractorWorkerEntrypoint,
+  ...Object.values(memoryCpuProcessEntrypoints),
+];
+export const runtimeProcessBuildEntries = createRuntimeProcessBuildEntries(
+  runtimeProcessBuildEntrypoints,
 );

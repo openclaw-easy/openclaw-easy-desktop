@@ -4,14 +4,22 @@ import fsSync from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
+import { hasErrnoCode } from "../infra/errno.js";
+import type { UpdateChannel } from "../infra/update-channels.js";
 import { formatConsoleDiagnosticLine } from "../logging/json-console-line.js";
+import { resolveInstalledPluginIndexInstallOwner } from "../plugins/installed-plugin-index-install-owner.js";
+import { isOptionalPluginManifestFile } from "../plugins/installed-plugin-index-manifest.js";
 import { readPersistedInstalledPluginIndex } from "../plugins/installed-plugin-index-store.js";
-import type {
-  InstalledPluginIndex,
-  InstalledPluginIndexRecord,
-} from "../plugins/installed-plugin-index-types.js";
+import type { InstalledPluginIndexRecord } from "../plugins/installed-plugin-index-types.js";
 import { resolvePackageExtensionEntries, type PackageManifest } from "../plugins/manifest.js";
 import { validatePackageExtensionEntriesForInstall } from "../plugins/package-entry-resolution.js";
+import {
+  detectPluginVersionDrift,
+  resolvePluginVersionDriftRegistryLag,
+  resolvePluginVersionDriftTargets,
+  resolvePluginVersionDriftUpdateCommand,
+} from "../plugins/plugin-version-drift.js";
+import { VERSION } from "../version.js";
 import {
   POST_UPGRADE_PROBE_CODES,
   type PostUpgradeFinding,
@@ -49,15 +57,6 @@ function isBundledSourceCheckoutPluginRoot(pluginRootDir: string): boolean {
   }
 }
 
-async function readInstalledPluginIndex(params: {
-  stateDir?: string;
-}): Promise<Pick<InstalledPluginIndex, "plugins"> | null> {
-  const index = await readPersistedInstalledPluginIndex(
-    params.stateDir ? { stateDir: params.stateDir } : {},
-  );
-  return index ? { plugins: [...index.plugins] } : null;
-}
-
 async function readInstalledPackageJson(
   rootDir: string,
   packageJsonRelPath: string,
@@ -85,21 +84,13 @@ async function resolvePackageJsonRelPath(
   }
 }
 
-async function sha256OfFile(absPath: string): Promise<string | null> {
-  try {
-    const raw = await fs.readFile(absPath);
-    return crypto.createHash("sha256").update(raw).digest("hex");
-  } catch {
-    return null;
-  }
-}
-
 /** Runs post-upgrade plugin probes and returns structured findings for the caller to render. */
 export async function runPostUpgradeProbes(params: {
   stateDir?: string;
+  updateChannel?: UpdateChannel;
 }): Promise<PostUpgradeReport> {
   const findings: PostUpgradeFinding[] = [];
-  const installs = await readInstalledPluginIndex(params);
+  const installs = await readPersistedInstalledPluginIndex(params);
   if (!installs) {
     findings.push({
       level: "error",
@@ -110,10 +101,42 @@ export async function runPostUpgradeProbes(params: {
     return buildReport(findings);
   }
 
-  for (const record of installs.plugins) {
-    if (!record.enabled) {
-      continue;
-    }
+  const enabledPlugins = installs.plugins.filter((record) => record.enabled);
+  const installRecords = Object.fromEntries(
+    Object.entries(installs.installRecords).filter(([id]) =>
+      enabledPlugins.some(
+        (record) =>
+          record.pluginId === id || resolveInstalledPluginIndexInstallOwner(record) === id,
+      ),
+    ),
+  );
+  // Post-upgrade validates the newly installed CLI even while the old Gateway
+  // is still running; the persisted index owns the selected plugins' enablement.
+  // Carry only update intent so current config cannot re-filter that selection.
+  const drift = await resolvePluginVersionDriftTargets(
+    detectPluginVersionDrift({
+      gatewayVersion: VERSION,
+      installRecords,
+      config: { update: { channel: params.updateChannel } },
+    }),
+  );
+  for (const entry of drift.drifts) {
+    const registryLag = resolvePluginVersionDriftRegistryLag(entry);
+    const updateCommand = resolvePluginVersionDriftUpdateCommand(entry);
+    const repair = registryLag
+      ? `The registry already serves ${registryLag.registryVersion}; no release reaches ${registryLag.expectedVersion} yet, so no update applies.`
+      : updateCommand
+        ? `Run \`${updateCommand}\`, then restart the Gateway.`
+        : "No confirmed repair target is available; check registry availability and rerun this command.";
+    findings.push({
+      level: "warn",
+      code: "plugin.version_drift",
+      plugin: entry.pluginId,
+      message: `Plugin ${entry.pluginId} is ${entry.installedVersion}, but OpenClaw is ${VERSION}. ${repair}`,
+    });
+  }
+
+  for (const record of enabledPlugins) {
     const pkgRelPath = await resolvePackageJsonRelPath(record);
     if (pkgRelPath) {
       let pkg: PackageManifest;
@@ -167,9 +190,26 @@ export async function runPostUpgradeProbes(params: {
       }
     }
 
-    if (record.manifestPath && record.manifestHash) {
-      const currentHash = await sha256OfFile(record.manifestPath);
-      if (currentHash && currentHash !== record.manifestHash) {
+    if (record.manifestPath) {
+      let currentHash: string;
+      try {
+        const raw = await fs.readFile(record.manifestPath);
+        currentHash = crypto.createHash("sha256").update(raw).digest("hex");
+      } catch (err) {
+        // Doctor checks current disk state; cached existence can predate a file transition.
+        if (hasErrnoCode(err, "ENOENT") && isOptionalPluginManifestFile(record)) {
+          continue;
+        }
+        const reason = err instanceof Error ? err.message : String(err);
+        findings.push({
+          level: "error",
+          code: "plugin.manifest_unavailable",
+          message: `Plugin ${record.pluginId}: could not read indexed manifest (${record.manifestPath}): ${reason}. Reinstall the plugin or run \`openclaw plugins registry --refresh\`.`,
+          plugin: record.pluginId,
+        });
+        continue;
+      }
+      if (record.manifestHash && currentHash !== record.manifestHash) {
         findings.push({
           level: "warn",
           code: "plugin.manifest_drift",

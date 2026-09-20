@@ -5,6 +5,7 @@ import { isRich } from "../../packages/terminal-core/src/theme.js";
 import { resolveChannelDefaultAccountId } from "../channels/plugins/helpers.js";
 import { listReadOnlyChannelPluginsForConfig } from "../channels/plugins/read-only.js";
 import { probeGatewayStatus } from "../cli/daemon-cli/probe.js";
+import { DEFAULT_RESTART_HEALTH_TIMEOUT_MS } from "../cli/daemon-cli/restart-health.constants.js";
 import { withProgress } from "../cli/progress.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import {
@@ -18,21 +19,16 @@ import {
 } from "../gateway/call.js";
 import { isGatewaySecretRefUnavailableError } from "../gateway/credentials.js";
 import { resolveHealthAccountContext } from "../gateway/health/account-context.js";
-import {
-  buildHealthAgentSummaries,
-  resolveHealthAgentOrder as resolveAgentOrder,
-} from "../gateway/health/collector.js";
 import type { HealthSummary } from "../gateway/health/types.js";
 import { info } from "../globals.js";
 import { isDiagnosticFlagEnabled } from "../infra/diagnostic-flags.js";
 import { formatErrorMessage } from "../infra/errors.js";
-import {
-  formatDurationCompact,
-  formatDurationHuman,
-} from "../infra/format-time/format-duration.js";
+import { formatExactDuration } from "../infra/format-time/format-duration-exact.js";
+import { formatDurationCompact } from "../infra/format-time/format-duration.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
 import { buildChannelAccountBindings, resolvePreferredAccountId } from "../routing/bindings.js";
 import { ExitError, type RuntimeEnv, writeRuntimeJson } from "../runtime.js";
+import { waitForGatewayDiagnostic } from "./gateway-diagnostic-readiness.js";
 import {
   buildCredentialsRequiredHealthDiagnostic,
   buildRateLimitedHealthDiagnostic,
@@ -41,12 +37,11 @@ import {
   gatewayProbeResultSawGateway,
   gatewayProbeResultWasRateLimited,
 } from "./gateway-health-auth-diagnostic.js";
-import { formatHealthChannelLines } from "./health-format.js";
+import { formatDeliveryQueueHealthLine, formatHealthChannelLines } from "./health-format.js";
 import { logGatewayConnectionDetails } from "./status.gateway-connection.js";
 export { formatHealthChannelLines } from "./health-format.js";
 export type { HealthSummary } from "../gateway/health/types.js";
 
-const DEFAULT_TIMEOUT_MS = 10_000;
 const healthLog = createSubsystemLogger("health");
 
 const debugHealth = (
@@ -102,7 +97,7 @@ export async function emitReachableGatewayAuthDiagnostic(params: {
     password: params.password,
     tlsFingerprint: details.tlsFingerprint,
     preauthHandshakeTimeoutMs: details.preauthHandshakeTimeoutMs,
-    timeoutMs: params.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+    timeoutMs: params.timeoutMs ?? DEFAULT_RESTART_HEALTH_TIMEOUT_MS,
     config: params.config,
     json: params.json,
   });
@@ -124,35 +119,6 @@ export async function emitReachableGatewayAuthDiagnostic(params: {
 }
 
 const loadConfigRuntime = async () => await import("../config/config.js");
-
-const formatDurationParts = (ms: number): string => {
-  if (!Number.isFinite(ms)) {
-    return "unknown";
-  }
-  if (ms < 1000) {
-    return `${Math.max(0, Math.round(ms))}ms`;
-  }
-  const units: Array<{ label: string; size: number }> = [
-    { label: "w", size: 7 * 24 * 60 * 60 * 1000 },
-    { label: "d", size: 24 * 60 * 60 * 1000 },
-    { label: "h", size: 60 * 60 * 1000 },
-    { label: "m", size: 60 * 1000 },
-    { label: "s", size: 1000 },
-  ];
-  let remaining = Math.max(0, Math.floor(ms));
-  const parts: string[] = [];
-  for (const unit of units) {
-    const value = Math.floor(remaining / unit.size);
-    if (value > 0) {
-      parts.push(`${value}${unit.label}`);
-      remaining -= value * unit.size;
-    }
-  }
-  if (parts.length === 0) {
-    return "0s";
-  }
-  return parts.join(" ");
-};
 
 function formatEventLoopHealthLine(summary: HealthSummary): string | null {
   const eventLoop = summary.eventLoop;
@@ -182,46 +148,6 @@ export function formatContextEngineHealthLine(summary: HealthSummary): string | 
   return `Context engine: warning (${quarantined.length} quarantined; downgraded to legacy: ${engines})`;
 }
 
-/** Formats dead-lettered and pressured delivery queue entries for text health output. */
-export function formatDeliveryQueueHealthLine(
-  summary: HealthSummary,
-  now = Date.now(),
-): string | null {
-  const failed = summary.deliveryQueues?.failed ?? [];
-  const ingressFailed = summary.deliveryQueues?.ingressFailed ?? [];
-  const ingressPressure = summary.deliveryQueues?.ingressPressure ?? [];
-  const warnings: string[] = [];
-  const deadLetterCounts = [
-    ...failed.map((queue) => `${queue.queueName}: ${queue.count}`),
-    ...ingressFailed.map(
-      (queue) => `inbound ${queue.channelId}/${queue.accountId}: ${queue.count}`,
-    ),
-  ].join(", ");
-  const oldest = [...failed, ...ingressFailed]
-    .map((queue) => queue.oldestFailedAt)
-    .filter((value): value is number => typeof value === "number");
-  const oldestNote =
-    oldest.length > 0 ? `; oldest ${formatDurationHuman(now - Math.min(...oldest))} ago` : "";
-  if (deadLetterCounts) {
-    warnings.push(`dead-lettered entries — ${deadLetterCounts}${oldestNote}`);
-  }
-  if (ingressPressure.length > 0) {
-    const pressureCounts = ingressPressure
-      .map(
-        (queue) =>
-          `inbound ${queue.channelId}/${queue.accountId}: ${queue.laneCount} pressured ${
-            queue.laneCount === 1 ? "lane" : "lanes"
-          }, ${queue.pendingCount} pending, ${queue.claimedCount} claimed, ${queue.blockedCount} blocked`,
-      )
-      .join(", ");
-    const oldestPressure = Math.min(...ingressPressure.map((queue) => queue.oldestReceivedAt));
-    warnings.push(
-      `ingress pressure — ${pressureCounts}; oldest ${formatDurationHuman(now - oldestPressure)} ago`,
-    );
-  }
-  return warnings.length > 0 ? `Delivery queue: warning (${warnings.join("; ")})` : null;
-}
-
 /** Formats config hot-reload watcher degradation for text health output. */
 export function formatConfigReloadHealthLine(summary: HealthSummary): string | null {
   if (summary.configReload?.hotReloadStatus !== "disabled") {
@@ -248,6 +174,10 @@ export async function healthCommand(
   // Always query the running gateway; do not open a direct Baileys socket here.
   let summary: HealthSummary;
   try {
+    const remainingMs = await waitForGatewayDiagnostic({ ...opts, config: cfg }, runtime);
+    if (remainingMs === undefined) {
+      return;
+    }
     summary = await withProgress(
       {
         label: "Checking gateway health…",
@@ -258,7 +188,7 @@ export async function healthCommand(
         await callGateway<HealthSummary>({
           method: "health",
           params: opts.verbose ? { probe: true } : undefined,
-          timeoutMs: opts.timeoutMs,
+          timeoutMs: remainingMs,
           config: cfg,
           token: opts.token,
           password: opts.password,
@@ -313,7 +243,9 @@ export async function healthCommand(
         message: details.message,
       });
     }
-    const localAgents = resolveAgentOrder(cfg);
+    const { buildHealthAgentSummaries, resolveHealthAgentOrder } =
+      await import("../gateway/health/collector.js");
+    const localAgents = resolveHealthAgentOrder(cfg);
     const defaultAgentId = summary.defaultAgentId ?? localAgents.defaultAgentId;
     const agents = Array.isArray(summary.agents) ? summary.agents : [];
     const resolvedAgents =
@@ -376,6 +308,9 @@ export async function healthCommand(
       }
     }
     const accountIdsByChannel = (() => {
+      if (opts.verbose) {
+        return undefined;
+      }
       const entries = displayAgents.length > 0 ? displayAgents : resolvedAgents;
       const byChannel: Record<string, string[]> = {};
       for (const [channelId, byAgent] of channelBindings.entries()) {
@@ -392,17 +327,12 @@ export async function healthCommand(
           byChannel[channelId] = accountIds;
         }
       }
-      return byChannel;
+      return Object.keys(byChannel).length > 0 ? byChannel : undefined;
     })();
-    const channelLines =
-      Object.keys(accountIdsByChannel).length > 0
-        ? formatHealthChannelLines(summary, {
-            accountMode: opts.verbose ? "all" : "default",
-            accountIdsByChannel,
-          })
-        : formatHealthChannelLines(summary, {
-            accountMode: opts.verbose ? "all" : "default",
-          });
+    const channelLines = formatHealthChannelLines(summary, {
+      accountMode: opts.verbose ? "all" : "default",
+      accountIdsByChannel,
+    });
     for (const line of channelLines) {
       runtime.log(styleHealthChannelLine(line, rich));
     }
@@ -488,38 +418,25 @@ export async function healthCommand(
     const heartbeatParts = displayAgents
       .map((agent) => {
         const everyMs = agent.heartbeat?.everyMs;
-        const label = everyMs ? formatDurationParts(everyMs) : "disabled";
+        const label = everyMs ? formatExactDuration(everyMs, "unknown", true) : "disabled";
         return `${label} (${agent.agentId})`;
       })
       .filter(Boolean);
     if (heartbeatParts.length > 0) {
       runtime.log(info(`Heartbeat interval: ${heartbeatParts.join(", ")}`));
     }
-    if (displayAgents.length === 0) {
-      runtime.log(
-        info(`Session store: ${summary.sessions.path} (${summary.sessions.count} entries)`),
-      );
-      if (summary.sessions.recent.length > 0) {
-        for (const r of summary.sessions.recent) {
-          runtime.log(
-            `- ${r.key} (${r.updatedAt ? `${Math.round((Date.now() - r.updatedAt) / 60000)}m ago` : "no activity"})`,
-          );
-        }
-      }
-    } else {
-      for (const agent of displayAgents) {
+    const sessionGroups =
+      displayAgents.length > 0
+        ? displayAgents
+        : [{ agentId: undefined, sessions: summary.sessions }];
+    for (const { agentId, sessions } of sessionGroups) {
+      const label = agentId ? `Session store (${agentId})` : "Session store";
+      runtime.log(info(`${label}: ${sessions.path} (${sessions.count} entries)`));
+      for (const { key, age } of sessions.recent) {
+        // A remote Gateway owns these ages; the CLI clock may differ.
         runtime.log(
-          info(
-            `Session store (${agent.agentId}): ${agent.sessions.path} (${agent.sessions.count} entries)`,
-          ),
+          `- ${key} (${age === null ? "no activity" : `${Math.round(age / 60000)}m ago`})`,
         );
-        if (agent.sessions.recent.length > 0) {
-          for (const r of agent.sessions.recent) {
-            runtime.log(
-              `- ${r.key} (${r.updatedAt ? `${Math.round((Date.now() - r.updatedAt) / 60000)}m ago` : "no activity"})`,
-            );
-          }
-        }
       }
     }
   }

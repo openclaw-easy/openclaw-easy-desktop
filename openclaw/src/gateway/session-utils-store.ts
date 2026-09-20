@@ -2,11 +2,8 @@ import {
   normalizeLowercaseStringOrEmpty,
   normalizeOptionalString,
 } from "@openclaw/normalization-core/string-coerce";
-import {
-  readAcpSessionMeta,
-  readAcpSessionMetaForEntry,
-  repairAcpSessionMetaKeyForMigration,
-} from "../acp/runtime/session-meta.js";
+import { readAcpSessionMetaForEntry } from "../acp/runtime/session-meta-readonly.js";
+import { readAcpSessionMeta } from "../acp/runtime/session-meta.js";
 import { resolveModelAgentRuntimeMetadata } from "../agents/agent-runtime-metadata.js";
 import {
   listAgentEntries,
@@ -18,9 +15,15 @@ import { resolveExecDefaults } from "../agents/exec-defaults.js";
 import { resolveAgentAvatarUrlFromSource } from "../agents/identity-avatar-file.js";
 import type { ModelCatalogEntry } from "../agents/model-catalog.js";
 import { splitTrailingAuthProfile } from "../agents/model-ref-profile.js";
-import { resolveDefaultModelForAgent } from "../agents/model-selection.js";
+import {
+  buildModelAliasIndex,
+  resolveDefaultModelForAgent,
+  resolveModelRefFromString,
+} from "../agents/model-selection.js";
 import { resolveSandboxConfigForAgent } from "../agents/sandbox/config.js";
 import { SESSION_PERMISSION_BY_EXEC_MODE } from "../agents/session-permission-exec-mode.js";
+import { readUtilityModelSetting } from "../agents/utility-model-setting.js";
+import { resolveConfiguredPrimaryModelForAgent } from "../agents/utility-model.js";
 import { insideGitCheckout } from "../agents/worktrees/git.js";
 import { getRuntimeConfig } from "../config/io.js";
 import { resolveAgentModelFallbackValues } from "../config/model-input.js";
@@ -29,6 +32,8 @@ import {
   type SessionEntry,
   type SessionScope,
 } from "../config/sessions.js";
+import { isInternalSessionEffectsKey } from "../config/sessions/internal-session-key.js";
+import type { SessionEntryListScope } from "../config/sessions/session-accessor.js";
 import { canonicalSessionKeyMigrationRequiredError } from "../config/sessions/session-canonical-key.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { resolveExecPolicyForMode } from "../infra/exec-approvals-core.js";
@@ -38,9 +43,11 @@ import { isAcpSessionKey } from "../sessions/session-key-utils.js";
 import { listAgentProvenance } from "../state/agent-provenance.js";
 import { listGatewayAgentsBasic } from "./agent-list.js";
 import type { GatewayAgentOwnership } from "./agent-list.js";
+import { resolveGatewayAssistantAvatar } from "./assistant-avatar.js";
 import { tryResolveSessionCompatibilityOwnerAgentId } from "./session-request-agent.js";
 import { resolveGatewayModelThinkingProfile } from "./session-utils-model.js";
 import {
+  type GatewaySessionStoreDiscoveryCache,
   resolveGatewaySessionStoreTarget,
   resolveGatewaySessionStoreTargetWithStore,
 } from "./session-utils-store-lookup.js";
@@ -57,7 +64,7 @@ export function resolveDeletedAgentIdFromSessionKey(
   cfg: OpenClawConfig,
   sessionKey: string,
   entry?: SessionEntry | null,
-  options?: { acpMetadataSessionKey?: string | null },
+  options?: { acpMetadataSessionKey?: string | null; acpMeta?: SessionEntry["acp"] | null },
 ): string | null {
   const parsed = parseAgentSessionKey(sessionKey);
   if (!parsed) {
@@ -71,12 +78,15 @@ export function resolveDeletedAgentIdFromSessionKey(
     // Free ACP runtime keys use agent:<harnessId>:acp:<uuid>, but key shape is
     // not proof: ACP bridge sessions can use ACP-shaped keys without SessionAcpMeta.
     // Configured acp:binding keys stay owner-scoped even when ACP metadata exists.
-    const acpMeta = readAcpMetaForDeletedAgentCheck({
-      cfg,
-      sessionKey,
-      entry,
-      acpMetadataSessionKey: options?.acpMetadataSessionKey,
-    });
+    const acpMeta =
+      options?.acpMeta !== undefined
+        ? options.acpMeta
+        : readAcpMetaForDeletedAgentCheck({
+            cfg,
+            sessionKey,
+            entry,
+            acpMetadataSessionKey: options?.acpMetadataSessionKey,
+          });
     if (acpMeta) {
       return null;
     }
@@ -120,24 +130,17 @@ function readAcpMetaForDeletedAgentCheck(params: {
     }
   }
 
-  repairAcpSessionMetaKeyForMigration({
-    sessionKey: params.sessionKey,
-    candidateSessionKeys: directKeys,
-    entry: params.entry ?? undefined,
-  });
-  const finalAgentId =
-    parseAgentSessionKey(params.sessionKey)?.agentId ??
-    tryResolveSessionCompatibilityOwnerAgentId(params.cfg, params.sessionKey);
-  return readAcpSessionMetaForEntry({
-    sessionKey: params.sessionKey,
-    ...(finalAgentId ? { agentId: finalAgentId } : {}),
-    entry: params.entry ?? undefined,
-  });
+  return undefined;
 }
 
 function loadSessionEntryWithMode(
   sessionKey: string,
-  opts: { agentId?: string; clone?: boolean; includeStoreChildEntries?: boolean } | undefined,
+  opts:
+    | (Pick<SessionEntryListScope, "agentId" | "clone" | "projection"> & {
+        includeStoreChildEntries?: boolean;
+        targetDiscoveryCache?: GatewaySessionStoreDiscoveryCache;
+      })
+    | undefined,
   readOnly: boolean,
 ) {
   const cfg = getRuntimeConfig();
@@ -145,18 +148,23 @@ function loadSessionEntryWithMode(
   const target = resolveGatewaySessionStoreTargetWithStore({
     cfg,
     key,
+    exactRead: true,
+    readOnly,
+    projection: opts?.projection,
+    targetDiscoveryCache: opts?.targetDiscoveryCache,
     ...(opts?.clone === false ? { clone: false } : {}),
     ...(opts?.agentId ? { agentId: opts.agentId } : {}),
-    ...(readOnly
-      ? {
-          exactRead: true,
-          readOnly: true,
-          ...(opts?.includeStoreChildEntries ? { includeStoreChildEntries: true } : {}),
-        }
-      : {}),
+    ...(opts?.includeStoreChildEntries ? { includeStoreChildEntries: true } : {}),
   });
   const storePath = target.storePath;
   const store = target.store;
+  if (!readOnly) {
+    for (const storeKey of target.storeKeys) {
+      if (isInternalSessionEffectsKey(storeKey)) {
+        delete store[storeKey];
+      }
+    }
+  }
   const canonicalMatch = resolveCanonicalSessionStoreMatchFromStoreKeys(store, target.storeKeys);
   const legacyKey = canonicalMatch?.key !== target.canonicalKey ? canonicalMatch?.key : undefined;
   const entry =
@@ -168,6 +176,7 @@ function loadSessionEntryWithMode(
     agentId: target.agentId,
     storePath,
     store,
+    ...(target.readSource ? { readSource: target.readSource } : {}),
     entry,
     canonicalKey: target.canonicalKey,
     storeKeys: target.storeKeys,
@@ -177,14 +186,17 @@ function loadSessionEntryWithMode(
 
 export function loadGatewaySessionEntry(
   sessionKey: string,
-  opts?: { agentId?: string; clone?: boolean },
+  opts?: Pick<SessionEntryListScope, "agentId" | "clone" | "projection">,
 ) {
   return loadSessionEntryWithMode(sessionKey, opts, false);
 }
 
 export function loadGatewaySessionEntryReadOnly(
   sessionKey: string,
-  opts?: { agentId?: string; clone?: boolean; includeStoreChildEntries?: boolean },
+  opts?: {
+    includeStoreChildEntries?: boolean;
+    targetDiscoveryCache?: GatewaySessionStoreDiscoveryCache;
+  } & Pick<SessionEntryListScope, "agentId" | "clone" | "projection">,
 ) {
   return loadSessionEntryWithMode(sessionKey, opts, true);
 }
@@ -294,13 +306,16 @@ function resolveGatewayAgentModel(
   // Agent rows expose model identity to clients; credential-profile binding stays in
   // canonical config and is consumed only by execution-time model selection.
   const primary = `${resolvedModel.provider}/${resolvedModel.model}`;
+  const utilityOnly =
+    !resolveConfiguredPrimaryModelForAgent({ cfg, agentId }) &&
+    readUtilityModelSetting(cfg, agentId).kind === "explicit";
   const fallbackOverride = resolveAgentModelFallbacksOverride(cfg, agentId);
   const defaultFallbacks = resolveAgentModelFallbackValues(cfg.agents?.defaults?.model);
   const fallbacks = normalizeFallbackList(
     (fallbackOverride ?? defaultFallbacks).map((value) => splitTrailingAuthProfile(value).model),
   );
   return {
-    primary,
+    ...(utilityOnly ? {} : { primary }),
     ...(fallbacks.length > 0 ? { fallbacks } : {}),
   };
 }
@@ -319,22 +334,24 @@ function resolvedPermissionLabel(
     : undefined;
 }
 
-export function listAgentsForGateway(
+export async function listAgentsForGateway(
   cfg: OpenClawConfig,
   modelCatalog?: ModelCatalogEntry[],
   options?: {
     modelCatalogByAgentId?: SessionListModelCatalog;
     includeSystem?: boolean;
+    httpAvatarBasePath?: string;
   },
-): {
+): Promise<{
   defaultId: string;
   ownership: GatewayAgentOwnership;
   selectionRequired: boolean;
   mainKey: string;
   scope: SessionScope;
   agents: GatewayAgentRow[];
-} {
+}> {
   const basic = listGatewayAgentsBasic(cfg);
+  const provenanceRecords = await listAgentProvenance();
   const execApprovals = loadExecApprovals();
   const identityById = new Map<string, GatewayAgentRow["identity"]>();
   for (const entry of listAgentEntries(cfg)) {
@@ -343,13 +360,21 @@ export function listAgentsForGateway(
     }
     const agentId = normalizeAgentId(entry.id);
     const avatar = normalizeOptionalString(entry.identity?.avatar);
-    const avatarUrl = resolveAgentAvatarUrlFromSource(cfg, agentId, avatar);
+    const httpAvatar =
+      avatar && options?.httpAvatarBasePath !== undefined
+        ? resolveGatewayAssistantAvatar({
+            cfg,
+            identity: { agentId, avatar },
+            httpBasePath: options.httpAvatarBasePath,
+          }).avatar
+        : undefined;
+    const avatarUrl = httpAvatar ?? resolveAgentAvatarUrlFromSource(cfg, agentId, avatar);
     const identity = entry.identity
       ? {
           name: normalizeOptionalString(entry.identity.name),
           theme: normalizeOptionalString(entry.identity.theme),
           emoji: normalizeOptionalString(entry.identity.emoji),
-          avatar,
+          avatar: httpAvatar ?? avatar,
           avatarUrl,
         }
       : undefined;
@@ -359,7 +384,7 @@ export function listAgentsForGateway(
     ? basic.agents
     : basic.agents.filter((entry) => entry.kind !== "system");
   const provenanceById = new Map(
-    listAgentProvenance().map((record) => [record.agentId, record] as const),
+    provenanceRecords.map((record) => [record.agentId, record] as const),
   );
   const agents = roster.map((entry) => {
     const { id } = entry;
@@ -372,6 +397,16 @@ export function listAgentsForGateway(
         : undefined;
     const resolvedModel = resolveDefaultModelForAgent({ cfg, agentId: id });
     const model = resolveGatewayAgentModel(cfg, id, resolvedModel);
+    const utilitySetting = readUtilityModelSetting(cfg, id);
+    const selectionParams = { cfg, agentId: id, defaultProvider: resolvedModel.provider };
+    const utility =
+      utilitySetting.kind === "explicit"
+        ? resolveModelRefFromString({
+            ...selectionParams,
+            raw: utilitySetting.modelRef,
+            aliasIndex: buildModelAliasIndex(selectionParams),
+          })?.ref
+        : undefined;
     const sessionKey = resolveAgentMainSessionKey({ cfg, agentId: id });
     const agentRuntime = projectWorkerPlacementAgentRuntime(
       resolveModelAgentRuntimeMetadata({
@@ -410,6 +445,9 @@ export function listAgentsForGateway(
     const agent = Object.assign(
       {
         id,
+        ...(entry.admissionRefusal
+          ? { status: entry.status, admissionRefusal: entry.admissionRefusal }
+          : {}),
         ...(options?.includeSystem ? { kind: entry.kind } : {}),
         name: entry.name,
         identity: identityById.get(id),
@@ -422,6 +460,7 @@ export function listAgentsForGateway(
         thinkingDefault: thinkingProfile.thinkingDefault,
       },
       { model },
+      utility ? { utilityModel: `${utility.provider}/${utility.model}` } : {},
       defaultPermissionMode ? { defaultPermissionMode } : {},
     );
     const provenance = provenanceById.get(id);
@@ -435,8 +474,8 @@ export function listAgentsForGateway(
   });
   return {
     defaultId: basic.defaultId,
-    ownership: basic.ownership!,
-    selectionRequired: basic.selectionRequired!,
+    ownership: basic.ownership,
+    selectionRequired: basic.selectionRequired,
     mainKey: basic.mainKey,
     scope: basic.scope,
     agents,

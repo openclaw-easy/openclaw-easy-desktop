@@ -5,6 +5,7 @@ import { titleForRoute } from "../../app-navigation.ts";
 import { applicationContext, type ApplicationContext } from "../../app/context.ts";
 import {
   renderLearnMoreLink,
+  renderSettingsDefaultDescription,
   renderSettingsPage,
   renderSettingsPageHeader,
   renderSettingsRow,
@@ -123,27 +124,23 @@ class LabsPage extends OpenClawLightDomElement {
     const featureState = resolveLabFeatureState(config, feature);
     const resetPatch =
       enabled === featureState.defaultEnabled ? labFeatureResetPatch(config, feature) : null;
-    void this.updateFeature(
-      feature,
-      enabled,
-      resetPatch ?? labFeatureMergePatch(config, feature, enabled),
-    );
+    void this.updateFeature(feature, enabled, resetPatch ?? labFeatureMergePatch(feature, enabled));
   }
 
   private renderFeature(feature: LabFeature) {
     const title = feature.title();
     const featureState = resolveLabFeatureState(this.editableConfig(), feature);
     const canToggle = this.canToggle();
-    const defaultDescription = t(
-      featureState.overridden ? "configForm.defaultValue" : "configForm.usingDefault",
-      { value: featureState.defaultEnabled ? t("common.enabled") : t("common.disabled") },
+    const defaultDescription = renderSettingsDefaultDescription(
+      featureState.defaultEnabled ? t("common.enabled") : t("common.disabled"),
+      featureState.overridden,
     );
     const description = html`
       ${feature.description()}
       <a href=${feature.docsUrl} target=${EXTERNAL_LINK_TARGET} rel=${buildExternalLinkRel()}
         >${t("labsPage.documentation")}</a
       >${feature.restartHint ? html` <span>${feature.restartHint()}</span>` : nothing}
-      <span>${defaultDescription}</span>
+      ${defaultDescription}
     `;
     return renderSettingsToggleRow({
       title,

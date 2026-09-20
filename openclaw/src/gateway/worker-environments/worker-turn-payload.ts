@@ -39,8 +39,10 @@ import {
   toWorkerTranscriptMessage,
   type WorkerProviderReplayUnavailable,
 } from "../../worker/transcript-message.js";
-import { parseWorkerRuntimeResult } from "../../worker/worker-process-protocol.js";
-import type { WorkerRuntimeResult } from "../../worker/worker.runtime.js";
+import {
+  parseWorkerRuntimeResult,
+  type WorkerRuntimeResult,
+} from "../../worker/worker-process-protocol.js";
 import {
   measureAgentRuntimeIdentityTokenBytes,
   mintAgentRuntimeIdentityToken,
@@ -48,10 +50,7 @@ import {
 } from "../agent-runtime-identity-token.js";
 import type { WorkerSessionTurnClaim } from "./placement-record.js";
 import type { WorkerSessionPlacementStore } from "./placement-store.js";
-import {
-  bindWorkerTurnAdmissionContinuation,
-  bindWorkerTurnExecutionIdentity,
-} from "./placement-turn-claim-events.js";
+import { bindWorkerTurnOwner } from "./placement-turn-claim-events.js";
 
 type WorkerInitialMessagePlan =
   | { kind: "complete"; messages: WorkerTranscriptMessage[] }
@@ -70,6 +69,7 @@ function buildWorkerAgentRuntimeIdentity(params: {
     | "currentChannelId"
     | "currentMessagingTarget"
     | "currentThreadTs"
+    | "gatewayUiCommandTarget"
     | "messageChannel"
     | "messageProvider"
   >;
@@ -87,6 +87,7 @@ function buildWorkerAgentRuntimeIdentity(params: {
     turnSourceTo: turn.currentMessagingTarget ?? turn.currentChannelId,
     turnSourceAccountId: turn.agentAccountId,
     turnSourceThreadId: turn.currentThreadTs,
+    gatewayUiCommandTarget: turn.gatewayUiCommandTarget,
     workerTurnClaim: params.turnClaim,
   };
 }
@@ -119,27 +120,22 @@ export async function prepareWorkerAgentRuntimeIdentity(
   }
   assertActive();
   const runtimeIdentity = buildWorkerAgentRuntimeIdentity({ ...params, admittedRunContext });
-  // Worker session RPC carries no raw identity token. Bind provenance to the exact
-  // host claim before launch so child lineage cannot become bearer authority.
-  if (runtimeIdentity.executionIdentityToken) {
-    bindWorkerTurnExecutionIdentity(
-      params.placements,
-      params.turnClaim,
-      runtimeIdentity.executionIdentityToken,
-      admittedRunContext.operationalRunInstance,
-      { agentId: params.agentId, sessionKey: params.sessionKey },
-    );
-  }
-  bindWorkerTurnAdmissionContinuation(
+  // Stop closes the operational run before its placement claim finishes draining.
+  // Worker tools must retain both owners even when audit collection is disabled.
+  const takeFinishingOutcome = bindWorkerTurnOwner(
     params.placements,
     params.turnClaim,
+    runtimeIdentity.executionIdentityToken,
     admittedRunContext.operationalRunInstance,
+    { agentId: params.agentId, sessionKey: params.sessionKey },
+    assertActive,
     params.turn.prepareAssistantTranscriptMessage,
   );
   return {
     operationalRunInstance: admittedRunContext.operationalRunInstance,
     runtimeIdentity,
     assertActive,
+    takeFinishingOutcome,
   };
 }
 

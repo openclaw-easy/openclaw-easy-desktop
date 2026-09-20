@@ -28,6 +28,43 @@ describe("Code Mode guest execution", () => {
     resetCodeModeTestState();
   });
 
+  it("preserves text encoding primitives across explicit suspension", async () => {
+    const { config, catalogRef, tools } = createCodeModeHarness();
+    applyCodeModeCatalog({ tools, config, catalogRef });
+    const details = await runUntilCompleted({
+      execTool: expectDefined(tools[0], "Code Mode exec"),
+      waitTool: expectDefined(tools[1], "Code Mode wait"),
+      code: `
+        const encoder = new TextEncoder();
+        const decoder = new TextDecoder("utf-8", { fatal: true });
+        const bytes = encoder.encode("hello 🦞");
+        await yield_control("restore encoding");
+        const destination = new Uint8Array(4);
+        return {
+          decoded: decoder.decode(bytes),
+          bytes: Array.from(bytes),
+          into: encoder.encodeInto("🦞", destination),
+          destination: Array.from(destination),
+          encoding: encoder.encoding,
+          network: typeof fetch,
+          modules: typeof require,
+        };
+      `,
+    });
+    expect(details, JSON.stringify(details)).toMatchObject({
+      status: "completed",
+      value: {
+        decoded: "hello 🦞",
+        bytes: [104, 101, 108, 108, 111, 32, 240, 159, 166, 158],
+        into: { read: 2, written: 4 },
+        destination: [240, 159, 166, 158],
+        encoding: "utf-8",
+        network: "undefined",
+        modules: "undefined",
+      },
+    });
+  });
+
   it("runs JavaScript through QuickJS-WASI and resumes nested tool calls with wait", async () => {
     const { config, catalogRef, tools: codeModeTools } = createCodeModeHarness();
     const ticket = pluginTool("fake_create_ticket", "Create a fake ticket");
@@ -110,7 +147,33 @@ describe("Code Mode guest execution", () => {
     expect(testing.resumingRunIds.size).toBe(0);
   });
 
-  it("does not invoke arbitrary toJSON methods while serializing final values", async () => {
+  it.each([
+    { kind: "own", setup: "", value: "result", expected: { invoked: false } },
+    {
+      kind: "object prototype",
+      setup: "Object.prototype.toJSON = result.value.toJSON;",
+      value: "({ kept: true })",
+      expected: { kept: true },
+    },
+    {
+      kind: "array prototype",
+      setup: "Array.prototype.toJSON = result.value.toJSON;",
+      value: "[1, 2]",
+      expected: [1, 2],
+    },
+    {
+      kind: "bigint prototype",
+      setup: "BigInt.prototype.toJSON = result.value.toJSON;",
+      value: "12n",
+      expected: "12",
+    },
+    {
+      kind: "date prototype",
+      setup: "Date.prototype.toJSON = result.value.toJSON;",
+      value: "new Date(0)",
+      expected: {},
+    },
+  ])("does not invoke $kind toJSON while serializing final values", async (scenario) => {
     const { config, catalogRef, tools: codeModeTools } = createCodeModeHarness();
     const noop = pluginTool("fake_noop", "Noop");
     applyCodeModeCatalog({
@@ -134,13 +197,14 @@ describe("Code Mode guest execution", () => {
             return "changed";
           },
         };
-        return result;
+        ${scenario.setup}
+        return ${scenario.value};
       `,
     });
 
     expect(details).toMatchObject({
       status: "completed",
-      value: { invoked: false },
+      value: scenario.expected,
       telemetry: { searchCount: 0, describeCount: 0, callCount: 0 },
     });
     expect(noop.execute).not.toHaveBeenCalled();
@@ -231,6 +295,8 @@ describe("Code Mode guest execution", () => {
       pluginTool("llm-task", "Run an LLM task"),
       pluginTool("llm_task", "Run the exact-name task"),
       pluginTool("catalog", "Collide with discovery"),
+      pluginTool("TextEncoder", "Collide with text encoding"),
+      pluginTool("TextDecoder", "Collide with text decoding"),
       pluginTool("class", "Use a reserved word"),
       pluginTool("9patch", "Start with a digit"),
       pluginTool("__openclawResult", "Collide with a private lifecycle hook"),
@@ -256,6 +322,7 @@ describe("Code Mode guest execution", () => {
           names: handles.map((handle) => handle.callableName),
           results,
           catalogSearch: typeof catalog.search,
+          encoding: new TextDecoder().decode(new TextEncoder().encode("still works")),
         };
       `,
     });
@@ -269,6 +336,8 @@ describe("Code Mode guest execution", () => {
       expect.arrayContaining([
         expect.stringMatching(/^llm_task_[a-f0-9]{8}$/u),
         expect.stringMatching(/^catalog_[a-f0-9]{8}$/u),
+        expect.stringMatching(/^TextEncoder_[a-f0-9]{8}$/u),
+        expect.stringMatching(/^TextDecoder_[a-f0-9]{8}$/u),
         expect.stringMatching(/^class_[a-f0-9]{8}$/u),
         expect.stringMatching(/^tool___openclawResult_[a-f0-9]{8}$/u),
       ]),
@@ -277,7 +346,10 @@ describe("Code Mode guest execution", () => {
       expect(name.startsWith("__openclaw")).toBe(false);
       expect(compacted.tools[0]?.description).toContain(`- ${name} `);
     }
+    expect(details).toMatchObject({ value: { encoding: "still works" } });
     expect(value.results).toMatchObject({
+      TextEncoder: { name: "TextEncoder", input: { ok: true } },
+      TextDecoder: { name: "TextDecoder", input: { ok: true } },
       "llm-task": { name: "llm-task", input: { ok: true } },
       llm_task: { name: "llm_task", input: { ok: true } },
       catalog: { name: "catalog", input: { ok: true } },
@@ -292,9 +364,9 @@ describe("Code Mode guest execution", () => {
     const { config, catalogRef, tools: codeModeTools } = createCodeModeHarness();
     const privateNames = [
       "__openclawResult",
-      "__openclawSerializeCatalogHandles",
+      "__openclawRunCell",
       "__openclawSettleBridge",
-      "__openclawTakeOutput",
+      "__openclawTakeOutputJson",
       "__openclawFuturePrivateHook",
     ];
     const targets = privateNames.map((name) => pluginTool(name, `Exercise ${name}`));
@@ -680,7 +752,7 @@ describe("Code Mode guest execution", () => {
     const details = resultDetails(
       await expectDefined(codeModeTools[0], "codeModeTools[0] test invariant").execute(
         "code-call-syntax",
-        { code: "const x = ;" },
+        { code: "const valid = 1;\nconst x = ;" },
       ),
     );
 
@@ -691,10 +763,18 @@ describe("Code Mode guest execution", () => {
     // actual cause dropped. The model now sees the name and message.
     expect(error).toContain("SyntaxError");
     expect(error).toContain("unexpected token");
+    expect(error).toMatch(/openclaw-code-mode:user\.js:2:\d+/);
     expect(error.startsWith("at ")).toBe(false);
   });
 
-  it("surfaces the QuickJS error name and message for guest runtime errors", async () => {
+  it.each([
+    {
+      name: "ReferenceError",
+      code: "const valid = 1;\nreturn missingFn();",
+      cause: "missingFn is not defined",
+    },
+    { name: "TypeError", code: "const value = 1;\nvalue();", cause: "not a function" },
+  ])("surfaces the QuickJS $name at the submitted source line", async ({ name, code, cause }) => {
     const { config, catalogRef, tools: codeModeTools } = createCodeModeHarness();
     applyCodeModeCatalog({
       tools: [...codeModeTools, pluginTool("fake_noop", "Noop")],
@@ -708,14 +788,16 @@ describe("Code Mode guest execution", () => {
     const details = resultDetails(
       await expectDefined(codeModeTools[0], "codeModeTools[0] test invariant").execute(
         "code-call-runtime",
-        { code: "return missingFn();" },
+        { code },
       ),
     );
 
     expect(details.status).toBe("failed");
     const error = String(details.error);
-    expect(error).toContain("ReferenceError");
-    expect(error).toContain("missingFn is not defined");
+    expect(error).toContain(name);
+    expect(error).toContain(cause);
+    expect(error).toMatch(/openclaw-code-mode:user\.js:2:\d+/);
+    expect(error).not.toContain("<eval>");
     expect(error.startsWith("at ")).toBe(false);
   });
 

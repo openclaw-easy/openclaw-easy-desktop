@@ -4,7 +4,7 @@ import type {
   EvaluatedModuleNode as ViteEvaluatedModuleNode,
   EvaluatedModules as ViteEvaluatedModules,
 } from "vite/module-runner";
-import { TestRunner, type RunnerTask, type RunnerTestFile, vi } from "vitest";
+import { TestRunner, type RunnerTask, type RunnerTestFile, type TestTryOptions, vi } from "vitest";
 import { resetAgentEventsForTest } from "../src/infra/agent-events.js";
 import { loggingState } from "../src/logging/state.js";
 import { clearNamedPluginRuntimeStoresForTest } from "../src/plugin-sdk/runtime-store-registry.js";
@@ -36,13 +36,13 @@ type EvaluatedModules = {
 type ModuleExecution = { external?: boolean };
 type ModuleExecutionInfo = Map<string, ModuleExecution>;
 
-type SerializableMocker = {
+type ModuleMocker = {
   reset?: () => void;
-  resolveMocks?: () => Promise<void>;
+  pendingMockResolution: Promise<void>;
 };
 
 type TestRunnerInternals = {
-  moduleRunner?: { mocker?: SerializableMocker };
+  moduleRunner?: { mocker?: ModuleMocker };
   workerState: { evaluatedModules: unknown; moduleExecutionInfo: ModuleExecutionInfo };
 };
 
@@ -55,6 +55,8 @@ const DIAGNOSTIC_EVENT_LISTENER_PRESENCE = Symbol.for(
   "openclaw.diagnosticEventListenerPresence.v1",
 );
 const SESSION_SUSPENSION_TEST_API = Symbol.for("openclaw.sessionSuspensionTestApi");
+const SECRET_REDACTION_TEST_API = Symbol.for("openclaw.secretRedactionRegistryTestApi");
+const TASK_REGISTRY_TEST_API = Symbol.for("openclaw.taskRegistryTestApi");
 // Shared-worker scoped: the registry lives on the worker global, not in the module graph.
 const CUSTOM_ELEMENT_TRACKING = Symbol.for("openclaw.nonIsolatedCustomElementTracking");
 const nativeConsoleMethods = {
@@ -183,9 +185,10 @@ function resetSharedDocumentBody(): void {
     body.removeAttribute(attribute);
   }
   // jsdom can retain detached shadow focus even after the fixture removes its DOM.
-  // Native body focus clears that state; blur cannot reach an already-detached target.
+  // Focus body to clear it, then blur while focusable to restore fresh-document state.
   body.tabIndex = -1;
   body.focus();
+  body.blur();
   body.removeAttribute("tabindex");
 }
 
@@ -269,6 +272,14 @@ type DiagnosticEventsStateForTest = {
 
 type SessionSuspensionTestApi = {
   resetSessionSuspensionStateForTest?: () => void;
+};
+
+type SecretRedactionTestApi = {
+  resetSecretRedactionRegistryForTest?: () => void;
+};
+
+type TaskRegistryTestApi = {
+  resetTaskRegistryForTests?: () => void;
 };
 
 function runCleanupActions(actions: CleanupAction[]): unknown {
@@ -373,87 +384,27 @@ function resetOpenClawSessionSuspensionState(): void {
   api?.resetSessionSuspensionStateForTest?.();
 }
 
-const SERIALIZED_RESOLVE_MOCKS = Symbol.for("openclaw.serializedResolveMocks");
-
-type SerializedResolveMocksState = {
-  tail: Promise<void>;
-};
-
-type SerializedMocker = SerializableMocker & {
-  [SERIALIZED_RESOLVE_MOCKS]?: SerializedResolveMocksState;
-};
-
-// Vitest's BareModuleMocker.resolveMocks has no in-flight guard: pendingIds is
-// cleared only after all parallel resolveId RPCs settle, and every registration
-// re-invalidates the mock module node. In a shared isolate:false worker, stray
-// async work from an earlier file (a leaked timer running a dynamic import) can
-// start a second concurrent pass over the same pendingIds while the next file's
-// vi.mock registrations resolve. The slower pass then re-registers and wipes
-// already-evaluated manual mock modules mid-import-chain, so importers before
-// the wipe hold one factory instance and later importers get a fresh one
-// (vi.mocked(...) on the test's binding silently stops reaching prod).
-//
-// The pin chains each caller onto its own sequential pass instead of sharing
-// one in-flight pass. Two invariants both matter:
-// - Serialization: a pass queued behind an in-flight one sees the cleared
-//   queue and no-ops, so a snapshot is never registered (and its mock modules
-//   never invalidated) twice.
-// - Freshness: every caller's pass starts at or after its call, so ids the
-//   caller queued (vi.mock/doMock/doUnmock before a dynamic import) are
-//   registered before its fetch proceeds. Sharing one pass breaks this — a
-//   caller can coalesce onto a pass snapshotted before its ids were queued and
-//   then import with mock state unresolved (observed: auth-provenance's
-//   doUnmock + Promise.all imports loading the real provider-auth warm worker
-//   and a 120s oauth refresh instead of the mocked provider hook).
-export function serializeMockerResolveMocks(mocker: SerializableMocker): void {
-  const serializedMocker = mocker as SerializedMocker;
-  if (!mocker.resolveMocks || serializedMocker[SERIALIZED_RESOLVE_MOCKS]) {
-    return;
-  }
-  const state: SerializedResolveMocksState = { tail: Promise.resolve() };
-  serializedMocker[SERIALIZED_RESOLVE_MOCKS] = state;
-  const original = mocker.resolveMocks.bind(mocker);
-  const statics = mocker.constructor as { pendingIds?: unknown[] };
-  const runPass = async (): Promise<void> => {
-    while (true) {
-      const queue = statics.pendingIds;
-      const processedCount = queue?.length ?? 0;
-      await original();
-      // Upstream snapshots the queue contents at pass start and reassigns the
-      // pendingIds static to [] at the end, so ids queued during the pass's RPC
-      // window land in the abandoned array. Requeue and drain them before this
-      // caller proceeds so a later module fetch cannot invalidate mocks mid-import.
-      if (queue && queue !== statics.pendingIds && queue.length > processedCount) {
-        statics.pendingIds?.push(...queue.slice(processedCount));
-      }
-      if ((statics.pendingIds?.length ?? 0) === 0) {
-        return;
-      }
-    }
-  };
-  mocker.resolveMocks = () => {
-    const pass = state.tail.then(runPass);
-    // Keep the chain alive after a rejected pass; the rejection still reaches
-    // the caller that owns that pass, matching upstream behavior.
-    state.tail = pass.then(
-      () => undefined,
-      () => undefined,
-    );
-    return pass;
-  };
+function resetOpenClawSecretRedactionState(): void {
+  const globalStore = globalThis as Record<PropertyKey, unknown>;
+  const api = globalStore[SECRET_REDACTION_TEST_API] as SecretRedactionTestApi | undefined;
+  api?.resetSecretRedactionRegistryForTest?.();
 }
 
-export async function drainMockerResolveMocks(
-  mocker: SerializableMocker | undefined,
-): Promise<void> {
-  const state = (mocker as SerializedMocker | undefined)?.[SERIALIZED_RESOLVE_MOCKS];
-  if (!state) {
+function resetOpenClawTaskRegistryState(): void {
+  const globalStore = globalThis as Record<PropertyKey, unknown>;
+  const api = globalStore[TASK_REGISTRY_TEST_API] as TaskRegistryTestApi | undefined;
+  api?.resetTaskRegistryForTests?.();
+}
+
+// Join the native owner's latest pass, including imports queued while cleanup waits.
+async function drainMockerResolveMocks(mocker: ModuleMocker | undefined): Promise<void> {
+  if (!mocker) {
     return;
   }
   while (true) {
-    const tail = state.tail;
+    const tail = mocker.pendingMockResolution;
     await tail;
-    if (state.tail === tail) {
+    if (mocker.pendingMockResolution === tail) {
       return;
     }
   }
@@ -464,10 +415,6 @@ export default class OpenClawNonIsolatedRunner extends TestRunner {
     super.onCollectStart(file);
     if (!this.config.isolate) {
       installCustomElementTracking();
-    }
-    const internals = this as unknown as TestRunnerInternals;
-    if (internals.moduleRunner?.mocker) {
-      serializeMockerResolveMocks(internals.moduleRunner.mocker);
     }
     restoreRealTimers();
     restoreNativeTimerGlobals();
@@ -480,10 +427,10 @@ export default class OpenClawNonIsolatedRunner extends TestRunner {
     await super.onBeforeRunTask(test);
   }
 
-  override onBeforeTryTask(test: RunnerTask) {
+  override onBeforeTryTask(test: RunnerTask, options: TestTryOptions) {
     restoreRealTimers();
     restoreNativeTimerGlobals();
-    super.onBeforeTryTask(test);
+    super.onBeforeTryTask(test, options);
   }
 
   // Cross-file cleanup lives in onAfterRunFiles, not onAfterRunSuite: vitest
@@ -493,12 +440,9 @@ export default class OpenClawNonIsolatedRunner extends TestRunner {
   // the next file's vi.mock factories silently never applied. The worker loop
   // calls startTests per file, so this hook runs after every file regardless
   // of its collect/run outcome.
-  override async onAfterRunFiles() {
-    await super.onAfterRunFiles();
-    if (this.config.isolate) {
-      return;
-    }
-
+  // oxlint-disable-next-line typescript/no-misused-promises -- Vitest awaits this hook; its concrete TestRunner declaration narrows the return to void.
+  override async onAfterRunFiles(files: RunnerTestFile[]) {
+    super.onAfterRunFiles(files);
     const internals = this as unknown as TestRunnerInternals;
     await drainMockerResolveMocks(internals.moduleRunner?.mocker);
 
@@ -524,6 +468,13 @@ export default class OpenClawNonIsolatedRunner extends TestRunner {
     // Lifecycle-owned singletons survive module resets; close them before the next file
     // can observe a previous file's sessions, caches, or registered resources.
     await drainGlobalSingletonLifecycleState();
+    // Retire the cleared event listener's registration after accepted writes settle.
+    resetOpenClawTaskRegistryState();
+    // Teardown can still register or log secrets; retire them only after its writers settle.
+    resetOpenClawSecretRedactionState();
+    if (this.config.isolate) {
+      return;
+    }
     // Named plugin runtimes intentionally survive duplicate module evaluation in production.
     // Clear their shared slots here so one test file cannot lend a partial runtime to the next.
     clearNamedPluginRuntimeStoresForTest();

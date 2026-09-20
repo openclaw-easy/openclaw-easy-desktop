@@ -26,17 +26,11 @@ export type AmbientEnvTriggerPolicy = "allow" | "suppress";
 
 type ChannelPresenceOptions = {
   channelIds?: readonly string[];
+  /** Canonical channel ids whose persisted credentials may be probed. */
+  persistedAuthChannelIds?: ReadonlySet<string>;
   discovery?: PluginDiscoveryResult;
   includePersistedAuthState?: boolean;
   ambientEnvTriggers?: AmbientEnvTriggerPolicy;
-  persistedAuthStateProbe?: {
-    listChannelIds: () => readonly string[];
-    hasState: (params: {
-      channelId: string;
-      cfg: OpenClawConfig;
-      env: NodeJS.ProcessEnv;
-    }) => boolean;
-  };
 };
 
 /** Source that made a channel look potentially configured. */
@@ -85,31 +79,6 @@ function hasPersistedChannelState(env: NodeJS.ProcessEnv): boolean {
   return fs.existsSync(resolveStateDir(env, os.homedir));
 }
 
-function listPersistedAuthStateChannelIds(options: ChannelPresenceOptions): readonly string[] {
-  return (
-    options.persistedAuthStateProbe?.listChannelIds() ??
-    listBundledChannelIdsWithPersistedAuthState(options.discovery)
-  );
-}
-
-function hasPersistedAuthState(params: {
-  channelId: string;
-  cfg: OpenClawConfig;
-  env: NodeJS.ProcessEnv;
-  options: ChannelPresenceOptions;
-}): boolean {
-  const override = params.options.persistedAuthStateProbe;
-  if (override) {
-    return override.hasState(params);
-  }
-  return hasBundledChannelPersistedAuthState({
-    channelId: params.channelId,
-    cfg: params.cfg,
-    env: params.env,
-    discovery: params.options.discovery,
-  });
-}
-
 /** Lists channel ids detected from config, env vars, or persisted auth state. */
 export function listPotentialConfiguredChannelIds(
   cfg: OpenClawConfig,
@@ -131,7 +100,6 @@ export function listPotentialConfiguredChannelPresenceSignals(
 ): ChannelPresenceSignal[] {
   const signals: ChannelPresenceSignal[] = [];
   const seenSignals = new Set<string>();
-  const configuredChannelIds = new Set<string>();
   const addSignal = (rawChannelId: string, source: ChannelPresenceSignalSource) => {
     const channelId = rawChannelId.trim();
     if (!channelId || isChannelConfigMetadataKey(channelId)) {
@@ -142,11 +110,8 @@ export function listPotentialConfiguredChannelPresenceSignals(
       return;
     }
     seenSignals.add(key);
-    configuredChannelIds.add(channelId);
     signals.push({ channelId, source });
   };
-  const channelIds = options.channelIds ?? listBundledChannelIds(env, options.discovery);
-  const channelEnvPrefixes = listChannelEnvPrefixes(channelIds);
   const scopedChannelIds = options.channelIds
     ? new Set(
         options.channelIds
@@ -154,6 +119,9 @@ export function listPotentialConfiguredChannelPresenceSignals(
           .filter((channelId): channelId is string => Boolean(channelId)),
       )
     : undefined;
+  const channelEnvPrefixes = listChannelEnvPrefixes(
+    options.channelIds ?? listBundledChannelIds(env, options.discovery),
+  );
   const officialExternalChannelEnvVars = listOfficialExternalChannelEnvVars().filter(
     ({ channelId }) => !scopedChannelIds || scopedChannelIds.has(channelId),
   );
@@ -192,12 +160,25 @@ export function listPotentialConfiguredChannelPresenceSignals(
   if (options.includePersistedAuthState !== false && hasPersistedChannelState(env)) {
     // Persisted auth can make a channel usable even when config/env is empty, but only probe it
     // when the state directory exists to keep startup/status checks cheap.
-    for (const channelId of listPersistedAuthStateChannelIds(options)) {
-      if (hasPersistedAuthState({ channelId, cfg, env, options })) {
+    for (const channelId of listBundledChannelIdsWithPersistedAuthState(options.discovery)) {
+      if (
+        options.persistedAuthChannelIds &&
+        !options.persistedAuthChannelIds.has(normalizeOptionalLowercaseString(channelId) ?? "")
+      ) {
+        continue;
+      }
+      if (
+        hasBundledChannelPersistedAuthState({
+          channelId,
+          cfg,
+          env,
+          discovery: options.discovery,
+        })
+      ) {
         addSignal(channelId, "persisted-auth");
       }
     }
   }
 
-  return signals.filter((signal) => configuredChannelIds.has(signal.channelId));
+  return signals;
 }

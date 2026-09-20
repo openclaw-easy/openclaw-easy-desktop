@@ -53,89 +53,53 @@ function makeReasoningRetryParams(
 }
 
 describe("incomplete-turn delivery resolution", () => {
-  it("suppresses the incomplete-turn warning after committed messaging text delivery", () => {
-    const incompleteTurnText = resolveIncompleteTurnPayloadText(
-      makeIncompleteTurnParams({
-        assistantTexts: [],
-        didSendViaMessagingTool: true,
-        messagingToolSentTexts: ["Delivered through the message tool."],
-        lastAssistant: makeLastAssistant({
-          provider: "ollama",
-          model: "kimi-k2.6:cloud",
+  it.each([
+    { state: "delivered", sourceDelivered: false, stopReason: "stop", warning: false },
+    { state: "delivered", sourceDelivered: false, stopReason: "error", warning: false },
+    { state: "pending", sourceDelivered: false, stopReason: "stop", warning: false },
+    { state: "missing", sourceDelivered: true, stopReason: "stop", warning: true },
+    { state: undefined, sourceDelivered: false, stopReason: "stop", warning: true },
+    { state: undefined, sourceDelivered: true, stopReason: "stop", warning: false },
+  ] as const)(
+    "uses current-source ownership rather than aggregate sends: $state/$sourceDelivered/$stopReason",
+    ({ state, sourceDelivered, stopReason, warning }) => {
+      const incompleteTurnText = resolveIncompleteTurnPayloadText(
+        makeIncompleteTurnParams({
+          assistantTexts: [],
+          sourceReplyDeliveryState: state,
+          sourceReplyDelivered: sourceDelivered ? true : undefined,
+          didSendViaMessagingTool: true,
+          messagingToolSentTexts: ["A message was sent."],
+          messagingToolSentMediaUrls: ["file:///tmp/render.png"],
+          replayMetadata: { hadPotentialSideEffects: true, replaySafe: false },
+          lastAssistant: makeLastAssistant({
+            stopReason,
+            ...(stopReason === "error" ? { errorMessage: "provider failed after delivery" } : {}),
+          }),
         }),
-      }),
-    );
-
-    expect(incompleteTurnText).toBeNull();
-  });
-
-  it("suppresses the incomplete-turn warning after committed messaging delivery before end_turn", () => {
-    const incompleteTurnText = resolveIncompleteTurnPayloadText(
-      makeIncompleteTurnParams({
-        assistantTexts: [],
-        didSendViaMessagingTool: true,
-        messagingToolSentTexts: ["Delivered through the message tool."],
-        lastAssistant: makeLastAssistant({
-          stopReason: "end_turn",
-          provider: "google",
-          model: "gemini-2.5-pro",
-          content: [
-            {
-              type: "thinking",
-              thinking: "internal reasoning",
-              thinkingSignature: JSON.stringify({ id: "rs_messaging_end_turn", type: "reasoning" }),
-            },
-          ],
-        }),
-      }),
-    );
-
-    expect(incompleteTurnText).toBeNull();
-  });
-
-  it("suppresses the incomplete-turn warning after committed media-only messaging delivery", () => {
-    const incompleteTurnText = resolveIncompleteTurnPayloadText(
-      makeIncompleteTurnParams({
-        assistantTexts: [],
-        didSendViaMessagingTool: false,
-        messagingToolSentMediaUrls: ["file:///tmp/render.png"],
-        lastAssistant: makeLastAssistant({
-          stopReason: "end_turn",
-          model: "gpt-5.4",
-        }),
-      }),
-    );
-
-    expect(incompleteTurnText).toBeNull();
-  });
-
-  it("suppresses the incomplete-turn warning after committed messaging delivery even when the provider errored", () => {
-    const incompleteTurnText = resolveIncompleteTurnPayloadText(
-      makeIncompleteTurnParams({
-        assistantTexts: [],
-        didSendViaMessagingTool: true,
-        messagingToolSentTexts: ["Delivered before the provider error."],
-        lastAssistant: makeLastAssistant({
-          stopReason: "error",
-          provider: "ollama",
-          model: "kimi-k2.6:cloud",
-          errorMessage: "provider failed after delivery",
-        }),
-      }),
-    );
-
-    expect(incompleteTurnText).toBeNull();
-  });
+      );
+      if (warning) {
+        expect(incompleteTurnText).toEqual(expect.any(String));
+      } else {
+        expect(incompleteTurnText).toBeNull();
+      }
+    },
+  );
 
   it("suppresses the incomplete-turn warning after an accepted sessions_spawn terminal success", () => {
     const attemptWithAcceptedSpawn: Partial<EmbeddedRunAttemptResult> & {
-      acceptedSessionSpawns: Array<{ runId: string; childSessionKey: string }>;
+      acceptedSessionSpawns: Array<{
+        runId: string;
+        childSessionKey: string;
+        expectsCompletionMessage: boolean;
+      }>;
     } = {
       assistantTexts: [],
       acceptedSessionSpawns: [
         {
           runId: "run-child",
           childSessionKey: "agent:claude:subagent:child",
+          expectsCompletionMessage: true,
         },
       ],
       lastAssistant: makeLastAssistant({
@@ -149,6 +113,29 @@ describe("incomplete-turn delivery resolution", () => {
     );
 
     expect(incompleteTurnText).toBeNull();
+  });
+
+  it("surfaces one warning when only a collector was accepted", () => {
+    const incompleteTurnText = resolveIncompleteTurnPayloadText(
+      makeIncompleteTurnParams(
+        {
+          assistantTexts: [],
+          acceptedSessionSpawns: [
+            {
+              runId: "collector-run",
+              childSessionKey: "agent:claude:subagent:collector",
+              expectsCompletionMessage: false,
+            },
+          ],
+          lastAssistant: makeLastAssistant({ provider: "anthropic", model: "sonnet-4.6" }),
+        },
+        { hadPotentialSideEffects: true },
+      ),
+    );
+
+    expect(incompleteTurnText).toBe(
+      "⚠️ Agent couldn't generate a response. Note: some tool actions may have already been executed — please verify before retrying.",
+    );
   });
 
   it("still surfaces the incomplete-turn warning without an accepted sessions_spawn success", () => {

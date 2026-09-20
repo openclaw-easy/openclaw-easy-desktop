@@ -4,6 +4,7 @@ import type {
 } from "../../../packages/gateway-protocol/src/schema/push.ts";
 import type { GatewayBrowserClient } from "../api/gateway.ts";
 import { formatUiError } from "../lib/format-error.ts";
+import type { ConnectionBootstrapCoordinator } from "./connection-bootstrap.ts";
 import type { ApplicationGateway } from "./gateway.ts";
 
 const SW_READY_TIMEOUT = 10_000;
@@ -175,6 +176,7 @@ async function reconcileWebPushCapability(
 }
 
 export function startWebPushReconciliation(params: {
+  connectionBootstrap?: ConnectionBootstrapCoordinator;
   gateway: ApplicationGateway;
   publish: (patch: WebPushCapabilityPatch) => void;
 }): () => void {
@@ -206,7 +208,11 @@ export function startWebPushReconciliation(params: {
     const currentGeneration = ++generation;
     params.publish({ subscription: "unknown", preferences: null, error: null });
     if (client) {
-      void reconcile(client, currentGeneration);
+      const reconcileCurrentClient = () => reconcile(client, currentGeneration);
+      void (
+        params.connectionBootstrap?.run("web-push-reconcile", reconcileCurrentClient) ??
+        reconcileCurrentClient()
+      ).catch(() => undefined);
     }
   };
   const stopGateway = params.gateway.subscribe(handleGateway);
@@ -218,8 +224,7 @@ export function startWebPushReconciliation(params: {
       !client ||
       !payload ||
       typeof payload !== "object" ||
-      !("profileId" in payload) ||
-      payload.profileId !== params.gateway.snapshot.selfUser?.id ||
+      !params.gateway.snapshot.selfUser?.id ||
       !("keys" in payload) ||
       !Array.isArray(payload.keys) ||
       !payload.keys.includes(WEB_PUSH_USER_PREFERENCES_KEY)
@@ -238,6 +243,7 @@ export function startWebPushReconciliation(params: {
 }
 
 export function createWebPushCapabilityRuntime(params: {
+  connectionBootstrap?: ConnectionBootstrapCoordinator;
   gateway: ApplicationGateway;
   publish: (patch: WebPushCapabilityPatch) => void;
 }): WebPushCapabilityRuntime {

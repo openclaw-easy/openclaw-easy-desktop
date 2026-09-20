@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { closeOpenClawStateDatabaseForTest } from "../state/openclaw-state-db.js";
 import {
   claimDeliveryQueueEntryPlatformSend,
   createInitialDeliveryProducerClaim,
@@ -8,17 +9,57 @@ import {
   transitionOwnedDeliveryQueueEntry,
 } from "./delivery-queue-sqlite-claim.js";
 import {
-  deleteDeliveryQueueEntry,
+  getDeliveryQueueEntryStatus,
   loadDeliveryQueueEntry,
   reserveDeliveryQueueEntryAttempt,
   updateDeliveryQueueEntry,
-  upsertDeliveryQueueEntry,
 } from "./delivery-queue-sqlite.js";
+import {
+  completeDeliveryQueueEntryInDatabase,
+  deleteDeliveryQueueEntryInDatabase,
+  upsertDeliveryQueueEntryInDatabase,
+} from "./delivery-queue-sqlite.kernel.js";
+import { seedDeliveryQueueEntry } from "./delivery-queue-sqlite.test-support.js";
 import { installDeliveryQueueTmpDirHooks } from "./outbound/delivery-queue.test-helpers.js";
 
 describe("delivery queue SQLite dispatch ownership", () => {
   const { tmpDir } = installDeliveryQueueTmpDirHooks();
   const queueName = "test-dispatch-owner";
+
+  it.each([false, true])(
+    "keeps owned settlement and its sibling row atomic after reopen (rollback=%s)",
+    (rollback) => {
+      const stateDir = tmpDir();
+      const entry = { id: "owned-settlement", enqueuedAt: 1, retryCount: 0 };
+      const sibling = { ...entry, id: "settlement-receipt" };
+      seedDeliveryQueueEntry({ queueName, entry, stateDir });
+
+      const settle = () =>
+        transitionOwnedDeliveryQueueEntry(
+          { queueName, id: entry.id, stateDir, platformSendAttemptId: null },
+          (current, database) => {
+            upsertDeliveryQueueEntryInDatabase({ queueName, entry: sibling }, database);
+            completeDeliveryQueueEntryInDatabase(database, queueName, current.id);
+            if (rollback) {
+              throw new Error("settlement rejected");
+            }
+          },
+        );
+      if (rollback) {
+        expect(settle).toThrow("settlement rejected");
+      } else {
+        expect(settle()).toBe(true);
+      }
+
+      closeOpenClawStateDatabaseForTest();
+      expect(getDeliveryQueueEntryStatus(queueName, entry.id, stateDir)).toBe(
+        rollback ? "pending" : "completed",
+      );
+      expect(loadDeliveryQueueEntry(queueName, sibling.id, stateDir)).toEqual(
+        rollback ? null : sibling,
+      );
+    },
+  );
 
   it.each(["producer_claimed", "send_attempt_started", "unknown_after_send"] as const)(
     "preserves the retry budget when a %s claim expires before reservation",
@@ -34,7 +75,7 @@ describe("delivery queue SQLite dispatch ownership", () => {
           maxAttempts: 2,
           expectedPlatformSendAttemptId: claimed.claimId,
         };
-        upsertDeliveryQueueEntry({
+        seedDeliveryQueueEntry({
           ...params,
           entry: { id: params.id, enqueuedAt: Date.now(), retryCount: 0, ...initialClaim },
         });
@@ -73,7 +114,9 @@ describe("delivery queue SQLite dispatch ownership", () => {
           expect(
             transitionOwnedDeliveryQueueEntry(
               { ...params, platformSendAttemptId: claimed.claimId },
-              () => deleteDeliveryQueueEntry(queueName, params.id, params.stateDir),
+              (_entry, database) => {
+                deleteDeliveryQueueEntryInDatabase(database, queueName, params.id);
+              },
             ),
           ).toBe(true);
           expect(loadDeliveryQueueEntry(queueName, params.id, params.stateDir)).toBeNull();
@@ -89,7 +132,7 @@ describe("delivery queue SQLite dispatch ownership", () => {
     try {
       vi.setSystemTime(new Date("2026-08-28T10:00:00.000Z"));
       const params = { queueName, id: "unleased-reservation", stateDir: tmpDir() };
-      upsertDeliveryQueueEntry({
+      seedDeliveryQueueEntry({
         ...params,
         entry: { id: params.id, enqueuedAt: Date.now(), retryCount: 0 },
       });
@@ -103,7 +146,7 @@ describe("delivery queue SQLite dispatch ownership", () => {
       }
       const claimed = { ...params, claimId };
       expect(dispatchDeliveryQueueEntryPlatformSend(claimed)).toBe(true);
-      vi.advanceTimersByTime(30_001);
+      vi.advanceTimersByTime(60_001);
       expect(
         reserveDeliveryQueueEntryAttempt({
           ...params,
@@ -127,7 +170,7 @@ describe("delivery queue SQLite dispatch ownership", () => {
       vi.setSystemTime(new Date("2026-08-10T10:00:00.000Z"));
       const stateDir = tmpDir();
       const id = "cron-direct-delivery:v1:dispatch-owner";
-      upsertDeliveryQueueEntry({
+      seedDeliveryQueueEntry({
         queueName,
         entry: {
           id,
@@ -147,7 +190,7 @@ describe("delivery queue SQLite dispatch ownership", () => {
       if (!expiredClaimId) {
         throw new Error("test invariant: the first producer claim must be available");
       }
-      vi.advanceTimersByTime(30_001);
+      vi.advanceTimersByTime(60_001);
       expect(
         dispatchDeliveryQueueEntryPlatformSend({
           queueName,
@@ -183,11 +226,11 @@ describe("delivery queue SQLite dispatch ownership", () => {
         platformSendAttemptId: claimId,
         platformSendStartedAt: Date.now(),
         effectiveReplyToId: "thread-1",
-        availableAt: Date.now() + 30_000,
+        availableAt: Date.now() + 60_000,
       });
       expect(loadDeliveryQueueEntry(queueName, id, stateDir)?.producerClaimId).toBeUndefined();
 
-      vi.advanceTimersByTime(30_001);
+      vi.advanceTimersByTime(60_001);
       expect(dispatchDeliveryQueueEntryPlatformSend({ queueName, id, claimId, stateDir })).toBe(
         false,
       );

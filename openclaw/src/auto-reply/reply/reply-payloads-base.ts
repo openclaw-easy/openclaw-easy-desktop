@@ -2,10 +2,14 @@
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import type { ReplyToMode } from "../../config/types.js";
 import { hasReplyPayloadContent } from "../../interactive/payload.js";
-import { copyReplyPayloadMetadata, setReplyPayloadMetadata } from "../reply-payload.js";
+import { parseInlineDirectives } from "../../utils/directive-tags.js";
+import {
+  copyReplyPayloadMetadata,
+  hasReplyPayloadSpeechContent,
+  setReplyPayloadMetadata,
+} from "../reply-payload.js";
 import type { OriginatingChannelType } from "../templating.js";
 import type { ReplyPayload, ReplyThreadingPolicy } from "../types.js";
-import { extractReplyToTag } from "./reply-tags.js";
 import {
   createReplyToModeFilterForChannel,
   resolveImplicitCurrentMessageReplyAllowance,
@@ -57,16 +61,16 @@ function resolveReplyThreadingForPayload(params: {
 
   // Inline reply tags override implicit threading without losing payload metadata.
   if (typeof resolved.text === "string" && resolved.text.includes("[[")) {
-    const { cleaned, replyToId, replyToCurrent, hasTag } = extractReplyToTag(
-      resolved.text,
+    const tags = parseInlineDirectives(resolved.text, {
       currentMessageId,
-    );
+      stripAudioTag: false,
+    });
     resolved = copyReplyPayloadMetadata(resolved, {
       ...resolved,
-      text: cleaned ? cleaned : undefined,
-      replyToId: replyToId ?? resolved.replyToId,
-      replyToTag: hasTag || resolved.replyToTag,
-      replyToCurrent: replyToCurrent || resolved.replyToCurrent,
+      text: tags.text ? tags.text : undefined,
+      replyToId: tags.replyToId ?? resolved.replyToId,
+      replyToTag: tags.hasReplyTag || resolved.replyToTag,
+      replyToCurrent: tags.replyToCurrent || resolved.replyToCurrent,
     });
   }
 
@@ -91,7 +95,8 @@ export function applyReplyTagsToPayload(
 /** True when a payload has visible or playable content for delivery. */
 export function isRenderablePayload(payload: ReplyPayload): boolean {
   return hasReplyPayloadContent(payload, {
-    extraContent: payload.audioAsVoice || payload.location != null,
+    extraContent:
+      payload.audioAsVoice || payload.location != null || hasReplyPayloadSpeechContent(payload),
   });
 }
 

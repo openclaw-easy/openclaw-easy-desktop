@@ -9,8 +9,10 @@ function rejectRuntimeImport(moduleName: string) {
 }
 
 vi.mock("./src/node-host/file-fetch.js", rejectRuntimeImport("node-host/file-fetch"));
+vi.mock("./src/node-host/file-stat.js", rejectRuntimeImport("node-host/file-stat"));
 vi.mock("./src/node-host/dir-list.js", rejectRuntimeImport("node-host/dir-list"));
 vi.mock("./src/node-host/dir-fetch.js", rejectRuntimeImport("node-host/dir-fetch"));
+vi.mock("./src/node-host/file-create.js", rejectRuntimeImport("node-host/file-create"));
 vi.mock("./src/node-host/file-write.js", rejectRuntimeImport("node-host/file-write"));
 vi.mock("./src/tools/file-fetch-tool.js", rejectRuntimeImport("tools/file-fetch-tool"));
 vi.mock("./src/tools/dir-list-tool.js", rejectRuntimeImport("tools/dir-list-tool"));
@@ -20,8 +22,10 @@ vi.mock("./src/shared/node-invoke-policy.js", rejectRuntimeImport("shared/node-i
 
 afterAll(() => {
   vi.doUnmock("./src/node-host/file-fetch.js");
+  vi.doUnmock("./src/node-host/file-stat.js");
   vi.doUnmock("./src/node-host/dir-list.js");
   vi.doUnmock("./src/node-host/dir-fetch.js");
+  vi.doUnmock("./src/node-host/file-create.js");
   vi.doUnmock("./src/node-host/file-write.js");
   vi.doUnmock("./src/tools/file-fetch-tool.js");
   vi.doUnmock("./src/tools/dir-list-tool.js");
@@ -44,9 +48,11 @@ describe("file-transfer plugin entry", () => {
     } as never);
 
     expect(pluginEntry.nodeHostCommands?.map((entry) => entry.command)).toEqual([
+      "file.stat",
       "file.fetch",
       "dir.list",
       "dir.fetch",
+      "file.create",
       "file.write",
     ]);
     expect(registerNodeInvokePolicy).toHaveBeenCalledTimes(1);
@@ -59,9 +65,11 @@ describe("file-transfer plugin entry", () => {
     ]);
     expect(registerNodeInvokePolicy.mock.calls[0]?.[0].commands).toEqual([
       "file.fetch",
+      "file.stat",
       "dir.list",
       "dir.fetch",
       "file.write",
+      "file.create",
     ]);
     expect(registerTool.mock.calls.map(([tool]) => tool.name)).toEqual([
       "file_fetch",

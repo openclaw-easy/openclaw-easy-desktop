@@ -7,41 +7,62 @@ import { withTempHome as withTempHomeBase } from "openclaw/plugin-sdk/test-env";
 import { beforeEach, describe, expect, it, type MockInstance, vi } from "vitest";
 // Register shared mocks before imports bind their production exports.
 import "./agent-command.test-mocks.js";
+import "./agent-command-attempt.test-mocks.js";
 import { testing as acpManagerTesting } from "../acp/control-plane/manager.js";
 import { executionIdentity } from "../agents/agent-command-execution-identity.js";
 import { createHostWorkspaceWriteTool } from "../agents/agent-tools.read.js";
-import * as authProfileStoreModule from "../agents/auth-profiles/store.js";
+import * as authProfileStoreModule from "../agents/auth-profiles/store-runtime.js";
 import * as attemptExecutionRuntime from "../agents/command/attempt-execution.runtime.js";
 import { deliverAgentCommandResult } from "../agents/command/delivery.runtime.js";
 import { prepareAgentCommandExecution } from "../agents/command/prepare.js";
 import { runEmbeddedAgent } from "../agents/embedded-agent.js";
 import { loadManifestModelCatalog } from "../agents/model-catalog.js";
 import * as modelSelectionModule from "../agents/model-selection.js";
-import { loadPreparedModelCatalog } from "../agents/prepared-model-catalog.js";
-import { isAgentRunRestartAbortReason } from "../agents/run-termination.js";
+import {
+  loadProviderScopedThinkingCatalog,
+  readPreparedModelCatalog,
+} from "../agents/prepared-model-catalog.js";
+import {
+  createAgentRunDirectAbortError,
+  createAgentRunRestartAbortError,
+  isAgentRunDirectAbortReason,
+  isAgentRunRestartAbortReason,
+} from "../agents/run-termination.js";
+import { resolveEffectiveAgentRuntime } from "../agents/thinking-runtime.js";
+import { callInProcessGatewayTool } from "../agents/tools/in-process-gateway.js";
 import { ensureAgentWorkspace } from "../agents/workspace.js";
 import { managedWorktrees } from "../agents/worktrees/service.js";
 import { BASE_THINKING_LEVELS } from "../auto-reply/thinking.shared.js";
-import { readAgentRunTerminalOutcome } from "../channels/turn/agent-run-terminal-outcome.js";
+import {
+  readAgentRunTerminalError,
+  readAgentRunTerminalOutcome,
+} from "../channels/turn/agent-run-terminal-outcome.js";
 import * as runtimeSnapshotModule from "../config/runtime-snapshot.js";
 import { parseSqliteSessionFileMarker } from "../config/sessions/legacy-sqlite-marker.js";
 import {
   listSessionEntriesCore,
   loadSessionEntry,
+  loadTranscriptEvents,
   replaceSessionEntry,
+  replaceTranscriptEvents,
 } from "../config/sessions/session-accessor.js";
+import { addSessionMember, listSessionMembers } from "../config/sessions/session-sharing-store.js";
 import { clearSessionStoreCacheForTest } from "../config/sessions/store-writer-state.js";
 import type { InternalSessionEntry as SessionEntry } from "../config/sessions/types.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { getBootEchoContextForSession } from "../gateway/boot-echo-guard.js";
+import { runBootOnce } from "../gateway/boot.js";
 import { emitAgentEvent, onAgentEvent, resetAgentEventsForTest } from "../infra/agent-events.js";
 import { buildOutboundBaseSessionKey } from "../infra/outbound/base-session-key.js";
 import { loadEnabledClaudeBundleCommands } from "../plugins/bundle-commands.js";
+import { resolveProviderPolicySurface } from "../plugins/provider-public-artifacts.js";
 import type { PluginProviderRegistration } from "../plugins/registry.test-fixtures.js";
 import { resetPluginRuntimeStateForTest, setActivePluginRegistry } from "../plugins/runtime.js";
 import type { RuntimeEnv } from "../runtime.js";
 import { AGENT_HARNESS_SESSION_KEY_RESERVED_MESSAGE } from "../sessions/agent-harness-session-key.js";
 import { MODEL_SELECTION_LOCKED_MESSAGE } from "../sessions/model-overrides.js";
 import { interruptSessionWorkAdmissions } from "../sessions/session-lifecycle-admission.js";
+import { createDeferredCore } from "../shared/deferred.js";
 import { resolveEffectiveAgentSkillFilter } from "../skills/discovery/agent-filter.js";
 import {
   loadVisibleSkills,
@@ -58,6 +79,7 @@ import {
   deliveryContextFromSession,
   normalizeSessionDeliveryState,
 } from "../utils/delivery-context.shared.js";
+import { getAgentAttemptExecutionMocks } from "./agent-command-state.test-mocks.js";
 import { agentCommand, agentCommandFromIngress } from "./agent.js";
 import { createThrowingTestRuntime } from "./test-runtime-config-helpers.js";
 
@@ -66,22 +88,23 @@ const configIoMocks = vi.hoisted(() => ({
   readConfigFileSnapshotForWrite: vi.fn(),
 }));
 
-const attemptExecutionMocks = vi.hoisted(() => ({
-  useRealRunAgentAttempt: false,
-}));
-
 vi.mock("../config/io.js", () => ({
   getRuntimeConfig: configIoMocks.loadConfig,
   loadConfig: configIoMocks.loadConfig,
   readConfigFileSnapshotForWrite: configIoMocks.readConfigFileSnapshotForWrite,
 }));
 
-vi.mock("../agents/auth-profiles/store.js", () => {
+vi.mock("../agents/auth-profiles/store.js", async (importOriginal) => {
+  return {
+    ...(await importOriginal<typeof import("../agents/auth-profiles/store.js")>()),
+    hasAnyAuthProfileStoreSource: vi.fn(() => false),
+  };
+});
+vi.mock("../agents/auth-profiles/store-runtime.js", () => {
   const createEmptyStore = () => ({ version: 1, profiles: {} });
   return {
     ensureAuthProfileStore: vi.fn(createEmptyStore),
     ensureAuthProfileStoreForLocalUpdate: vi.fn(createEmptyStore),
-    hasAnyAuthProfileStoreSource: vi.fn(() => false),
     loadAuthProfileStore: vi.fn(createEmptyStore),
     loadAuthProfileStoreForRuntime: vi.fn(createEmptyStore),
     loadAuthProfileStoreForSecretsRuntime: vi.fn(createEmptyStore),
@@ -159,7 +182,7 @@ vi.mock("../agents/thinking-runtime.js", () => ({
   normalizeThinkingCatalogProviders: <T extends { provider: string }>(catalog: T[]) =>
     catalog.map((entry) => ({ ...entry, provider: entry.provider.toLowerCase() })),
   resolveCandidateThinkingLevel: ({ level }: { level?: string }) => level,
-  resolveEffectiveAgentRuntime: () => "openclaw",
+  resolveEffectiveAgentRuntime: vi.fn(() => "openclaw"),
 }));
 
 vi.mock("../agents/main-session-recovery/main-session-recovery-store.js", () => ({
@@ -184,6 +207,7 @@ vi.mock("../infra/outbound/channel-bootstrap.runtime.js", () => ({
   // Every channel fixture in this suite is already active. Bootstrap discovery
   // and its plugin-loader graph have focused owner coverage.
   bootstrapOutboundChannelPlugin: vi.fn(() => undefined),
+  bootstrapOutboundChannelPluginAsync: vi.fn(() => undefined),
   resetOutboundChannelBootstrapStateForTests: vi.fn(),
 }));
 
@@ -200,112 +224,6 @@ vi.mock("../agents/command/assistant-transcript-repair.js", () => ({
   persistAssistantTranscriptRepairRecord: vi.fn(async () => undefined),
   repairPendingAssistantTranscriptTurns: vi.fn(async () => undefined),
 }));
-
-vi.mock("../agents/command/session-store.runtime.js", async () => {
-  const accessor = await import("../config/sessions/session-accessor.js");
-  return {
-    loadSessionEntry: accessor.loadSessionEntry,
-    loadSessionEntryReadOnly: accessor.loadSessionEntryReadOnly,
-    updateSessionStoreAfterAgentRun: vi.fn(async () => undefined),
-  };
-});
-
-vi.mock("../agents/command/cli-compaction.js", () => {
-  return {
-    runCliTurnCompactionLifecycle: vi.fn(
-      async (params: { sessionEntry?: unknown }) => params.sessionEntry,
-    ),
-  };
-});
-
-vi.mock("../agents/command/attempt-execution.runtime.js", () => {
-  return {
-    buildAcpResult: vi.fn(),
-    createAcpToolLifecycleTracker: () => ({
-      active: new Map(),
-      terminalToolCallIds: new Set(),
-      saturated: false,
-    }),
-    createAcpVisibleTextAccumulator: vi.fn(),
-    emitAcpAssistantDelta: vi.fn(),
-    emitAcpLifecycleEnd: vi.fn(),
-    emitAcpLifecycleError: vi.fn(),
-    emitAcpLifecycleStart: vi.fn(),
-    persistAcpTurnTranscript: vi.fn(async (params: { sessionEntry?: unknown }) => ({
-      kind: "persisted",
-      sessionEntry: params.sessionEntry,
-    })),
-    persistCliTurnTranscript: vi.fn(async (params: { sessionEntry?: unknown }) => ({
-      kind: "persisted",
-      sessionEntry: params.sessionEntry,
-    })),
-    runAgentAttempt: vi.fn(async (params: Record<string, unknown>) => {
-      if (attemptExecutionMocks.useRealRunAgentAttempt) {
-        const actual = await vi.importActual<
-          typeof import("../agents/command/attempt-execution.js")
-        >("../agents/command/attempt-execution.js");
-        return await actual.runAgentAttempt(params as never);
-      }
-      const opts = params.opts as Record<string, unknown>;
-      const runContext = params.runContext as Record<string, unknown>;
-      const sessionEntry = params.sessionEntry as
-        | {
-            authProfileOverride?: string;
-            authProfileOverrideSource?: string;
-          }
-        | undefined;
-      const providerOverride = params.providerOverride as string;
-      const authProfileProvider = params.authProfileProvider as string;
-      const authProfileId =
-        providerOverride === authProfileProvider ? sessionEntry?.authProfileOverride : undefined;
-
-      return await runEmbeddedAgent({
-        sessionId: params.sessionId,
-        sessionKey: params.sessionKey,
-        agentId: params.sessionAgentId,
-        trigger: "user",
-        messageChannel: params.messageChannel,
-        agentAccountId: runContext.accountId,
-        messageTo: opts.replyTo ?? opts.to,
-        messageThreadId: opts.threadId,
-        sessionFile: params.sessionFile,
-        workspaceDir: params.workspaceDir,
-        config: params.cfg,
-        skillsSnapshot: params.skillsSnapshot,
-        prompt: params.body,
-        images: opts.images,
-        imageOrder: opts.imageOrder,
-        clientTools: opts.clientTools,
-        provider: providerOverride,
-        model: params.modelOverride,
-        authProfileId,
-        authProfileIdSource: authProfileId ? sessionEntry?.authProfileOverrideSource : undefined,
-        thinkLevel: params.resolvedThinkLevel,
-        fastMode: params.fastMode,
-        verboseLevel: params.resolvedVerboseLevel,
-        timeoutMs: params.timeoutMs,
-        runId: params.runId,
-        lane: opts.lane,
-        abortSignal: opts.abortSignal,
-        extraSystemPrompt: opts.extraSystemPrompt,
-        bootstrapContextMode: opts.bootstrapContextMode,
-        bootstrapContextRunKind: opts.bootstrapContextRunKind,
-        internalEvents: opts.internalEvents,
-        inputProvenance: opts.inputProvenance,
-        streamParams: opts.streamParams,
-        agentDir: params.agentDir,
-        allowTransientCooldownProbe: params.allowTransientCooldownProbe,
-        cleanupBundleMcpOnRunEnd: opts.cleanupBundleMcpOnRunEnd,
-        cleanupCliLiveSessionOnRunEnd: opts.cleanupCliLiveSessionOnRunEnd,
-        modelRun: opts.modelRun,
-        promptMode: opts.promptMode,
-        disableTools: opts.modelRun === true,
-        onAgentEvent: params.onAgentEvent,
-      } as never);
-    }),
-    sessionTranscriptHasContent: vi.fn(async () => false),
-  };
-});
 
 vi.mock("../agents/command/delivery.runtime.js", () => {
   return {
@@ -386,6 +304,8 @@ vi.mock("../config/sessions/transcript-resolve.runtime.js", () => {
     ),
   };
 });
+
+const attemptExecutionMocks = getAgentAttemptExecutionMocks();
 
 const runtime = createThrowingTestRuntime();
 
@@ -491,8 +411,7 @@ function createDefaultAgentResult(params?: {
 }
 
 function getLastEmbeddedCall() {
-  const calls = vi.mocked(runEmbeddedAgent).mock.calls;
-  return calls[calls.length - 1]?.[0];
+  return vi.mocked(runEmbeddedAgent).mock.calls.at(-1)?.[0];
 }
 
 function expectLastRunProviderModel(provider: string, model: string): void {
@@ -529,7 +448,7 @@ async function runAgentWithSessionKey(sessionKey: string): Promise<void> {
 
 function mockModelCatalogOnce(entries: ReturnType<typeof loadManifestModelCatalog>): void {
   vi.mocked(loadManifestModelCatalog).mockReturnValueOnce(entries);
-  vi.mocked(loadPreparedModelCatalog).mockResolvedValueOnce(entries);
+  vi.mocked(readPreparedModelCatalog).mockResolvedValueOnce(entries);
 }
 
 function installThinkingTestProviders(channels: Parameters<typeof createTestRegistry>[0] = []) {
@@ -584,7 +503,9 @@ beforeEach(() => {
   runtimeSnapshotModule.clearRuntimeConfigSnapshot();
   vi.mocked(runEmbeddedAgent).mockResolvedValue(createDefaultAgentResult());
   vi.mocked(loadManifestModelCatalog).mockReturnValue([]);
-  vi.mocked(loadPreparedModelCatalog).mockResolvedValue([]);
+  vi.mocked(loadProviderScopedThinkingCatalog).mockResolvedValue([]);
+  vi.mocked(readPreparedModelCatalog).mockResolvedValue([]);
+  vi.mocked(resolveEffectiveAgentRuntime).mockReturnValue("openclaw");
   vi.mocked(loadEnabledClaudeBundleCommands).mockReturnValue([]);
   vi.mocked(modelSelectionModule.isCliProvider).mockImplementation(() => false);
   configIoMocks.readConfigFileSnapshotForWrite.mockResolvedValue({
@@ -594,6 +515,109 @@ beforeEach(() => {
 });
 
 describe("agentCommand", () => {
+  it("delivers a real local Gateway tool result through the normal CLI admission", async () => {
+    await withTempHome(async (home) => {
+      mockConfig(home, path.join(home, "sessions.json"));
+      // The synthetic provider substitutes inference only; command admission and RPC stay real.
+      vi.mocked(runEmbeddedAgent).mockImplementationOnce(async () => {
+        const identity = await callInProcessGatewayTool<{ agentId: string }>("agent.identity.get", {
+          agentId: "main",
+        });
+        expect(identity).toMatchObject({ agentId: "main" });
+        return createDefaultAgentResult({
+          payloads: [{ text: `Local agent: ${identity.agentId}` }],
+        });
+      });
+      const actualDelivery = await vi.importActual<typeof import("../agents/command/delivery.js")>(
+        "../agents/command/delivery.js",
+      );
+      vi.mocked(deliverAgentCommandResult).mockImplementationOnce(
+        actualDelivery.deliverAgentCommandResult,
+      );
+
+      const result = await agentCommand(
+        { message: "Identify this local agent", agentId: "main" },
+        runtime,
+      );
+
+      expect(result?.payloads).toEqual([{ text: "Local agent: main", mediaUrl: null }]);
+      expect(runtime.log).toHaveBeenCalledWith("Local agent: main");
+      expect(readAgentRunTerminalOutcome(result)).toBe("completed");
+    });
+  });
+
+  it.each([false, true])(
+    "runs BOOT.md with an existing SQLite boot session and cleans up after failure=%s",
+    async (fail) => {
+      await withTempHome(async (home) => {
+        const storePath = path.join(home, "sessions.json");
+        const cfg = mockConfig(home, storePath, undefined, undefined, [
+          { id: "main", default: true },
+        ]);
+        const workspaceDir = path.join(home, "openclaw");
+        fs.mkdirSync(workspaceDir, { recursive: true });
+        fs.writeFileSync(path.join(workspaceDir, "BOOT.md"), "Check status.");
+        const priorScope = { storePath, sessionKey: "agent:main:boot", sessionId: "previous-boot" };
+        await replaceSessionEntry(priorScope, {
+          sessionId: priorScope.sessionId,
+          updatedAt: Date.now(),
+          label: "Previous boot",
+          visibility: "read-only",
+        });
+        const transcript = [
+          { type: "session", id: priorScope.sessionId, cwd: workspaceDir },
+          {
+            type: "message",
+            id: "old-message",
+            parentId: null,
+            message: { role: "user", content: "Keep this history." },
+          },
+        ];
+        await replaceTranscriptEvents(priorScope, transcript);
+        const priorEntry = loadSessionEntry(priorScope);
+        const { member } = addSessionMember(priorScope, {
+          identityId: "boot-history-reader",
+          addedBy: "operator",
+        });
+        const bootSessions = new Map<string, string>();
+        vi.mocked(runEmbeddedAgent).mockImplementation(async (params) => {
+          const sessionKey = expectDefined(params.sessionKey, "boot session key");
+          expect(params.sessionId).not.toBe(priorScope.sessionId);
+          expect(getBootEchoContextForSession(sessionKey)).toContain("Check status.");
+          bootSessions.set(sessionKey, params.sessionId);
+          await replaceTranscriptEvents({ storePath, sessionKey, sessionId: params.sessionId }, [
+            { type: "session", id: params.sessionId, cwd: workspaceDir },
+          ]);
+          if (fail) {
+            throw new Error("boot runtime failed");
+          }
+          return createDefaultAgentResult();
+        });
+
+        for (let restart = 0; restart < 2; restart++) {
+          const result = await runBootOnce({ cfg, deps: {}, workspaceDir });
+          expect(result).toEqual(
+            fail
+              ? { status: "failed", reason: "agent run failed: boot runtime failed" }
+              : { status: "ran" },
+          );
+          expect(vi.mocked(runEmbeddedAgent).mock.calls).toHaveLength(restart + 1);
+          expect(loadSessionEntry(priorScope)).toEqual(priorEntry);
+          expect(await loadTranscriptEvents(priorScope)).toEqual(transcript);
+          expect(listSessionMembers(priorScope)).toEqual([member]);
+          expect(listSessionEntriesCore({ storePath }).map(({ sessionKey }) => sessionKey)).toEqual(
+            [priorScope.sessionKey],
+          );
+          for (const [sessionKey, sessionId] of bootSessions) {
+            expect(getBootEchoContextForSession(sessionKey)).toBeUndefined();
+            expect(await loadTranscriptEvents({ storePath, sessionKey, sessionId })).toEqual([]);
+          }
+        }
+        expect(bootSessions.size).toBe(2);
+      });
+    },
+  );
+
   it.each([
     { name: "completed stop", meta: { stopReason: "stop" }, outcome: "completed" },
     {
@@ -634,6 +658,7 @@ describe("agentCommand", () => {
       await withTempHome(async (home) => {
         mockConfig(home, path.join(home, "sessions.json"));
         const controller = new AbortController();
+        const secret = ["sk", "abcdefghijklmnopqrstuv"].join("-");
         const text = meta.error?.message ?? "ok";
         const rawResult = {
           ...createDefaultAgentResult(),
@@ -644,7 +669,10 @@ describe("agentCommand", () => {
           if (fault === "callback") {
             await params.onAgentEvent?.({
               stream: "lifecycle",
-              data: { phase: "finishing", error: "Deferred provider failure" },
+              data: {
+                phase: "finishing",
+                error: `Deferred provider failure. Authorization: Bearer ${secret}`,
+              },
             });
           }
           return rawResult;
@@ -666,10 +694,19 @@ describe("agentCommand", () => {
         );
 
         expect(runEmbeddedAgent).toHaveBeenCalledTimes(1);
-        expect(result?.payloads).toEqual([{ text, mediaUrl: null }]);
+        expect(result?.payloads).toEqual([
+          { text, mediaUrl: null, ...(meta.error ? { isError: true } : {}) },
+        ]);
         expect(vi.mocked(runtime.log).mock.calls.at(-1)?.[0]).toBe(JSON.stringify(result, null, 2));
         expect(readAgentRunTerminalOutcome(rawResult)).toBeUndefined();
+        expect(readAgentRunTerminalError(rawResult)).toBeUndefined();
         expect(readAgentRunTerminalOutcome(result)).toBe(outcome);
+        if (fault === "callback") {
+          expect(readAgentRunTerminalError(result)).toContain("Deferred provider failure.");
+          expect(readAgentRunTerminalError(result)).not.toContain(secret);
+        } else if (outcome === "completed") {
+          expect(readAgentRunTerminalError(result)).toBeUndefined();
+        }
       });
     },
   );
@@ -712,6 +749,7 @@ describe("agentCommand", () => {
         vi.mocked(attemptExecutionRuntime.runAgentAttempt).mockImplementationOnce(
           async (params) => {
             params.deferredLifecycle?.adopt({
+              beginRetryWait: () => undefined,
               complete: async () => {
                 if (fault === "rejection") {
                   throw failure;
@@ -755,7 +793,7 @@ describe("agentCommand", () => {
 
       expect(resolveReusableWorkspaceSkillSnapshot).toHaveBeenCalledWith(
         expect.objectContaining({
-          executionSkillsDir: path.join(executionWorkspace, "skills"),
+          executionWorkspaceDir: executionWorkspace,
         }),
       );
     });
@@ -871,7 +909,7 @@ describe("agentCommand", () => {
 
       expect(resolveReusableWorkspaceSkillSnapshot).toHaveBeenCalledWith(
         expect.objectContaining({
-          executionSkillsDir: path.join(canonicalWorkspace, "skills"),
+          executionWorkspaceDir: canonicalWorkspace,
         }),
       );
     });
@@ -1422,52 +1460,82 @@ describe("agentCommand", () => {
     });
   });
 
-  it("classifies lifecycle interruption as a restart abort", async () => {
-    await withTempHome(async (home) => {
-      const store = path.join(home, "sessions.json");
-      const sessionKey = "agent:main:subagent:lifecycle-restart";
-      const sessionId = "lifecycle-restart-session-id";
-      mockConfig(home, store);
-      await writeSessionStoreSeed(store, {
-        [sessionKey]: { sessionId, updatedAt: Date.now() },
-      });
-      let observedAbortReason: unknown;
-      vi.mocked(runEmbeddedAgent).mockImplementationOnce(
-        async (opts) =>
-          await new Promise((resolve) => {
-            const finish = () => {
-              observedAbortReason = opts.abortSignal?.reason;
-              resolve(createDefaultAgentResult());
-            };
-            if (opts.abortSignal?.aborted) {
-              finish();
-              return;
-            }
-            opts.abortSignal?.addEventListener("abort", finish, { once: true });
-          }),
-      );
+  it.each(["generic", "explicit restart", "terminal Stop"] as const)(
+    "preserves lifecycle interruption semantics: %s",
+    async (interruption) => {
+      await withTempHome(async (home) => {
+        const store = path.join(home, "sessions.json");
+        const sessionKey = "agent:main:subagent:lifecycle-restart";
+        const sessionId = "lifecycle-restart-session-id";
+        mockConfig(home, store);
+        await writeSessionStoreSeed(store, {
+          [sessionKey]: { sessionId, updatedAt: Date.now() },
+        });
+        let observedAbortReason: unknown;
+        const entered = createDeferredCore();
+        const cleanup = new AbortController();
+        const reason =
+          interruption === "terminal Stop"
+            ? createAgentRunDirectAbortError()
+            : interruption === "explicit restart"
+              ? createAgentRunRestartAbortError()
+              : undefined;
+        vi.mocked(runEmbeddedAgent).mockImplementationOnce(
+          async (opts) =>
+            await new Promise((resolve) => {
+              entered.resolve();
+              const finish = () => {
+                observedAbortReason = opts.abortSignal?.reason;
+                resolve(createDefaultAgentResult());
+              };
+              if (opts.abortSignal?.aborted) {
+                finish();
+                return;
+              }
+              opts.abortSignal?.addEventListener("abort", finish, { once: true });
+            }),
+        );
 
-      const command = agentCommandFromIngress(
-        {
-          message: "interrupt this lifecycle run",
-          sessionId,
-          allowModelOverride: false,
-        },
-        runtime,
-      ).catch((error: unknown) => error);
-      await vi.waitFor(() => {
-        expect(runEmbeddedAgent).toHaveBeenCalledOnce();
+        const command = agentCommandFromIngress(
+          {
+            message: "interrupt this lifecycle run",
+            sessionId,
+            allowModelOverride: false,
+            abortSignal: cleanup.signal,
+          },
+          runtime,
+        ).catch((error: unknown) => error);
+        try {
+          await Promise.race([
+            entered.promise,
+            command.then((result) => {
+              throw new Error("Command settled before embedded entry", { cause: result });
+            }),
+          ]);
+          expect(runEmbeddedAgent).toHaveBeenCalledOnce();
+          await interruptSessionWorkAdmissions({
+            scope: store,
+            identities: [sessionKey, sessionId],
+            reason,
+          });
+          const commandResult = await command;
+          if (interruption === "terminal Stop") {
+            expect(observedAbortReason).toBe(reason);
+            expect(isAgentRunDirectAbortReason(observedAbortReason)).toBe(true);
+          }
+          expect(isAgentRunRestartAbortReason(observedAbortReason)).toBe(
+            interruption !== "terminal Stop",
+          );
+          expect(isAgentRunRestartAbortReason(commandResult)).toBe(
+            interruption !== "terminal Stop",
+          );
+        } finally {
+          cleanup.abort(createAgentRunDirectAbortError());
+          await command;
+        }
       });
-      await interruptSessionWorkAdmissions({
-        scope: store,
-        identities: [sessionKey, sessionId],
-      });
-      const commandError = await command;
-
-      expect(isAgentRunRestartAbortReason(observedAbortReason)).toBe(true);
-      expect(isAgentRunRestartAbortReason(commandError)).toBe(true);
-    });
-  });
+    },
+  );
 
   it("rejects a stale requested session id after command preparation", async () => {
     await withTempHome(async (home) => {
@@ -1488,7 +1556,7 @@ describe("agentCommand", () => {
           },
           runtime,
         ),
-      ).rejects.toThrow(`Session "${sessionKey}" changed while starting work. Retry.`);
+      ).rejects.toMatchObject({ code: "SESSION_WORK_START_CHANGED" });
       expect(runEmbeddedAgent).not.toHaveBeenCalled();
     });
   });
@@ -1652,15 +1720,107 @@ describe("agentCommand", () => {
         runtime,
       );
 
-      expect(loadPreparedModelCatalog).not.toHaveBeenCalled();
+      expect(readPreparedModelCatalog).not.toHaveBeenCalled();
       expectLastRunProviderModel("openrouter", "openrouter/auto");
-      const thinkingDefaultCall = vi.mocked(modelSelectionModule.resolveThinkingDefault).mock
-        .calls[0]?.[0];
-      expect(thinkingDefaultCall?.provider).toBe("openrouter");
-      expect(thinkingDefaultCall?.model).toBe("openrouter/auto");
-      expect(thinkingDefaultCall?.catalog).toBeUndefined();
+      expect(getLastEmbeddedCall()?.thinkLevel).toBe("off");
     });
   });
+
+  it("validates an unconfigured model against manifest thinking capabilities without live discovery", async () => {
+    await withTempHome(async (home) => {
+      mockConfig(home, path.join(home, "sessions.json"), { models: {} });
+      vi.mocked(loadManifestModelCatalog).mockReturnValue([
+        {
+          provider: "reasoning-test",
+          id: "catalog-max",
+          name: "Catalog reasoning model",
+          api: "openai-completions",
+          reasoning: true,
+          compat: { supportedReasoningEfforts: ["max"] },
+        },
+      ]);
+
+      await agentCommand(
+        {
+          message: "ping",
+          to: "+1222",
+          model: "reasoning-test/catalog-max",
+          thinking: "max",
+        },
+        runtime,
+      );
+
+      expect(getLastEmbeddedCall()?.thinkLevel).toBe("max");
+      expect(readPreparedModelCatalog).not.toHaveBeenCalled();
+    });
+  });
+
+  it.each(["off", "max"] as const)(
+    "validates native %s against observed capabilities despite manifest reasoning",
+    async (thinking) => {
+      await withTempHome(async (home) => {
+        mockConfig(home, path.join(home, "sessions.json"), {
+          model: { primary: "openai/account-reasoner" },
+          models: { "openai/account-reasoner": {} },
+        });
+        const registry = createTestRegistry();
+        registry.providers.push({
+          pluginId: "openai",
+          source: "test",
+          provider: {
+            id: "openai",
+            label: "OpenAI",
+            auth: [],
+            resolveThinkingProfile: expectDefined(
+              resolveProviderPolicySurface("openai")?.resolveThinkingProfile,
+              "OpenAI thinking policy",
+            ),
+          },
+        });
+        setActivePluginRegistry(registry);
+        vi.mocked(loadManifestModelCatalog).mockReturnValue([
+          {
+            provider: "openai",
+            id: "account-reasoner",
+            name: "Catalog reasoning model",
+            api: "openai-chatgpt-responses",
+            reasoning: true,
+            compat: { supportedReasoningEfforts: ["none", "high", "max"] },
+          },
+        ]);
+        vi.mocked(resolveEffectiveAgentRuntime).mockReturnValue("codex");
+        vi.mocked(loadProviderScopedThinkingCatalog).mockResolvedValue([
+          {
+            provider: "openai",
+            id: "account-reasoner",
+            name: "Native reasoning model",
+            nativeRuntime: "codex",
+            reasoning: true,
+            compat: { supportedReasoningEfforts: ["high"] },
+          },
+        ]);
+
+        await expect(
+          agentCommand(
+            { message: "ping", to: "+1222", model: "openai/account-reasoner", thinking },
+            runtime,
+          ),
+        ).rejects.toThrow(
+          `Thinking level "${thinking}" is not supported for openai/account-reasoner.`,
+        );
+
+        expect(loadProviderScopedThinkingCatalog).toHaveBeenCalledWith(
+          expect.objectContaining({
+            provider: "openai",
+            model: "account-reasoner",
+            agentRuntime: "codex",
+          }),
+        );
+        expect(runEmbeddedAgent).not.toHaveBeenCalled();
+        expect(readPreparedModelCatalog).not.toHaveBeenCalled();
+      });
+    },
+  );
 
   it("bypasses ACP sessions for one-shot model runs", async () => {
     await withTempHome(async (home) => {
@@ -2560,16 +2720,18 @@ describe("agentCommand", () => {
       expect(callArgs?.agentId).toBe("ops");
       expect(callArgs?.sessionKey).toBe("agent:ops:incident-42");
 
-      await agentCommand({ message: "hi", agentId: "ops", sessionKey: "global" }, runtime);
+      for (const sessionKey of ["global", "unknown"]) {
+        await agentCommand({ message: "hi", agentId: "ops", sessionKey }, runtime);
 
-      callArgs = getLastEmbeddedCall();
-      expect(callArgs?.agentId).toBe("ops");
-      expect(callArgs?.sessionKey).toBe("agent:ops:global");
-      expectSqliteSessionFileMarker({
-        agentId: "ops",
-        sessionFile: callArgs?.sessionFile,
-        storePath: store,
-      });
+        callArgs = getLastEmbeddedCall();
+        expect(callArgs?.agentId).toBe("ops");
+        expect(callArgs?.sessionKey).toBe(sessionKey);
+        expectSqliteSessionFileMarker({
+          agentId: "ops",
+          sessionFile: callArgs?.sessionFile,
+          storePath: store,
+        });
+      }
     });
   });
 

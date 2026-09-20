@@ -1,9 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { classifyProviderFailoverSignalWithPlugin } from "../../plugins/provider-failover.js";
 import { buildApiErrorObservationFields } from "../embedded-agent-error-observation.js";
+import { PROVIDER_SCHEMA_REJECTION_USER_TEXT } from "../failover/assistant-request-failure-copy.js";
 import { classifyFailoverSignal, isContextOverflowError } from "../failover/classify.js";
-import { PROVIDER_SCHEMA_REJECTION_USER_TEXT } from "../failover/user-copy.js";
 import { makeAssistantMessageFixture } from "../test-helpers/assistant-message-fixtures.js";
+import { classifyAssistantFailoverReason } from "./assistant-message-failures.js";
 import { formatAssistantErrorText } from "./error-text.js";
 import { classifyProviderRuntimeFailureKind } from "./provider-runtime-failure.js";
 
@@ -36,6 +37,12 @@ describe("assistant diagnostic provider ownership", () => {
         { providerOwner: { id: "synthetic-owner", classifyFailoverReason } },
       ),
     ).toBe(PROVIDER_SCHEMA_REJECTION_USER_TEXT);
+    expect(
+      buildApiErrorObservationFields("provider rejected this payload", {
+        provider: "custom-route",
+        providerOwner: { id: "synthetic-owner", classifyFailoverReason },
+      }),
+    ).toMatchObject({ providerRuntimeFailureKind: "schema" });
     expect(classifyFailoverReason).toHaveBeenCalledWith(
       expect.objectContaining({ provider: "synthetic-owner" }),
     );
@@ -58,6 +65,12 @@ describe("assistant diagnostic provider ownership", () => {
   });
 
   it("records diagnostics without discovering provider policy", () => {
+    expect(
+      classifyAssistantFailoverReason(
+        makeAssistantMessageFixture({ errorMessage: "provider sent an opaque failure" }),
+        { providerOwner: null },
+      ),
+    ).toBeNull();
     expect(
       buildApiErrorObservationFields("provider sent an opaque failure", { provider: "openai" }),
     ).toMatchObject({ providerRuntimeFailureKind: "unclassified" });

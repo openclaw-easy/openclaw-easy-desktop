@@ -4,13 +4,13 @@ import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
 import { runQaGatewayCliCommand } from "./gateway-child-command.js";
 import { QaGatewayChildLifecycle, type QaGatewayStopOptions } from "./gateway-child-lifecycle.js";
 import {
+  createQaGatewayChildLogAccess,
   formatQaGatewayProcessBoundaryStartupFailure,
   monitorQaGatewayChildFailure,
   throwQaGatewayChildFailure,
   type QaChildFailure,
 } from "./gateway-child-process.js";
 import {
-  callQaGatewayWithRetry,
   isRetryableRpcStartupError,
   QA_GATEWAY_CHILD_STARTUP_MAX_ATTEMPTS,
   resolveQaGatewayStartupRetry,
@@ -23,7 +23,6 @@ import {
   type QaGatewayChildParams,
   type QaGatewayChildStateMutationContext,
 } from "./gateway-child-setup.js";
-import { redactQaGatewayDebugText } from "./gateway-log-redaction.js";
 import { startQaGatewayRpcClient } from "./gateway-rpc-client.js";
 import { readProcessTreeCpuMs, readProcessTreeRssBytes } from "./process-tree-cpu.js";
 
@@ -192,7 +191,7 @@ async function startOwnedGatewayChild(
       await launchReady(true, attempt);
       break;
     } catch (error) {
-      const attemptLogs = redactQaGatewayDebugText(output.readSince(attemptLogMark));
+      const attemptLogs = output.readRedactedSince(attemptLogMark);
       const retry = resolveQaGatewayStartupRetry({
         attempt,
         details: attemptLogs.trim() ? attemptLogs : formatErrorMessage(error),
@@ -222,7 +221,7 @@ async function startOwnedGatewayChild(
   const { cfg, baseUrl, wsUrl, env: runningEnv } = launch;
   const signalActiveProcess = async (signal: NodeJS.Signals) => {
     if (active.identity && lifetime.controller) {
-      if (signal !== "SIGUSR1" && signal !== "SIGUSR2") {
+      if (signal !== "SIGUSR2" && signal !== "SIGQUIT") {
         throw new Error(`unsupported verified gateway signal: ${signal}`);
       }
       await lifetime.controller.signal(active.identity, signal);
@@ -238,6 +237,9 @@ async function startOwnedGatewayChild(
     cfg,
     baseUrl,
     wsUrl,
+    get evidenceIdentity() {
+      return lifetime.rpcClient?.evidenceIdentity ?? null;
+    },
     get pid() {
       return active.identity?.pid ?? active.child.pid ?? null;
     },
@@ -249,7 +251,13 @@ async function startOwnedGatewayChild(
     tempRoot,
     configPath,
     runtimeEnv: runningEnv,
+    // Verified launchers implement a Gateway-only process boundary, not a direct CLI.
+    cliCommand:
+      params.command && !params.command.processBoundary
+        ? { executablePath: nodeExecPath, argsPrefix: [...cliArgsPrefix], cwd: gatewayCwd }
+        : undefined,
     logs,
+    ...createQaGatewayChildLogAccess(output),
     runCli(args: readonly string[]) {
       throwActiveChildFailure();
       return runQaGatewayCliCommand({
@@ -265,13 +273,13 @@ async function startOwnedGatewayChild(
       throwActiveChildFailure();
       await signalActiveProcess(signal);
     },
-    async restart(signal: NodeJS.Signals = "SIGUSR1") {
+    async restart(signal: NodeJS.Signals = "SIGUSR2") {
       throwActiveChildFailure();
       const restartLogMark = output.mark();
       await signalActiveProcess(signal);
-      if (signal === "SIGUSR1") {
+      if (signal === "SIGUSR2") {
         await waitForQaGatewayRestartBoundary({
-          readLogsSince: (mark) => redactQaGatewayDebugText(output.readSince(mark)),
+          readLogsSince: (mark) => output.readSince(mark),
           mark: restartLogMark,
         });
         await waitForGatewayReady({
@@ -296,10 +304,9 @@ async function startOwnedGatewayChild(
         } catch (error) {
           const retry = resolveQaGatewayStartupRetry({
             attempt: 1,
-            details: [
-              redactQaGatewayDebugText(output.readSince(replacementLogMark)),
-              formatErrorMessage(error),
-            ].join("\n"),
+            details: [output.readRedactedSince(replacementLogMark), formatErrorMessage(error)].join(
+              "\n",
+            ),
             migrationConvergenceRestartUsed: false,
           });
           if (retry?.kind !== "migration-convergence-restart") {
@@ -320,26 +327,14 @@ async function startOwnedGatewayChild(
       rpcParams?: unknown,
       opts?: { deadlineMs?: number; expectFinal?: boolean; timeoutMs?: number },
     ) {
-      const timeoutMs = opts?.timeoutMs ?? 20_000;
-      return await callQaGatewayWithRetry({
-        deadlineMs: opts?.deadlineMs,
-        logs,
-        request: async (requestOptions) =>
-          await requireRpcClient().request(method, rpcParams, {
-            ...opts,
-            ...requestOptions,
-          }),
-        throwChildFailure: throwActiveChildFailure,
-        timeoutMs,
-        waitForReady: async (readinessTimeoutMs) =>
-          await waitForGatewayReady({
-            baseUrl,
-            logs,
-            child: active.child,
-            getChildFailure,
-            timeoutMs: readinessTimeoutMs,
-          }),
-      });
+      throwActiveChildFailure();
+      try {
+        // The RPC client owns unsent reconnects; replaying a sent call can repeat committed work.
+        return await requireRpcClient().request(method, rpcParams, opts);
+      } catch (error) {
+        throwActiveChildFailure();
+        throw error;
+      }
     },
     async stop(opts?: QaGatewayStopOptions) {
       const result = await lifetime.stop(opts);

@@ -1,14 +1,10 @@
-// Matrix plugin module implements approval native behavior.
 import {
   createChannelApprovalCapability,
   createApproverRestrictedNativeApprovalCapability,
   splitChannelApprovalCapability,
 } from "openclaw/plugin-sdk/approval-delivery-runtime";
 import { createLazyChannelApprovalNativeRuntimeAdapter } from "openclaw/plugin-sdk/approval-handler-adapter-runtime";
-import type {
-  ChannelApprovalKind,
-  ChannelApprovalNativeRuntimeAdapter,
-} from "openclaw/plugin-sdk/approval-handler-runtime";
+import type { ChannelApprovalKind } from "openclaw/plugin-sdk/approval-handler-runtime";
 import {
   createChannelNativeOriginTargetResolver,
   resolveApprovalRequestSessionConversation,
@@ -16,6 +12,7 @@ import {
 import type {
   ExecApprovalRequest,
   PluginApprovalRequest,
+  SystemAgentApprovalRequest,
 } from "openclaw/plugin-sdk/approval-runtime";
 import type { ChannelApprovalCapability } from "openclaw/plugin-sdk/channel-contract";
 import {
@@ -39,7 +36,7 @@ import { normalizeMatrixUserId } from "./matrix/monitor/allowlist.js";
 import { resolveMatrixTargetIdentity } from "./matrix/target-ids.js";
 import type { CoreConfig } from "./types.js";
 
-type ApprovalRequest = ExecApprovalRequest | PluginApprovalRequest;
+type ApprovalRequest = ExecApprovalRequest | PluginApprovalRequest | SystemAgentApprovalRequest;
 type MatrixOriginTarget = { to: string; threadId?: string };
 
 function normalizeComparableTarget(value: string): string {
@@ -155,7 +152,7 @@ function resolveSuppressionAccountId(params: {
 const resolveMatrixOriginTarget = createChannelNativeOriginTargetResolver({
   channel: "matrix",
   shouldHandleRequest: ({ cfg, accountId, approvalKind, request }) => {
-    if (approvalKind !== "exec" && approvalKind !== "plugin") {
+    if (approvalKind !== "exec" && approvalKind !== "plugin" && approvalKind !== "system-agent") {
       return false;
     }
     return shouldHandleMatrixApprovalRequest({
@@ -240,7 +237,8 @@ const matrixNativeApprovalCapability = createApproverRestrictedNativeApprovalCap
   resolveApproverDmTargets: resolveMatrixApproverDmTargets,
   notifyOriginWhenDmOnly: true,
   nativeRuntime: createLazyChannelApprovalNativeRuntimeAdapter({
-    eventKinds: ["exec", "plugin"],
+    capabilityBoundary: true,
+    eventKinds: ["exec", "plugin", "system-agent"],
     isConfigured: ({ cfg, accountId }) =>
       isMatrixAnyApprovalClientEnabled({
         cfg,
@@ -253,9 +251,7 @@ const matrixNativeApprovalCapability = createApproverRestrictedNativeApprovalCap
         approvalKind,
         request,
       }),
-    load: async () =>
-      (await import("./approval-handler.runtime.js"))
-        .matrixApprovalNativeRuntime as unknown as ChannelApprovalNativeRuntimeAdapter,
+    load: async () => (await import("./approval-handler.runtime.js")).matrixApprovalNativeRuntime,
   }),
 });
 

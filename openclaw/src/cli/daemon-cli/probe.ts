@@ -6,21 +6,18 @@ import {
   ConnectErrorDetailCodes,
   readConnectErrorDetailCode,
 } from "../../../packages/gateway-protocol/src/connect-error-details.js";
+import type { HelloOk } from "../../../packages/gateway-protocol/src/schema/frames.js";
 import type { OpenClawConfig } from "../../config/types.js";
 import type { GatewayProbeAuthSummary, GatewayProbeServerSummary } from "../../gateway/probe.js";
+import { isGatewayTransportError } from "../../gateway/transport-error.js";
 import { formatErrorMessage } from "../../infra/errors.js";
 import { createLazyImportLoader } from "../../shared/lazy-promise.js";
 import { withProgress } from "../progress.js";
 
-type GatewayStatusProbeKind = "connect" | "read";
 const probeGatewayModuleLoader = createLazyImportLoader(() => import("../../gateway/probe.js"));
 const CONNECT_ERROR_DETAIL_CODE_VALUES: ReadonlySet<string> = new Set(
   Object.values(ConnectErrorDetailCodes),
 );
-
-async function loadProbeGatewayModule(): Promise<typeof import("../../gateway/probe.js")> {
-  return await probeGatewayModuleLoader.load();
-}
 
 function resolveProbeFailureMessage(result: {
   error?: string | null;
@@ -53,6 +50,7 @@ function projectGatewayConnectFailure(params: {
 /** Probe Gateway connectivity or read-capability status with optional RPC verification. */
 export async function probeGatewayStatus(opts: {
   url: string;
+  urlOverride?: string;
   localPortOverride?: number;
   token?: string;
   password?: string;
@@ -65,9 +63,10 @@ export async function probeGatewayStatus(opts: {
   allowRpcConfigCredentials?: boolean;
   configPath?: string;
 }) {
-  const kind = (opts.requireRpc ? "read" : "connect") satisfies GatewayStatusProbeKind;
+  const kind = opts.requireRpc ? "read" : "connect";
   let auth: GatewayProbeAuthSummary | undefined;
   let server: GatewayProbeServerSummary | undefined;
+  let eventLoop: HelloOk["snapshot"]["health"]["eventLoop"] | undefined;
   let gatewayReached = false;
   try {
     const result = await withProgress(
@@ -84,10 +83,10 @@ export async function probeGatewayStatus(opts: {
               "gateway status RPC skipped because configured gateway credentials are disabled for this status request",
             );
           }
-          const { resolveProbeAuthSummary } = await loadProbeGatewayModule();
+          const { resolveProbeAuthSummary } = await probeGatewayModuleLoader.load();
           const { callGateway } = await import("../../gateway/call.js");
           await callGateway({
-            url: opts.url,
+            ...(opts.urlOverride ? { url: opts.urlOverride } : { serviceTargetUrl: opts.url }),
             localPortOverride: opts.localPortOverride,
             token: opts.token,
             password: opts.password,
@@ -97,6 +96,7 @@ export async function probeGatewayStatus(opts: {
             method: "status",
             timeoutMs: opts.timeoutMs,
             sharedStateMode: "read-only",
+            skipImplicitAuth: true,
             ...(opts.configPath ? { configPath: opts.configPath } : {}),
             onHelloOk: (hello) => {
               gatewayReached = true;
@@ -106,11 +106,12 @@ export async function probeGatewayStatus(opts: {
                 authMetadataPresent: true,
               });
               server = hello.server;
+              eventLoop = hello.snapshot?.health?.eventLoop;
             },
           });
           return { ok: true as const, auth, server };
         }
-        const { probeGateway } = await loadProbeGatewayModule();
+        const { probeGateway } = await probeGatewayModuleLoader.load();
         return await probeGateway({
           url: opts.url,
           ...(opts.config ? { config: opts.config } : {}),
@@ -151,6 +152,7 @@ export async function probeGatewayStatus(opts: {
       ok: false,
       kind,
       ...(result.gatewayReached ? { gatewayReached: true as const } : {}),
+      ...(result.error === "timeout" && !result.close ? { timedOut: true as const } : {}),
       capability: auth?.capability,
       auth,
       ...serverSummary,
@@ -172,8 +174,12 @@ export async function probeGatewayStatus(opts: {
       ...(gatewayReached || isGatewayProtocolResponseError(err)
         ? { gatewayReached: true as const }
         : {}),
+      ...(isGatewayTransportError(err) && err.kind === "timeout"
+        ? { timedOut: true as const }
+        : {}),
       ...(auth ? { auth, capability: auth.capability } : {}),
       ...(server ? { server, ...(server.version != null ? { version: server.version } : {}) } : {}),
+      ...(eventLoop ? { eventLoop } : {}),
       connectFailure: projectGatewayConnectFailure({
         message: error,
         ...(isGatewayProtocolResponseError(err) ? { details: err.details } : {}),

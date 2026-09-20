@@ -25,6 +25,9 @@ if (!runtimeArg || !expectedInfoPath) {
 const runtime = fs.realpathSync(runtimeArg);
 const node = path.join(runtime, "bin/node");
 const packageRoot = path.join(runtime, "lib/node_modules/openclaw");
+if (fs.existsSync(path.join(packageRoot, "dist/control-ui"))) {
+  throw new Error("Private worker must not contain Gateway Control UI assets");
+}
 const expected = JSON.parse(fs.readFileSync(expectedInfoPath, "utf8"));
 const actual = JSON.parse(fs.readFileSync(path.join(packageRoot, "dist/build-info.json"), "utf8"));
 for (const key of ["version", "commit", "builtAt", "buildId"]) {
@@ -129,6 +132,9 @@ try {
         PATH: `${path.dirname(node)}:/usr/bin:/bin:/usr/sbin:/sbin`,
         OPENCLAW_NODE_EXEC_HOST: "app",
         OPENCLAW_NODE_EXEC_FALLBACK: "0",
+        // Same launch shape as MacNodeHostWorker: the worker must stay in the owned
+        // process group, or requireProcessTreeExit only proves the respawn wrapper died.
+        OPENCLAW_NO_RESPAWN: "1",
       },
       stdio: ["pipe", "pipe", "pipe"],
       timeoutMs: 300_000,

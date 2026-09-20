@@ -9,8 +9,9 @@ import {
   forceDisconnectPlaywrightForTarget,
   getObservedBrowserStateForPage,
   getObservedBrowserStateViaPlaywright,
-  getMainFrameDocumentIdentityViaPlaywright,
+  getDocumentIdentitiesViaPlaywright,
   getPageForTargetId,
+  hasCachedPlaywrightBrowserConnection,
   isBrowserObservedDialogBlockedError,
   listPagesViaPlaywright,
   markObservedDialogsHandledRemotelyForPage,
@@ -28,6 +29,7 @@ import {
 import {
   armDialogViaPlaywright,
   armFileUploadViaPlaywright,
+  downloadCurrentDocumentViaPlaywright,
   downloadViaPlaywright,
   uploadViaPlaywright,
   waitForDownloadViaPlaywright,
@@ -83,6 +85,7 @@ import {
 import { traceStartViaPlaywright, traceStopViaPlaywright } from "./pw-tools-core.trace.js";
 
 export const pwAi = {
+  downloadCurrentDocumentViaPlaywright,
   closePageByTargetIdViaPlaywright,
   closePlaywrightBrowserConnection,
   retirePlaywrightBrowserConnection,
@@ -94,8 +97,9 @@ export const pwAi = {
   createObservedDialogAbortSignalForPage,
   getObservedBrowserStateForPage,
   getObservedBrowserStateViaPlaywright,
-  getMainFrameDocumentIdentityViaPlaywright,
+  getDocumentIdentitiesViaPlaywright,
   getPageForTargetId,
+  hasCachedPlaywrightBrowserConnection,
   isBrowserObservedDialogBlockedError,
   listPagesViaPlaywright,
   markObservedDialogsHandledRemotelyForPage,

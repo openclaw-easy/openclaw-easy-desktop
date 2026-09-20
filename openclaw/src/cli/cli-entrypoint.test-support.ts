@@ -1,0 +1,119 @@
+// Both concurrent writers must use the same runtime graph and version metadata.
+export const cliRecoveryEntrypoints = {
+  cli: {
+    currentModuleUrl: import.meta.url,
+    sourceWorkerName: "../entry",
+    distWorkerPath: "entry.js",
+  },
+  sessionAccessor: {
+    currentModuleUrl: import.meta.url,
+    sourceWorkerName: "../config/sessions/session-accessor",
+    distWorkerPath: "config/sessions/session-accessor.js",
+  },
+  cliSession: {
+    currentModuleUrl: import.meta.url,
+    sourceWorkerName: "../agents/cli-session",
+    distWorkerPath: "agents/cli-session.js",
+  },
+} as const;
+
+// Failure reporting and exit finalization must share their compiled error classes.
+export const updateCandidateExitEntrypoints = {
+  oneShotExit: {
+    currentModuleUrl: import.meta.url,
+    sourceWorkerName: "one-shot-exit",
+    distWorkerPath: "cli/one-shot-exit.js",
+  },
+  failureTriage: {
+    currentModuleUrl: import.meta.url,
+    sourceWorkerName: "update-cli/update-command-triage",
+    distWorkerPath: "cli/update-cli/update-command-triage.js",
+  },
+  commandResult: {
+    currentModuleUrl: import.meta.url,
+    sourceWorkerName: "update-cli/update-command-result",
+    distWorkerPath: "cli/update-cli/update-command-result.js",
+  },
+} as const;
+
+// Prepare the real Gateway fixture before its readiness hook starts; source
+// transforms must not consume that hook's startup deadline.
+export const stateDirGatewayFixtureEntrypoint = {
+  currentModuleUrl: import.meta.url,
+  sourceWorkerName: "state-dir-gateway-check.server-fixture.test-support",
+  distWorkerPath: "cli/state-dir-gateway-check.server-fixture.test-support.js",
+} as const;
+
+export const updateFinalizationOutputEntrypoint = {
+  currentModuleUrl: import.meta.url,
+  sourceWorkerName: "update-finalization-output.test-support",
+  distWorkerPath: "legacy-finalizer/src/cli/update-finalization-output.test-support.js",
+} as const;
+
+// Direct-stop children use the invocation's prepared graph before readiness starts.
+export const gatewayDirectStopEntrypoints = {
+  forcedCronFixture: {
+    currentModuleUrl: import.meta.url,
+    sourceWorkerName: "gateway-cli/run-loop.forced-cron.test-support",
+    distWorkerPath: "cli/gateway-cli/run-loop.forced-cron.test-support.js",
+  },
+  modelAcquisitionFixture: {
+    currentModuleUrl: import.meta.url,
+    sourceWorkerName: "gateway-cli/run-loop.model-acquisition.test-support",
+    distWorkerPath: "cli/gateway-cli/run-loop.model-acquisition.test-support.js",
+  },
+  fileLogTransport: {
+    currentModuleUrl: import.meta.url,
+    sourceWorkerName: "../logging/logger-file-transport",
+    distWorkerPath: "logging/logger-file-transport.js",
+  },
+  ingressDrain: {
+    currentModuleUrl: import.meta.url,
+    sourceWorkerName: "../channels/message/ingress-drain",
+    distWorkerPath: "channels/message/ingress-drain.js",
+  },
+  ingressQueue: {
+    currentModuleUrl: import.meta.url,
+    sourceWorkerName: "../channels/message/ingress-queue",
+    distWorkerPath: "channels/message/ingress-queue.js",
+  },
+  runs: {
+    currentModuleUrl: import.meta.url,
+    sourceWorkerName: "../agents/embedded-agent-runner/runs",
+    distWorkerPath: "agents/embedded-agent-runner/runs.js",
+  },
+  activeRunProjections: {
+    currentModuleUrl: import.meta.url,
+    sourceWorkerName: "../agents/embedded-agent-runner/active-run-projections",
+    distWorkerPath: "agents/embedded-agent-runner/active-run-projections.js",
+  },
+  runLoop: {
+    currentModuleUrl: import.meta.url,
+    sourceWorkerName: "gateway-cli/run-loop",
+    distWorkerPath: "cli/gateway-cli/run-loop.js",
+  },
+  restartPolicy: {
+    currentModuleUrl: import.meta.url,
+    sourceWorkerName: "../infra/restart",
+    distWorkerPath: "infra/restart.js",
+  },
+  workAdmission: {
+    currentModuleUrl: import.meta.url,
+    sourceWorkerName: "../process/gateway-work-admission",
+    distWorkerPath: "process/gateway-work-admission.js",
+  },
+} as const;
+
+// Extra update roots share the native fixture generation.
+export const updateExecutorEntrypoints = {
+  lease: {
+    currentModuleUrl: import.meta.url,
+    sourceWorkerName: "../infra/update-managed-service-handoff-lease",
+    distWorkerPath: "infra/update-managed-service-handoff-lease.js",
+  },
+  activation: {
+    currentModuleUrl: import.meta.url,
+    sourceWorkerName: "../infra/package-update-activation",
+    distWorkerPath: "infra/package-update-activation.js",
+  },
+} as const;

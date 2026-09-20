@@ -3,7 +3,15 @@ import type { SessionEntry } from "../../config/sessions.js";
 
 export type SessionPatchTargetIdentity = Pick<
   SessionsPatchParams,
-  "agentId" | "expectedLifecycleRevision" | "expectedMarkedUnreadAt" | "expectedSessionId" | "key"
+  | "agentId"
+  | "expectedLifecycleRevision"
+  | "expectedMarkedUnreadAt"
+  | "expectedPermissionMode"
+  | "expectedSandboxMode"
+  | "expectedNativeRuntimeConsent"
+  | "expectedSessionId"
+  | "expectedToolOverrides"
+  | "key"
 >;
 
 const CONDITIONAL_UNREAD_ACK_ALLOWED_KEYS = new Set([

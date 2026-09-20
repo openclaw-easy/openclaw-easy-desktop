@@ -1,7 +1,8 @@
+import fs from "node:fs";
 import { expectDefined } from "@openclaw/normalization-core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ErrorCodes } from "../../../packages/gateway-protocol/src/index.js";
-import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js";
+import { createTempDirTracker } from "../../../test/helpers/temp-dir.js";
 import { resolveEmbeddedSessionLane } from "../../agents/embedded-agent-runner/lanes.js";
 import {
   clearSessionQueues,
@@ -16,9 +17,17 @@ import {
   getCommandLaneSnapshot,
   setCommandLaneConcurrency,
 } from "../../process/command-queue.js";
-import { closeOpenClawAgentDatabasesForTest } from "../../state/openclaw-agent-db.js";
-import { closeOpenClawStateDatabaseForTest } from "../../state/openclaw-state-db.js";
+import { registerOpenClawAgentDatabaseAsyncResource } from "../../state/openclaw-agent-db-resources.js";
+import {
+  closeOpenClawAgentDatabasesForTest,
+  openOpenClawAgentDatabase,
+} from "../../state/openclaw-agent-db.js";
+import {
+  closeOpenClawStateDatabaseForTest,
+  openOpenClawStateDatabase,
+} from "../../state/openclaw-state-db.js";
 import { ensureProfileForEmail, setUserProfileRole } from "../../state/user-profiles.js";
+import { cleanupSessionStateForTest } from "../../test-utils/session-state-cleanup.js";
 import type { GatewayRequestContext, RespondFn, GatewayClient } from "./types.js";
 
 const mocks = vi.hoisted(() => ({
@@ -37,6 +46,7 @@ import {
   appendTranscriptMessage,
   listSessionEntriesCore,
   loadSessionEntry,
+  patchSessionEntryCore,
   upsertSessionEntryCore,
 } from "../../config/sessions/session-accessor.js";
 import { createEmptyPluginRegistry } from "../../plugins/registry-empty.js";
@@ -49,7 +59,8 @@ import { upsertSessionUpstreamLink } from "../../sessions/session-upstream-links
 import { createDeferredCore } from "../../shared/deferred.js";
 import { sessionRewindHandlers } from "./sessions-rewind.js";
 
-const tempDirs = useAutoCleanupTempDirTracker(afterEach);
+// One teardown owns drainage and deletion so a failed drain retains the fixture root.
+const tempDirs = createTempDirTracker();
 const sessionKey = "agent:main:rewind-handler";
 const sourceSessionId = "rewind-handler-source";
 const sessionLane = resolveEmbeddedSessionLane(sessionKey);
@@ -139,10 +150,48 @@ afterEach(async () => {
   setCommandLaneConcurrency(sessionLane, 1);
   await Promise.all(queuedCommandSettlements);
   queuedCommandSettlements.clear();
-  resetPluginRuntimeStateForTest();
-  closeOpenClawAgentDatabasesForTest();
-  closeOpenClawStateDatabaseForTest();
-  vi.unstubAllEnvs();
+  try {
+    for (const stateDir of tempDirs.dirs) {
+      await cleanupSessionStateForTest({ stateDir });
+    }
+    resetPluginRuntimeStateForTest();
+    closeOpenClawAgentDatabasesForTest();
+    closeOpenClawStateDatabaseForTest();
+    tempDirs.cleanup();
+  } finally {
+    vi.unstubAllEnvs();
+  }
+});
+
+it("drains rewind fixture owners before closing handles and restoring selectors", ({
+  onTestFinished,
+}) => {
+  const stateDir = process.env.OPENCLAW_STATE_DIR!;
+  const agent = openOpenClawAgentDatabase({ agentId: "main" });
+  const state = openOpenClawStateDatabase();
+  const closing: unknown[] = [];
+  registerOpenClawAgentDatabaseAsyncResource({
+    agentId: "main",
+    path: agent.path,
+    revoke: () => {},
+    close: async () => {
+      await Promise.resolve();
+      closing.push({
+        agentOpen: agent.db.isOpen,
+        stateOpen: state.db.isOpen,
+        rootExists: fs.existsSync(stateDir),
+        selector: process.env.OPENCLAW_STATE_DIR,
+      });
+    },
+  });
+  onTestFinished(() => {
+    expect(closing).toEqual([
+      { agentOpen: true, stateOpen: true, rootExists: true, selector: stateDir },
+    ]);
+    expect(agent.db.isOpen).toBe(false);
+    expect(state.db.isOpen).toBe(false);
+    expect(fs.existsSync(stateDir)).toBe(false);
+  });
 });
 
 function context(active = false): GatewayRequestContext {
@@ -489,7 +538,54 @@ describe("session message-cut methods", () => {
     );
   });
 
+  it.each(["sessions.rewind", "sessions.fork"] as const)(
+    "%s restores canonical inbound media facts and skips invalid URI hints",
+    async (method) => {
+      await appendTranscriptMessage(
+        { agentId: "main", sessionId: sourceSessionId, sessionKey },
+        {
+          eventId: "canonical-image",
+          parentId: "assistant-entry",
+          message: {
+            role: "user",
+            content: "canonical image prompt",
+            __openclaw: {
+              media: [
+                { url: `media://inbound/${storedImageId}`, contentType: "image/png" },
+                { url: "media://inbound/%73tored-image.png", contentType: "image/png" },
+                { url: `media://outbound/${storedImageId}`, contentType: "image/png" },
+                { url: "media://inbound/nested%2Fimage.png", contentType: "image/png" },
+                { url: `media://inbound/${storedImageId}?query=1`, contentType: "image/png" },
+                { url: "https://example.test/stored-image.png", contentType: "image/png" },
+                { url: "file:///tmp/stored-image.png", contentType: "image/png" },
+              ],
+            },
+          },
+        },
+      );
+      const respond = await invoke(method, "canonical-image");
+      expect(respond).toHaveBeenCalledWith(
+        true,
+        expect.objectContaining({
+          editorText: "canonical image prompt",
+          editorAttachments: [{ mimeType: "image/png", data: storedImageData.toString("base64") }],
+        }),
+        undefined,
+      );
+      expect(mocks.readMediaBuffer).toHaveBeenCalledTimes(1);
+      expect(mocks.readMediaBuffer).toHaveBeenCalledWith(
+        storedImageId,
+        "inbound",
+        expect.any(Number),
+      );
+    },
+  );
+
   it("returns editor text for rewind and a new key for fork", async () => {
+    await patchSessionEntryCore({ agentId: "main", sessionKey }, () => ({
+      sandboxMode: "off",
+      nativeRuntimeConsent: "native-fixture",
+    }));
     const profileId = "profile-fork-creator";
     const fork = await invoke("sessions.fork", "user-entry", {
       connect: { scopes: ["operator.write"] },
@@ -516,6 +612,8 @@ describe("session message-cut methods", () => {
     const forkKey = (fork.mock.calls[0]?.[1] as { sessionKey?: string } | undefined)?.sessionKey;
     expect(forkKey).toBeTruthy();
     const forkEntry = loadSessionEntry({ agentId: "main", sessionKey: forkKey ?? "" });
+    expect(forkEntry).not.toHaveProperty("sandboxMode");
+    expect(forkEntry).not.toHaveProperty("nativeRuntimeConsent");
     expect(forkEntry).toMatchObject({
       createdVia: "operator",
       createdActor: { type: "human", id: profileId },
@@ -542,6 +640,7 @@ describe("session message-cut methods", () => {
       undefined,
     );
     expect(mocks.readMediaBuffer).toHaveBeenCalledTimes(4);
+    expect(loadSessionEntry({ agentId: "main", sessionKey })?.sandboxMode).toBe("off");
   });
 
   it.each([

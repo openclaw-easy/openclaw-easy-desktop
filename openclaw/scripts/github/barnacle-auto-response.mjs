@@ -26,7 +26,7 @@ const rules = [
     label: "r: support",
     close: true,
     message:
-      "Please use [our support server](https://discord.gg/clawd) and ask in #help or #users-helping-users to resolve this, or follow the stuck FAQ at https://docs.openclaw.ai/help/faq#im-stuck-whats-the-fastest-way-to-get-unstuck.",
+      "Please use [our support server](https://discord.gg/clawd) and ask in #help or #users-helping-users to resolve this, or follow the stuck FAQ at https://docs.openclaw.ai/help/faq-first-run#i-am-stuck-fastest-way-to-get-unstuck.",
   },
   {
     label: "r: false-positive",
@@ -436,6 +436,31 @@ function isInfraLikeFile(filename) {
   );
 }
 
+function isStandaloneSkillSubmission(files) {
+  // Auto-close only whole submissions; rename sources stop core files from
+  // acquiring the destructive skill label by moving under a new skill root.
+  const addedSkillRoots = files
+    .filter(
+      (file) => file.status === "added" && /^skills\/(?:[^/]+\/)+SKILL\.md$/i.test(file.filename),
+    )
+    .map((file) => file.filename.slice(0, -"SKILL.md".length).toLowerCase());
+  const isInAddedSkillRoot = (filename) => {
+    const normalizedFilename = filename.toLowerCase();
+    return addedSkillRoots.some((root) => normalizedFilename.startsWith(root));
+  };
+
+  return (
+    addedSkillRoots.length > 0 &&
+    files.every(
+      (file) =>
+        isInAddedSkillRoot(file.filename) &&
+        (file.status !== "renamed" ||
+          (typeof file.previous_filename === "string" &&
+            isInAddedSkillRoot(file.previous_filename))),
+    )
+  );
+}
+
 function surfacesForFile(filename) {
   const surfaces = new Set();
   if (/\.generated\/|generated|\.snap$/i.test(filename)) {
@@ -551,10 +576,7 @@ export function classifyPullRequestCandidateLabels(pullRequest, files) {
     labelsToAdd.push(candidateLabels.externalPluginCandidate);
   }
 
-  const addsBundledSkill = files.some(
-    (file) => file.status === "added" && /^skills\/(?:[^/]+\/)+SKILL\.md$/i.test(file.filename),
-  );
-  if (addsBundledSkill) {
+  if (isStandaloneSkillSubmission(files)) {
     labelsToAdd.push(skillCloseLabel);
   }
 

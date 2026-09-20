@@ -3,7 +3,12 @@ import { extractPluginInstallRecordsFromInstalledPluginIndex } from "../plugins/
 import { resolvePluginMetadataSnapshot } from "../plugins/plugin-metadata-snapshot.js";
 import type { PluginMetadataSnapshot } from "../plugins/plugin-metadata-snapshot.types.js";
 import type { PluginRegistry } from "../plugins/registry-types.js";
-import { setPluginRuntimeLoadContext } from "../plugins/runtime/load-context.js";
+import {
+  createPluginRuntimeLoaderLogger,
+  getPluginRuntimeLoadContext,
+  getReusablePluginRuntimeActivation,
+  setPluginRuntimeLoadContext,
+} from "../plugins/runtime/load-context.js";
 import { resolvePluginRuntimeLoadContext } from "../plugins/runtime/load-context.resolve.js";
 import { createAgentRuntimeMetadataPluginIdScope } from "./harness/runtime-plugin-load-plan.js";
 import type { PreparedModelRuntimeInput } from "./prepared-model-runtime.types.js";
@@ -22,6 +27,7 @@ export function prepareOwnedPluginLoadContext(
   registry: PluginRegistry | undefined,
   preparedMetadataSnapshot?: PluginMetadataSnapshot,
   preferBuiltPluginArtifacts = false,
+  preparedRegistry?: PluginRegistry,
 ): PluginMetadataSnapshot {
   const metadataSnapshot =
     preparedMetadataSnapshot ??
@@ -46,6 +52,28 @@ export function prepareOwnedPluginLoadContext(
   }
   const { config } = input;
   const workspaceDir = metadataSnapshot.workspaceDir ?? input.workspaceDir;
+  const preparedActivation = getReusablePluginRuntimeActivation(preparedRegistry ?? registry, {
+    config,
+    env,
+    workspaceDir,
+    metadataSnapshot,
+  });
+  if (preparedActivation) {
+    const targetContext = getPluginRuntimeLoadContext(registry);
+    setPluginRuntimeLoadContext(registry, {
+      ...preparedActivation,
+      rawConfig: config,
+      env,
+      workspaceDir,
+      metadataSnapshot,
+      manifestRegistry: metadataSnapshot.manifestRegistry,
+      installRecords: extractPluginInstallRecordsFromInstalledPluginIndex(metadataSnapshot.index),
+      logger: targetContext?.logger ?? createPluginRuntimeLoaderLogger(),
+      expectedSourceDigests: targetContext?.expectedSourceDigests,
+      preferBuiltPluginArtifacts,
+    });
+    return metadataSnapshot;
+  }
   // The prepared owner already selected the exact metadata generation for this runtime.
   // Missing discovery facts stay empty here instead of reopening cold plugin discovery.
   const discoverySnapshot = metadataSnapshot.discovery
@@ -61,7 +89,6 @@ export function prepareOwnedPluginLoadContext(
       preferBuiltPluginArtifacts,
     }),
     metadataSnapshot,
-    installRecords: extractPluginInstallRecordsFromInstalledPluginIndex(metadataSnapshot.index),
   };
   // The prepared registry is the lifecycle-owned carrier; standalone callers keep the cold path.
   setPluginRuntimeLoadContext(registry, context);

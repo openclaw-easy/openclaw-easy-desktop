@@ -1,8 +1,8 @@
 import type { lookup as dnsLookupCb } from "node:dns";
 import { asOptionalRecord, readStringField } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { rawDataToString } from "openclaw/plugin-sdk/webhook-ingress";
+import { WebSocket } from "openclaw/plugin-sdk/websocket-runtime";
 import type { Browser, ConnectOverCDPTransport } from "playwright-core";
-import WebSocket from "ws";
 import { formatErrorMessage } from "../infra/errors.js";
 import { isWebSocketUrl, openCdpWebSocket } from "./cdp.helpers.js";
 import { getPlaywrightCore } from "./playwright-core.runtime.js";
@@ -13,7 +13,9 @@ const FIRST_INTERNAL_COMMAND_ID = -10_000;
 
 // Playwright's browser-root handler requires browserContextId for non-browser targets.
 // Release only those root targets; nested sessions belong to Playwright's frame handler.
-function contextlessTargetSession(message: Record<string, unknown>): string | undefined {
+function contextlessTargetParams(
+  message: Record<string, unknown>,
+): Record<string, unknown> | undefined {
   if (readStringField(message, "method") !== "Target.attachedToTarget") {
     return undefined;
   }
@@ -26,7 +28,7 @@ function contextlessTargetSession(message: Record<string, unknown>): string | un
   ) {
     return undefined;
   }
-  return readStringField(params, "sessionId");
+  return params ?? {};
 }
 
 type CdpTransportOptions = {
@@ -142,7 +144,14 @@ export async function connectOverCdpTransport(
       wire.send({ id, method, ...(params ? { params } : {}), sessionId });
       return id;
     };
-    const releaseContextlessTarget = (sessionId: string) => {
+    const releaseContextlessTarget = (params: Record<string, unknown>) => {
+      const sessionId = readStringField(params, "sessionId");
+      if (!sessionId) {
+        // A root attach without a session cannot use the session command path.
+        // Consume only that malformed event so Playwright cannot crash before the
+        // shared browser transport handles the next valid message.
+        return;
+      }
       // Chrome dispatches session and root commands independently. Wait for the
       // resume response before detach so the hidden target cannot stay paused.
       const resumeId = sendInternalCommand("Runtime.runIfWaitingForDebugger", undefined, sessionId);
@@ -158,7 +167,9 @@ export async function connectOverCdpTransport(
           return;
         }
         try {
-          onMessage(message);
+          void Promise.resolve(onMessage(message)).catch((error: unknown) => {
+            closeTransportSocket(formatErrorMessage(error));
+          });
         } catch (error) {
           closeTransportSocket(formatErrorMessage(error));
         }
@@ -218,9 +229,9 @@ export async function connectOverCdpTransport(
             }
             return;
           }
-          const contextlessSessionId = contextlessTargetSession(parsed);
-          if (contextlessSessionId) {
-            releaseContextlessTarget(contextlessSessionId);
+          const contextlessParams = contextlessTargetParams(parsed);
+          if (contextlessParams) {
+            releaseContextlessTarget(contextlessParams);
             return;
           }
           scheduleMessage(parsed);

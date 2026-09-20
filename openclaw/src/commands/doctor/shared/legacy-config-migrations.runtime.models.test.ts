@@ -151,8 +151,8 @@ describe("explicit model allow policy migration", () => {
           agentId,
         });
         expect(policy.allowAny).toBe(false);
-        expect(policy.allowsKey(`${agentId}/bare`)).toBe(true);
-        expect(policy.allowsKey("unrelated/denied")).toBe(false);
+        expect(policy.allows({ provider: agentId, model: "bare" })).toBe(true);
+        expect(policy.allows({ provider: "unrelated", model: "denied" })).toBe(false);
       }
     },
   );
@@ -311,7 +311,12 @@ describe("legacy Codex policy wildcard migration", () => {
         defaults: {},
         list: [{ id: "worker", modelPolicy: { allow: ["codex/*"] } }],
       },
-      expectedPath: "agents.list.0.modelPolicy.allow.0",
+      expectedPath: "agents.list[0].modelPolicy.allow.0",
+    },
+    {
+      name: "keyed per-agent policy",
+      agents: { entries: { worker: { modelPolicy: { allow: ["codex/*"] } } } },
+      expectedPath: "agents.entries.worker.modelPolicy.allow.0",
     },
   ])("retains the legacy provider for a $name", ({ agents, expectedPath }) => {
     const raw = {

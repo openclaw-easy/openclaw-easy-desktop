@@ -3,9 +3,11 @@ import http from "node:http";
 import net from "node:net";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { WebSocket, type RawData } from "ws";
+import { createDeferred } from "../../../test/helpers/promise.js";
 import { createHostDesktopService } from "./host-source.js";
 import { handleDesktopObserveUpgrade } from "./observe-bridge.js";
 import { createDesktopSessionRegistry } from "./session-registry.js";
+import { SocketReader } from "./socket-reader.test-support.js";
 
 const VERSION = Buffer.from("RFB 003.008\n", "ascii");
 const cleanups: Array<() => Promise<void>> = [];
@@ -13,35 +15,6 @@ const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => {
   await Promise.all(cleanups.splice(0).map((cleanup) => cleanup()));
 });
-
-class SocketReader {
-  private buffered = Buffer.alloc(0);
-  private readonly waiters = new Set<() => void>();
-
-  constructor(socket: net.Socket) {
-    socket.on("data", (chunk) => {
-      this.buffered = Buffer.concat([
-        this.buffered,
-        Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk),
-      ]);
-      for (const waiter of this.waiters) {
-        waiter();
-      }
-      this.waiters.clear();
-    });
-  }
-
-  async readExactly(length: number): Promise<Buffer> {
-    while (this.buffered.length < length) {
-      await new Promise<void>((resolve) => {
-        this.waiters.add(resolve);
-      });
-    }
-    const value = this.buffered.subarray(0, length);
-    this.buffered = this.buffered.subarray(length);
-    return value;
-  }
-}
 
 class WebSocketReader {
   private readonly messages: AsyncIterator<unknown[]>;
@@ -64,12 +37,11 @@ describe("gateway host desktop observe integration", () => {
   it("pre-authenticates ARD, synthesizes None, and starts view-only filtering at ClientInit", async () => {
     const peers = new Set<net.Socket>();
     let connectionCount = 0;
-    let resolveObserverScript!: () => void;
-    let rejectObserverScript!: (error: Error) => void;
-    const observerScript = new Promise<void>((resolve, reject) => {
-      resolveObserverScript = resolve;
-      rejectObserverScript = reject;
-    });
+    const {
+      promise: observerScript,
+      resolve: resolveObserverScript,
+      reject: rejectObserverScript,
+    } = createDeferred();
     const rfbServer = net.createServer((socket) => {
       peers.add(socket);
       socket.once("close", () => peers.delete(socket));

@@ -1,3 +1,4 @@
+import { createBoundedLineFramer } from "../process/bounded-line-framer.js";
 import {
   appendCapturedOutput,
   createCapturedOutputBuffers,
@@ -31,30 +32,75 @@ type NodeWorkerChildObservation = {
   stopState?: Extract<NodeWorkerTerminalState, "cancelled" | "interrupted">;
 };
 
-/** Turn results settle independently; process exit alone releases the physical owner. */
-export async function observeNodeWorkerChildOutput(
+type NodeWorkerChildCompletion = Readonly<{
+  kind: "confirmed" | "deferred";
+  outcome: NodeWorkerTerminalOutcome;
+}>;
+
+/** Report cleanup facts without releasing supervisor ownership or capacity. */
+export async function observeNodeWorkerChild(
+  active: NodeWorkerChildObservation,
+  onResult: (frame: WorkerProcessResult) => void,
+  currentTurnId: () => string | undefined,
+  cleanupContainer?: () => Promise<void>,
+): Promise<NodeWorkerChildCompletion> {
+  const outcome = await observeNodeWorkerChildOutput(active, onResult, currentTurnId);
+  try {
+    const cleanup = await active.adapter.waitForExtinction?.();
+    if (!cleanupContainer && cleanup && cleanup.status === "uncertain") {
+      throw new Error(`node worker process cleanup is uncertain: ${cleanup.reason}`, {
+        cause: cleanup,
+      });
+    }
+  } catch (error) {
+    return {
+      kind: "deferred",
+      outcome: {
+        state: active.stopState ?? "failed",
+        errorText: sanitizeNodeWorkerDiagnostic(
+          error,
+          "node worker process cleanup failed",
+          active.scrubber.scrub,
+        ),
+      },
+    };
+  }
+  if (cleanupContainer) {
+    try {
+      await cleanupContainer();
+    } catch {
+      // Preserve the result while the supervisor retains the container for a later retry.
+      return { kind: "deferred", outcome };
+    }
+  }
+  return { kind: "confirmed", outcome };
+}
+
+/** Turn results settle independently; the supervisor retains physical cleanup ownership. */
+async function observeNodeWorkerChildOutput(
   active: NodeWorkerChildObservation,
   onResult: (frame: WorkerProcessResult) => void,
   currentTurnId: () => string | undefined,
 ): Promise<NodeWorkerTerminalOutcome> {
   let stdout = "";
+  const framer = createBoundedLineFramer(
+    NODE_WORKER_STDOUT_MAX_BYTES,
+    `worker stdout exceeded ${NODE_WORKER_STDOUT_MAX_BYTES} bytes`,
+  );
   let lastResult: string | undefined;
   let outputError: unknown;
   let journaled = false;
+  let observationEnded = false;
   const drain = () => {
-    if (!journaled || outputError) {
+    if (!journaled || outputError || observationEnded) {
       return;
     }
     try {
-      let newline: number;
-      while ((newline = stdout.indexOf("\n")) >= 0) {
-        const line = stdout.slice(0, newline);
-        stdout = stdout.slice(newline + 1);
-        if (Buffer.byteLength(line, "utf8") > NODE_WORKER_STDOUT_MAX_BYTES) {
-          throw new Error(`worker stdout exceeded ${NODE_WORKER_STDOUT_MAX_BYTES} bytes`);
-        }
+      const chunk = Buffer.from(stdout, "utf8");
+      stdout = "";
+      for (const line of framer.push(chunk)) {
         const frame = parseWorkerProcessResult(
-          JSON.parse(parseNodeWorkerOutputJson(line, active.scrubber.scrub)),
+          JSON.parse(parseNodeWorkerOutputJson(line.toString("utf8"), active.scrubber.scrub)),
         );
         if (!frame) {
           throw new Error("worker returned an invalid turn result");
@@ -62,12 +108,10 @@ export async function observeNodeWorkerChildOutput(
         onResult(frame);
         lastResult = JSON.stringify(frame.result);
       }
-      if (Buffer.byteLength(stdout, "utf8") > NODE_WORKER_STDOUT_MAX_BYTES) {
-        throw new Error(`worker stdout exceeded ${NODE_WORKER_STDOUT_MAX_BYTES} bytes`);
-      }
     } catch (error) {
       outputError = error;
       stdout = "";
+      framer.clear();
       active.adapter.kill("SIGKILL");
     }
   };
@@ -82,7 +126,7 @@ export async function observeNodeWorkerChildOutput(
     return stderr;
   };
   active.adapter.onStdout((chunk) => {
-    if (outputError) {
+    if (outputError || observationEnded) {
       return;
     }
     stdout += chunk;
@@ -93,14 +137,16 @@ export async function observeNodeWorkerChildOutput(
     }
     drain();
   });
-  active.adapter.onStderr((chunk) =>
-    appendCapturedOutput(
-      currentStderr(),
-      chunk,
-      NODE_WORKER_STDERR_MAX_BYTES + active.scrubber.maxRepresentationBytes,
-      "tail",
-    ),
-  );
+  active.adapter.onStderr((chunk) => {
+    if (!observationEnded) {
+      appendCapturedOutput(
+        currentStderr(),
+        chunk,
+        NODE_WORKER_STDERR_MAX_BYTES + active.scrubber.maxRepresentationBytes,
+        "tail",
+      );
+    }
+  });
   try {
     void active.journalReady.then(() => {
       journaled = true;
@@ -118,7 +164,7 @@ export async function observeNodeWorkerChildOutput(
             : "node worker launch interrupted during node-host shutdown"),
       });
     }
-    if (outputError || stdout.length > 0 || (exit.code === 0 && !lastResult)) {
+    if (outputError || framer.pendingByteLength > 0 || (exit.code === 0 && !lastResult)) {
       return Object.freeze({
         state: "failed",
         errorText: sanitizeNodeWorkerDiagnostic(
@@ -152,6 +198,8 @@ export async function observeNodeWorkerChildOutput(
         sanitizeNodeWorkerDiagnostic(error, "node worker wait failed", active.scrubber.scrub),
     });
   } finally {
-    active.adapter.dispose();
+    observationEnded = true;
+    stdout = "";
+    framer.clear();
   }
 }

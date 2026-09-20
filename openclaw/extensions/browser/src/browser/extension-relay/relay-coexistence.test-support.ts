@@ -4,8 +4,8 @@ import path from "node:path";
 import { setRuntimeConfigSnapshot } from "openclaw/plugin-sdk/runtime-config-snapshot";
 import { withEnvAsync, withTempDir } from "openclaw/plugin-sdk/test-env";
 import { rawDataToString } from "openclaw/plugin-sdk/webhook-ingress";
+import { WebSocket } from "openclaw/plugin-sdk/websocket-runtime";
 import { expect } from "vitest";
-import { WebSocket } from "ws";
 import { relayTestKey } from "../../../chrome-extension/relay-key.test-support.js";
 import { stopBrowserControlService } from "../../control-service.js";
 import { runExtensionRelayDaemon } from "../relay-daemon.js";
@@ -100,10 +100,10 @@ export async function withConnectedDaemon(
     stateDir: string,
     config: object,
   ) => Promise<{ stop: () => void; done: Promise<unknown> }>,
-  handleCdpCommand?: (
+  handleExtensionCommand?: (
     command: Record<string, unknown>,
     send: (message: Record<string, unknown>) => void,
-  ) => void,
+  ) => boolean,
 ) {
   await withTempDir("relay-coexistence-", async (dir) => {
     const stateDir = await fs.realpath(dir);
@@ -168,8 +168,9 @@ export async function withConnectedDaemon(
               extension.send(JSON.stringify({ type: "pong" }));
               return;
             }
-            if (command.type === "cdp" && handleCdpCommand) {
-              handleCdpCommand(command, (message) => extension.send(JSON.stringify(message)));
+            const send = (message: Record<string, unknown>) =>
+              extension.send(JSON.stringify(message));
+            if (handleExtensionCommand?.(command, send)) {
               return;
             }
             if (command.type === "detach" && detachHeld) {

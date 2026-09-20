@@ -1,6 +1,4 @@
-const GITHUB_HOST = "github.com";
-
-export const GITHUB_HOVERCARD_OPEN_DELAY_MS = 250;
+const GITHUB_URL_PREFIX = "https://github.com/";
 
 type GitHubItemTarget = {
   kind: "issue" | "pull";
@@ -38,43 +36,15 @@ export function parseGitHubItemPath(url: URL): GitHubItemTarget | null {
 export function parseGitHubLinkTarget(href: string): GitHubLinkTarget | null {
   let url: URL;
   try {
-    url = new URL(href, globalThis.location?.href ?? "http://localhost/");
+    // Anchors resolve relative links; the stream scanner supplies absolute URLs.
+    url = new URL(href);
   } catch {
     return null;
   }
-  if (url.protocol !== "https:" || url.hostname.toLowerCase() !== GITHUB_HOST) {
-    return null;
-  }
-  if (url.username || url.password || (url.port && url.port !== "443")) {
+  // Match the parsed URL so credentials, ports, and lookalike hosts cannot pass.
+  if (!url.href.startsWith(GITHUB_URL_PREFIX)) {
     return null;
   }
   const target = parseGitHubItemPath(url);
   return target ? { ...target, href: url.href } : null;
-}
-
-export function gitHubProfileUrl(login: string): string {
-  return `https://${GITHUB_HOST}/${encodeURIComponent(login)}`;
-}
-
-// Build from parsed parts because the source href may already carry its own
-// sub-path, query, or comment fragment.
-export function gitHubFilesChangedUrl(target: GitHubItemTarget): string {
-  const repoPath = `${encodeURIComponent(target.owner)}/${encodeURIComponent(target.repo)}`;
-  return `https://${GITHUB_HOST}/${repoPath}/pull/${target.number}/files`;
-}
-
-export function githubLinkAnchorFromEvent(event: Event): HTMLAnchorElement | null {
-  for (const candidate of event.composedPath()) {
-    if (candidate instanceof HTMLAnchorElement) {
-      return candidate;
-    }
-    if (candidate === event.currentTarget) {
-      break;
-    }
-  }
-  return null;
-}
-
-export function isGitHubPullRequestLink(href: string): boolean {
-  return parseGitHubLinkTarget(href)?.kind === "pull";
 }

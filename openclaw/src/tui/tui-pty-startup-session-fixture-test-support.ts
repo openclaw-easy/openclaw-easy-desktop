@@ -1,3 +1,11 @@
+import { expect } from "vitest";
+import {
+  hasHistoricalSynchronizedFrameRow,
+  readFixtureLog,
+  type StartTuiPtyFixture,
+  waitForSynchronizedFrameRows,
+} from "./tui-pty-harness-assertion-test-support.js";
+
 // Injects delayed session restore and history controls into the real-runTui PTY fixture.
 export const TUI_PTY_STARTUP_SESSION_FIXTURE = {
   variables: `
@@ -9,6 +17,26 @@ export const TUI_PTY_STARTUP_SESSION_FIXTURE = {
       let restoreAttempts = 0;
       let reconnectDuringRestore = process.env.OPENCLAW_TUI_PTY_RECONNECT_DURING_RESTORE === "1";
   `,
+  sessionInventory: `
+      const sessionDefaults = () => ({
+        model: currentModel,
+        modelProvider: "fixture-provider",
+        contextTokens: 128,
+        thinkingLevels,
+      });
+      const fixtureSessions = () => enablePickerFixture ? [
+        sessionEntry("main"),
+        ...Array.from({ length: Number(process.env.OPENCLAW_TUI_PTY_DECOY_COUNT ?? 0) }, (_, index) => ({
+          ...sessionEntry(pickerSessionKey + "-decoy-" + index),
+          label: pickerSessionKey + " label " + index,
+        })),
+        {
+          ...sessionEntry(pickerSessionKey),
+          derivedTitle: pickerSessionTitle,
+          lastMessagePreview: pickerSessionPreview,
+        },
+      ] : [];
+  `,
   loadHistory: `
           if (reconnectHistoryReady && reconnectHistoryDelayMs > 0) {
             reconnectHistoryReady = false;
@@ -16,21 +44,62 @@ export const TUI_PTY_STARTUP_SESSION_FIXTURE = {
             await new Promise((resolve) => setTimeout(resolve, reconnectHistoryDelayMs));
           }
   `,
-  listSessionsSetup: `
-          const isRestore = Boolean(opts?.search);
-  `,
-  listSessionsDelay: `
-          if (isRestore && reconnectDuringRestore) {
+  historyBarrier: `const startupReleasePath = process.env.OPENCLAW_TUI_PTY_STARTUP_RELEASE_PATH;
+          if (startupReleasePath) {
+            record("startupHistoryPending", { sessionKey });
+            while (!existsSync(startupReleasePath)) {
+              await new Promise((resolve) => setTimeout(resolve, 5));
+            }
+            record("startupHistoryReleased", { sessionKey });
+          }`,
+  describeSessionDelay: `
+          if (reconnectDuringRestore) {
             reconnectDuringRestore = false;
             record("restoreReconnect");
             this.onDisconnected?.("fixture reconnect during restore");
             queueMicrotask(() => this.onConnected?.());
           }
-          if (isRestore && restoreDelayMs > 0) {
+          if (restoreDelayMs > 0) {
             await new Promise((resolve) => setTimeout(resolve, restoreDelayMs));
           }
-          if (isRestore && restoreAttempts++ < restoreFailures) {
+          if (restoreAttempts++ < restoreFailures) {
             throw new Error("fixture remembered-session lookup failed");
           }
   `,
 } as const;
+
+export async function exerciseStartupHistoryRendering(
+  fixture: Awaited<ReturnType<StartTuiPtyFixture>> & {
+    releaseStartupHistory: () => Promise<void>;
+  },
+  timeoutMs: number,
+) {
+  try {
+    await fixture.waitForLogEntry((entry) => entry.method === "startupHistoryPending", timeoutMs);
+    let startupOutput = "";
+    const startupRows = await waitForSynchronizedFrameRows(
+      {
+        ...fixture.run,
+        output: () => (startupOutput = fixture.run.output()),
+      },
+      (rows) => rows.some((row) => row.includes("starting up")),
+      timeoutMs,
+    );
+    expect(startupRows.join("\n")).not.toContain("local ready | idle");
+    expect(
+      hasHistoricalSynchronizedFrameRow(startupOutput, [], "local ready | idle", fixture.run),
+    ).toBe(false);
+    expect(await readFixtureLog(fixture.logPath)).not.toContainEqual(
+      expect.objectContaining({ method: "startupHistoryReleased" }),
+    );
+
+    await fixture.releaseStartupHistory();
+    await waitForSynchronizedFrameRows(
+      fixture.run,
+      (rows) => rows.some((row) => row.includes("local ready | idle")),
+      timeoutMs,
+    );
+  } finally {
+    await fixture.releaseStartupHistory();
+  }
+}

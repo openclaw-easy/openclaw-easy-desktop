@@ -5,6 +5,7 @@ import type { Command } from "commander";
 import type { MessageReceipt } from "../channels/message/types.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import type { ApprovalScope } from "../infra/approval-scope.js";
+import type { InternalDiagnosticEventInterest } from "../infra/diagnostic-event-listener-presence.js";
 import type {
   DiagnosticEventPrivateData,
   DiagnosticEventInput,
@@ -250,6 +251,7 @@ export type OpenClawPluginNodeInvokePolicyContext = {
     displayName?: string;
     platform?: string;
     deviceFamily?: string;
+    caps?: string[];
     commands?: string[];
   };
   client?: {
@@ -303,6 +305,14 @@ export type OpenClawPluginNodeInvokePolicy = {
    * explicitly allowed by config.
    */
   dangerous?: boolean;
+  /**
+   * Explicitly permits one approval to cover later launches on the same managed placement.
+   * The scope is a stable semantic capability key, never user or action arguments.
+   */
+  standingApproval?: {
+    kind: "placement";
+    scope: string;
+  };
   /**
    * iOS foreground-restricted commands should be queued for foreground delivery
    * when an iOS node reports BACKGROUND_UNAVAILABLE.
@@ -363,12 +373,30 @@ export type OpenClawPluginServiceContext = {
   stateDir: string;
   logger: PluginLogger;
   serviceHealth?: OpenClawPluginServiceHealth;
+  /** Gateway-owned scheduler access, revoked when this service stops. */
+  getCron?: () => import("./hook-gateway.types.js").PluginHookGatewayCronService | undefined;
+  /** Service-owned node calls for this plugin's commands; normal node policy still applies. */
+  invokeNode?: (
+    params: Omit<
+      Parameters<import("./runtime/types.js").PluginRuntime["nodes"]["invoke"]>[0],
+      "scopes"
+    >,
+  ) => Promise<unknown>;
+  /** Service-owned binary transport for this plugin's duplex node commands. */
+  openNodeDuplex?: (
+    params: Omit<
+      Parameters<import("./runtime/types.js").PluginRuntime["nodes"]["openDuplex"]>[0],
+      "scopes"
+    > & { assertCurrent?: () => void },
+  ) => ReturnType<import("./runtime/types.js").PluginRuntime["nodes"]["openDuplex"]>;
   gatewayEvents?: import("./gateway-events.js").OpenClawPluginGatewayEvents;
   startupTrace?: {
     detail?: (name: string, metrics: ReadonlyArray<readonly [string, number | string]>) => void;
     measure: <T>(name: string, run: () => T | Promise<T>) => Promise<T>;
   };
   internalDiagnostics?: {
+    /** Identity of the hosting process, available only while this service is active. */
+    getRuntimeIdentity?: () => { processInstanceId: string; buildId?: string };
     emit: (event: DiagnosticEventInput, privateData?: DiagnosticEventPrivateData) => void;
     onEvent: (
       listener: (
@@ -376,6 +404,9 @@ export type OpenClawPluginServiceContext = {
         metadata: DiagnosticEventMetadata,
         privateData: DiagnosticEventPrivateData,
       ) => void,
+      filter?: InternalDiagnosticEventInterest<DiagnosticEventPayload["type"]>,
+      /** Defaults to true; false skips private payload copies and passes a frozen empty object. */
+      options?: { includePrivateData?: boolean },
     ) => () => void;
     registerTracePropagationBridge?: (bridge: DiagnosticTracePropagationBridge) => () => void;
   };
@@ -384,6 +415,8 @@ export type OpenClawPluginServiceContext = {
 /** Background service registered by a plugin during `register(api)`. */
 export type OpenClawPluginService = {
   id: string;
+  /** Restart this service with committed config when one of these paths changes. */
+  reload?: { configPrefixes: readonly string[] };
   start: (ctx: OpenClawPluginServiceContext) => void | Promise<void>;
   stop?: (ctx: OpenClawPluginServiceContext) => void | Promise<void>;
 };

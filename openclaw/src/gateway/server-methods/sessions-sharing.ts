@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import {
   ErrorCodes,
   errorShape,
@@ -5,25 +6,37 @@ import {
   validateSessionMemberRemoveParams,
   validateSessionMembersListParams,
   validateSessionVisibilitySetParams,
+  validateSessionPublicShareSetParams,
+  type SessionPublicShare,
   type SessionMember,
   type SessionMemberEvidence,
-  type SessionCreatedActor,
   type SessionSharingEvent,
   type SessionSharingEvidenceEvent,
-  type SessionSharingIdentity,
   type SessionVisibility,
 } from "../../../packages/gateway-protocol/src/index.js";
 import {
   addSessionMember,
   listSessionMembers,
-  loadCombinedSessionStoreForGatewayCore,
   removeSessionMember,
 } from "../../config/sessions.js";
-import { patchSessionEntryCore } from "../../config/sessions/session-accessor.js";
+import {
+  loadExactSessionEntryReadOnly,
+  patchSessionEntryCore,
+} from "../../config/sessions/session-accessor.js";
+import { resolveSessionPublicShare } from "../../config/sessions/session-public-share.js";
+import { listSessionMembersInWorker } from "../../config/sessions/session-transcript-worker-runtime.js";
+import { registerSecretValueForRedaction } from "../../logging/secret-redaction-registry.js";
+import { isIncognitoSessionKey } from "../../routing/session-key.js";
 import { runExclusiveSessionLifecycleMutation } from "../../sessions/session-lifecycle-admission.js";
 import { listProfiles } from "../../state/user-profiles.js";
+import {
+  loadPublicSessionShareTokenCodec,
+  type PublicSessionShareTokenCodec,
+} from "../control-ui-public-session-token.js";
+import { bumpGatewayAccessRevision } from "../gateway-access-revision.js";
 import { getGatewayLocalUserIngress } from "../local-user-ingress.js";
 import { resolveRequestedSessionAgentId } from "../session-request-agent.js";
+import { getSessionRowProjection } from "../session-row-projection-access.js";
 import {
   allowedSessionVisibilities,
   canManageSessionSharing,
@@ -35,6 +48,7 @@ import {
 } from "../session-sharing.js";
 import { gatewayClientSessionCreator } from "./gateway-client-identity.js";
 import { emitSessionsChanged } from "./session-change-event.js";
+import { knownSessionIdentities, type SharingActorFacts } from "./sessions-sharing-identities.js";
 import type { GatewayClient, GatewayRequestContext, GatewayRequestHandlers } from "./types.js";
 import { assertValidParams } from "./validation.js";
 
@@ -54,11 +68,6 @@ function runExclusiveSharingMutation<T>(
 const UNKNOWN_SHARING_ACTOR_STORAGE_REF = "actor-evidence:unknown";
 const UNATTRIBUTED_SHARING_ACTOR_STORAGE_REF = "actor-evidence:unattributed";
 const LEGACY_SYNTHETIC_SHARING_ACTOR_STORAGE_REFS = new Set(["local-operator", "operator.admin"]);
-
-type SharingActorFacts =
-  | { state: "present"; actor: SessionSharingIdentity }
-  | { state: "unknown" }
-  | { state: "absent" };
 
 function actorIdentity(client: GatewayClient | null): SharingActorFacts {
   const principal = gatewayClientSessionCreator(client);
@@ -106,6 +115,24 @@ function projectLegacySessionMember(member: SessionMemberEvidence): SessionMembe
     identityId: member.identityId,
     addedBy: member.addedBy,
     addedAt: member.addedAt,
+  };
+}
+
+function projectPublicSessionShare(params: {
+  agentId: string;
+  sessionKey: string;
+  grant: NonNullable<ReturnType<typeof resolveSessionPublicShare>>;
+  codec?: PublicSessionShareTokenCodec;
+}): SessionPublicShare {
+  const codec = params.codec ?? loadPublicSessionShareTokenCodec();
+  return {
+    token: codec.mint({
+      agentId: params.agentId,
+      sessionKey: params.sessionKey,
+      sessionId: params.grant.sessionId,
+      shareId: params.grant.id,
+    }),
+    createdAt: params.grant.createdAt,
   };
 }
 
@@ -160,14 +187,22 @@ function requireCurrentManagedTarget(params: {
   cfg: ReturnType<GatewayRequestContext["getRuntimeConfig"]>;
   client: GatewayClient | null;
   authorized: NonNullable<ReturnType<typeof resolveSessionSharingTarget>>;
+  operation?: "read" | "mutation";
 }): NonNullable<ReturnType<typeof resolveSessionSharingTarget>> {
   const current = resolveSessionSharingTarget({
     cfg: params.cfg,
     sessionKey: params.authorized.canonicalKey,
     agentId: params.authorized.agentId,
   });
-  if (!current || current.entry.sessionId !== params.authorized.entry.sessionId) {
-    throw new Error("session changed before sharing mutation");
+  if (
+    !current ||
+    current.agentId !== params.authorized.agentId ||
+    current.canonicalKey !== params.authorized.canonicalKey ||
+    current.storeKey !== params.authorized.storeKey ||
+    current.storePath !== params.authorized.storePath ||
+    current.entry.sessionId !== params.authorized.entry.sessionId
+  ) {
+    throw new Error(`session changed before sharing ${params.operation ?? "mutation"}`);
   }
   const role = resolveSessionSharingRole({
     client: params.client,
@@ -175,45 +210,9 @@ function requireCurrentManagedTarget(params: {
     target: current,
   });
   if (!canManageSessionSharing(role)) {
-    throw new Error("session ownership changed before sharing mutation");
+    throw new Error(`session ownership changed before sharing ${params.operation ?? "mutation"}`);
   }
   return current;
-}
-
-function knownSessionIdentities(params: {
-  cfg: ReturnType<GatewayRequestContext["getRuntimeConfig"]>;
-  actor: SharingActorFacts;
-}): SessionSharingIdentity[] {
-  const identities = new Map<string, SessionSharingIdentity>();
-  const remember = (identity: SessionCreatedActor | null) => {
-    if (!identity?.id) {
-      return;
-    }
-    const current = identities.get(identity.id);
-    identities.set(identity.id, {
-      type: identity.type,
-      id: identity.id,
-      ...((identity.label ?? current?.label) ? { label: identity.label ?? current?.label } : {}),
-    });
-  };
-  if (params.actor.state === "present") {
-    remember(params.actor.actor);
-  }
-  for (const entry of Object.values(loadCombinedSessionStoreForGatewayCore(params.cfg).store)) {
-    remember(entry.createdActor ?? null);
-  }
-  for (const profile of listProfiles()) {
-    remember({
-      type: "human",
-      id: profile.id,
-      ...(profile.displayName ? { label: profile.displayName } : {}),
-    });
-  }
-  return [...identities.values()].toSorted(
-    (left, right) =>
-      (left.label ?? left.id).localeCompare(right.label ?? right.id) ||
-      left.id.localeCompare(right.id),
-  );
 }
 
 function publishSharingChange(params: {
@@ -222,6 +221,7 @@ function publishSharingChange(params: {
   event: Omit<SessionSharingEvidenceEvent, "actorState">;
   agentId: string;
 }): void {
+  bumpGatewayAccessRevision();
   invalidateSessionSharingSnapshot(params.event.sessionKey);
   const eventOptions = {
     sessionKeys: [params.event.sessionKey],
@@ -265,13 +265,29 @@ function createSessionMembersListHandler(
     if (!managed) {
       return;
     }
-    const target = managed.target;
+    const projection = getSessionRowProjection(context);
+    if (!projection) {
+      throw new Error("Session projection is unavailable before Gateway startup completes");
+    }
+    const profiles = await listProfiles();
+    const evidenceMembers = (
+      await listSessionMembersInWorker({
+        agentId: managed.target.agentId,
+        sessionKey: managed.target.storeKey,
+        storePath: managed.target.storePath,
+      })
+    ).map(projectSessionMemberEvidence);
+    do {
+      await projection.ensureMaterialized();
+    } while (projection.needsMaterialization);
+    const currentCfg = context.getRuntimeConfig();
+    const target = requireCurrentManagedTarget({
+      cfg: currentCfg,
+      client,
+      authorized: managed.target,
+      operation: "read",
+    });
     const actor = actorIdentity(client);
-    const evidenceMembers = listSessionMembers({
-      agentId: target.agentId,
-      sessionKey: target.storeKey,
-      storePath: target.storePath,
-    }).map(projectSessionMemberEvidence);
     const members = evidenceAware
       ? evidenceMembers
       : evidenceMembers.map(projectLegacySessionMember);
@@ -293,7 +309,11 @@ function createSessionMembersListHandler(
       return;
     }
     const projectedMembers = members.filter((member) => member !== null);
-    const identities = knownSessionIdentities({ cfg, actor });
+    const identities = knownSessionIdentities({
+      creators: projection.listCreatedActors(),
+      actor,
+      profiles,
+    });
     for (const member of projectedMembers) {
       if (!identities.some((identity) => identity.id === member.identityId)) {
         identities.push({ type: "human", id: member.identityId });
@@ -305,15 +325,31 @@ function createSessionMembersListHandler(
         left.id.localeCompare(right.id),
     );
     const owner = target.entry.createdActor?.id ? target.entry.createdActor : undefined;
+    const publicShareGrant = resolveSessionPublicShare(
+      loadExactSessionEntryReadOnly({
+        agentId: target.agentId,
+        sessionKey: target.storeKey,
+        storePath: target.storePath,
+      })?.entry,
+    );
+    const publicShare =
+      publicShareGrant?.sessionId === target.entry.sessionId
+        ? projectPublicSessionShare({
+            agentId: target.agentId,
+            sessionKey: target.canonicalKey,
+            grant: publicShareGrant,
+          })
+        : undefined;
     respond(
       true,
       {
         sessionKey: target.canonicalKey,
+        ...(publicShare ? { publicShare } : {}),
         ...(owner ? { owner: { ...owner } } : {}),
         members: projectedMembers,
         identities,
-        role: managed.role,
-        allowedVisibilities: allowedSessionVisibilities(cfg),
+        role: resolveSessionSharingRole({ cfg: currentCfg, client, target }),
+        allowedVisibilities: allowedSessionVisibilities(currentCfg),
       },
       undefined,
     );
@@ -321,6 +357,142 @@ function createSessionMembersListHandler(
 }
 
 export const sessionSharingHandlers: GatewayRequestHandlers = {
+  "session.publicShare.set": async ({ params, respond, client, context }) => {
+    if (
+      !assertValidParams(
+        params,
+        validateSessionPublicShareSetParams,
+        "session.publicShare.set",
+        respond,
+      )
+    ) {
+      return;
+    }
+    const cfg = context.getRuntimeConfig();
+    const managed = requireManageableTarget({
+      cfg,
+      client,
+      sessionKey: params.sessionKey,
+      agentId: params.agentId,
+      respond,
+    });
+    if (!managed) {
+      return;
+    }
+    if (managed.target.entry.incognito || isIncognitoSessionKey(managed.target.canonicalKey)) {
+      respond(
+        false,
+        undefined,
+        errorShape(ErrorCodes.INVALID_REQUEST, "Incognito sessions cannot be published."),
+      );
+      return;
+    }
+    if (managed.target.entry.sessionId !== params.expectedSessionId) {
+      respond(
+        false,
+        undefined,
+        errorShape(
+          ErrorCodes.INVALID_REQUEST,
+          "Session changed; reopen sharing before publishing.",
+        ),
+      );
+      return;
+    }
+    let tokenCodec: PublicSessionShareTokenCodec | undefined;
+    let publicShareGrant: NonNullable<ReturnType<typeof resolveSessionPublicShare>> | undefined;
+    let publicShare: SessionPublicShare | undefined;
+    await runExclusiveSharingMutation(managed.target, async () => {
+      const current = requireCurrentManagedTarget({
+        cfg: context.getRuntimeConfig(),
+        client,
+        authorized: managed.target,
+      });
+      tokenCodec = params.enabled ? loadPublicSessionShareTokenCodec() : undefined;
+      let changed = false;
+      let inspected = false;
+      await patchSessionEntryCore(
+        {
+          agentId: current.agentId,
+          sessionKey: current.storeKey,
+          storePath: current.storePath,
+        },
+        (entry) => {
+          inspected = true;
+          if (entry.sessionId !== params.expectedSessionId) {
+            throw new Error("session changed before sharing mutation");
+          }
+          if (entry.incognito || isIncognitoSessionKey(current.canonicalKey)) {
+            throw new Error("Incognito sessions cannot be published.");
+          }
+          if (
+            !canManageSessionSharing(
+              resolveSessionSharingRole({
+                cfg: context.getRuntimeConfig(),
+                client,
+                target: { ...current, entry },
+              }),
+            )
+          ) {
+            throw new Error("session ownership changed before sharing mutation");
+          }
+          const previous = resolveSessionPublicShare(entry);
+          publicShareGrant = params.enabled
+            ? (previous ?? {
+                id: randomBytes(24).toString("hex"),
+                sessionId: entry.sessionId,
+                createdAt: Date.now(),
+              })
+            : undefined;
+          if (publicShareGrant) {
+            // Capability URLs may surface in free-form diagnostics where no
+            // structured field or query-name policy is available.
+            registerSecretValueForRedaction(publicShareGrant.id);
+          }
+          publicShare =
+            publicShareGrant && tokenCodec
+              ? projectPublicSessionShare({
+                  agentId: current.agentId,
+                  sessionKey: current.canonicalKey,
+                  grant: publicShareGrant,
+                  codec: tokenCodec,
+                })
+              : undefined;
+          changed = publicShareGrant?.id !== previous?.id;
+          return changed ? { publicShare: publicShareGrant } : null;
+        },
+        {
+          // Entry patches await preparation before committing. Recheck current
+          // sharing authority on the synchronous commit edge, after that await.
+          assertCommitAllowed: () => {
+            requireCurrentManagedTarget({
+              cfg: context.getRuntimeConfig(),
+              client,
+              authorized: current,
+            });
+          },
+        },
+      );
+      if (!inspected) {
+        throw new Error("session changed before sharing mutation");
+      }
+      if (changed) {
+        emitSessionsChanged(context, {
+          reason: "sharing",
+          sessionKey: current.canonicalKey,
+          agentId: current.agentId,
+        });
+      }
+    });
+    respond(
+      true,
+      {
+        ok: true,
+        sessionKey: managed.target.canonicalKey,
+        ...(publicShare ? { publicShare } : {}),
+      },
+      undefined,
+    );
+  },
   "session.visibility.set": async ({ params, respond, client, context }) => {
     if (
       !assertValidParams(
@@ -417,17 +589,35 @@ export const sessionSharingHandlers: GatewayRequestHandlers = {
     if (!managed) {
       return;
     }
+    const projection = getSessionRowProjection(context);
+    if (!projection) {
+      throw new Error("Session projection is unavailable before Gateway startup completes");
+    }
+    const profiles = await listProfiles();
+    do {
+      await projection.ensureMaterialized();
+    } while (projection.needsMaterialization);
+    requireCurrentManagedTarget({
+      cfg: context.getRuntimeConfig(),
+      client,
+      authorized: managed.target,
+    });
     const actor = actorIdentity(client);
     const known = knownSessionIdentities({
-      cfg,
+      creators: projection.listCreatedActors(),
       actor,
+      profiles,
     });
     if (!known.some((identity) => identity.id === params.identityId)) {
       respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, "unknown identity"));
       return;
     }
     await runExclusiveSharingMutation(managed.target, async () => {
-      const current = requireCurrentManagedTarget({ cfg, client, authorized: managed.target });
+      const current = requireCurrentManagedTarget({
+        cfg: context.getRuntimeConfig(),
+        client,
+        authorized: managed.target,
+      });
       const scope = {
         agentId: current.agentId,
         sessionKey: current.storeKey,

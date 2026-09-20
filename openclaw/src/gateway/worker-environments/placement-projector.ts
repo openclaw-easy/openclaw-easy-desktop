@@ -2,6 +2,7 @@ import type {
   SessionPlacement,
   SessionPlacementDiskSpace,
   SessionPlacementMove,
+  SessionPlacementMachine,
   SessionPlacementRunner,
 } from "../../../packages/gateway-protocol/src/index.js";
 import { DEVICE_WORKER_PROVIDER_ID } from "./device-provider-identity.js";
@@ -11,6 +12,14 @@ import type { WorkerEnvironmentServiceContract } from "./service-contract.js";
 
 export type WorkerSessionPlacementReader = {
   getMany(sessionIds: readonly string[]): ReadonlyMap<string, WorkerSessionPlacementRecord>;
+  getWorkspaceResultReconcilingSessionIds?(sessionIds: readonly string[]): ReadonlySet<string>;
+  listPendingWorkspaceResults?(
+    sessionId?: string,
+  ): import("./placement-workspace-result.js").WorkerWorkspacePendingResult[];
+  /** Runtime consumers may cancel work when the exact captured turn claim closes. */
+  registerTurnClaimClosedHandler?: (
+    handler: (claim: import("./placement-record.js").WorkerSessionTurnClaim) => void,
+  ) => () => void;
   getPlacementMoves?(sessionIds: readonly string[]): ReadonlyMap<string, WorkerPlacementMoveIntent>;
 };
 
@@ -20,14 +29,23 @@ export type WorkerPlacementDiskSpaceReader = {
 };
 
 export type WorkerPlacementRunnerAvailabilityReader = {
-  read(record: WorkerSessionPlacementRecord): SessionPlacementRunner | undefined;
+  read(
+    record: WorkerSessionPlacementRecord,
+    environment?: ReturnType<WorkerEnvironmentServiceContract["get"]> | null,
+  ): SessionPlacementRunner | undefined;
   version(): number;
+};
+
+type WorkerPlacementIdentity = {
+  providerId: string;
+  profileId: string;
+  machine?: SessionPlacementMachine;
 };
 
 export function readWorkerPlacementIdentity(
   record: WorkerSessionPlacementRecord,
-  environments: Pick<WorkerEnvironmentServiceContract, "get"> | undefined,
-): { providerId: string; profileId: string } | undefined {
+  environments: Pick<WorkerEnvironmentServiceContract, "get" | "readMachineShape"> | undefined,
+): WorkerPlacementIdentity | undefined {
   const environment = record.environmentId ? environments?.get(record.environmentId) : undefined;
   if (!environment) {
     return undefined;
@@ -41,9 +59,15 @@ export function readWorkerPlacementIdentity(
       : record.state === "provisioning" ||
         record.state === "syncing" ||
         record.state === "starting";
-  return correlated
-    ? { providerId: environment.providerId, profileId: environment.profileId }
-    : undefined;
+  if (!correlated) {
+    return undefined;
+  }
+  const machine = environments?.readMachineShape(environment.environmentId);
+  return {
+    providerId: environment.providerId,
+    profileId: environment.profileId,
+    ...(machine && Object.keys(machine).length ? { machine } : {}),
+  };
 }
 
 export function createWorkerPlacementRunnerAvailabilityReader(params: {
@@ -51,11 +75,14 @@ export function createWorkerPlacementRunnerAvailabilityReader(params: {
   hasCurrentDeviceRunner: (deviceId: string) => boolean;
 }): WorkerPlacementRunnerAvailabilityReader & { markChanged(): void } {
   let version = 0;
-  const read: WorkerPlacementRunnerAvailabilityReader["read"] = (record) => {
+  const read: WorkerPlacementRunnerAvailabilityReader["read"] = (record, preparedEnvironment) => {
     if (record.state !== "active") {
       return undefined;
     }
-    const environment = params.environments.get(record.environmentId);
+    const environment =
+      preparedEnvironment === undefined
+        ? params.environments.get(record.environmentId)
+        : preparedEnvironment;
     if (
       environment?.providerId !== DEVICE_WORKER_PROVIDER_ID ||
       environment.state !== "attached" ||
@@ -96,7 +123,9 @@ export function projectWorkerSessionPlacement(
   record: WorkerSessionPlacementRecord,
   diskSpace?: SessionPlacementDiskSpace,
   runner?: SessionPlacementRunner,
-  identity?: { providerId: string; profileId: string },
+  identity?: WorkerPlacementIdentity,
+  failedRecoveryAction?: "restart" | "stop-first",
+  workspaceResultReconciling = false,
 ): SessionPlacement {
   const timing = {
     generation: record.generation,
@@ -142,46 +171,10 @@ export function projectWorkerSessionPlacement(
         remoteWorkspaceDir: record.remoteWorkspaceDir,
       };
     case "active":
-      return {
-        state: "active",
-        ...timing,
-        ...identity,
-        environmentId: record.environmentId,
-        activeOwnerEpoch: record.activeOwnerEpoch,
-        workerBundleHash: record.workerBundleHash,
-        workspaceBaseManifestRef: record.workspaceBaseManifestRef,
-        remoteWorkspaceDir: record.remoteWorkspaceDir,
-        ...(record.lastTranscriptAckCursor !== null
-          ? { lastTranscriptAckCursor: record.lastTranscriptAckCursor }
-          : {}),
-        ...(record.lastLiveEventAckCursor !== null
-          ? { lastLiveEventAckCursor: record.lastLiveEventAckCursor }
-          : {}),
-        ...(diskSpace ? { diskSpace } : {}),
-        ...(runner ? { runner } : {}),
-        ...conflict,
-      };
     case "draining":
-      return {
-        state: "draining",
-        ...timing,
-        ...identity,
-        environmentId: record.environmentId,
-        activeOwnerEpoch: record.activeOwnerEpoch,
-        workerBundleHash: record.workerBundleHash,
-        workspaceBaseManifestRef: record.workspaceBaseManifestRef,
-        remoteWorkspaceDir: record.remoteWorkspaceDir,
-        ...(record.lastTranscriptAckCursor !== null
-          ? { lastTranscriptAckCursor: record.lastTranscriptAckCursor }
-          : {}),
-        ...(record.lastLiveEventAckCursor !== null
-          ? { lastLiveEventAckCursor: record.lastLiveEventAckCursor }
-          : {}),
-        ...conflict,
-      };
     case "reconciling":
       return {
-        state: "reconciling",
+        state: record.state,
         ...timing,
         ...identity,
         environmentId: record.environmentId,
@@ -194,12 +187,17 @@ export function projectWorkerSessionPlacement(
           : {}),
         ...(record.lastLiveEventAckCursor !== null
           ? { lastLiveEventAckCursor: record.lastLiveEventAckCursor }
+          : {}),
+        ...(record.state === "active" && diskSpace ? { diskSpace } : {}),
+        ...(record.state === "active" && runner ? { runner } : {}),
+        ...(workspaceResultReconciling && record.state !== "reconciling"
+          ? { workspaceResultReconciling: true as const }
           : {}),
         ...conflict,
       };
     case "reclaimed":
-      return {
-        state: "reclaimed",
+    case "failed": {
+      const retained = {
         ...timing,
         ...identity,
         ...(record.environmentId ? { environmentId: record.environmentId } : {}),
@@ -216,30 +214,17 @@ export function projectWorkerSessionPlacement(
           ? { lastLiveEventAckCursor: record.lastLiveEventAckCursor }
           : {}),
         ...conflict,
-        ...terminal,
       };
-    case "failed":
-      return {
-        state: "failed",
-        ...timing,
-        ...identity,
-        ...(record.environmentId ? { environmentId: record.environmentId } : {}),
-        ...(record.activeOwnerEpoch !== null ? { activeOwnerEpoch: record.activeOwnerEpoch } : {}),
-        ...(record.workspaceBaseManifestRef
-          ? { workspaceBaseManifestRef: record.workspaceBaseManifestRef }
-          : {}),
-        ...(record.remoteWorkspaceDir ? { remoteWorkspaceDir: record.remoteWorkspaceDir } : {}),
-        ...(record.workerBundleHash ? { workerBundleHash: record.workerBundleHash } : {}),
-        ...(record.lastTranscriptAckCursor !== null
-          ? { lastTranscriptAckCursor: record.lastTranscriptAckCursor }
-          : {}),
-        ...(record.lastLiveEventAckCursor !== null
-          ? { lastLiveEventAckCursor: record.lastLiveEventAckCursor }
-          : {}),
-        ...conflict,
-        recoveryError: record.recoveryError,
-        ...terminal,
-      };
+      return record.state === "failed"
+        ? {
+            state: "failed",
+            ...retained,
+            recoveryError: record.recoveryError,
+            ...(failedRecoveryAction ? { recoveryAction: failedRecoveryAction } : {}),
+            ...terminal,
+          }
+        : { state: "reclaimed", ...retained, ...terminal };
+    }
   }
   // Exhaustive over placement states; the return satisfies consistent-return.
   return record satisfies never;

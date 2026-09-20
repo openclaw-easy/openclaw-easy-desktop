@@ -9,6 +9,8 @@ export type DoctorSessionSqliteIssue = {
 
 const SESSION_SQLITE_WARNING_ISSUE_CODES = new Set([
   "entry_invalid",
+  "historical_transcript_deferred",
+  "plugin_migration_source_retained",
   "transcript_archive_failed",
   "transcript_malformed",
   "transcript_missing",
@@ -17,6 +19,14 @@ const SESSION_SQLITE_WARNING_ISSUE_CODES = new Set([
 
 export function isSessionSqliteMigrationWarning(issue: DoctorSessionSqliteIssue): boolean {
   return SESSION_SQLITE_WARNING_ISSUE_CODES.has(issue.code);
+}
+
+export function countBlockingSessionSqliteIssues(report: DoctorSessionSqliteTargetReport): number {
+  return report.issues.filter((issue) => !isSessionSqliteMigrationWarning(issue)).length;
+}
+
+export function isRetainedSourceIssue(issue: DoctorSessionSqliteIssue): boolean {
+  return ["entry_invalid", "transcript_malformed", "transcript_missing"].includes(issue.code);
 }
 
 export type DoctorSessionSqliteRestoreConflict = {
@@ -67,13 +77,11 @@ export type SessionSqliteMigrationFailureIssue = {
   body: string;
   bodyPath?: string;
   github?: {
-    fallbackUrl?: string;
     message?: string;
     status: "created" | "failed" | "skipped";
     url?: string;
   };
   title: string;
-  url: string;
 };
 
 export type DoctorSessionSqliteMode =

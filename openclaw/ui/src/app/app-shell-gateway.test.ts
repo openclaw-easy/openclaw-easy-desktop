@@ -3,6 +3,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { UI_APPEARANCE_PREFERENCE_KEYS } from "../../../packages/gateway-protocol/src/schema/ui-appearance-preferences.ts";
 import type { GatewayBrowserClient } from "../api/gateway.ts";
+import { createChatPageSessions } from "../pages/chat/chat-page.test-support.ts";
 import { createStorageMock } from "../test-helpers/storage.ts";
 import { ShellGatewayOwner, type ShellGatewayHost } from "./app-shell-gateway.ts";
 import type { ApplicationContext, ApplicationGatewaySnapshot } from "./context.ts";
@@ -31,11 +32,18 @@ function createProfileAppearanceGateway(profileId: string | null) {
     hello: { auth: { role: "operator", scopes: ["operator.write"] } },
   } as ApplicationGatewaySnapshot;
   const refreshTheme = vi.fn();
+  const connectionBootstrap = {
+    reset: vi.fn(),
+    run: (_key: string, task: () => Promise<unknown>) => task(),
+    synchronize: vi.fn(),
+  };
   const context = {
     gateway: {
       connection: { gatewayUrl: "ws://profile.test" },
       snapshot,
     },
+    connectionBootstrap,
+    sessions: createChatPageSessions(),
     runtimeConfig: {
       canPatch: false,
       ensureLoaded: vi.fn(async () => undefined),
@@ -54,19 +62,20 @@ function createProfileAppearanceGateway(profileId: string | null) {
     agentRosterRefreshTimer: null,
     agentsListClient: null,
     agentsListSource: null,
-    criticalNoticeRuntime: null,
     lastLocalePrefSignature: null,
     outboxStoreImport: { load: vi.fn(async () => undefined) },
     previousGatewayPhase: null,
+    recoverDeletedActiveSession: vi.fn(),
     routeState: {},
     runtimeConfigClient: null,
     runtimeConfigSource: null,
     sessionKeyClient: null,
-    sidebarWorkboardRuntime: null,
-    syncSidebarWorkboard: vi.fn(),
   } as unknown as ShellGatewayHost;
   return {
-    completeProfileAppearance(this: void, accent = "#336699") {
+    async completeProfileAppearance(this: void, accent = "#336699") {
+      await vi.waitFor(() => {
+        expect(pendingResponses).toHaveLength(1);
+      });
       const respond = pendingResponses.shift();
       expect(respond, "pending users.prefs.get response").toBeDefined();
       // Config reconciliation can also refresh the theme. Arm this only when
@@ -111,6 +120,26 @@ describe("ShellGatewayOwner profile appearance integration", () => {
     expect(request).not.toHaveBeenCalled();
   });
 
+  it("refreshes the cached agent roster when hello lands", async () => {
+    const { context, host, owner, snapshot } = createProfileAppearanceGateway(null);
+    const agentsList = {
+      defaultId: "main",
+      mainKey: "main",
+      scope: "per-sender" as const,
+      agents: [{ id: "main" }],
+    };
+    const ensureList = vi.fn(async () => agentsList);
+    Object.assign(context, {
+      agents: { state: { agentsList, agentsListCached: true }, ensureList },
+    });
+    host.routeState.routeId = "chat";
+
+    owner.synchronizeGateway(snapshot);
+    await Promise.resolve();
+
+    expect(ensureList).toHaveBeenCalledOnce();
+  });
+
   it("loads profile appearance when authenticated presence appears on an existing connection", async () => {
     const { completeProfileAppearance, context, owner, refreshTheme, request, snapshot } =
       createProfileAppearanceGateway(null);
@@ -120,10 +149,10 @@ describe("ShellGatewayOwner profile appearance integration", () => {
     owner.synchronizeGateway(snapshot);
 
     owner.reconcileServerUiPrefs(context.runtimeConfig);
-    expect(refreshTheme).toHaveBeenCalledOnce();
-    expect(loadSettings().accent).toBe("#ff0000");
+    expect(refreshTheme).not.toHaveBeenCalled();
+    expect(loadSettings().accent).toBeUndefined();
     await completeProfileAppearance();
-    expect(refreshTheme).toHaveBeenCalledTimes(2);
+    expect(refreshTheme).toHaveBeenCalledOnce();
     expect(loadSettings().accent).toBe("#336699");
     expect(request).toHaveBeenCalledOnce();
     // Derived from the wire contract so new appearance keys extend the
@@ -165,31 +194,32 @@ describe("ShellGatewayOwner profile appearance integration", () => {
     expect(loadSettings().accent).toBe("#336699");
   });
 
-  it("refreshes only matching profile-change events and republishes the resolved appearance", async () => {
-    const { completeProfileAppearance, owner, refreshTheme, request, snapshot } =
-      createProfileAppearanceGateway("profile-owner");
-    owner.synchronizeGateway(snapshot);
-    await completeProfileAppearance();
-    expect(loadSettings().accent).toBe("#336699");
-    request.mockClear();
-    refreshTheme.mockClear();
+  it.each(["profile-owner", "canonical-owner"])(
+    "refreshes current profile appearance for its routed %s invalidation",
+    async (eventProfileId) => {
+      const { completeProfileAppearance, owner, refreshTheme, request, snapshot } =
+        createProfileAppearanceGateway("profile-owner");
+      owner.synchronizeGateway(snapshot);
+      await completeProfileAppearance();
+      expect(loadSettings().accent).toBe("#336699");
+      request.mockClear();
+      refreshTheme.mockClear();
 
-    owner.handleGatewayEvent({
-      type: "event",
-      event: "users.prefs.changed",
-      payload: { profileId: "other-profile", keys: ["ui.accent"] },
-    });
-    expect(request).not.toHaveBeenCalled();
+      owner.handleGatewayEvent({
+        type: "event",
+        event: "users.prefs.changed",
+        payload: {
+          profileId: eventProfileId,
+          keys: ["ui.accent"],
+          entries: { "ui.accent": "#ffffff" },
+        },
+      });
 
-    owner.handleGatewayEvent({
-      type: "event",
-      event: "users.prefs.changed",
-      payload: { profileId: "profile-owner", keys: ["ui.accent"] },
-    });
-
-    await completeProfileAppearance("#224466");
-    expect(loadSettings().accent).toBe("#224466");
-    expect(request).toHaveBeenCalledOnce();
-    expect(refreshTheme).toHaveBeenCalledOnce();
-  });
+      expect(loadSettings().accent).toBe("#336699");
+      await completeProfileAppearance("#224466");
+      expect(loadSettings().accent).toBe("#224466");
+      expect(request).toHaveBeenCalledOnce();
+      expect(refreshTheme).toHaveBeenCalledOnce();
+    },
+  );
 });

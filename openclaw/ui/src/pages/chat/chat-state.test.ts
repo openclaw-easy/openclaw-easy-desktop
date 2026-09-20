@@ -1,27 +1,46 @@
+import { asOptionalRecord } from "@openclaw/normalization-core/record-coerce";
 import { render, type ReactiveController, type ReactiveControllerHost } from "lit";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../../../test/helpers/promise.js";
 import type { GatewayBrowserClient } from "../../api/gateway.ts";
+import type { GatewaySessionRow } from "../../api/types.ts";
 import * as assistantIdentity from "../../app/assistant-identity.ts";
+import { createChatSubmissions } from "../../app/chat-submissions.ts";
+import { createConnectionBootstrapCoordinator } from "../../app/connection-bootstrap.ts";
 import type { ApplicationContext } from "../../app/context.ts";
-import { createInitialUserMessageHandoff } from "../../app/initial-user-message-handoff.ts";
-import { invalidateChatMetadataStore } from "../../lib/chat/chat-metadata-store.ts";
+import { createAgentIdentityCapability } from "../../lib/agents/identity.ts";
+import { invalidateChatMetadataStore } from "../../lib/chat/chat-metadata-cache.ts";
+import { revalidateChatMetadata } from "../../lib/chat/chat-metadata-store.ts";
 import {
   buildFallbackSlashCommands,
   replaceSlashCommands,
   SLASH_COMMANDS,
 } from "../../lib/chat/commands.ts";
 import { extractText } from "../../lib/chat/message-extract.ts";
-import { invalidateModelCatalogCache } from "../../lib/model-catalog-store.ts";
+import {
+  beginModelCatalogRead,
+  clearModelCatalogCache,
+  invalidateModelCatalogCache,
+  publishModelCatalogResult,
+} from "../../lib/model-catalog-cache.ts";
+import { createSessionCapability } from "../../lib/sessions/index.ts";
+import {
+  createGatewayHarness,
+  createTestSessionCapability,
+  sessionsResult,
+} from "../../lib/sessions/session-capability.test-support.ts";
+import { createTestGatewayClient } from "../../test-helpers/gateway-client.ts";
 import type { ChatHistoryResult } from "./chat-history-snapshot.ts";
 import { loadChatHistory } from "./chat-history.ts";
 import { makeChatHost } from "./chat-host.test-support.ts";
+import { removeQueuedMessage } from "./chat-queue.ts";
 import { ChatStateController } from "./chat-state-controller.ts";
 import { handlePageGatewayEvent } from "./chat-state-events.ts";
 import type { ChatPageHost } from "./chat-state-host.ts";
 import { createPageState } from "./chat-state-page.ts";
 import {
   applySelectedChatAgent,
+  applyChatModelCatalogSnapshot,
   refreshChatMetadata,
   refreshChatModelCatalogOnDemand,
   refreshChatModelAuthStatus,
@@ -35,6 +54,7 @@ import { scheduleControlUiAfterPaint } from "./performance.ts";
 import { applySessionMessagePayload } from "./session-message-apply.ts";
 import { activatePanel, openSlot } from "./sidebar-layout.ts";
 import { buildToolStreamIdentity } from "./tool-stream-identity.ts";
+import { createHost as createToolStreamHost } from "./tool-stream.test-helpers.ts";
 
 beforeEach(() => {
   vi.spyOn(assistantIdentity, "loadLocalAssistantIdentity").mockReturnValue({
@@ -56,20 +76,27 @@ describe("canonical session message recovery", () => {
       thinkingLevel: null,
     });
     const requestUpdate = overrides.requestUpdate ?? vi.fn();
-    const state = {
-      ...makeChatHost(),
-      client: { request } as unknown as GatewayBrowserClient,
+    const host = makeChatHost({
+      client: createTestGatewayClient(request),
       connectionEpoch: 1,
       sessionKey: "agent:main:main",
+      ...overrides,
+    });
+    if (!overrides.sessions) {
+      vi.spyOn(host.sessions, "reconcileChanged").mockImplementation(() => ({
+        applied: false,
+        result: host.sessions.state.result,
+      }));
+      vi.spyOn(host.sessions, "refresh").mockResolvedValue(undefined);
+      vi.spyOn(host.sessions, "listBranches").mockResolvedValue([]);
+    }
+    const state = {
+      ...host,
       currentSessionId: "selected-session",
       chatMessagesBySession: new Map(),
       chatThinkingLevel: null,
       chatVerboseLevel: null,
       chatStreamStartedAt: null,
-      sessions: {
-        reconcileChanged: vi.fn().mockReturnValue({ applied: false }),
-        refresh: vi.fn().mockResolvedValue(undefined),
-      },
       renderLifecycle: { invalidate: requestUpdate },
       requestUpdate,
       ...overrides,
@@ -87,6 +114,7 @@ describe("canonical session message recovery", () => {
       streamSegments: state.chatStreamSegments,
       stream: state.chatStream,
       streamStartedAt: state.chatStreamStartedAt,
+      queue: state.chatQueue,
       showToolCalls: true,
     }).flatMap((item) => {
       if (item.kind === "group") {
@@ -98,6 +126,203 @@ describe("canonical session message recovery", () => {
       return item.kind === "stream" ? [{ role: "assistant", text: item.text }] : [];
     });
   }
+
+  it.each([
+    ["before tool", false],
+    ["after tool", false],
+    ["after final delta", false],
+    ["before tool", true],
+    ["after tool", true],
+    ["after final delta", true],
+  ] as const)(
+    "keeps streaming commentary whole with persistence %s (nested tools: %s)",
+    (persistence, nestedTools) => {
+      const runId = "active-run";
+      const text = "I am checking the files and will report the result.";
+      const partial = text.slice(0, text.indexOf(" will report"));
+      const { state } = createSessionEventState({ chatRunId: runId });
+      const delta = (value: string) =>
+        handlePageGatewayEvent(state, {
+          type: "event",
+          event: "chat",
+          payload: {
+            sessionKey: state.sessionKey,
+            runId,
+            state: "delta",
+            message: { role: "assistant", content: [{ type: "text", text: value }] },
+          },
+        });
+      const item = (seq: number) =>
+        handlePageGatewayEvent(state, {
+          type: "event",
+          event: "agent",
+          payload: {
+            sessionKey: state.sessionKey,
+            runId,
+            seq,
+            ts: seq,
+            stream: "item",
+            data: { kind: "preamble", phase: "end", itemId: "item-a", progressText: text },
+          },
+        });
+      const persist = () =>
+        handlePageGatewayEvent(state, {
+          type: "event",
+          event: "session.message",
+          payload: {
+            sessionKey: state.sessionKey,
+            sessionId: state.currentSessionId,
+            runId,
+            runActive: true,
+            messageId: "saved-commentary",
+            messageSeq: 1,
+            message: {
+              role: "assistant",
+              content: [{ type: "text", text }],
+              openclawStreamFallback: { source: "segment", itemId: "item-a" },
+              __openclaw: { id: "saved-commentary", seq: 1, runId },
+            },
+          },
+        });
+      const visible = () => renderedTranscript(state).filter((entry) => entry.text);
+      const single = [{ role: "assistant", text }];
+      if (nestedTools) {
+        for (const [index, value] of ["I am", partial].entries()) {
+          delta(value);
+          expect(visible()).toEqual([{ role: "assistant", text: value }]);
+          handlePageGatewayEvent(state, {
+            type: "event",
+            event: "agent",
+            payload: {
+              sessionKey: state.sessionKey,
+              runId,
+              seq: index + 1,
+              ts: index + 1,
+              stream: "tool",
+              data: {
+                phase: "start",
+                toolCallId: `earlier-${index}`,
+                parentToolCallId: "outer",
+                name: "read",
+                args: {},
+              },
+            },
+          });
+          expect(visible()).toEqual([{ role: "assistant", text: value }]);
+        }
+      } else {
+        delta(partial);
+        expect(visible()).toEqual([{ role: "assistant", text: partial }]);
+      }
+      item(10);
+      expect(visible()).toEqual(single);
+      if (persistence === "before tool") {
+        persist();
+        expect(visible()).toEqual(single);
+      }
+      handlePageGatewayEvent(state, {
+        type: "event",
+        event: "agent",
+        payload: {
+          sessionKey: state.sessionKey,
+          runId,
+          seq: 2,
+          ts: 2,
+          stream: "tool",
+          data: { phase: "result", toolCallId: "call-a", name: "list_files", result: {} },
+        },
+      });
+      expect(visible()).toEqual(single);
+      if (persistence === "after tool") {
+        persist();
+        expect(visible()).toEqual(single);
+      }
+      delta(`${partial} will report`);
+      expect(visible()).toEqual(single);
+      // The final chunk also brings a distinct, identically worded occurrence.
+      delta(`${text}\n\n${text}`);
+      expect(visible()).toEqual([...single, ...single]);
+      if (persistence === "after final delta") {
+        persist();
+        expect(visible()).toEqual([...single, ...single]);
+      }
+      item(12);
+      expect(visible()).toEqual([...single, ...single]);
+      expect(state.chatMessages).toHaveLength(1);
+      expect(extractText(state.chatMessages[0])).toBe(text);
+    },
+  );
+
+  it.each([true, false])(
+    "keeps completed messages distinct while tools overlap the next stream (persist first: %s)",
+    (persistFirst) => {
+      const runId = "active-run";
+      const { state } = createSessionEventState({ chatRunId: runId });
+      let seq = 0;
+      const delta = (text: string) =>
+        handlePageGatewayEvent(state, {
+          type: "event",
+          event: "chat",
+          payload: {
+            sessionKey: state.sessionKey,
+            runId,
+            state: "delta",
+            message: { role: "assistant", content: text },
+          },
+        });
+      const tool = (id: string) =>
+        handlePageGatewayEvent(state, {
+          type: "event",
+          event: "agent",
+          payload: {
+            sessionKey: state.sessionKey,
+            runId,
+            seq: ++seq,
+            ts: seq,
+            stream: "tool",
+            data: { phase: "start", toolCallId: id, name: "read", args: {} },
+          },
+        });
+      const first = "First observation.";
+      const persist = () =>
+        handlePageGatewayEvent(state, {
+          type: "event",
+          event: "session.message",
+          payload: {
+            sessionKey: state.sessionKey,
+            sessionId: state.currentSessionId,
+            runId,
+            runActive: true,
+            messageId: "saved-first",
+            messageSeq: 1,
+            message: {
+              role: "assistant",
+              content: first,
+              __openclaw: { id: "saved-first", seq: 1, runId },
+            },
+          },
+        });
+      delta(first);
+      if (persistFirst) {
+        persist();
+      }
+      tool("outer");
+      expect(renderedTranscript(state).filter((entry) => entry.text)).toEqual([
+        { role: "assistant", text: first },
+      ]);
+      if (!persistFirst) {
+        persist();
+      }
+      for (const text of ["Next", "Next observation", "Next observation continues."]) {
+        delta(first + "\n\n" + text);
+        tool("overlap-" + seq);
+        expect(renderedTranscript(state).filter((entry) => entry.text)).toEqual([
+          { role: "assistant", text: first },
+          { role: "assistant", text },
+        ]);
+      }
+    },
+  );
 
   it("reconciles live approval events for the selected session", () => {
     const { state } = createSessionEventState();
@@ -501,7 +726,7 @@ describe("canonical session message recovery", () => {
         { role: "assistant", text },
       ]);
       expect(state.chatRunId).toBe(runId);
-      expect(request).not.toHaveBeenCalledWith("chat.history", expect.anything());
+      expect(request.mock.calls.filter(([method]) => method === "chat.history")).toHaveLength(0);
 
       // Replayed cumulative deltas must not revive the retired projection.
       delta(text, text.slice(partial.length));
@@ -528,6 +753,280 @@ describe("canonical session message recovery", () => {
       if (terminal === "error") {
         expect(state.chatRunError?.summary).toContain("Workspace reconciliation failed.");
       }
+    },
+  );
+
+  it.each([
+    ["before-final", false, false],
+    ["after-final", false, false],
+    ["before-final", true, false],
+    ["after-final", true, false],
+    ["after-final", false, true],
+    ["after-final", true, true],
+  ] as const)(
+    "keeps reconnected commentary and answer single with persistence %s (repeated=%s, second tool=%s)",
+    async (persistence, repeated, secondTool) => {
+      const runId = "reconnected-run";
+      const commentary = "Checking the workspace.\n\n- first file\n- second file";
+      const partial = repeated ? "Checking" : "I found the requested files.";
+      const answer = repeated ? commentary : `${partial}\n\nThe final answer is ready.`;
+      const prompt = {
+        role: "user",
+        content: "Check the workspace.",
+        idempotencyKey: `${runId}:user`,
+        __openclaw: { id: "prompt", seq: 1 },
+      };
+      const savedCommentary = {
+        role: "assistant",
+        content: [{ type: "text", text: commentary }],
+        openclawStreamFallback: { source: "segment", itemId: "commentary-1" },
+        __openclaw: { id: "commentary-and-tool", seq: 2, runId },
+      };
+      const toolCall = {
+        role: "assistant",
+        content: [{ type: "toolCall", id: "read-1", name: "read", arguments: { path: "files" } }],
+        __openclaw: { id: "commentary-and-tool", seq: 2, runId },
+      };
+      const savedAnswer = {
+        role: "assistant",
+        content: [{ type: "text", text: answer }],
+        __openclaw: { id: "answer", seq: secondTool ? 6 : 4, runId },
+      };
+      const { state, request } = createSessionEventState({
+        chatRunId: null,
+        chatStream: null,
+        chatStreamSegments: [],
+        chatToolMessages: [],
+      });
+      const sessionInfo = {
+        key: state.sessionKey,
+        sessionId: state.currentSessionId,
+        kind: "direct",
+        updatedAt: 1,
+        status: "running",
+        hasActiveRun: true,
+        activeRunIds: [runId],
+      };
+      request.mockResolvedValue({
+        messages: [prompt, savedCommentary, toolCall],
+        sessionId: state.currentSessionId,
+        sessionInfo,
+        deltaCursor: "during-tool",
+        inFlightRun: {
+          runId,
+          text: commentary,
+          startedAt: 1,
+          events: [
+            {
+              sessionKey: state.sessionKey,
+              runId,
+              seq: 1,
+              ts: 1,
+              stream: "item",
+              data: {
+                kind: "preamble",
+                itemId: "commentary-1",
+                progressText: commentary.replace(/\s+/gu, " "),
+              },
+            },
+            {
+              sessionKey: state.sessionKey,
+              runId,
+              seq: 2,
+              ts: 2,
+              stream: "tool",
+              data: {
+                phase: "start",
+                name: "read",
+                toolCallId: "read-1",
+                args: { path: "files" },
+              },
+            },
+          ],
+        },
+      });
+      await loadChatHistory(state);
+      const visibleText = () => renderedTranscript(state).filter((entry) => entry.text);
+      expect(visibleText()).toEqual([
+        { role: "user", text: prompt.content },
+        { role: "assistant", text: commentary },
+      ]);
+      const savedResult = {
+        role: "toolResult",
+        toolCallId: "read-1",
+        toolName: "read",
+        content: [{ type: "text", text: "alpha.txt\nbeta.txt" }],
+        __openclaw: { id: "tool-result", seq: 3, runId },
+      };
+      const nextToolCall = {
+        ...toolCall,
+        content: [
+          { type: "toolCall", id: "read-2", name: "read", arguments: { path: "more-files" } },
+        ],
+        __openclaw: { id: "next-tool", seq: 4, runId },
+      };
+      const nextToolResult = {
+        ...savedResult,
+        toolCallId: "read-2",
+        __openclaw: { id: "next-result", seq: 5, runId },
+      };
+      const persistedPayload = (
+        message: typeof savedAnswer | typeof savedResult | typeof toolCall,
+      ) => {
+        const { __openclaw: identity } = message;
+        return {
+          sessionKey: state.sessionKey,
+          runId,
+          hasActiveRun: true,
+          messageId: identity.id,
+          messageSeq: identity.seq,
+          message,
+        };
+      };
+      request.mockResolvedValue({
+        kind: "delta",
+        messages: [
+          persistedPayload(savedResult),
+          ...(secondTool ? [persistedPayload(nextToolCall), persistedPayload(nextToolResult)] : []),
+          persistedPayload(savedAnswer),
+        ],
+        deltaCursor: "after-final",
+        sessionInfo: {
+          ...sessionInfo,
+          status: "done",
+          hasActiveRun: false,
+          activeRunIds: [],
+          lastRunId: runId,
+        },
+      });
+      handlePageGatewayEvent(state, {
+        type: "event",
+        event: "agent",
+        payload: {
+          sessionKey: state.sessionKey,
+          runId,
+          seq: 3,
+          ts: 3,
+          stream: "tool",
+          data: {
+            phase: "result",
+            name: "read",
+            toolCallId: "read-1",
+            result: savedResult,
+            isError: false,
+          },
+        },
+      });
+      for (const [index, text] of [partial, answer].entries()) {
+        handlePageGatewayEvent(state, {
+          type: "event",
+          event: "agent",
+          payload: {
+            sessionKey: state.sessionKey,
+            runId,
+            seq: index + 4,
+            ts: index + 4,
+            stream: "assistant",
+            data: { text, delta: index === 0 ? partial : answer.slice(partial.length) },
+          },
+        });
+        handlePageGatewayEvent(state, {
+          type: "event",
+          event: "chat",
+          payload: {
+            sessionKey: state.sessionKey,
+            runId,
+            seq: index + 4,
+            state: "delta",
+            deltaText: index === 0 ? partial : answer.slice(partial.length),
+            message: { role: "assistant", content: [{ type: "text", text: commentary + text }] },
+          },
+        });
+        if (secondTool && index === 0) {
+          for (const phase of ["start", "result"]) {
+            handlePageGatewayEvent(state, {
+              type: "event",
+              event: "agent",
+              payload: {
+                sessionKey: state.sessionKey,
+                runId,
+                seq: phase === "start" ? 4 : 5,
+                ts: 5,
+                stream: "tool",
+                data: {
+                  phase,
+                  name: "read",
+                  toolCallId: "read-2",
+                  ...(phase === "start"
+                    ? { args: { path: "more-files" } }
+                    : { result: nextToolResult, isError: false }),
+                },
+              },
+            });
+          }
+        }
+      }
+      if (persistence === "before-final") {
+        handlePageGatewayEvent(state, {
+          type: "event",
+          event: "session.message",
+          payload: persistedPayload(savedAnswer),
+        });
+      }
+      for (const [index, phase] of ["finishing", "end"].entries()) {
+        handlePageGatewayEvent(state, {
+          type: "event",
+          event: "agent",
+          payload: {
+            sessionKey: state.sessionKey,
+            runId,
+            seq: index + 6,
+            ts: index + 6,
+            stream: "lifecycle",
+            data: { phase },
+          },
+        });
+      }
+      const terminalMessage = {
+        role: "assistant",
+        content: [{ type: "text", text: commentary + answer }],
+      };
+      handlePageGatewayEvent(state, {
+        type: "event",
+        event: "chat",
+        payload: {
+          sessionKey: state.sessionKey,
+          runId,
+          seq: 8,
+          state: "final",
+          message: terminalMessage,
+        },
+      });
+      const expected = [
+        { role: "user", text: prompt.content },
+        { role: "assistant", text: commentary },
+        { role: "assistant", text: answer },
+      ];
+      expect(visibleText()).toEqual(expected);
+      expect(terminalMessage.content).toEqual([{ type: "text", text: commentary + answer }]);
+      if (persistence === "after-final") {
+        handlePageGatewayEvent(state, {
+          type: "event",
+          event: "session.message",
+          payload: persistedPayload(savedAnswer),
+        });
+        expect(visibleText()).toEqual(expected);
+      }
+      await loadChatHistory(state);
+      expect(visibleText()).toEqual(expected);
+      expect(state.chatMessages).toContainEqual(savedCommentary);
+      expect(state.chatMessages).toContainEqual(toolCall);
+      if (secondTool) {
+        expect(state.chatMessages).toContainEqual(nextToolCall);
+      }
+      expect(state.chatMessages.filter((message) => extractText(message) === answer)).toHaveLength(
+        repeated ? 2 : 1,
+      );
     },
   );
 
@@ -598,134 +1097,180 @@ describe("canonical session message recovery", () => {
     expect(state.chatStreamSegments.filter((segment) => segment.itemId)).toHaveLength(1);
   });
 
-  it("keeps cumulative assistant output split across an authoritative steer", () => {
-    const activeRunId = "active-run";
-    const steerRunId = "steer-request";
-    const originalPrompt = {
-      role: "user",
-      content: [{ type: "text", text: "Original prompt" }],
-      timestamp: 100,
-      __openclaw: {
-        id: "original-user",
-        idempotencyKey: `${activeRunId}:user`,
-        seq: 1,
-      },
-    };
-    const { state } = createSessionEventState({
-      connected: false,
-      chatMessages: [originalPrompt],
-      chatRunId: activeRunId,
-      chatStream: null,
-      chatStreamSegments: [],
-      chatToolMessages: [],
-    });
-    handlePageGatewayEvent(state, {
-      type: "event",
-      event: "chat",
-      payload: {
-        sessionKey: state.sessionKey,
-        runId: activeRunId,
-        state: "delta",
-        deltaText: "Before steer.",
-        message: {
-          role: "assistant",
-          content: [{ type: "text", text: "Before steer." }],
-        },
-      },
-    });
-    expect(renderedTranscript(state)).toEqual([
-      { role: "user", text: "Original prompt" },
-      { role: "assistant", text: "Before steer." },
-    ]);
-    expect(state.chatRunId).toBe(activeRunId);
-    expect(state.chatQueue).toEqual([]);
-    reduceChatSessionProjection(state, {
-      type: "sendPending",
-      runId: steerRunId,
-      message: {
+  it.each([false, true])(
+    "keeps cumulative output ordered across a steer (later commentary=%s)",
+    (laterCommentary) => {
+      const activeRunId = "active-run";
+      const steerRunId = "steer-request";
+      const originalPrompt = {
         role: "user",
-        content: [{ type: "text", text: "Steer prompt" }],
-        timestamp: 50,
-        __openclaw: { idempotencyKey: `${steerRunId}:user` },
-      },
-    });
-    state.chatRunId = steerRunId;
-
-    const steerEvent = {
-      type: "event",
-      event: "session.message",
-      payload: {
-        sessionKey: state.sessionKey,
-        clientRunId: activeRunId,
-        hasActiveRun: true,
-        messageId: "persisted-steer-user",
-        messageSeq: 2,
+        content: [{ type: "text", text: "Original prompt" }],
+        timestamp: 100,
+        __openclaw: {
+          id: "original-user",
+          idempotencyKey: `${activeRunId}:user`,
+          seq: 1,
+        },
+      };
+      const { state } = createSessionEventState({
+        connected: false,
+        chatMessages: [originalPrompt],
+        chatRunId: activeRunId,
+        chatStream: null,
+        chatStreamSegments: [],
+        chatToolMessages: [],
+      });
+      handlePageGatewayEvent(state, {
+        type: "event",
+        event: "chat",
+        payload: {
+          sessionKey: state.sessionKey,
+          runId: activeRunId,
+          state: "delta",
+          deltaText: "Before steer.",
+          message: {
+            role: "assistant",
+            content: [{ type: "text", text: "Before steer." }],
+          },
+        },
+      });
+      expect(renderedTranscript(state)).toEqual([
+        { role: "user", text: "Original prompt" },
+        { role: "assistant", text: "Before steer." },
+      ]);
+      expect(state.chatRunId).toBe(activeRunId);
+      expect(state.chatQueue).toEqual([]);
+      reduceChatSessionProjection(state, {
+        type: "sendPending",
+        runId: steerRunId,
         message: {
           role: "user",
           content: [{ type: "text", text: "Steer prompt" }],
           timestamp: 50,
-          __openclaw: {
-            id: "persisted-steer-user",
-            idempotencyKey: `${steerRunId}:user`,
-            seq: 2,
-            steerTargetRunId: activeRunId,
+          __openclaw: { idempotencyKey: `${steerRunId}:user` },
+        },
+      });
+      state.chatRunId = steerRunId;
+
+      const steerEvent = {
+        type: "event",
+        event: "session.message",
+        payload: {
+          sessionKey: state.sessionKey,
+          clientRunId: activeRunId,
+          hasActiveRun: true,
+          messageId: "persisted-steer-user",
+          messageSeq: 2,
+          message: {
+            role: "user",
+            content: [{ type: "text", text: "Steer prompt" }],
+            timestamp: 50,
+            __openclaw: {
+              id: "persisted-steer-user",
+              idempotencyKey: `${steerRunId}:user`,
+              seq: 2,
+              steerTargetRunId: activeRunId,
+            },
           },
         },
-      },
-    } satisfies Parameters<typeof handlePageGatewayEvent>[1];
-    handlePageGatewayEvent(state, steerEvent);
-    expect(state.chatRunId).toBe(activeRunId);
-    const segmentsAfterRequestBoundary = state.chatStreamSegments;
-    expect(segmentsAfterRequestBoundary.at(-1)?.boundaryRunId).toBe(steerRunId);
-    expect(state.chatStreamSegments).toBe(segmentsAfterRequestBoundary);
-    expect(
-      state.chatMessages.filter((message) => extractText(message) === "Steer prompt"),
-    ).toHaveLength(1);
-    handlePageGatewayEvent(state, {
-      type: "event",
-      event: "chat",
-      payload: {
-        sessionKey: state.sessionKey,
-        runId: activeRunId,
-        state: "delta",
-        deltaText: " After steer.",
-        message: {
-          role: "assistant",
-          content: [{ type: "text", text: "Before steer. After steer." }],
+      } satisfies Parameters<typeof handlePageGatewayEvent>[1];
+      handlePageGatewayEvent(state, steerEvent);
+      expect(state.chatRunId).toBe(activeRunId);
+      const segmentsAfterRequestBoundary = state.chatStreamSegments;
+      expect(segmentsAfterRequestBoundary.at(-1)?.boundaryRunId).toBe(steerRunId);
+      expect(state.chatStreamSegments).toBe(segmentsAfterRequestBoundary);
+      expect(
+        state.chatMessages.filter((message) => extractText(message) === "Steer prompt"),
+      ).toHaveLength(1);
+      handlePageGatewayEvent(state, {
+        type: "event",
+        event: "chat",
+        payload: {
+          sessionKey: state.sessionKey,
+          runId: activeRunId,
+          state: "delta",
+          deltaText: " After steer.",
+          message: {
+            role: "assistant",
+            content: [{ type: "text", text: "Before steer. After steer." }],
+          },
         },
-      },
-    });
+      });
 
-    expect(renderedTranscript(state)).toEqual([
-      { role: "user", text: "Original prompt" },
-      { role: "assistant", text: "Before steer." },
-      { role: "user", text: "Steer prompt" },
-      { role: "assistant", text: "After steer." },
-    ]);
+      expect(renderedTranscript(state)).toEqual([
+        { role: "user", text: "Original prompt" },
+        { role: "assistant", text: "Before steer." },
+        { role: "user", text: "Steer prompt" },
+        { role: "assistant", text: "After steer." },
+      ]);
 
-    handlePageGatewayEvent(state, steerEvent);
-    expect(state.chatStreamSegments).toBe(segmentsAfterRequestBoundary);
+      handlePageGatewayEvent(state, steerEvent);
+      expect(state.chatStreamSegments).toBe(segmentsAfterRequestBoundary);
 
-    handlePageGatewayEvent(state, {
-      type: "event",
-      event: "chat",
-      payload: {
-        sessionKey: state.sessionKey,
-        runId: activeRunId,
-        state: "final",
-        message: {
-          role: "assistant",
-          content: [{ type: "text", text: "Before steer. After steer. Final unseen suffix." }],
+      if (laterCommentary) {
+        handlePageGatewayEvent(state, {
+          type: "event",
+          event: "agent",
+          payload: {
+            sessionKey: state.sessionKey,
+            runId: activeRunId,
+            seq: 1,
+            ts: 101,
+            stream: "item",
+            data: {
+              kind: "preamble",
+              itemId: "after-steer-commentary",
+              progressText: "After steer.",
+            },
+          },
+        });
+        handlePageGatewayEvent(state, {
+          type: "event",
+          event: "session.message",
+          payload: {
+            sessionKey: state.sessionKey,
+            runId: activeRunId,
+            hasActiveRun: true,
+            messageId: "saved-commentary",
+            messageSeq: 3,
+            message: {
+              role: "assistant",
+              content: [{ type: "text", text: "After steer." }],
+              openclawStreamFallback: { source: "segment", itemId: "after-steer-commentary" },
+              __openclaw: { id: "saved-commentary", seq: 3, runId: activeRunId },
+            },
+          },
+        });
+      }
+      const terminalText = "Before steer. After steer. Final unseen suffix.";
+      const terminalMessage = {
+        role: "assistant",
+        content: [{ type: "text", text: terminalText }],
+      };
+      handlePageGatewayEvent(state, {
+        type: "event",
+        event: "chat",
+        payload: {
+          sessionKey: state.sessionKey,
+          runId: activeRunId,
+          state: "final",
+          message: terminalMessage,
         },
-      },
-    });
-    expect(renderedTranscript(state)).toEqual([
-      { role: "user", text: "Original prompt" },
-      { role: "assistant", text: "Before steer." },
-      { role: "user", text: "Steer prompt" },
-      { role: "assistant", text: "After steer. Final unseen suffix." },
-    ]);
-  });
+      });
+      expect(renderedTranscript(state)).toEqual([
+        { role: "user", text: "Original prompt" },
+        { role: "assistant", text: "Before steer." },
+        { role: "user", text: "Steer prompt" },
+        ...(laterCommentary
+          ? [
+              { role: "assistant", text: "After steer." },
+              { role: "assistant", text: " Final unseen suffix." },
+            ]
+          : [{ role: "assistant", text: "After steer. Final unseen suffix." }]),
+      ]);
+      expect(terminalMessage.content).toEqual([{ type: "text", text: terminalText }]);
+    },
+  );
 
   it.each([
     {
@@ -852,6 +1397,205 @@ describe("canonical session message recovery", () => {
     ]);
   });
 
+  it("hydrates one final when an earlier same-run tool boundary overlaps terminal persistence", async () => {
+    const runId = "tool-heavy-run";
+    const prompt = {
+      role: "user",
+      content: [{ type: "text", text: "Inspect the repository." }],
+      __openclaw: { id: "prompt", idempotencyKey: `${runId}:user`, seq: 1 },
+    };
+    const toolBoundary = {
+      role: "assistant",
+      content: [
+        { type: "text", text: "Checking the repository." },
+        { type: "toolCall", id: "read-1", name: "read", arguments: { path: "AGENTS.md" } },
+      ],
+      __openclaw: { id: "assistant-tool-boundary", seq: 2, runId },
+    };
+    const persistedFinal = {
+      role: "assistant",
+      content: [{ type: "text", text: "The repair is complete." }],
+      __openclaw: { id: "assistant-final", seq: 4, runId, runTerminal: true },
+    };
+    const request = vi.fn().mockResolvedValue({
+      messages: [prompt, toolBoundary, persistedFinal],
+      sessionId: "selected-session",
+      sessionInfo: {
+        key: "agent:main:main",
+        kind: "direct",
+        updatedAt: 1,
+        hasActiveRun: false,
+        activeRunIds: [],
+        lastRunId: runId,
+        status: "done",
+      },
+    });
+    const { state } = createSessionEventState({
+      chatMessages: [prompt],
+      chatHistoryPagination: { hasMore: false },
+      chatRunId: runId,
+      chatStream: null,
+      chatStreamSegments: [],
+      chatToolMessages: [],
+      client: createTestGatewayClient(request),
+    });
+
+    handlePageGatewayEvent(state, {
+      type: "event",
+      event: "chat",
+      payload: {
+        sessionKey: state.sessionKey,
+        runId,
+        state: "final",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "The repair is complete." }],
+        },
+      },
+    });
+    handlePageGatewayEvent(state, {
+      type: "event",
+      event: "session.message",
+      payload: {
+        sessionKey: state.sessionKey,
+        message: prompt,
+        messageId: "prompt",
+        messageSeq: 1,
+        hasActiveRun: false,
+        activeRunIds: [],
+        session: {
+          key: state.sessionKey,
+          kind: "direct",
+          status: "done",
+          hasActiveRun: false,
+          activeRunIds: [],
+          updatedAt: 1,
+        },
+      },
+    });
+    await loadChatHistory(state);
+
+    expect(state.chatMessages).toEqual([prompt, toolBoundary, persistedFinal]);
+    expect(renderedTranscript(state)).toEqual([
+      { role: "user", text: "Inspect the repository." },
+      { role: "tool", text: "Checking the repository." },
+      { role: "assistant", text: "The repair is complete." },
+    ]);
+  });
+
+  it("keeps the owned local prompt before an early durable reply after placement abandonment", () => {
+    const runId = "local-placement-run-2";
+    const promptText = "Resume locally 2.";
+    const replyText = "Exactly one local Gateway response 2.";
+    const originalPrompt = {
+      role: "user",
+      content: [{ type: "text", text: "Continue interrupted work 2." }],
+      timestamp: 1_700_000_000_000,
+      __openclaw: {
+        id: "placement-user-2",
+        idempotencyKey: "abandoned-placement-run-2:user",
+        seq: 1,
+      },
+    };
+    const abandonedPartial = {
+      role: "assistant",
+      content: [{ type: "text", text: "Gateway-synced device response 2." }],
+      timestamp: 1_700_000_000_001,
+      __openclaw: { id: "placement-aborted-assistant-2", seq: 2 },
+      idempotencyKey: "abandoned-placement-run-2:assistant",
+      openclawAbort: {
+        aborted: true,
+        origin: "placement-abandon",
+        runId: "abandoned-placement-run-2",
+      },
+      stopReason: "stop",
+    };
+    const localUser = {
+      role: "user",
+      content: [{ type: "text", text: promptText }],
+      timestamp: 1_700_000_000_002,
+      __openclaw: { id: "placement-local-user-2", idempotencyKey: `${runId}:user`, seq: 3 },
+    };
+    const localFinalIdentity = { id: "placement-local-final-2", seq: 4 };
+    const localFinal = {
+      role: "assistant",
+      content: [{ type: "text", text: replyText }],
+      timestamp: 1_700_000_000_003,
+      __openclaw: localFinalIdentity,
+    };
+    // Begin at the settled abandonment snapshot; the new prompt still belongs
+    // to the outbox, not history. Keep the original fixture's Gateway timestamps.
+    const { state, request } = createSessionEventState({
+      chatMessages: [originalPrompt, abandonedPartial],
+      chatRunId: runId,
+      chatQueue: [
+        {
+          id: "placement-local-send-2",
+          text: promptText,
+          createdAt: Date.now(),
+          sendState: "sending",
+          sendRunId: runId,
+          sendAttempts: 1,
+        },
+      ],
+    });
+    const expected = [originalPrompt, abandonedPartial, localUser, localFinal].map((message) => ({
+      role: message.role,
+      text: extractText(message),
+    }));
+
+    try {
+      handlePageGatewayEvent(state, {
+        type: "event",
+        event: "chat",
+        payload: {
+          sessionKey: state.sessionKey,
+          runId,
+          seq: 5,
+          state: "delta",
+          deltaText: replyText,
+          message: {
+            role: "assistant",
+            content: localFinal.content,
+            timestamp: localFinal.timestamp,
+          },
+        },
+      });
+      expect(renderedTranscript(state)).toEqual(expected);
+
+      // setHistoryMessages in the browser fixture changes only future responses;
+      // it does not deliver a user persistence event before this assistant row.
+      request.mockResolvedValue({
+        messages: [originalPrompt, abandonedPartial, localUser, localFinal],
+        sessionId: state.currentSessionId,
+      });
+      handlePageGatewayEvent(state, {
+        type: "event",
+        event: "session.message",
+        payload: {
+          sessionKey: state.sessionKey,
+          runId,
+          activeRunIds: null,
+          hasActiveRun: true,
+          messageId: localFinalIdentity.id,
+          messageSeq: localFinalIdentity.seq,
+          message: localFinal,
+        },
+      });
+      expect(state.chatMessages.map(extractText)).toEqual([
+        extractText(originalPrompt),
+        extractText(abandonedPartial),
+        replyText,
+      ]);
+      expect(request).not.toHaveBeenCalled();
+      // Full terminal/outbox retirement and reload use the real browser lifecycle
+      // in session-placement.move.e2e.test.ts; this boundary is before either.
+      expect(renderedTranscript(state)).toEqual(expected);
+    } finally {
+      removeQueuedMessage(state, "placement-local-send-2");
+    }
+  });
+
   it.each([
     { name: "omitted", terminalMessage: undefined, startsActive: true, pendingReload: false },
     { name: "null", terminalMessage: null, startsActive: true, pendingReload: false },
@@ -922,10 +1666,15 @@ describe("canonical session message recovery", () => {
         { role: "user", text: "Finish the dashboard task" },
       ]);
       await vi.waitFor(() =>
-        expect(request).toHaveBeenCalledWith("chat.history", {
-          sessionKey: state.sessionKey,
-          limit: 800,
-        }),
+        expect(request).toHaveBeenCalledWith(
+          "chat.history",
+          {
+            sessionKey: state.sessionKey,
+            limit: 80,
+            maxBytes: 256 * 1024,
+          },
+          { signal: expect.any(AbortSignal) },
+        ),
       );
       await vi.waitFor(() => expect(state.chatLoading).toBe(false));
       expect(request).toHaveBeenCalledTimes(1);
@@ -1195,6 +1944,7 @@ describe("canonical session message recovery", () => {
       expect(request).toHaveBeenLastCalledWith(
         "chat.history",
         expect.objectContaining({ sessionKey: "global", agentId: "main" }),
+        { signal: expect.any(AbortSignal) },
       );
       state.assistantAgentId = "work";
       state.agentsSelectedId = "work";
@@ -1302,9 +2052,7 @@ describe("canonical session message recovery", () => {
         },
       });
       expect(state.chatRunId).toBeNull();
-      expect(
-        getChatSessionProjection(state, state.chatMessages).runs[replacementRunId]?.status,
-      ).toBe("completed");
+      expect(getChatSessionProjection(state).runs[replacementRunId]?.status).toBe("completed");
 
       await vi.advanceTimersByTimeAsync(100);
       expect(request).toHaveBeenCalledTimes(1);
@@ -1429,7 +2177,7 @@ describe("canonical session message recovery", () => {
   it.each([
     { name: "without a pending session-message reload", pendingReload: false },
     { name: "after a pending session-message reload", pendingReload: true },
-  ])("starts a fresh history request $name", async ({ pendingReload }) => {
+  ])("waits for the old read before fresh terminal history $name", async ({ pendingReload }) => {
     const runId = "run-with-pre-final-history";
     const prompt = {
       role: "user",
@@ -1480,9 +2228,10 @@ describe("canonical session message recovery", () => {
       },
     });
 
-    expect(request).toHaveBeenCalledTimes(2);
+    expect(request).toHaveBeenCalledTimes(1);
     staleHistory.resolve({ messages: [prompt], sessionId: "selected-session", sessionInfo });
     await preFinalLoad;
+    await vi.waitFor(() => expect(request).toHaveBeenCalledTimes(2));
     expect(renderedTranscript(state)).toEqual([
       { role: "user", text: "Finish after the stale snapshot" },
     ]);
@@ -1714,9 +2463,7 @@ describe("canonical session message recovery", () => {
       { role: "assistant", text: "Active reply. Final suffix." },
       { role: "user", text: "Queued follow-up" },
     ]);
-    expect(getChatSessionProjection(state, state.chatMessages).messages).toEqual(
-      state.chatMessages,
-    );
+    expect(getChatSessionProjection(state).messages).toEqual(state.chatMessages);
   });
 
   it("does not rebind an unrelated run from a persisted steer", () => {
@@ -1964,18 +2711,11 @@ describe("canonical session message recovery", () => {
       renderFrame = callback;
       return 1;
     });
-    let resolveHistory!: (result: {
+    const { promise: history, resolve: resolveHistory } = createDeferred<{
       messages: unknown[];
       sessionId: string;
       thinkingLevel: null;
-    }) => void;
-    const history = new Promise<{
-      messages: unknown[];
-      sessionId: string;
-      thinkingLevel: null;
-    }>((resolve) => {
-      resolveHistory = resolve;
-    });
+    }>();
     const { request, state } = createSessionEventState({ chatDisplayedLeafEntryId: undefined });
     request.mockReturnValue(history);
 
@@ -2230,10 +2970,15 @@ describe("canonical session message recovery", () => {
     });
 
     await vi.waitFor(() => {
-      expect(request).toHaveBeenCalledWith("chat.history", {
-        sessionKey: state.sessionKey,
-        limit: 800,
-      });
+      expect(request).toHaveBeenCalledWith(
+        "chat.history",
+        {
+          sessionKey: state.sessionKey,
+          limit: 80,
+          maxBytes: 256 * 1024,
+        },
+        { signal: expect.any(AbortSignal) },
+      );
     });
     expect(state.chatRunId).toBe("active-run");
   });
@@ -2349,6 +3094,7 @@ describe("ChatStateController render lifecycle", () => {
       assistantAgentId: "main",
       agentsList: { defaultId: "main" },
       chatRunId: null,
+      chatMessages: [],
       observerDigest: null,
       renderLifecycle: { invalidate: requestUpdate },
       requestUpdate,
@@ -2436,10 +3182,9 @@ describe("ChatStateController render lifecycle", () => {
           allowExternalEmbedUrls: false,
           assistantIdentity: { name: "Assistant" },
           embedSandboxMode: "scripts",
-          localMediaPreviewRoots: [],
         },
       },
-      initialUserMessage: createInitialUserMessageHandoff(),
+      chatSubmissions: createChatSubmissions(),
       sessions: {},
     } as unknown as ApplicationContext;
   }
@@ -2449,6 +3194,7 @@ describe("ChatStateController render lifecycle", () => {
       createPageContext(),
       { invalidate: vi.fn(), afterCommit: () => () => {} },
       {
+        dispatchEvent: () => true,
         getBoundingClientRect: () => new DOMRect(0, 0, 1_440, 0),
         querySelector: () => null,
       },
@@ -2471,7 +3217,7 @@ describe("ChatStateController render lifecycle", () => {
     expect(
       state.sidebarLayout.columns.flatMap((column) => column.panels.map((panel) => panel.slot)),
     ).toEqual(["detail", "workspace"]);
-    expect(state.attachmentSidebarContent?.kind).toBe("attachment");
+    expect(state.sessionWorkspaceState?.previews.at(-1)?.content.kind).toBe("attachment");
     expect(state.sidebarContent).toBe(detailContent);
 
     state.sidebarLayout = activatePanel(state.sidebarLayout, "detail");
@@ -2480,13 +3226,13 @@ describe("ChatStateController render lifecycle", () => {
     expect(
       state.sidebarLayout.columns.flatMap((column) => column.panels.map((panel) => panel.slot)),
     ).toEqual(["workspace"]);
-    expect(state.attachmentSidebarContent?.kind).toBe("attachment");
+    expect(state.sessionWorkspaceState?.previews.at(-1)?.content.kind).toBe("attachment");
     expect(state.sidebarContent).toBe(detailContent);
 
     state.handleCloseSidebar("workspace");
 
     expect(state.sidebarLayout.columns.flatMap((column) => column.panels)).toHaveLength(0);
-    expect(state.attachmentSidebarContent).toBeNull();
+    expect(state.sessionWorkspaceState?.previews ?? []).toEqual([]);
     expect(state.sidebarContent).toBe(detailContent);
   });
 
@@ -2785,19 +3531,14 @@ describe("ChatStateController render lifecycle", () => {
   it("tracks waiting approval only for the selected session until resolution", () => {
     const requestUpdate = vi.fn();
     const state = {
-      sessionKey: "agent:main:current",
-      assistantAgentId: "main",
+      ...createToolStreamHost({
+        sessionKey: "agent:main:current",
+        assistantAgentId: "main",
+        chatRunId: "client-run-1",
+        chatStreamStartedAt: 1,
+      }),
       agentsList: { defaultId: "main" },
-      chatRunId: "client-run-1",
-      chatStream: null,
-      chatStreamStartedAt: 1,
-      chatStreamSegments: [],
-      chatToolMessages: [],
-      toolStreamById: new Map(),
-      toolStreamOrder: [],
-      toolStreamSyncTimer: null,
       waitingApprovalStatuses: new Map(),
-      sessions: { refreshReplacement: vi.fn(async () => undefined) },
       chatStreamRenderFrame: null,
       renderLifecycle: { invalidate: requestUpdate },
       requestUpdate,
@@ -2860,7 +3601,9 @@ describe("ChatStateController render lifecycle", () => {
       toolStreamById: new Map(),
       toolStreamOrder: [],
       toolStreamSyncTimer: null,
-      sessions: { refreshReplacement: vi.fn(async () => undefined) } as never,
+      sessions: {
+        reconcileMutation: vi.fn(async () => ({ status: "refreshed" as const })),
+      } as never,
     });
     const emitAgent = (seq: number, stream: string, data: Record<string, unknown>) =>
       handlePageGatewayEvent(state, {
@@ -2999,7 +3742,7 @@ describe("ChatStateController render lifecycle", () => {
 
   it("forces one PR-chips refresh per PR link seen in the live stream", () => {
     vi.spyOn(globalThis, "requestAnimationFrame").mockImplementation(() => 1);
-    const refreshSessionPullRequests = vi.fn(() => Promise.resolve());
+    const refreshSessionPullRequests = vi.fn(() => true);
     const state = createStreamEventState({
       refreshSessionPullRequests,
     });
@@ -3038,10 +3781,7 @@ describe("ChatStateController render lifecycle", () => {
   });
 
   it("requests a render before selecting the commit promise", async () => {
-    let resolveCommit: (value: boolean) => void = () => {};
-    const nextCommit = new Promise<boolean>((resolve) => {
-      resolveCommit = resolve;
-    });
+    const { promise: nextCommit, resolve: resolveCommit } = createDeferred<boolean>();
     let completion = Promise.resolve(true);
     const controllers: ReactiveController[] = [];
     const requestUpdate = vi.fn(() => {
@@ -3072,10 +3812,7 @@ describe("ChatStateController render lifecycle", () => {
   });
 
   it("cancels pending commit effects on disconnect", async () => {
-    let resolveCommit: (value: boolean) => void = () => {};
-    const completion = new Promise<boolean>((resolve) => {
-      resolveCommit = resolve;
-    });
+    const { promise: completion, resolve: resolveCommit } = createDeferred<boolean>();
     const host = createControllerHost({
       updateComplete: completion,
     });
@@ -3098,6 +3835,7 @@ describe("ChatStateController render lifecycle", () => {
     controller.hostConnected();
     const renderLifecycle = controller.createRenderLifecycle();
     const state = createPageState(createPageContext(), renderLifecycle, {
+      dispatchEvent: () => true,
       querySelector: () => null,
     });
     const stop = vi.fn(() => {
@@ -3338,7 +4076,7 @@ describe("session pull request refresh", () => {
     },
   ])("$name", ({ text, activeRunId, runId, stream, sessionKey, refresh }) => {
     vi.useFakeTimers();
-    const refreshSessionPullRequests = vi.fn(async () => undefined);
+    const refreshSessionPullRequests = vi.fn(() => true);
     const state = createFinalReplyState(refreshSessionPullRequests);
     if (activeRunId) {
       state.chatRunId = activeRunId;
@@ -3377,16 +4115,15 @@ describe("image lightbox lifecycle", () => {
           allowExternalEmbedUrls: false,
           assistantIdentity: { name: "Assistant" },
           embedSandboxMode: "scripts",
-          localMediaPreviewRoots: [],
         },
       },
-      initialUserMessage: createInitialUserMessageHandoff(),
+      chatSubmissions: createChatSubmissions(),
       sessions: {},
     } as unknown as ApplicationContext;
     const state = createPageState(
       context,
       { invalidate: vi.fn(), afterCommit: () => () => {} },
-      { querySelector: () => null },
+      { dispatchEvent: () => true, querySelector: () => null },
     );
 
     const source = "data:video/mp4;base64,AAAA";
@@ -3428,10 +4165,9 @@ describe("image lightbox lifecycle", () => {
           allowExternalEmbedUrls: false,
           assistantIdentity: { name: "Assistant" },
           embedSandboxMode: "scripts",
-          localMediaPreviewRoots: [],
         },
       },
-      initialUserMessage: createInitialUserMessageHandoff(),
+      chatSubmissions: createChatSubmissions(),
       sessions: {},
     } as unknown as ApplicationContext;
     const state = createPageState(
@@ -3440,7 +4176,7 @@ describe("image lightbox lifecycle", () => {
         invalidate,
         afterCommit: () => () => {},
       },
-      { querySelector: () => null },
+      { dispatchEvent: () => true, querySelector: () => null },
     );
     const release = vi.fn();
     state.imageLightbox = {
@@ -3481,6 +4217,10 @@ describe("loadPageAssistantIdentity", () => {
       }),
     );
     const client = { request } as unknown as GatewayBrowserClient;
+    const identities = createAgentIdentityCapability({
+      snapshot: { client, phase: "connected" },
+      subscribe: () => () => undefined,
+    });
     const context = {
       agents: { state: { agentsList: null }, ensureList: vi.fn(async () => null) },
       agentSelection: { state: { selectedId: "main" } },
@@ -3491,17 +4231,16 @@ describe("loadPageAssistantIdentity", () => {
           assistantIdentity: { name: "Assistant" },
           chatMessageMaxWidth: null,
           embedSandboxMode: "scripts",
-          localMediaPreviewRoots: [],
         },
       },
       gateway: { snapshot: { client, connected: true, hello: null } },
-      initialUserMessage: createInitialUserMessageHandoff(),
+      chatSubmissions: createChatSubmissions(),
       sessions: { refresh: vi.fn().mockResolvedValue(undefined) },
     } as unknown as ApplicationContext;
     const state = createPageState(
       context,
       { invalidate: vi.fn(), afterCommit: () => () => {} },
-      { querySelector: () => null },
+      { dispatchEvent: () => true, querySelector: () => null },
     );
     state.client = client;
     state.connected = true;
@@ -3528,13 +4267,12 @@ describe("loadPageAssistantIdentity", () => {
     state.sessionKey = "agent:main:third";
     await state.loadAssistantIdentity();
     expect(request).toHaveBeenCalledTimes(3);
-    expect(request).toHaveBeenLastCalledWith("agent.identity.get", { agentId: "main" });
 
     const staleIdentity = createDeferred<{ name: string; agentId: string }>();
-    assistantIdentity.invalidateAssistantIdentityCache(client);
+    identities.invalidate(["main"]);
     let holdMainIdentity = true;
     request.mockImplementation((method: string, params?: { agentId?: string }) => {
-      if (method === "chat.metadata") {
+      if (method === "chat.metadata" || method === "models.list") {
         return Promise.resolve({ commands: [], models: [] });
       }
       if (method === "models.authStatus") {
@@ -3587,62 +4325,689 @@ describe("refreshChatMetadata", () => {
     } as unknown as ChatPageHost;
   }
 
+  it("keeps a pending explicit picker catalog through command-only revalidation", async () => {
+    const models = [{ id: "fresh", name: "Fresh", provider: "test" }];
+    const catalog = createDeferred<{ models: typeof models }>();
+    const request = vi.fn((method: string) =>
+      method === "models.list" ? catalog.promise : Promise.resolve({ commands: [] }),
+    );
+    const state = createMetadataState(request);
+    const picker = refreshChatModelCatalogOnDemand(state);
+    try {
+      expect(state.chatModelsLoading).toBe(true);
+      await revalidateChatMetadata(state.client!, {
+        agentId: "work",
+        sessionKey: state.sessionKey,
+      });
+      catalog.resolve({ models });
+      await picker;
+      expect(state.chatModelCatalog).toEqual(models);
+      expect(state.chatModelsLoading).toBe(false);
+      expect(request.mock.calls.map(([method]) => method)).toEqual([
+        "models.list",
+        "chat.metadata",
+        "sessions.describe",
+      ]);
+    } finally {
+      catalog.resolve({ models });
+      await picker;
+      retireChatMetadataRequests(state);
+      state.sessions.dispose();
+    }
+  });
+
+  it("ends a retired automatic catalog's loading before unrelated commands settle", async () => {
+    const catalog = createDeferred<{ models: [] }>();
+    const commands = createDeferred<{ commands: [] }>();
+    const request = vi.fn((method: string) =>
+      method === "models.list" ? catalog.promise : commands.promise,
+    );
+    const state = createMetadataState(request);
+    const automatic = refreshChatMetadata(state, { automatic: true });
+    try {
+      expect(state.chatModelsLoading).toBe(true);
+      invalidateModelCatalogCache(state.client!, {
+        agentId: "work",
+        sessionKey: state.sessionKey,
+      });
+      catalog.resolve({ models: [] });
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, 0);
+      });
+      expect(state.chatModelsLoading).toBe(false);
+      expect(request.mock.calls.filter(([method]) => method === "models.list")).toHaveLength(1);
+    } finally {
+      catalog.resolve({ models: [] });
+      commands.resolve({ commands: [] });
+      await automatic;
+      retireChatMetadataRequests(state);
+      state.sessions.dispose();
+    }
+  });
+
+  it.each(
+    (["automatic", "picker"] as const).flatMap((first) => [
+      { first, failure: false },
+      { first, failure: true },
+    ]),
+  )(
+    "keeps the replacement loading when the retired $first catalog settles (failure=$failure)",
+    async ({ first, failure }) => {
+      const retiredModels = [{ id: "retired", name: "Retired", provider: "test" }];
+      const oldCatalog = createDeferred<{ models: typeof retiredModels }>();
+      const freshModels = [{ id: "fresh", name: "Fresh", provider: "test" }];
+      const freshCatalog = createDeferred<{ models: typeof freshModels }>();
+      let catalogReads = 0;
+      const request = vi.fn((method: string) =>
+        method === "models.list"
+          ? ++catalogReads === 1
+            ? oldCatalog.promise
+            : freshCatalog.promise
+          : Promise.resolve({ commands: [] }),
+      );
+      const state = createMetadataState(request);
+      const original =
+        first === "automatic"
+          ? refreshChatMetadata(state, { automatic: true })
+          : refreshChatModelCatalogOnDemand(state);
+      invalidateModelCatalogCache(state.client!, { agentId: "work", sessionKey: state.sessionKey });
+      const replacement =
+        first === "automatic"
+          ? refreshChatModelCatalogOnDemand(state)
+          : refreshChatMetadata(state, { automatic: true });
+      try {
+        expect(catalogReads).toBe(1);
+        expect(state.chatModelsLoading).toBe(true);
+        if (failure) {
+          oldCatalog.reject(new Error("Retired catalog failure"));
+        } else {
+          oldCatalog.resolve({ models: retiredModels });
+        }
+        await original;
+        expect(catalogReads).toBe(2);
+        expect(state.chatModelCatalog).toEqual([]);
+        expect(state.chatModelCatalogError).toBeNull();
+        expect(state.chatModelsLoading).toBe(true);
+        freshCatalog.resolve({ models: freshModels });
+        await replacement;
+        expect(state.chatModelCatalog).toEqual(freshModels);
+        expect(state.chatModelsLoading).toBe(false);
+      } finally {
+        oldCatalog.resolve({ models: retiredModels });
+        freshCatalog.resolve({ models: freshModels });
+        await Promise.all([original, replacement]);
+        retireChatMetadataRequests(state);
+        state.sessions.dispose();
+      }
+    },
+  );
+
+  it("shares a failed automatic attempt until explicit refresh recovers it", async () => {
+    const models = [{ id: "fresh", name: "Fresh", provider: "test" }];
+    let failing = true;
+    const request = vi.fn(async (method: string) => {
+      if (failing) {
+        throw new Error("Shared automatic failure");
+      }
+      return method === "models.list" ? { models } : { commands: [] };
+    });
+    const first = createMetadataState(request);
+    const follower = createMetadataState(request, { client: first.client });
+    const counts = () =>
+      ["chat.metadata", "models.list"].map(
+        (method) => request.mock.calls.filter(([called]) => called === method).length,
+      );
+    try {
+      await Promise.all([
+        refreshChatMetadata(first, { automatic: true }),
+        refreshChatMetadata(follower, { automatic: true }),
+      ]);
+      await refreshChatMetadata(follower, { automatic: true });
+      expect(counts()).toEqual([1, 1]);
+      expect(follower.chatModelCatalogError).toContain("Shared automatic failure");
+      failing = false;
+      await refreshChatMetadata(first);
+      await refreshChatMetadata(follower, { automatic: true });
+      expect(counts()).toEqual([2, 2]);
+      expect(follower.chatModelCatalog).toEqual(models);
+      expect(follower.chatModelCatalogError).toBeNull();
+    } finally {
+      for (const state of [first, follower]) {
+        retireChatMetadataRequests(state);
+        state.sessions.dispose();
+      }
+    }
+  });
+
+  it.each([
+    "snapshot",
+    "snapshot-after-failure",
+    "invalidation",
+    "expiry",
+    "refresh",
+    "eviction",
+  ] as const)(
+    "reobserves canonical catalog %s after an automatic attempt settled",
+    async (change) => {
+      const clock = change === "expiry" ? vi.spyOn(Date, "now").mockReturnValue(1000) : undefined;
+      const before = [
+        {
+          id: "before",
+          name: "Before",
+          provider: "test",
+          ...(change === "expiry" ? { unavailableUntil: 2000 } : {}),
+        },
+      ];
+      const after = [{ id: "after", name: "After", provider: "test" }];
+      const request = vi.fn(async (method: string) => {
+        if (method === "models.list" && change === "snapshot-after-failure") {
+          throw new Error("Old catalog failure");
+        }
+        return method === "models.list" ? { models: before } : { commands: [] };
+      });
+      const first = createMetadataState(request);
+      const states = [first];
+      const scope = { agentId: "work", sessionKey: first.sessionKey };
+      const refresh =
+        change === "refresh"
+          ? beginModelCatalogRead(first.client!, { agentId: "other", refresh: true })
+          : undefined;
+      try {
+        await refreshChatMetadata(first, { automatic: true });
+        expect(first.chatModelCatalog).toEqual(change === "snapshot-after-failure" ? [] : before);
+        if (change.startsWith("snapshot")) {
+          publishModelCatalogResult(beginModelCatalogRead(first.client!, scope), scope, {
+            models: after,
+          });
+          const follower = createMetadataState(request, { client: first.client });
+          states.push(follower);
+          await refreshChatMetadata(follower, { automatic: true });
+          expect(follower.chatModelCatalog).toEqual(after);
+          expect(follower.chatModelCatalogError).toBeNull();
+        } else {
+          first.chatMetadataIsPresented = () => false;
+          if (refresh) {
+            publishModelCatalogResult(
+              refresh,
+              { agentId: "other", refresh: true },
+              { models: after },
+            );
+          } else if (change === "eviction") {
+            for (let index = 0; index < 65; index++) {
+              const otherScope = { agentId: `other-${index}` };
+              publishModelCatalogResult(
+                beginModelCatalogRead(first.client!, otherScope),
+                otherScope,
+                {
+                  models: after,
+                },
+              );
+            }
+          } else if (clock) {
+            clock.mockReturnValue(2000);
+          } else {
+            invalidateModelCatalogCache(first.client!, scope);
+          }
+          request.mockImplementation(async (method) =>
+            method === "models.list" ? { models: after } : { commands: [] },
+          );
+          first.chatMetadataIsPresented = () => true;
+          await refreshChatMetadata(first, { automatic: true });
+          expect(first.chatModelCatalog).toEqual(after);
+        }
+        expect(request.mock.calls.filter(([method]) => method === "models.list")).toHaveLength(
+          change.startsWith("snapshot") ? 1 : 2,
+        );
+      } finally {
+        clock?.mockRestore();
+        for (const state of states) {
+          retireChatMetadataRequests(state);
+          state.sessions.dispose();
+        }
+      }
+    },
+  );
+
+  it.each([1, 2])(
+    "ends automatic catalog loading for an expired response without retrying (%s panes)",
+    async (panes) => {
+      const models = [{ id: "expired", name: "Expired", provider: "test", unavailableUntil: 1 }];
+      const request = vi.fn(async (method: string) =>
+        method === "models.list" ? { models } : { commands: [] },
+      );
+      const state = createMetadataState(request);
+      const states = [state];
+      if (panes === 2) {
+        states.push(createMetadataState(request, { client: state.client }));
+      }
+      try {
+        await Promise.all(states.map((pane) => refreshChatMetadata(pane, { automatic: true })));
+        for (const pane of states) {
+          expect(pane.chatModelsLoading).toBe(false);
+          expect(pane.chatModelCatalog).toEqual(models);
+        }
+        expect(request.mock.calls.filter(([method]) => method === "models.list")).toHaveLength(1);
+      } finally {
+        for (const pane of states) {
+          retireChatMetadataRequests(pane);
+          pane.sessions.dispose();
+        }
+      }
+    },
+  );
+
+  it("keeps a fresh picker snapshot usable while automatic admission waits for commands", async () => {
+    const models = [{ id: "fresh", name: "Fresh", provider: "test" }];
+    const catalog = createDeferred<{ models: typeof models }>();
+    const pendingCommands = createDeferred<{ commands: [] }>();
+    const request = vi.fn((method: string) =>
+      method === "models.list"
+        ? catalog.promise
+        : method === "chat.metadata"
+          ? pendingCommands.promise
+          : Promise.resolve({}),
+    );
+    const state = createMetadataState(request);
+    const picker = refreshChatModelCatalogOnDemand(state);
+    const commands = revalidateChatMetadata(state.client!, {
+      agentId: "work",
+      sessionKey: state.sessionKey,
+    });
+    const automatic = refreshChatMetadata(state, { automatic: true });
+    try {
+      catalog.resolve({ models });
+      await picker;
+      expect(state.chatModelCatalog).toEqual(models);
+      expect(state.chatModelsLoading).toBe(false);
+      expect(request.mock.calls.filter(([method]) => method === "models.list")).toHaveLength(1);
+    } finally {
+      catalog.resolve({ models });
+      pendingCommands.resolve({ commands: [] });
+      await Promise.all([commands, automatic, picker]);
+      retireChatMetadataRequests(state);
+      state.sessions.dispose();
+    }
+  });
+
+  it.each(
+    ["settled", "catalog-first", "selection-first"].flatMap((order) => [
+      { order, picker: false },
+      { order, picker: true },
+    ]),
+  )(
+    "keeps foreground session selection through catalog refresh ($order, picker=$picker)",
+    async ({ order, picker }) => {
+      vi.useFakeTimers();
+      const catalog = createDeferred<{ models: [] }>();
+      const mainList = createDeferred<ReturnType<typeof sessionsResult>>();
+      let revision = 1;
+      let catalogInvalidated = false;
+      let holdMain = false;
+      const request = vi.fn(async (method: string, params?: unknown) => {
+        if (method === "models.list") {
+          return catalogInvalidated ? catalog.promise : { models: [] };
+        }
+        if (method !== "sessions.list") {
+          return { commands: [] };
+        }
+        const args = asOptionalRecord(params);
+        if (args?.agentId === "main" && holdMain) {
+          holdMain = false;
+          return mainList.promise;
+        }
+        const row: GatewaySessionRow = {
+          key: `agent:${String(args?.agentId)}:kept`,
+          kind: "direct",
+          label: `Kept ${revision}`,
+          updatedAt: revision,
+          ...(args?.includeLastMessage ? { lastMessagePreview: "Saved preview" } : {}),
+        };
+        return sessionsResult(
+          args?.search === "keep"
+            ? [row]
+            : [row, { key: "agent:work:other", kind: "direct", updatedAt: revision }],
+          revision,
+        );
+      });
+      const client = createTestGatewayClient(request);
+      const { gateway } = createGatewayHarness(client);
+      const sessions = createTestSessionCapability(gateway);
+      const state = createMetadataState(request, {
+        client,
+        sessions,
+        sessionKey: "agent:main:retained",
+      });
+      const workQuery = { agentId: "work", search: "keep", includeLastMessage: true };
+      const oldMain = sessionsResult(
+        [{ key: "agent:main:kept", kind: "direct", label: "Main", updatedAt: 1 }],
+        1,
+      );
+      let oldRefresh: Promise<void> | undefined;
+      let selection: Promise<void> | undefined;
+      let refresh: Promise<void> | undefined;
+      try {
+        await refreshChatMetadata(state);
+        await sessions.refresh({ agentId: "main" });
+        if (order === "settled") {
+          await sessions.refresh(workQuery);
+        } else {
+          holdMain = true;
+          oldRefresh = sessions.refresh({ agentId: "main", force: true });
+          selection = sessions.refresh(workQuery);
+        }
+        catalogInvalidated = true;
+        invalidateChatMetadataStore(client);
+        refresh = picker ? refreshChatModelCatalogOnDemand(state) : refreshChatMetadata(state);
+        if (order === "selection-first") {
+          mainList.resolve(oldMain);
+          await Promise.all([oldRefresh, selection]);
+          expect(sessions.state.agentId).toBe("work");
+        }
+        revision = 2;
+        catalog.resolve({ models: [] });
+        await vi.advanceTimersByTimeAsync(1_000);
+        mainList.resolve(oldMain);
+        await Promise.all([oldRefresh, selection, refresh]);
+        await vi.advanceTimersByTimeAsync(1_000);
+        expect(sessions.state.agentId).toBe("work");
+        expect(sessions.state.result?.sessions).toEqual([
+          {
+            key: "agent:work:kept",
+            kind: "direct",
+            label: `Kept ${order === "catalog-first" ? 2 : 1}`,
+            lastMessagePreview: "Saved preview",
+            updatedAt: order === "catalog-first" ? 2 : 1,
+          },
+        ]);
+      } finally {
+        retireChatMetadataRequests(state);
+        sessions.dispose();
+        mainList.resolve(oldMain);
+        catalog.resolve({ models: [] });
+        await Promise.allSettled([oldRefresh, selection, refresh]);
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  it("keeps the scoped bootstrap when a picker catalog completes before history", async () => {
+    vi.useFakeTimers();
+    const sessionKey = "agent:work:literal-session";
+    const bootstrap = createConnectionBootstrapCoordinator();
+    bootstrap.setForegroundRoute(sessionKey);
+    const result = sessionsResult([{ key: sessionKey, kind: "direct", updatedAt: 1 }], 1);
+    const request = vi.fn(async (method: string) => {
+      if (method === "sessions.subscribe") {
+        return { subscribed: true };
+      }
+      return method === "sessions.list" ? result : { models: [] };
+    });
+    const client = createTestGatewayClient(request);
+    const { gateway, publish } = createGatewayHarness(client);
+    const sessions = createSessionCapability(
+      gateway,
+      { state: { selectedId: "work" }, subscribe: () => () => {} },
+      { connectionBootstrap: bootstrap },
+    );
+    const state = createMetadataState(request, { client, sessions, sessionKey });
+    try {
+      bootstrap.synchronize({ client, connected: true });
+      publish(true);
+      await refreshChatModelCatalogOnDemand(state);
+      await vi.advanceTimersByTimeAsync(250);
+      expect(request.mock.calls.filter(([method]) => method === "sessions.list")).toEqual([]);
+
+      bootstrap.setForegroundPane({}, { sessionKey, client, ready: true });
+      await vi.advanceTimersByTimeAsync(250);
+      expect(request.mock.calls.filter(([method]) => method === "sessions.list")).toEqual([
+        ["sessions.list", expect.objectContaining({ agentId: "work", includeLastMessage: true })],
+      ]);
+      expect(sessions.state.agentId).toBe("work");
+      expect(sessions.state.result?.sessions).toEqual(result.sessions);
+    } finally {
+      retireChatMetadataRequests(state);
+      sessions.dispose();
+      bootstrap.reset();
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([
+    {
+      pickerPending: false,
+      scopedAfterGlobal: false,
+      metadataPending: false,
+      hidden: false,
+      empty: false,
+    },
+    {
+      pickerPending: true,
+      scopedAfterGlobal: false,
+      metadataPending: false,
+      hidden: false,
+      empty: false,
+    },
+    {
+      pickerPending: false,
+      scopedAfterGlobal: true,
+      metadataPending: false,
+      hidden: false,
+      empty: false,
+    },
+    {
+      pickerPending: false,
+      scopedAfterGlobal: true,
+      metadataPending: true,
+      hidden: false,
+      empty: false,
+    },
+    {
+      pickerPending: false,
+      scopedAfterGlobal: true,
+      metadataPending: true,
+      hidden: true,
+      empty: false,
+    },
+    {
+      pickerPending: false,
+      scopedAfterGlobal: true,
+      metadataPending: true,
+      hidden: false,
+      empty: true,
+    },
+  ])(
+    "converges catalog invalidation with pending picker=$pickerPending, metadata=$metadataPending, scoped follow-up=$scopedAfterGlobal, hidden=$hidden and empty=$empty",
+    async ({ pickerPending, scopedAfterGlobal, metadataPending, hidden, empty }) => {
+      const prepared = { id: "model", name: "Model", provider: "test", contextWindow: 8_192 };
+      const discovered = { ...prepared, contextWindow: 262_144 };
+      const acceptedModels = empty ? [] : [discovered];
+      const retiredCatalog = createDeferred<{ models: (typeof prepared)[] }>();
+      const currentCatalog = createDeferred<{ models: (typeof prepared)[] }>();
+      const metadata = createDeferred<{ commands: [] }>();
+      let invalidated = false;
+      let catalogReads = 0;
+      const request = vi.fn((method: string) =>
+        method === "chat.metadata"
+          ? metadataPending && invalidated
+            ? metadata.promise
+            : Promise.resolve({ commands: [] })
+          : method === "sessions.describe"
+            ? Promise.resolve({})
+            : invalidated
+              ? ++catalogReads === 1
+                ? retiredCatalog.promise
+                : currentCatalog.promise
+              : Promise.resolve({ models: [prepared] }),
+      );
+      const state = createMetadataState(request);
+      let follower: ChatPageHost | undefined;
+      const invalidateSessions = vi
+        .spyOn(state.sessions, "invalidate")
+        .mockImplementation(() => {});
+      try {
+        await refreshChatMetadata(state);
+        expect(invalidateSessions).not.toHaveBeenCalled();
+        const picker = pickerPending ? refreshChatModelCatalogOnDemand(state) : undefined;
+        invalidated = true;
+        invalidateChatMetadataStore(state.client!);
+        if (scopedAfterGlobal) {
+          invalidateChatMetadataStore(state.client!, {
+            agentId: "work",
+            sessionKey: state.sessionKey,
+          });
+        }
+        expect(invalidateSessions).not.toHaveBeenCalled();
+        state.chatMetadataIsPresented = () => !hidden;
+        retiredCatalog.resolve({ models: [discovered] });
+        if (scopedAfterGlobal) {
+          await new Promise<void>((resolve) => {
+            setTimeout(resolve, 0);
+          });
+          expect(request.mock.calls.filter(([method]) => method === "sessions.describe")).toEqual(
+            [],
+          );
+        }
+        if (metadataPending) {
+          const scope = { agentId: "work", sessionKey: state.sessionKey };
+          publishModelCatalogResult(beginModelCatalogRead(state.client!, scope), scope, {
+            models: acceptedModels,
+          });
+          applyChatModelCatalogSnapshot(state);
+          expect(state.chatModelCatalog).toEqual(acceptedModels);
+          if (empty) {
+            follower = createMetadataState(request, { client: state.client });
+            void refreshChatMetadata(follower, { automatic: true });
+            expect(follower.chatModelsLoading).toBe(false);
+            expect(follower.chatModelCatalog).toEqual([]);
+          }
+          if (hidden) {
+            expect(request.mock.calls.filter(([method]) => method === "sessions.describe")).toEqual(
+              [],
+            );
+            state.chatMetadataIsPresented = () => true;
+            void refreshChatMetadata(state, { automatic: true });
+          }
+        } else {
+          currentCatalog.resolve({ models: [discovered] });
+        }
+        await vi.waitFor(() =>
+          expect(
+            request.mock.calls.filter(([method]) => method === "sessions.describe"),
+          ).toHaveLength(1),
+        );
+        expect(invalidateSessions).not.toHaveBeenCalled();
+        await picker;
+
+        expect(state.chatModelCatalog).toEqual(acceptedModels);
+        metadata.resolve({ commands: [] });
+        await refreshChatMetadata(state);
+      } finally {
+        retiredCatalog.resolve({ models: [discovered] });
+        currentCatalog.resolve({ models: [discovered] });
+        metadata.resolve({ commands: [] });
+        retireChatMetadataRequests(state);
+        if (follower) {
+          retireChatMetadataRequests(follower);
+          follower.sessions.dispose();
+        }
+      }
+    },
+  );
+
+  it.each(["session", "agent", "connection", "superseded"])(
+    "does not refresh session facts after an invalidated catalog loses its %s owner",
+    async (transition) => {
+      const pending = createDeferred<{ models: [] }>();
+      const replacement = createDeferred<{ models: [] }>();
+      let catalogReads = 0;
+      const request = vi.fn((method: string) =>
+        method === "chat.metadata"
+          ? Promise.resolve({ commands: [] })
+          : ++catalogReads === 1
+            ? Promise.resolve({ models: [] })
+            : catalogReads === 2
+              ? pending.promise
+              : replacement.promise,
+      );
+      const state = createMetadataState(request, {
+        sessionKey: "global",
+        assistantAgentId: "work",
+      });
+      const invalidateSessions = vi
+        .spyOn(state.sessions, "invalidate")
+        .mockImplementation(() => {});
+      try {
+        await refreshChatMetadata(state);
+        invalidateChatMetadataStore(state.client!);
+        const refresh = refreshChatMetadata(state);
+        if (transition === "session") {
+          state.sessionKey = "agent:work:other";
+        } else if (transition === "agent") {
+          state.assistantAgentId = "main";
+        } else if (transition === "connection") {
+          state.connectionEpoch += 1;
+        } else {
+          invalidateChatMetadataStore(state.client!);
+        }
+        pending.resolve({ models: [] });
+        await refresh;
+        expect(invalidateSessions).not.toHaveBeenCalled();
+      } finally {
+        retireChatMetadataRequests(state);
+        replacement.resolve({ models: [] });
+      }
+    },
+  );
+
   it.each(["metadata", "picker"] as const)(
     "fences a late %s result across same-client reconnect",
     async (kind) => {
-      const old = createDeferred<{ commands: never[]; models: typeof state.chatModelCatalog }>();
+      const old = createDeferred<{
+        commands: never[];
+        models: typeof state.chatModelCatalog;
+        accountSelection: NonNullable<ChatPageHost["chatAccountSelection"]>;
+      }>();
       const ready = { id: "model", name: "Model", provider: "test", available: true };
-      const request = vi
-        .fn()
-        .mockReturnValueOnce(old.promise)
-        .mockResolvedValue({ commands: [], models: [ready] });
+      const accountSelection: NonNullable<ChatPageHost["chatAccountSelection"]> = {
+        kind: "personal",
+        label: "Current owner's account",
+        authProfileId: "test:current",
+        source: "user",
+      };
+      let reads = 0;
+      const request = vi.fn((method: string) =>
+        method === "chat.metadata"
+          ? Promise.resolve({ commands: [] })
+          : ++reads === 1
+            ? old.promise
+            : Promise.resolve({ models: [ready], accountSelection }),
+      );
       const state = createMetadataState(request);
+      state.chatAccountSelection = { kind: "automatic", label: "Automatic account selection" };
       const pending =
         kind === "picker" ? refreshChatModelCatalogOnDemand(state) : refreshChatMetadata(state);
       state.connected = false;
       retireChatMetadataRequests(state);
-      invalidateModelCatalogCache(state.client!);
+      clearModelCatalogCache(state.client!);
       invalidateChatMetadataStore(state.client!);
       expect(state.chatModelCatalog).toEqual([]);
+      expect(state.chatAccountSelection).toBeNull();
       state.connectionEpoch += 1;
       state.connected = true;
       await refreshChatMetadata(state);
       old.resolve({
         commands: [],
         models: [{ ...ready, available: false, unavailableReason: "missing-auth" }],
+        accountSelection: {
+          kind: "shared",
+          label: "Old connection's account",
+          authProfileId: "test:old",
+        },
       });
       await pending;
       expect(state.chatModelCatalog).toEqual([ready]);
+      expect(state.chatAccountSelection).toEqual(accountSelection);
       expect(state.chatModelCatalogError).toBeNull();
-      retireChatMetadataRequests(state);
-    },
-  );
-
-  it.each(["command-metadata", "patch"])(
-    "refreshes only the matching session for %s, not streaming updates",
-    async (reason) => {
-      const request = vi.fn().mockResolvedValue({ commands: [], models: [] });
-      const state = createMetadataState(request);
-      await refreshChatMetadata(state);
-      for (const [key, eventReason] of [
-        ["agent:work:other", reason],
-        [state.sessionKey, "message"],
-      ]) {
-        handlePageGatewayEvent(state, {
-          type: "event",
-          event: "sessions.changed",
-          payload: { key, agentId: "work", reason: eventReason },
-        });
-      }
-      expect(request.mock.calls.filter(([method]) => method === "chat.metadata")).toHaveLength(1);
-      handlePageGatewayEvent(state, {
-        type: "event",
-        event: "sessions.changed",
-        payload: { key: state.sessionKey, agentId: "work", reason },
-      });
-      await vi.waitFor(() =>
-        expect(request.mock.calls.filter(([method]) => method === "chat.metadata")).toHaveLength(2),
-      );
       retireChatMetadataRequests(state);
     },
   );
@@ -3654,24 +5019,29 @@ describe("refreshChatMetadata", () => {
     },
     { label: "cold", existingModels: [] },
   ])(
-    "refreshes $label session metadata after full model discovery completes",
+    "reads the $label session catalog without provider acquisition",
     async ({ existingModels }) => {
-      const refreshSessions = vi.fn().mockResolvedValue(undefined);
       const discovery = createDeferred<{
         models: Array<{ id: string; name: string; provider: string; reasoning: boolean }>;
       }>();
       const request = vi.fn((method: string, params?: unknown) => {
-        expect(params).toEqual(
-          method === "models.list"
-            ? { view: "configured", agentId: "work", refresh: true }
-            : { agentId: "work", sessionKey: "agent:work:main" },
-        );
+        if (method === "sessions.describe") {
+          return Promise.resolve({});
+        }
+        expect(method).toBe("models.list");
+        expect(params).toEqual({
+          view: "configured",
+          agentId: "work",
+          sessionKey: "agent:work:main",
+        });
         return discovery.promise;
       });
       const state = createMetadataState(request, {
         chatModelCatalog: existingModels,
-        sessions: { refresh: refreshSessions } as never,
       });
+      const invalidateSessions = vi
+        .spyOn(state.sessions, "invalidate")
+        .mockImplementation(() => {});
 
       const refresh = refreshChatModelCatalogOnDemand(state);
       expect(state.chatModelCatalog).toEqual(existingModels);
@@ -3689,34 +5059,26 @@ describe("refreshChatMetadata", () => {
           reasoning: true,
         },
       ]);
-      expect(refreshSessions).toHaveBeenCalledWith(
-        expect.objectContaining({ agentId: "work", force: true }),
-      );
+      expect(invalidateSessions).not.toHaveBeenCalled();
+      expect(request).toHaveBeenCalledWith("sessions.describe", {
+        key: "agent:work:main",
+        agentId: "work",
+      });
       expect(state.chatModelCatalogError).toBeNull();
     },
   );
 
   it("does not apply session metadata after a same-agent session switch", async () => {
-    let resolveMetadata:
-      | ((value: {
-          commands: never[];
-          models: Array<{
-            id: string;
-            name: string;
-            provider: string;
-            available: boolean;
-          }>;
-        }) => void)
-      | undefined;
-    const metadata = new Promise<{
+    const { promise: metadata, resolve: resolveMetadata } = createDeferred<{
       commands: never[];
       models: Array<{ id: string; name: string; provider: string; available: boolean }>;
-    }>((resolve) => {
-      resolveMetadata = resolve;
-    });
+    }>();
     const request = vi.fn(async (method: string, params?: unknown) => {
-      expect(method).toBe("chat.metadata");
-      expect(params).toEqual({ agentId: "work", sessionKey: "agent:work:main" });
+      expect(params).toEqual({
+        agentId: "work",
+        sessionKey: "agent:work:main",
+        ...(method === "models.list" ? { view: "configured" } : {}),
+      });
       return await metadata;
     });
     const state = createMetadataState(request);
@@ -3730,7 +5092,7 @@ describe("refreshChatMetadata", () => {
     await refresh;
 
     expect(state.chatModelCatalog).toEqual([]);
-    expect(request).toHaveBeenCalledTimes(1);
+    expect(request.mock.calls.filter(([method]) => method === "models.list")).toHaveLength(1);
   });
 
   it("isolates metadata across sessions and agents", async () => {
@@ -3749,31 +5111,25 @@ describe("refreshChatMetadata", () => {
     await refreshChatMetadata(state);
     state.sessionKey = "agent:work:second";
     await refreshChatMetadata(state);
-    expect(request).toHaveBeenCalledTimes(2);
+    expect(request.mock.calls.filter(([method]) => method === "models.list")).toHaveLength(2);
 
     state.sessionKey = "agent:other:main";
     await refreshChatMetadata(state);
-    expect(request).toHaveBeenCalledTimes(3);
-    expect(request).toHaveBeenLastCalledWith("chat.metadata", {
+    expect(request.mock.calls.filter(([method]) => method === "models.list")).toHaveLength(3);
+    expect(state.chatModelCatalog[0]?.id).toBe("other-model");
+    expect(request).toHaveBeenLastCalledWith("models.list", {
+      view: "configured",
       agentId: "other",
       sessionKey: "agent:other:main",
     });
   });
 
   it("ignores metadata after switching to a different agent", async () => {
-    let resolveMetadata:
-      | ((value: {
-          commands: never[];
-          models: Array<{ id: string; name: string; provider: string }>;
-        }) => void)
-      | undefined;
-    const metadata = new Promise<{
+    const { promise: metadata, resolve: resolveMetadata } = createDeferred<{
       commands: never[];
       models: Array<{ id: string; name: string; provider: string }>;
-    }>((resolve) => {
-      resolveMetadata = resolve;
-    });
-    const request = vi.fn(async () => await metadata);
+    }>();
+    const request = vi.fn(async (_method: string) => await metadata);
     const existingCatalog = [
       { id: "work-model", name: "Work Model", provider: "openai", available: true },
     ];
@@ -3788,30 +5144,18 @@ describe("refreshChatMetadata", () => {
     await refresh;
 
     expect(state.chatModelCatalog).toBe(existingCatalog);
-    expect(request).toHaveBeenCalledTimes(1);
+    expect(request.mock.calls.filter(([method]) => method === "models.list")).toHaveLength(1);
   });
 
   it("keeps loading owned by the newest agent metadata request", async () => {
-    let resolveWork: (value: {
+    const { promise: workMetadata, resolve: resolveWork } = createDeferred<{
       commands: never[];
       models: Array<{ id: string; name: string; provider: string }>;
-    }) => void = () => {};
-    let resolveOther: (value: {
+    }>();
+    const { promise: otherMetadata, resolve: resolveOther } = createDeferred<{
       commands: never[];
       models: Array<{ id: string; name: string; provider: string }>;
-    }) => void = () => {};
-    const workMetadata = new Promise<{
-      commands: never[];
-      models: Array<{ id: string; name: string; provider: string }>;
-    }>((resolve) => {
-      resolveWork = resolve;
-    });
-    const otherMetadata = new Promise<{
-      commands: never[];
-      models: Array<{ id: string; name: string; provider: string }>;
-    }>((resolve) => {
-      resolveOther = resolve;
-    });
+    }>();
     const request = vi.fn(
       async (_method: string, params?: { agentId?: string }) =>
         await (params?.agentId === "work" ? workMetadata : otherMetadata),
@@ -3841,16 +5185,10 @@ describe("refreshChatMetadata", () => {
   });
 
   it("does not publish metadata after the pane retires its request owner", async () => {
-    let resolveMetadata: (value: {
+    const { promise: pending, resolve: resolveMetadata } = createDeferred<{
       commands: never[];
       models: Array<{ id: string; name: string; provider: string }>;
-    }) => void = () => {};
-    const pending = new Promise<{
-      commands: never[];
-      models: Array<{ id: string; name: string; provider: string }>;
-    }>((resolve) => {
-      resolveMetadata = resolve;
-    });
+    }>();
     const request = vi.fn().mockReturnValue(pending);
     const existingCatalog = [{ id: "existing-model", name: "Existing Model", provider: "openai" }];
     const state = createMetadataState(request, { chatModelCatalog: existingCatalog });
@@ -3866,26 +5204,43 @@ describe("refreshChatMetadata", () => {
     expect(state.chatModelCatalog).toEqual([]);
   });
 
-  it("keeps the seeded catalog and reports chat metadata failures without model fallback", async () => {
-    const seededCatalog = [
-      { id: "seeded-model", name: "Seeded Model", provider: "openai", available: true },
-    ];
+  it("keeps model reads independent of command metadata failures", async () => {
+    const model = { id: "published", name: "Published", provider: "example", available: true };
     const request = vi.fn(async (method: string) => {
       if (method === "chat.metadata") {
-        throw new Error("metadata unavailable");
+        throw new Error("commands unavailable");
       }
-      if (method === "models.list") {
-        return { models: [{ id: "substitute-model", name: "Substitute Model" }] };
-      }
-      return { commands: [] };
+      return { models: [model], accountSelection: { kind: "automatic", label: "Automatic" } };
     });
-    const state = createMetadataState(request, { chatModelCatalog: seededCatalog });
-
+    const state = createMetadataState(request);
     await refreshChatMetadata(state);
+    expect(state.chatModelCatalog).toEqual([model]);
+    expect(state.chatAccountSelection).toEqual({ kind: "automatic", label: "Automatic" });
+    expect(state.chatModelCatalogError).toBeNull();
+  });
 
-    expect(state.chatModelCatalog).toBe(seededCatalog);
-    expect(state.chatModelCatalogError).toBe("metadata unavailable");
-    expect(request.mock.calls.map(([method]) => method)).toEqual(["chat.metadata"]);
+  it("retains rows after catalog failure and clears failure on a successful empty publication", async () => {
+    const model = { id: "retained", name: "Retained", provider: "example" };
+    const catalog = vi
+      .fn()
+      .mockResolvedValueOnce({ models: [model], refreshFailed: true })
+      .mockRejectedValueOnce(new Error("catalog transport failed"))
+      .mockResolvedValueOnce({ models: [] });
+    const request = vi.fn((method: string) =>
+      method === "models.list" ? catalog() : Promise.resolve({}),
+    );
+    const state = createMetadataState(request);
+    await refreshChatModelCatalogOnDemand(state);
+    expect(state.chatModelCatalog).toEqual([model]);
+    expect(state.chatModelCatalogError).toBeNull();
+    expect(state.chatModelCatalogRefreshFailed).toBe(true);
+    await refreshChatModelCatalogOnDemand(state);
+    expect(state.chatModelCatalog).toEqual([model]);
+    expect(state.chatModelCatalogError).toBe("catalog transport failed");
+    await refreshChatModelCatalogOnDemand(state);
+    expect(state.chatModelCatalog).toEqual([]);
+    expect(state.chatModelCatalogError).toBeNull();
+    expect(state.chatModelCatalogRefreshFailed).toBeUndefined();
   });
 
   it("keeps fallback slash commands when chat metadata omits commands", async () => {
@@ -3895,6 +5250,9 @@ describe("refreshChatMetadata", () => {
         return {
           models: [{ id: "metadata-model", name: "Metadata Model", provider: "openai" }],
         };
+      }
+      if (method === "models.list") {
+        return { models: [] };
       }
       return {
         commands: [
@@ -3913,7 +5271,7 @@ describe("refreshChatMetadata", () => {
 
     await refreshChatMetadata(state);
 
-    expect(request.mock.calls.map(([method]) => method)).toEqual(["chat.metadata"]);
+    expect(request.mock.calls.map(([method]) => method)).toEqual(["chat.metadata", "models.list"]);
     expect(SLASH_COMMANDS.some((command) => command.name === "help")).toBe(true);
     expect(SLASH_COMMANDS.some((command) => command.name === "remote-command")).toBe(false);
   });
@@ -4023,12 +5381,11 @@ describe("refreshChatModelAuthStatus", () => {
   it.each(["success", "failure"] as const)(
     "ignores a stale auth status %s after reconnecting the same client",
     async (outcome) => {
-      let resolveStatus!: (value: { ts: number; providers: never[] }) => void;
-      let rejectStatus!: (error: unknown) => void;
-      const response = new Promise<{ ts: number; providers: never[] }>((resolve, reject) => {
-        resolveStatus = resolve;
-        rejectStatus = reject;
-      });
+      const {
+        promise: response,
+        resolve: resolveStatus,
+        reject: rejectStatus,
+      } = createDeferred<{ ts: number; providers: never[] }>();
       const request = vi.fn(() => response);
       const currentStatus = { ts: 2, providers: [] };
       const state = {

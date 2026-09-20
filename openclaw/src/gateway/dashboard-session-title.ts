@@ -1,19 +1,28 @@
+import { AsyncLocalStorage } from "node:async_hooks";
+import { isValidBase64 } from "@openclaw/media-core/base64";
 import { truncateUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
 import { resolveAgentEffectiveModelPrimary } from "../agents/agent-scope.js";
 import { splitTrailingAuthProfile } from "../agents/model-ref-profile.js";
 import { resolveSessionModelRef } from "../agents/session-model-ref.js";
 import { resolveSessionRuntimeOverrideForProvider } from "../agents/session-runtime-compat.js";
+import { createCrustaceanSlug } from "../agents/session-slug.js";
 import { resolveUtilityModelRefForAgent } from "../agents/utility-model.js";
-import { generateConversationLabelWithFallback } from "../auto-reply/reply/conversation-label-generator.js";
+import type { WorktreeSourceStage } from "../agents/worktrees/types.js";
 import { stripInboundMetadata } from "../auto-reply/reply/strip-inbound-meta.js";
 import { loadSessionEntry, patchSessionEntryCore } from "../config/sessions/session-accessor.js";
 import type { SessionEntry } from "../config/sessions/types.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { withTimeout } from "../infra/fs-safe.js";
 import { parseAgentSessionKey } from "../sessions/session-key-utils.js";
-import { getOrCreatePromise } from "../shared/lazy-promise.js";
-import { isValidAttachmentBase64, type ChatAttachment } from "./chat-attachments.js";
+import { runWithAsyncWorkResources } from "../shared/async-work-resources.js";
+import { AsyncWorkScope, getAsyncWorkSignal } from "../shared/async-work-scope.js";
+import type { ChatAttachment } from "./chat-attachments.js";
 import { resolveStoredSessionKeyForAgentStore } from "./session-store-key.js";
+import {
+  hasExplicitSessionName,
+  resolveExplicitSessionName,
+  sessionTitleRequests,
+} from "./session-title-state.js";
 import { readSessionTitleFieldsFromTranscript } from "./session-transcript-title-reader.js";
 
 type DashboardSessionTitleModelEntry = Pick<
@@ -30,17 +39,9 @@ type DashboardSessionTitleModelEntry = Pick<
 
 const DASHBOARD_SESSION_TITLE_MAX_CHARS = 60;
 const DASHBOARD_SESSION_TITLE_SOURCE_MAX_CHARS = 1_000;
-const WORKTREE_SESSION_TITLE_TIMEOUT_MS = 8_000;
-const WORKTREE_SESSION_TITLE_ATTEMPT_TIMEOUT_MS = 4_000;
+const WORKTREE_SESSION_TITLE_WAIT_MS = 30_000;
 const DASHBOARD_SESSION_TITLE_PROMPT =
   "Generate a concise session title (3-6 words, max 60 characters) from the user's first message. Use the same language as the message, in sentence case: capitalize only the first word and words that language always capitalizes. No emoji. Return only the title.";
-
-// One title request per session generation. Concurrent triggers cannot race duplicate model
-// calls or metadata writes; late callers receive the in-flight promise so they
-// may await the persisted title before proceeding. Stored promises always
-// settle: isolated completion enforces a timeout, so a hung model call cannot
-// pin an entry here and block future attempts.
-const sessionTitleRequests = new Map<string, Promise<boolean>>();
 
 function decodeTextAttachmentPrefix(attachment: ChatAttachment, maxChars: number): string | null {
   const mimeType = attachment.mimeType?.trim().toLowerCase();
@@ -48,7 +49,7 @@ function decodeTextAttachmentPrefix(attachment: ChatAttachment, maxChars: number
   if (!mimeType?.startsWith("text/") || typeof content !== "string" || !content) {
     return null;
   }
-  if (!isValidAttachmentBase64(content)) {
+  if (!isValidBase64(content)) {
     return null;
   }
   // Three UTF-8 bytes per UTF-16 code unit plus one partial code point is sufficient
@@ -98,27 +99,19 @@ type SessionTitleAttempt =
   | { kind: "skipped" }
   | { kind: "in-flight"; settled: Promise<boolean> };
 
-export function resolveExplicitSessionName(entry: SessionEntry | undefined): string | undefined {
-  return [entry?.label, entry?.displayName, entry?.subject, entry?.groupChannel, entry?.space]
-    .map((value) => value?.trim())
-    .find(Boolean);
+function isAutoTitleSessionKey(sessionKey: string): boolean {
+  const rest = parseAgentSessionKey(sessionKey)?.rest ?? "";
+  return rest.startsWith("dashboard:") || rest.startsWith("ios-") || rest.startsWith("node-");
 }
 
-export function hasExplicitSessionName(entry: SessionEntry | undefined): boolean {
-  return Boolean(resolveExplicitSessionName(entry));
-}
-
-function isDashboardSessionKey(sessionKey: string): boolean {
-  return parseAgentSessionKey(sessionKey)?.rest.startsWith("dashboard:") === true;
-}
-
+/** True when this interactive chat key should receive an automatic topic title. */
 export function isDashboardSessionTitleCandidate(params: {
   sessionKey: string;
   userMessage: string;
 }): boolean {
   const sourceText = params.userMessage.trim();
   return Boolean(
-    sourceText && !sourceText.startsWith("/") && isDashboardSessionKey(params.sessionKey),
+    sourceText && !sourceText.startsWith("/") && isAutoTitleSessionKey(params.sessionKey),
   );
 }
 
@@ -163,7 +156,9 @@ async function generateDashboardSessionTitle(params: {
   entry?: DashboardSessionTitleModelEntry;
   userMessage: string;
   attachments?: readonly ChatAttachment[];
-  timeoutMs?: number;
+  utilityOnly?: boolean;
+  abortSignal?: AbortSignal;
+  assertCurrent?: () => void;
 }): Promise<string | null> {
   const sourceText = buildDashboardSessionTitleSource({
     message: params.userMessage,
@@ -193,20 +188,64 @@ async function generateDashboardSessionTitle(params: {
     primaryProvider: regularModel.provider,
     primaryModelRef: regularModelRef,
   });
-  const generated = await generateConversationLabelWithFallback({
-    userMessage: truncateUtf16Safe(sourceText, DASHBOARD_SESSION_TITLE_SOURCE_MAX_CHARS),
-    prompt: DASHBOARD_SESSION_TITLE_PROMPT,
-    cfg: params.cfg,
-    agentId: params.agentId,
-    ...(agentHarnessRuntimeOverride ? { agentHarnessRuntimeOverride } : {}),
-    ...(utilityModelRef ? { utilityModelRef } : {}),
-    regularModelRef,
-    ...(preferredProfile ? { preferredProfile } : {}),
-    normalizeLabel: normalizeDashboardSessionTitle,
-    maxLength: DASHBOARD_SESSION_TITLE_MAX_CHARS,
-    ...(params.timeoutMs ? { timeoutMs: params.timeoutMs } : {}),
-  });
-  return generated ? normalizeDashboardSessionTitle(generated) : null;
+  const boundedSource = truncateUtf16Safe(sourceText, DASHBOARD_SESSION_TITLE_SOURCE_MAX_CHARS);
+  try {
+    const { generateConversationLabelWithFallback } =
+      await import("../auto-reply/reply/conversation-label-generator.js");
+    params.assertCurrent?.();
+    params.abortSignal?.throwIfAborted();
+    const generated = await generateConversationLabelWithFallback({
+      userMessage: boundedSource,
+      prompt: DASHBOARD_SESSION_TITLE_PROMPT,
+      cfg: params.cfg,
+      agentId: params.agentId,
+      ...(agentHarnessRuntimeOverride ? { agentHarnessRuntimeOverride } : {}),
+      ...(utilityModelRef ? { utilityModelRef } : {}),
+      regularModelRef,
+      ...(preferredProfile ? { preferredProfile } : {}),
+      normalizeLabel: normalizeDashboardSessionTitle,
+      maxLength: DASHBOARD_SESSION_TITLE_MAX_CHARS,
+      abortSignal: params.abortSignal,
+      assertCurrent: params.assertCurrent,
+      ...(params.utilityOnly ? { utilityOnly: true } : {}),
+    });
+    if (generated) {
+      return normalizeDashboardSessionTitle(generated);
+    }
+  } catch {
+    params.assertCurrent?.();
+    params.abortSignal?.throwIfAborted();
+    if (params.utilityOnly) {
+      return null;
+    }
+    // Fall through to the two-word name; keep provider errors private.
+  }
+  // Speculative utility-only naming must not persist a provisional title that
+  // would skip the healthy primary-model pass after send.
+  if (params.utilityOnly) {
+    return null;
+  }
+  // Saved titles also name Git branches; never persist raw prompt text as a fallback.
+  return createCrustaceanSlug();
+}
+
+/** Prepares a creation draft's title without creating or updating a session. */
+export async function prepareDashboardSessionTitle(params: {
+  cfg: OpenClawConfig;
+  agentId: string;
+  entry?: DashboardSessionTitleModelEntry;
+  userMessage: string;
+  abortSignal?: AbortSignal;
+  assertCurrent?: () => void;
+}): Promise<string | null> {
+  try {
+    return await generateDashboardSessionTitle({ ...params, utilityOnly: true });
+  } catch {
+    params.assertCurrent?.();
+    params.abortSignal?.throwIfAborted();
+    // Speculation is optional; a failed utility pass must not invent a title.
+    return null;
+  }
 }
 
 /** Worktree callers bound their own wait without cancelling another naming owner's request. */
@@ -216,7 +255,7 @@ export async function generateWorktreeSessionTitle(
     onPersisted: () => void;
   },
 ): Promise<string | undefined> {
-  const request = maybeGenerateSessionTitle({ ...params, worktree: true }).then(async (attempt) => {
+  const request = maybeGenerateSessionTitle(params).then(async (attempt) => {
     if (attempt.kind === "in-flight") {
       await attempt.settled;
     } else if (attempt.kind === "persisted") {
@@ -224,20 +263,26 @@ export async function generateWorktreeSessionTitle(
     }
   });
   try {
-    await withTimeout(request, WORKTREE_SESSION_TITLE_TIMEOUT_MS, "worktree title generation");
+    await withTimeout(request, WORKTREE_SESSION_TITLE_WAIT_MS, "worktree title generation");
   } catch (error) {
     params.onError(error);
   }
-  params.commitGuard?.();
-  const current = loadSessionEntry({
-    agentId: params.agentId,
-    sessionKey: resolveStoredSessionKeyForAgentStore(params),
-    storePath: params.storePath,
-  });
-  if (current?.sessionId !== params.sessionId) {
-    throw new Error("Session changed while naming its worktree; retry from the current session.");
-  }
-  return resolveExplicitSessionName(current);
+  const readCurrent = (assertSourceCurrent?: () => void) => {
+    params.commitGuard?.();
+    assertSourceCurrent?.();
+    const current = loadSessionEntry({
+      agentId: params.agentId,
+      sessionKey: resolveStoredSessionKeyForAgentStore(params),
+      storePath: params.storePath,
+    });
+    if (current?.sessionId !== params.sessionId) {
+      throw new Error("Session changed while naming its worktree; retry from the current session.");
+    }
+    return resolveExplicitSessionName(current);
+  };
+  return params.withSource
+    ? await params.withSource((source) => readCurrent(source.assertCurrent))
+    : readCurrent();
 }
 
 export async function maybeGenerateDashboardSessionTitle(params: {
@@ -259,9 +304,12 @@ export async function maybeGenerateDashboardSessionTitle(params: {
   ) {
     return false;
   }
-  // Dashboard sends never wait on a duplicate request: only the owning call
-  // may claim persistence (and emit sessions.changed), duplicates skip fast.
-  const attempt = await maybeGenerateSessionTitle({ ...params, userMessage: sourceText });
+  // Only the writer emits sessions.changed. A failed join can retry once under
+  // this caller's authority after the previous request has left the registry.
+  let attempt = await maybeGenerateSessionTitle({ ...params, userMessage: sourceText });
+  if (attempt.kind === "in-flight" && !(await attempt.settled.catch(() => false))) {
+    attempt = await maybeGenerateSessionTitle({ ...params, userMessage: sourceText });
+  }
   return attempt.kind === "persisted";
 }
 
@@ -274,8 +322,8 @@ export async function maybeGenerateSessionTitle(params: {
   storePath: string;
   currentUserMessage?: string;
   userMessage: string;
-  worktree?: boolean;
   commitGuard?: () => void;
+  withSource?: WorktreeSourceStage;
 }): Promise<SessionTitleAttempt> {
   const sessionKey = resolveStoredSessionKeyForAgentStore(params);
   const scope = { agentId: params.agentId, sessionKey, storePath: params.storePath };
@@ -284,8 +332,8 @@ export async function maybeGenerateSessionTitle(params: {
     return { kind: "skipped" };
   }
 
-  const requestKey = `${params.storePath}\0${sessionKey}\0${params.sessionId}`;
-  const existing = sessionTitleRequests.get(requestKey);
+  const requestTarget = { ...scope, sessionId: params.sessionId };
+  const existing = sessionTitleRequests.get(requestTarget);
   if (existing) {
     return { kind: "in-flight", settled: existing };
   }
@@ -312,44 +360,100 @@ export async function maybeGenerateSessionTitle(params: {
     return { kind: "skipped" };
   }
 
-  const request = getOrCreatePromise(
-    sessionTitleRequests,
-    requestKey,
-    () =>
-      Promise.resolve().then(async () => {
-        params.commitGuard?.();
-        const generation = generateDashboardSessionTitle({
-          cfg: params.cfg,
-          agentId: params.agentId,
-          entry: params.entry ?? entry,
-          userMessage: sourceText,
-          ...(params.worktree ? { timeoutMs: WORKTREE_SESSION_TITLE_ATTEMPT_TIMEOUT_MS } : {}),
-        });
-        const displayName = await (params.worktree
-          ? withTimeout(generation, WORKTREE_SESSION_TITLE_TIMEOUT_MS, "worktree title generation")
-          : generation);
-        if (!displayName) {
-          return false;
-        }
+  const generate = (abortSignal?: AbortSignal) =>
+    generateDashboardSessionTitle({
+      cfg: params.cfg,
+      agentId: params.agentId,
+      entry: params.entry ?? entry,
+      userMessage: sourceText,
+      ...(abortSignal ? { abortSignal } : {}),
+    });
+  const finish = async (generation: Promise<string | null>) => {
+    const displayName = await generation;
+    if (!displayName) {
+      return false;
+    }
+    const persist = async (assertSourceCurrent?: () => void) => {
+      const assertCommitAllowed = assertSourceCurrent
+        ? () => {
+            params.commitGuard?.();
+            assertSourceCurrent();
+          }
+        : params.commitGuard;
+      if (assertSourceCurrent) {
+        assertCommitAllowed?.();
+      }
+      let persisted = false;
+      await patchSessionEntryCore(
+        scope,
+        (current) => {
+          if (current.sessionId !== params.sessionId || hasExplicitSessionName(current)) {
+            return null;
+          }
+          persisted = true;
+          return { displayName };
+        },
+        {
+          requireWriteSuccess: true,
+          ...(assertCommitAllowed ? { assertCommitAllowed } : {}),
+        },
+      );
+      return persisted;
+    };
+    return params.withSource
+      ? await params.withSource((source) => persist(source.assertCurrent))
+      : await persist();
+  };
 
-        let persisted = false;
-        await patchSessionEntryCore(
-          scope,
-          (current) => {
-            if (current.sessionId !== params.sessionId || hasExplicitSessionName(current)) {
-              return null;
+  const request = sessionTitleRequests.run(requestTarget, () =>
+    Promise.resolve().then(async () => {
+      const withSource = params.withSource;
+      if (!withSource) {
+        params.commitGuard?.();
+        return await finish(generate());
+      }
+      const parentSignal = getAsyncWorkSignal();
+      return await runWithAsyncWorkResources(async (onAcquired) => {
+        const generationWork = new AsyncWorkScope();
+        const runInGenerationContext = generationWork.run(() => AsyncLocalStorage.snapshot());
+        const cancelFromParent = () =>
+          runInGenerationContext(() => generationWork.beginClose(parentSignal?.reason));
+        onAcquired({
+          release: async () => {
+            try {
+              await AsyncWorkScope.runWhenAllIdle(
+                () => [generationWork],
+                () => runInGenerationContext(() => generationWork.drain()),
+              );
+            } finally {
+              parentSignal?.removeEventListener("abort", cancelFromParent);
             }
-            persisted = true;
-            return { displayName };
           },
-          {
-            requireWriteSuccess: true,
-            ...(params.commitGuard ? { assertCommitAllowed: params.commitGuard } : {}),
-          },
-        );
-        return persisted;
-      }),
-    { evictOnSettled: true },
+        });
+        parentSignal?.addEventListener("abort", cancelFromParent, { once: true });
+        if (parentSignal?.aborted) {
+          cancelFromParent();
+        }
+        let pending: { completion: Promise<string | null> };
+        try {
+          pending = await withSource((source) => {
+            params.commitGuard?.();
+            source.assertCurrent();
+            // This is the existing generation-start check, not provider dispatch authority.
+            const completion = runInGenerationContext(() =>
+              generationWork.track(() => generate(generationWork.signal)),
+            );
+            void completion.catch(() => undefined);
+            return { completion };
+          });
+          return await finish(pending.completion);
+        } catch (error) {
+          runInGenerationContext(() => generationWork.beginClose(error));
+          await runInGenerationContext(() => generationWork.drain());
+          throw error;
+        }
+      });
+    }),
   );
   return (await request) ? { kind: "persisted" } : { kind: "skipped" };
 }

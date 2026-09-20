@@ -1,5 +1,6 @@
 // Markdown Core owns provider-tag scanning and CommonMark/GFM ownership.
-import { fromMarkdown } from "mdast-util-from-markdown";
+import { expectDefined } from "@openclaw/normalization-core";
+import { fromMarkdown, type Extension, type Handle } from "mdast-util-from-markdown";
 import { gfmTableFromMarkdown } from "mdast-util-gfm-table";
 import { gfmTable } from "micromark-extension-gfm-table";
 
@@ -177,50 +178,191 @@ export function findNextLineEnding(text: string, start: number): number {
 
 type PositionedNode = {
   type?: string;
-  position?: { start?: { offset?: number }; end?: { offset?: number } };
+  value?: string;
+  position?: {
+    start?: { offset?: number; line?: number };
+    end?: { offset?: number; line?: number };
+  };
   children?: PositionedNode[];
 };
 
-type MarkdownOwnership = {
-  codeSpans: Array<[number, number]>;
-  retainStart: number;
+type MarkdownCodeRegion = {
+  start: number;
+  end: number;
+  block: boolean;
+  source?: MarkdownInlineSource;
 };
 
-export function parseMarkdownOwnership(text: string): MarkdownOwnership {
-  if (!text) {
-    return { codeSpans: [], retainStart: 0 };
-  }
-  const tree = fromMarkdown(text, {
-    extensions: [DISABLE_HTML_MARKDOWN, gfmTable()],
-    mdastExtensions: [gfmTableFromMarkdown()],
-  }) as PositionedNode;
-  const spans: Array<[number, number]> = [];
-  const pending: PositionedNode[] = [tree];
-  while (pending.length > 0) {
-    const node = pending.pop();
-    if (!node) {
-      continue;
+type MarkdownCompletedParagraph = {
+  start: number;
+  end: number;
+  hasReferenceCandidate: boolean;
+};
+
+type MarkdownInlineSource = {
+  prefix: { start: number; end: number; text: string; ownerStart: number };
+  value: string;
+  offsets: number[];
+};
+
+type MarkdownOwnershipOptions = {
+  includeSource?: boolean;
+  includeText?: boolean;
+  syntax?: "commonmark" | "gfm";
+};
+
+function captureInlineSources(text: string, sources: Map<number, MarkdownInlineSource>): Extension {
+  const observe: Handle = function (token) {
+    const start = this.stack.findLast((entry) => entry.type === "inlineCode")?.position?.start
+      .offset;
+    if (start === undefined) {
+      return;
     }
-    if (node.type === "code" || node.type === "inlineCode") {
+    let source = sources.get(start);
+    if (!source) {
+      const inlineBlock = this.stack.findLast(
+        (entry) => entry.type === "paragraph" || entry.type === "heading",
+      );
+      const begin = inlineBlock?.children[0]?.position?.start.offset;
+      const containers = this.stack.filter(
+        (entry) => entry.type === "listItem" || entry.type === "blockquote",
+      );
+      const prefixEnd = begin !== undefined && containers.length ? begin : start;
+      const prefixStart = containers.length
+        ? Math.max(text.lastIndexOf("\n", prefixEnd - 1), text.lastIndexOf("\r", prefixEnd - 1)) + 1
+        : start;
+      const prefix = containers
+        .map((entry) =>
+          text.slice(entry.position?.start.offset, entry.children[0]?.position?.start.offset),
+        )
+        .join("");
+      source = {
+        prefix: {
+          start: prefixStart,
+          end: prefixEnd,
+          ownerStart: containers[0]?.position?.start.offset ?? start,
+          text:
+            prefix +
+            (containers.length && inlineBlock?.type === "heading"
+              ? text.slice(inlineBlock.position?.start.offset, begin)
+              : ""),
+        },
+        value: "",
+        offsets: [],
+      };
+      sources.set(start, source);
+    }
+    const value = this.sliceSerialize(token);
+    // A tab partly consumed by a container can contribute virtual spaces to the first source unit.
+    const extra = value.length - (token.end.offset - token.start.offset);
+    for (let cursor = start + source.offsets.length; cursor < token.end.offset; cursor += 1) {
+      const consumed = cursor - token.start.offset;
+      source.offsets.push(source.value.length + (consumed > 0 ? consumed + extra : 0));
+    }
+    source.value += value;
+  };
+  return {
+    enter: {
+      codeTextData(token) {
+        observe.call(this, token);
+        // Preserve normal data compilation; the observation only records source/content ownership.
+        expectDefined(this.config.enter.data, "Markdown data handler").call(this, token);
+      },
+      lineEnding: observe,
+    },
+  };
+}
+
+export function parseMarkdownOwnership(text: string, options?: MarkdownOwnershipOptions) {
+  if (!text) {
+    return { regions: [], codeSpans: [], textSpans: [], retainStart: 0, completedParagraphs: [] };
+  }
+  const sources = new Map<number, MarkdownInlineSource>();
+  const tables = options?.syntax !== "commonmark";
+  const tree = fromMarkdown(text, {
+    extensions: [DISABLE_HTML_MARKDOWN, ...(tables ? [gfmTable()] : [])],
+    mdastExtensions: [
+      ...(tables ? [gfmTableFromMarkdown()] : []),
+      ...(options?.includeSource ? [captureInlineSources(text, sources)] : []),
+    ],
+  }) as PositionedNode;
+  const completedParagraphs: MarkdownCompletedParagraph[] = [];
+  const regions: MarkdownCodeRegion[] = [];
+  const textSpans: Array<[number, number]> = [];
+  const blocks = tree.children ?? [];
+  for (let index = 0; index < blocks.length; index += 1) {
+    const block = expectDefined(blocks[index], "Markdown block");
+    const next = blocks[index + 1]?.position?.start;
+    const blockStart = block.position?.start?.offset;
+    const endLine = block.position?.end?.line;
+    let paragraph: MarkdownCompletedParagraph | undefined;
+    if (
+      block.type === "paragraph" &&
+      blockStart !== undefined &&
+      endLine !== undefined &&
+      next?.offset !== undefined &&
+      next.line !== undefined &&
+      next.line > endLine + 1
+    ) {
+      // Include the blank separator so projections can retain the completed block boundary.
+      // Unresolved reference labels can still become image alt text after a later definition.
+      paragraph = {
+        start: blockStart,
+        end: next.offset,
+        hasReferenceCandidate: false,
+      };
+      completedParagraphs.push(paragraph);
+    }
+    const pending: PositionedNode[] = [block];
+    while (pending.length > 0) {
+      const node = expectDefined(pending.pop(), "Markdown ownership node");
+      if (paragraph && node.type === "text" && node.value?.includes("[")) {
+        paragraph.hasReferenceCandidate = true;
+      }
       const start = node.position?.start?.offset;
       const end = node.position?.end?.offset;
-      if (start !== undefined && end !== undefined) {
-        spans.push([start, end]);
+      if (
+        options?.includeText &&
+        node.type === "text" &&
+        start !== undefined &&
+        end !== undefined
+      ) {
+        textSpans.push([start, end]);
       }
-    }
-    const children = node.children ?? [];
-    for (let index = children.length - 1; index >= 0; index -= 1) {
-      const child = children[index];
-      if (child) {
+      if (
+        (node.type === "code" || node.type === "inlineCode") &&
+        start !== undefined &&
+        end !== undefined
+      ) {
+        const source = sources.get(start);
+        if (source) {
+          while (source.offsets.length <= end - start) {
+            source.offsets.push(source.value.length);
+          }
+        }
+        regions.push({ start, end, block: node.type === "code", ...(source ? { source } : {}) });
+      }
+      for (const child of node.children?.toReversed() ?? []) {
         pending.push(child);
       }
     }
   }
-  const rootChildren = tree.children ?? [];
+  regions.sort((left, right) => left.start - right.start);
   return {
-    codeSpans: spans.toSorted((left, right) => left[0] - right[0]),
-    retainStart: rootChildren.at(-1)?.position?.start?.offset ?? text.length,
+    regions,
+    codeSpans: regions.map(({ start, end }): [number, number] => [start, end]),
+    textSpans,
+    retainStart: tree.children?.at(-1)?.position?.start?.offset ?? text.length,
+    completedParagraphs,
   };
+}
+
+/** Returns parser-owned CommonMark/GFM code ranges with block ownership. */
+export function findMarkdownCodeRegions(
+  text: string,
+  options?: MarkdownOwnershipOptions,
+): MarkdownCodeRegion[] {
+  return /[`~\t]| {4}/u.test(text) ? parseMarkdownOwnership(text, options).regions : [];
 }
 
 /** Returns parser-owned CommonMark/GFM code ranges, including their delimiters. */
@@ -433,6 +575,7 @@ export function reduceReasoningText(
 type ReasoningTagStripOptions = {
   mode: "strict" | "preserve";
   scope: "all" | "leading";
+  recoverUnclosed?: boolean;
 };
 
 /** Strips reasoning tags using the same reducer as streamed partitioning. */
@@ -443,7 +586,12 @@ export function stripReasoningTagsFromMarkdown(
   const state: ReductionState = { depth: 0, visibleEver: false };
   return reduceReasoningText(text, findMarkdownCodeSpans(text), state, {
     final: true,
-    mode: options.mode === "preserve" ? "static-preserve" : "static-strict",
+    mode:
+      options.recoverUnclosed === false
+        ? "hide"
+        : options.mode === "preserve"
+          ? "static-preserve"
+          : "static-strict",
     scope: options.scope,
   })
     .filter((delta) => delta.kind === "text")

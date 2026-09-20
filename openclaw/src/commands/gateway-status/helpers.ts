@@ -30,30 +30,7 @@ export type GatewayStatusTarget = {
 };
 
 /** Sanitized config subset rendered by the deep gateway status view. */
-export type GatewayConfigSummary = {
-  path: string | null;
-  exists: boolean;
-  valid: boolean;
-  issues: Array<{ path: string; message: string }>;
-  legacyIssues: Array<{ path: string; message: string }>;
-  gateway: {
-    mode: string | null;
-    bind: string | null;
-    port: number | null;
-    controlUiEnabled: boolean | null;
-    controlUiBasePath: string | null;
-    authMode: string | null;
-    authTokenConfigured: boolean;
-    authPasswordConfigured: boolean;
-    remoteUrl: string | null;
-    remoteTokenConfigured: boolean;
-    remotePasswordConfigured: boolean;
-    tailscaleMode: string | null;
-  };
-  discovery: {
-    wideAreaEnabled: boolean | null;
-  };
-};
+export type GatewayConfigSummary = ReturnType<typeof extractConfigSummary>;
 
 function parseIntOrNull(value: unknown): number | null {
   const s =
@@ -192,7 +169,7 @@ export async function resolveAuthForTarget(
 }
 
 /** Extracts the config fields displayed by `openclaw gateway status --deep`. */
-export function extractConfigSummary(snapshotUnknown: unknown): GatewayConfigSummary {
+export function extractConfigSummary(snapshotUnknown: unknown) {
   const snap = snapshotUnknown as Partial<ConfigFileSnapshot> | null;
   const path = typeof snap?.path === "string" ? snap.path : null;
   const exists = Boolean(snap?.exists);
@@ -307,10 +284,6 @@ export function isProbeReachable(probe: GatewayProbeResult): boolean {
   return probe.ok || probe.gatewayReached === true;
 }
 
-function getGatewayProbeCapability(probe: GatewayProbeResult): GatewayProbeCapability {
-  return probe.auth.capability;
-}
-
 export function summarizeGatewayProbeCapability(
   probes: GatewayProbeResult[],
 ): GatewayProbeCapability {
@@ -324,7 +297,7 @@ export function summarizeGatewayProbeCapability(
     "unknown",
   ];
   for (const capability of priority) {
-    if (probes.some((probe) => getGatewayProbeCapability(probe) === capability)) {
+    if (probes.some((probe) => probe.auth.capability === capability)) {
       return capability;
     }
   }
@@ -363,7 +336,7 @@ function colorForGatewayProbeCapability(capability: GatewayProbeCapability) {
 }
 
 function renderProbeCapabilityLine(probe: GatewayProbeResult, rich: boolean) {
-  const capability = getGatewayProbeCapability(probe);
+  const capability = probe.auth.capability;
   return colorize(
     rich,
     colorForGatewayProbeCapability(capability),
@@ -389,7 +362,7 @@ export function renderProbeSummaryLine(probe: GatewayProbeResult, rich: boolean)
     return `${colorize(rich, theme.success, "Connect: ok")} (${latency}) · ${capability} · ${readStatus}${detail}`;
   }
 
-  if (getGatewayProbeCapability(probe) === "pairing_pending") {
+  if (probe.auth.capability === "pairing_pending") {
     return `${colorize(rich, theme.warn, "Connect: blocked")}${detail} · ${capability}`;
   }
 

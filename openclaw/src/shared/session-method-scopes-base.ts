@@ -5,14 +5,19 @@ export type SessionMutationOperatorScope = "operator.write" | "operator.admin";
 
 const SESSIONS_PATCH_WRITE_SCOPE_MUTATIONS: ReadonlySet<string> = new Set([
   "label",
+  "autoLabel",
   "icon",
   "color",
   "category",
   "boardFace",
+  "boardPresentation",
   "pinned",
   "archived",
   "unread",
   "model",
+  "agentRuntime",
+  "thinkingLevel",
+  "fastMode",
   "permissionMode",
 ]);
 
@@ -21,6 +26,7 @@ const SESSIONS_PATCH_WRITE_SCOPE_ENVELOPE_FIELDS: ReadonlySet<string> = new Set(
   "agentId",
   "expectedSessionId",
   "expectedLifecycleRevision",
+  "expectedPermissionMode",
   "expectedMarkedUnreadAt",
 ]);
 
@@ -36,7 +42,7 @@ function resolveSessionsPatchRequiredScope(params: unknown): SessionMutationOper
   if (!isRecord(params)) {
     return "operator.write";
   }
-  if (params.permissionMode === "full") {
+  if (params.permissionMode === "full" || Object.hasOwn(params, "sandboxMode")) {
     return "operator.admin";
   }
   return Object.keys(params).every(
@@ -52,7 +58,7 @@ function resolveSessionsPatchManyRequiredScope(params: unknown): SessionMutation
   if (!isRecord(params) || !isRecord(params.patch)) {
     return "operator.write";
   }
-  if (params.patch.permissionMode === "full") {
+  if (params.patch.permissionMode === "full" || Object.hasOwn(params.patch, "sandboxMode")) {
     return "operator.admin";
   }
   return Object.keys(params.patch).every((key) => SESSIONS_PATCH_WRITE_SCOPE_MUTATIONS.has(key))

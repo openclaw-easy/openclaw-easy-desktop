@@ -6,33 +6,47 @@ import type { AddressInfo } from "node:net";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { maxBytesForKind } from "@openclaw/media-core/constants";
-import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from "vitest";
 import {
-  createNoisyPngBuffer as createNoisyPngFixtureBuffer,
-  createSolidPngBuffer,
-} from "../../test/helpers/image-fixtures.js";
+  afterAll,
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+  type MockInstance,
+} from "vitest";
+import { createNoisyPngBuffer, createSolidPngBuffer } from "../../test/helpers/image-fixtures.js";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
 import { extractToolResultMediaArtifact } from "../agents/embedded-agent-tool-media.js";
 import type { ReplyMediaAttachment } from "../auto-reply/reply-payload.js";
 import { resolveSqliteTargetFromSessionStorePath } from "../config/sessions/session-sqlite-target.js";
 import { resolveExistingAgentSessionStoreTargetsReadOnlyResult } from "../config/sessions/targets-read-availability.js";
-import { createPinnedLookup } from "../infra/net/ssrf.js";
 import { requireNodeSqlite } from "../infra/node-sqlite.js";
 import {
   completeSessionDelivery,
   enqueueSessionDelivery,
 } from "../infra/session-delivery-queue-storage.js";
-import { readImageProbeFromHeader } from "../media/image-ops.js";
-import { setMediaStoreNetworkDepsForTest } from "../media/store.test-support.js";
+import { readImageProbeFromHeader, resizeToJpeg } from "../media/image-ops.js";
+import {
+  disposeStoreRemoteFixtures,
+  withStoreRemoteFixture,
+  wrapStoreSaveRemoteMedia,
+} from "../media/store-network.test-support.js";
 import {
   closeOpenClawAgentDatabasesForTest,
   openOpenClawAgentDatabase,
 } from "../state/openclaw-agent-db.js";
-import { closeOpenClawStateDatabaseForTest } from "../state/openclaw-state-db.js";
+import {
+  closeOpenClawStateDatabaseAsync,
+  closeOpenClawStateDatabaseForTest,
+} from "../state/openclaw-state-db.js";
+import { captureOpenClawStateWorkerContext } from "../state/openclaw-state-worker-context.js";
 import { withEnvAsync } from "../test-utils/env.js";
+import { createFixture } from "./managed-image-attachments.test-support.js";
 import {
   attachManagedImageRecordToMessage,
-  insertManagedImageRecord,
   listManagedImageRecordEntries,
   MANAGED_OUTGOING_ORIGINALS_SUBDIR,
   readManagedImageRecord,
@@ -53,14 +67,32 @@ const resolveOpenAiCompatibleHttpOperatorScopesMock = vi.fn();
 const resolveOpenAiCompatibleHttpSenderIsOwnerMock = vi.fn();
 const loadSessionEntryMock = vi.fn();
 const readSessionMessagesMock = vi.fn();
-const resolveSessionHistoryTranscriptPathMock = vi.fn();
 const getRuntimeConfigMock = vi.fn(() => ({}));
 const probePlaybackMediaFileDescriptorMock = vi.fn(async () => ({ durationMs: 1000 }));
 const resolvePlaybackModeForSourceMock = vi.fn<PlaybackModeForSourceResolver>();
-const resolvePlaybackTranscodeMock = vi.fn(
-  async (): Promise<PlaybackTranscodeResolution> => ({ kind: "passthrough" }),
-);
+const resolvePlaybackTranscodeMock = vi.fn(async (): Promise<PlaybackTranscodeResolution> => ({
+  kind: "passthrough",
+}));
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
+
+let storeSaveSpy: MockInstance<typeof import("../media/fetch.js").saveRemoteMedia> | undefined;
+
+beforeAll(async () => {
+  // Spy after graph evaluation: importOriginal(fetch) can pull store into its mock cycle.
+  const mediaFetch = await import("../media/fetch.js");
+  const saveRemoteMedia = mediaFetch.saveRemoteMedia;
+  storeSaveSpy = vi
+    .spyOn(mediaFetch, "saveRemoteMedia")
+    .mockImplementation(wrapStoreSaveRemoteMedia(saveRemoteMedia));
+});
+
+afterAll(() => {
+  try {
+    disposeStoreRemoteFixtures();
+  } finally {
+    storeSaveSpy?.mockRestore();
+  }
+});
 
 beforeEach(() => {
   resolvePlaybackModeForSourceMock.mockReset();
@@ -82,14 +114,16 @@ vi.mock("./http-utils.js", () => ({
 vi.mock("./session-utils.js", () => ({
   loadSessionEntry: loadSessionEntryMock,
   loadGatewaySessionEntryReadOnly: loadSessionEntryMock,
-  resolveSessionHistoryTranscriptPathAsync: resolveSessionHistoryTranscriptPathMock,
 }));
 
 vi.mock("./session-transcript-readers.js", () => ({
   readSessionMessagesAsync: readSessionMessagesMock,
+  readSessionMessagesMatchingIdAsync: async (scope: unknown, messageId: string) =>
+    (await readSessionMessagesMock(scope)).filter(
+      (message: { __openclaw?: { id?: string } }) => message["__openclaw"]?.id === messageId,
+    ),
   readSessionMessagesWithSourceAsync: async (...args: unknown[]) => ({
     messages: await readSessionMessagesMock(...args),
-    transcriptPath: await resolveSessionHistoryTranscriptPathMock(...args),
   }),
 }));
 
@@ -118,6 +152,7 @@ const {
   createManagedOutgoingMediaBlocks: createManagedOutgoingImageBlocksActual,
   handleManagedOutgoingMediaHttpRequest: handleManagedOutgoingImageHttpRequest,
   prepareOutgoingMediaFromReplyPayload,
+  readManagedOutgoingImageThumbnail,
   resolveManagedOutgoingMediaArtifactDownload: resolveManagedOutgoingImageArtifactDownload,
   resolveManagedImageAttachmentLimits,
 } = await import("./managed-image-attachments.js");
@@ -176,10 +211,6 @@ async function createPngDataUrl(width: number, height: number): Promise<string> 
   return `data:image/png;base64,${buffer.toString("base64")}`;
 }
 
-async function createNoisyPngBuffer(width: number, height: number): Promise<Buffer> {
-  return createNoisyPngFixtureBuffer(width, height);
-}
-
 function requireAttachmentIdFromUrl(url: unknown): string {
   expect(url).toBeTypeOf("string");
   const attachmentId = String(url).split("/").at(-2);
@@ -219,8 +250,8 @@ function requireBlock(blocks: unknown[], index = 0): ManagedImageBlock {
   return block as ManagedImageBlock;
 }
 
-function requireManagedOriginalPath(stateDir: string, attachmentId: string): string {
-  const record = readManagedImageRecord(attachmentId, stateDir);
+async function requireManagedOriginalPath(stateDir: string, attachmentId: string): Promise<string> {
+  const record = await readManagedImageRecord(attachmentId, stateDir);
   if (!record) {
     throw new Error(`expected managed image record ${attachmentId}`);
   }
@@ -260,50 +291,6 @@ async function prepareManagedSessionStore(stateDir: string): Promise<void> {
   getRuntimeConfigMock.mockReturnValue({ session: { store: storePath } });
 }
 
-async function createFixture(
-  stateDir: string,
-  options?: {
-    sessionKey?: string;
-    agentId?: string;
-    attachmentId?: string;
-    filename?: string;
-    contentType?: string;
-    body?: Buffer;
-    messageId?: string | null;
-    createdAt?: string;
-  },
-) {
-  const attachmentId = options?.attachmentId ?? "11111111-1111-4111-8111-111111111111";
-  const sessionKey = options?.sessionKey ?? "agent:main:main";
-  const filename = options?.filename ?? `${attachmentId}-cat-full.png`;
-  const originalPath = path.join(stateDir, "media", MANAGED_OUTGOING_ORIGINALS_SUBDIR, filename);
-  await fs.mkdir(path.dirname(originalPath), { recursive: true });
-  const body = options?.body ?? Buffer.from("original-image");
-  await fs.writeFile(originalPath, body);
-  insertManagedImageRecord(
-    {
-      attachmentId,
-      sessionKey,
-      ...(options?.agentId ? { agentId: options.agentId } : {}),
-      messageId: options?.messageId === undefined ? "msg-1" : options.messageId,
-      createdAt: options?.createdAt ?? new Date().toISOString(),
-      alt: "Cat",
-      original: {
-        mediaRoot: path.join(stateDir, "media"),
-        mediaId: filename,
-        mediaSubdir: MANAGED_OUTGOING_ORIGINALS_SUBDIR,
-        contentType: options?.contentType ?? "image/png",
-        width: options?.contentType?.startsWith("image/") === false ? null : 1024,
-        height: options?.contentType?.startsWith("image/") === false ? null : 768,
-        sizeBytes: body.byteLength,
-        filename: options?.filename ?? "cat.png",
-      },
-    },
-    stateDir,
-  );
-  return { attachmentId, sessionKey, originalPath };
-}
-
 async function requestManagedImage(params: {
   stateDir: string;
   pathName: string;
@@ -314,8 +301,6 @@ async function requestManagedImage(params: {
   headers?: http.ClientRequestArgs["headers"];
   transcriptMessages?: Record<string, unknown>[];
   sessionEntry?: { sessionId: string; sessionFile?: string };
-  resolvedTranscriptPath?: string | null;
-  onReadTranscriptMessages?: () => Promise<void> | void;
 }) {
   authorizeGatewayHttpRequestOrReplyMock.mockImplementation(async ({ res }) => {
     if (params.denyAuth) {
@@ -339,11 +324,7 @@ async function requestManagedImage(params: {
     storePath: path.join(params.stateDir, "sessions.sqlite"),
     entry: params.sessionEntry ?? { sessionId: "sess-1", sessionFile: "session.jsonl" },
   });
-  resolveSessionHistoryTranscriptPathMock.mockResolvedValue(
-    params.resolvedTranscriptPath ?? params.sessionEntry?.sessionFile ?? "session.jsonl",
-  );
   readSessionMessagesMock.mockImplementation(async () => {
-    await params.onReadTranscriptMessages?.();
     return (
       params.transcriptMessages ?? [
         {
@@ -428,8 +409,8 @@ describe("handleManagedOutgoingImageHttpRequest", () => {
   });
 
   afterEach(async () => {
+    await closeOpenClawStateDatabaseAsync();
     closeOpenClawStateDatabaseForTest();
-    setMediaStoreNetworkDepsForTest();
     await fs.rm(stateDir, { recursive: true, force: true });
   });
 
@@ -450,7 +431,6 @@ describe("handleManagedOutgoingImageHttpRequest", () => {
       authResponse: { authMethod: "token" },
     });
 
-    expect(resolveSessionHistoryTranscriptPathMock).toHaveBeenCalled();
     expect(readSessionMessagesMock).toHaveBeenCalled();
     expect(result.statusCode).toBe(200);
     expect(result.headers["content-type"]).toBe("image/png");
@@ -458,31 +438,89 @@ describe("handleManagedOutgoingImageHttpRequest", () => {
     expect(result.body.toString("utf-8")).toBe("original-image");
   });
 
-  it("serves Unicode media filenames with an encoded content disposition", async () => {
-    const { attachmentId, sessionKey } = await createFixture(stateDir, {
-      filename: "音声.mp3",
+  it.each([
+    {
+      kind: "audio",
       contentType: "audio/mpeg",
-      body: Buffer.from([0xff, 0xfb, 0x90, 0x00]),
-    });
-    const pathName = `/api/chat/media/outgoing/${encodeURIComponent(sessionKey)}/${attachmentId}/full`;
+      filename: "音声.mp3",
+      variant: "full",
+      encodedFilename: "%E9%9F%B3%E5%A3%B0.mp3",
+    },
+    {
+      kind: "audio",
+      contentType: "audio/wav",
+      filename: "recording%20take.wav",
+      variant: "full",
+      encodedFilename: "recording%2520take.wav",
+    },
+    {
+      kind: "video",
+      contentType: "video/mp4",
+      filename: "recording%20take.mp4",
+      variant: "full",
+      encodedFilename: "recording%2520take.mp4",
+    },
+    {
+      kind: "image",
+      contentType: "image/png",
+      filename: "progress%20chart.png",
+      variant: "full",
+      encodedFilename: "progress%2520chart.png",
+    },
+    {
+      kind: "image",
+      contentType: "image/png",
+      filename: "progress%20chart.png",
+      variant: "thumbnail",
+      encodedFilename: "progress%2520chart-thumbnail.png",
+    },
+    {
+      kind: "document",
+      contentType: "text/plain",
+      filename: "progress%20report.txt",
+      variant: "full",
+      encodedFilename: "progress%2520report.txt",
+    },
+  ])(
+    "preserves $filename in $variant download metadata",
+    async ({ kind, contentType, filename, variant, encodedFilename }) => {
+      const { attachmentId, sessionKey } = await createFixture(stateDir, {
+        filename,
+        contentType,
+        body:
+          kind === "image"
+            ? createSolidPngBuffer(16, 8, { r: 24, g: 64, b: 128 })
+            : Buffer.from("media"),
+      });
+      const route = `/api/chat/media/outgoing/${encodeURIComponent(sessionKey)}/${attachmentId}`;
+      const fullUrl = `${route}/full`;
+      const block =
+        kind === "document"
+          ? { type: "attachment", attachment: { url: fullUrl } }
+          : { type: kind, url: fullUrl, openUrl: fullUrl };
+      const { result } = await requestManagedImage({
+        stateDir,
+        pathName: `${route}/${variant}`,
+        authResponse: { authMethod: "token" },
+        transcriptMessages: [
+          {
+            role: "assistant",
+            content: [block],
+            __openclaw: { id: "msg-1" },
+          },
+        ],
+      });
 
-    const { result } = await requestManagedImage({
-      stateDir,
-      pathName,
-      authResponse: { authMethod: "token" },
-      transcriptMessages: [
-        {
-          role: "assistant",
-          content: [{ type: "audio", url: pathName, openUrl: pathName }],
-          __openclaw: { id: "msg-1" },
-        },
-      ],
-    });
-
-    expect(result.statusCode).toBe(200);
-    expect(result.headers["content-disposition"]).toContain("filename*=UTF-8''");
-    expect(result.headers["content-disposition"]).toContain("%E9%9F%B3%E5%A3%B0.mp3");
-  });
+      expect(result.statusCode).toBe(200);
+      expect(result.headers["content-type"]).toBe(contentType);
+      expect(result.headers["content-disposition"]).toContain(
+        `filename*=UTF-8''${encodedFilename}`,
+      );
+      expect(result.headers["content-disposition"]).toMatch(
+        kind === "document" ? /^attachment;/ : /^inline;/,
+      );
+    },
+  );
 
   it("serves a byte range from the validated managed image", async () => {
     const { attachmentId, sessionKey } = await createFixture(stateDir);
@@ -585,36 +623,139 @@ describe("handleManagedOutgoingImageHttpRequest", () => {
     }
   });
 
-  it.each(["GET", "HEAD"])(
-    "revalidates managed media ETags before ranges for %s",
-    async (method) => {
-      const { attachmentId, sessionKey } = await createFixture(stateDir);
+  it.each<{
+    name: string;
+    method?: string;
+    range?: string;
+    ifRange?: string;
+    validator: string | string[] | ((etag: string) => string);
+    expectedStatus: number;
+  }>([
+    {
+      name: "quoted comma/star GET",
+      validator: '"client,*,tag"',
+      expectedStatus: 200,
+    },
+    {
+      name: "quoted comma/star HEAD",
+      method: "HEAD",
+      validator: '"client,*,tag"',
+      expectedStatus: 200,
+    },
+    {
+      name: "quoted comma/star range",
+      range: "bytes=2-5",
+      validator: '"client,*,tag"',
+      expectedStatus: 206,
+    },
+    {
+      name: "weak quoted comma/star range",
+      range: "bytes=2-5",
+      validator: 'W/"client,*,tag"',
+      expectedStatus: 206,
+    },
+    {
+      name: "multiple nonmatching fields",
+      validator: ['"client,*,tag"', '"other"'],
+      expectedStatus: 200,
+    },
+    {
+      name: "quoted literal asterisk",
+      validator: '"*"',
+      expectedStatus: 200,
+    },
+    {
+      name: "ordinary stale range",
+      range: "bytes=2-5",
+      validator: '"stale"',
+      expectedStatus: 206,
+    },
+    {
+      name: "strong match",
+      validator: (etag: string) => etag,
+      expectedStatus: 304,
+    },
+    {
+      name: "weak HEAD match before If-Range",
+      method: "HEAD",
+      range: "bytes=2-5",
+      ifRange: '"stale"',
+      validator: (etag: string) => `W/${etag}`,
+      expectedStatus: 304,
+    },
+    {
+      name: "matching list before If-Range",
+      range: "bytes=2-5",
+      ifRange: '"stale"',
+      validator: (etag: string) => `"other", W/${etag}`,
+      expectedStatus: 304,
+    },
+    {
+      name: "standalone wildcard",
+      validator: "*",
+      expectedStatus: 304,
+    },
+    {
+      name: "literal backslash before a matching tag",
+      validator: (etag: string) => String.raw`"trailing\", ` + etag,
+      expectedStatus: 304,
+    },
+  ])(
+    "honors $name for managed media",
+    async ({ method = "GET", range, ifRange, validator, expectedStatus }) => {
+      const body = Buffer.from("0123456789");
+      const { attachmentId, sessionKey } = await createFixture(stateDir, {
+        filename: "report.txt",
+        contentType: "text/plain",
+        body,
+      });
       const pathName = `/api/chat/media/outgoing/${encodeURIComponent(sessionKey)}/${attachmentId}/full`;
-      const initial = await requestManagedImage({
+      const request = {
         stateDir,
         pathName,
         authResponse: { authMethod: "token" },
-      });
-      const etag = initial.result.headers.etag;
+        transcriptMessages: [
+          {
+            role: "assistant",
+            content: [{ type: "attachment", attachment: { url: pathName } }],
+            __openclaw: { id: "msg-1" },
+          },
+        ],
+      };
+      const initial = await requestManagedImage(request);
+      const etag = String(initial.result.headers.etag);
       expect(etag).toMatch(/^"[A-Za-z0-9_-]+"$/);
 
+      const ifNoneMatch = typeof validator === "function" ? validator(etag) : validator;
       const { result } = await requestManagedImage({
-        stateDir,
-        pathName,
+        ...request,
         method,
-        authResponse: { authMethod: "token" },
-        headers: {
-          "if-none-match": `W/${String(etag)}`,
-          range: "bytes=0-3",
-          "if-range": '"stale"',
-        },
+        headers: [
+          "Host",
+          "127.0.0.1",
+          ...[ifNoneMatch].flat().flatMap((value) => ["if-none-match", value]),
+          ...(range ? ["range", range] : []),
+          ...(ifRange ? ["if-range", ifRange] : []),
+        ],
       });
 
-      expect(result.statusCode).toBe(304);
+      expect(result.statusCode).toBe(expectedStatus);
       expect(result.headers.etag).toBe(etag);
-      expect(result.headers["content-length"]).toBeUndefined();
-      expect(result.headers["content-range"]).toBeUndefined();
-      expect(result.body).toHaveLength(0);
+      expect(result.headers["content-type"]).toBe("text/plain");
+      expect(result.headers["content-disposition"]).toContain('filename="report.txt"');
+      expect(result.headers["content-length"]).toBe(
+        expectedStatus === 304 ? undefined : expectedStatus === 206 ? "4" : "10",
+      );
+      expect(result.headers["content-range"]).toBe(
+        expectedStatus === 206 ? "bytes 2-5/10" : undefined,
+      );
+      expect(result.body.toString("utf8")).toBe(
+        method === "HEAD" || expectedStatus === 304
+          ? ""
+          : expectedStatus === 206
+            ? "2345"
+            : "0123456789",
+      );
     },
   );
 
@@ -685,7 +826,6 @@ describe("handleManagedOutgoingImageHttpRequest", () => {
       storePath: path.join(stateDir, "gateway-sessions.json"),
       entry: { sessionId: "sess-1", sessionFile: "session.jsonl" },
     });
-    resolveSessionHistoryTranscriptPathMock.mockResolvedValue("session.jsonl");
     readSessionMessagesMock.mockResolvedValue([
       {
         role: "assistant",
@@ -756,6 +896,9 @@ describe("handleManagedOutgoingImageHttpRequest", () => {
 
     expect(result.statusCode).toBe(200);
     expect(result.headers["content-type"]).toBe("audio/x-caf");
+    expect(result.headers["cache-control"]).toBe("private, no-cache");
+    expect(result.headers.etag).toBeUndefined();
+    expect(result.headers["last-modified"]).toBeUndefined();
     expect(result.body).toEqual(body);
   });
 
@@ -772,7 +915,6 @@ describe("handleManagedOutgoingImageHttpRequest", () => {
       storePath: path.join(stateDir, "gateway-sessions.json"),
       entry: { sessionId: "sess-1", sessionFile: "session.jsonl" },
     });
-    resolveSessionHistoryTranscriptPathMock.mockResolvedValue("session.jsonl");
     readSessionMessagesMock.mockResolvedValue([
       {
         role: "assistant",
@@ -833,6 +975,9 @@ describe("handleManagedOutgoingImageHttpRequest", () => {
       expect.objectContaining({ mimeType: "audio/mpeg", kind: "audio" }),
     );
     expect(result.statusCode).toBe(200);
+    expect(result.headers["cache-control"]).toBe("private, no-cache");
+    expect(result.headers.etag).toBeUndefined();
+    expect(result.headers["last-modified"]).toBeUndefined();
     expect(result.body).toEqual(body);
   });
 
@@ -840,12 +985,13 @@ describe("handleManagedOutgoingImageHttpRequest", () => {
     const transcodedPath = path.join(stateDir, "cached-voice.m4a");
     const transcoded = Buffer.from("normalized-audio");
     await fs.writeFile(transcodedPath, transcoded);
-    resolvePlaybackTranscodeMock.mockResolvedValueOnce({
+    const playback = {
       kind: "transcoded",
       path: transcodedPath,
       contentType: "audio/mp4",
       extension: ".m4a",
-    });
+    } as const;
+    resolvePlaybackTranscodeMock.mockResolvedValueOnce(playback);
     const { attachmentId, sessionKey } = await createFixture(stateDir, {
       filename: "voice.caf",
       contentType: "audio/x-caf",
@@ -861,27 +1007,48 @@ describe("handleManagedOutgoingImageHttpRequest", () => {
 
     expect(result.statusCode).toBe(206);
     expect(result.headers["content-type"]).toBe("audio/mp4");
+    expect(result.headers["cache-control"]).toBe("private, no-cache");
+    expect(result.headers.etag).toBeUndefined();
+    expect(result.headers["last-modified"]).toBeUndefined();
     expect(result.headers["content-disposition"]).toContain('filename="voice.m4a"');
     expect(result.headers["content-range"]).toBe(`bytes 11-15/${transcoded.byteLength}`);
     expect(result.body.toString("utf8")).toBe("audio");
+
+    for (const method of ["GET", "HEAD"]) {
+      resolvePlaybackTranscodeMock.mockResolvedValueOnce(playback);
+      const exists = await requestManagedImage({
+        stateDir,
+        pathName: `/api/chat/media/outgoing/${encodeURIComponent(sessionKey)}/${attachmentId}/full?playback=1`,
+        authResponse: { authMethod: "token" },
+        method,
+        headers: { "if-none-match": "*", range: "bytes=11-15" },
+      });
+      expect(exists.result.statusCode).toBe(304);
+      expect(exists.result.headers.etag).toBeUndefined();
+      expect(exists.result.headers["content-length"]).toBeUndefined();
+      expect(exists.result.body).toHaveLength(0);
+    }
   });
 
-  it("advertises byte ranges without a body for HEAD", async () => {
-    const { attachmentId, sessionKey } = await createFixture(stateDir);
+  it.each(["", "?playback=1"])(
+    "advertises immutable image byte ranges without a body for HEAD%s",
+    async (query) => {
+      const { attachmentId, sessionKey } = await createFixture(stateDir);
 
-    const { result } = await requestManagedImage({
-      stateDir,
-      pathName: `/api/chat/media/outgoing/${encodeURIComponent(sessionKey)}/${attachmentId}/full`,
-      method: "HEAD",
-      authResponse: { authMethod: "token" },
-    });
+      const { result } = await requestManagedImage({
+        stateDir,
+        pathName: `/api/chat/media/outgoing/${encodeURIComponent(sessionKey)}/${attachmentId}/full${query}`,
+        method: "HEAD",
+        authResponse: { authMethod: "token" },
+      });
 
-    expect(result.statusCode).toBe(200);
-    expect(result.headers["accept-ranges"]).toBe("bytes");
-    expect(result.headers["content-length"]).toBe("14");
-    expect(result.headers.etag).toMatch(/^"[A-Za-z0-9_-]+"$/);
-    expect(result.body).toHaveLength(0);
-  });
+      expect(result.statusCode).toBe(200);
+      expect(result.headers["accept-ranges"]).toBe("bytes");
+      expect(result.headers["content-length"]).toBe("14");
+      expect(result.headers.etag).toMatch(/^"[A-Za-z0-9_-]+"$/);
+      expect(result.body).toHaveLength(0);
+    },
+  );
 
   it("serves an empty managed image without a body", async () => {
     const { attachmentId, sessionKey, originalPath } = await createFixture(stateDir);
@@ -905,7 +1072,6 @@ describe("handleManagedOutgoingImageHttpRequest", () => {
       storePath: path.join(stateDir, "gateway-sessions.json"),
       entry: { sessionId: "sess-1", sessionFile: "session.jsonl" },
     });
-    resolveSessionHistoryTranscriptPathMock.mockResolvedValue("session.jsonl");
     readSessionMessagesMock.mockResolvedValue([
       {
         role: "assistant",
@@ -970,44 +1136,72 @@ describe("handleManagedOutgoingImageHttpRequest", () => {
     expect(download?.title).toBe("meeting-note.mp3");
   });
 
-  it("serves a bounded thumbnail through the full-image artifact ticket", async () => {
-    const source = createSolidPngBuffer(640, 320, { r: 24, g: 64, b: 128 });
-    const { attachmentId, sessionKey } = await createFixture(stateDir, { body: source });
-    const canonicalPath = `/api/chat/media/outgoing/${encodeURIComponent(sessionKey)}/${attachmentId}/full`;
-    const transcriptMessages = [
-      {
-        role: "assistant",
-        content: [{ type: "image", url: canonicalPath, openUrl: canonicalPath }],
-        __openclaw: { id: "msg-1" },
-      },
-    ];
-    loadSessionEntryMock.mockReturnValue({
-      storePath: path.join(stateDir, "sessions.sqlite"),
-      entry: { sessionId: "sess-1", sessionFile: "session.jsonl" },
-    });
-    resolveSessionHistoryTranscriptPathMock.mockResolvedValue("session.jsonl");
-    readSessionMessagesMock.mockResolvedValue(transcriptMessages);
-    const download = await resolveManagedOutgoingImageArtifactDownload({
-      sessionKey,
-      artifactId: `${MANAGED_OUTGOING_IMAGE_ARTIFACT_ID_PREFIX}${attachmentId}`,
-      stateDir,
-    });
-    const thumbnailUrl = download?.url.replace(/\/full(?=\?)/u, "/thumbnail") ?? "";
+  it.each([
+    { width: 1600, height: 800, previewWidth: 1200, previewHeight: 600 },
+    { width: 800, height: 1600, previewWidth: 600, previewHeight: 1200 },
+    { width: 160, height: 80, previewWidth: 160, previewHeight: 80 },
+  ])(
+    "serves a sharp bounded $width×$height thumbnail through local reads and the artifact ticket",
+    async ({ width, height, previewWidth, previewHeight }) => {
+      const source = createSolidPngBuffer(width, height, { r: 24, g: 64, b: 128 });
+      const { attachmentId, sessionKey } = await createFixture(stateDir, { body: source });
+      const canonicalPath = `/api/chat/media/outgoing/${encodeURIComponent(sessionKey)}/${attachmentId}/full`;
+      const transcriptMessages = [
+        {
+          role: "assistant",
+          content: [{ type: "image", url: canonicalPath, openUrl: canonicalPath }],
+          __openclaw: { id: "msg-1" },
+        },
+      ];
+      loadSessionEntryMock.mockReturnValue({
+        storePath: path.join(stateDir, "sessions.sqlite"),
+        entry: { sessionId: "sess-1", sessionFile: "session.jsonl" },
+      });
+      readSessionMessagesMock.mockResolvedValue(transcriptMessages);
+      const download = await resolveManagedOutgoingImageArtifactDownload({
+        sessionKey,
+        artifactId: `${MANAGED_OUTGOING_IMAGE_ARTIFACT_ID_PREFIX}${attachmentId}`,
+        stateDir,
+      });
+      const thumbnailUrl = `${download?.url.replace(/\/full(?=\?)/u, "/thumbnail")}&v=2`;
+      const localRequest = {
+        sessionKey,
+        artifactId: `${MANAGED_OUTGOING_IMAGE_ARTIFACT_ID_PREFIX}${attachmentId}`,
+        stateDir,
+        maxBytes: 12 * 1024 * 1024,
+        signal: new AbortController().signal,
+      };
+      const localThumbnail = await readManagedOutgoingImageThumbnail(localRequest);
+      expect(localThumbnail && readImageProbeFromHeader(localThumbnail)).toMatchObject({
+        width: previewWidth,
+        height: previewHeight,
+      });
+      await expect(
+        readManagedOutgoingImageThumbnail({ ...localRequest, maxBytes: 1 }),
+      ).rejects.toThrow("byte limit");
+      await expect(
+        readManagedOutgoingImageThumbnail({ ...localRequest, sessionKey: "agent:other:main" }),
+      ).resolves.toBeNull();
 
-    vi.clearAllMocks();
-    const { result } = await requestManagedImage({
-      stateDir,
-      pathName: thumbnailUrl,
-      denyAuth: true,
-      transcriptMessages,
-    });
+      vi.clearAllMocks();
+      const { result } = await requestManagedImage({
+        stateDir,
+        pathName: thumbnailUrl,
+        denyAuth: true,
+        transcriptMessages,
+      });
 
-    expect(result.statusCode).toBe(200);
-    expect(result.headers["content-type"]).toBe("image/png");
-    expect(result.headers["content-disposition"]).toContain("cat-thumbnail.png");
-    expect(readImageProbeFromHeader(result.body)).toMatchObject({ width: 300, height: 150 });
-    expect(authorizeGatewayHttpRequestOrReplyMock).not.toHaveBeenCalled();
-  });
+      expect(result.statusCode).toBe(200);
+      expect(result.headers["content-type"]).toBe("image/png");
+      expect(result.headers["content-disposition"]).toContain("cat-thumbnail.png");
+      expect(readImageProbeFromHeader(result.body)).toMatchObject({
+        width: previewWidth,
+        height: previewHeight,
+      });
+      expect(result.body).toEqual(localThumbnail);
+      expect(authorizeGatewayHttpRequestOrReplyMock).not.toHaveBeenCalled();
+    },
+  );
 
   it("rejects a managed global artifact owned by another agent", async () => {
     const { attachmentId } = await createFixture(stateDir, {
@@ -1180,152 +1374,6 @@ describe("handleManagedOutgoingImageHttpRequest", () => {
 
     expect(result.statusCode).toBe(404);
   });
-
-  it("reuses the session attachment index across requests until the transcript changes", async () => {
-    const { attachmentId, sessionKey } = await createFixture(stateDir);
-    const sessionFile = path.join(stateDir, "sessions", "sess-main.jsonl");
-    await fs.mkdir(path.dirname(sessionFile), { recursive: true });
-    await fs.writeFile(sessionFile, '{"message":{}}\n', "utf-8");
-
-    const transcriptMessages = [
-      {
-        __openclaw: { id: "msg-1" },
-        content: [
-          {
-            type: "image",
-            url: `/api/chat/media/outgoing/${encodeURIComponent(sessionKey)}/${attachmentId}/full`,
-            openUrl: `/api/chat/media/outgoing/${encodeURIComponent(sessionKey)}/${attachmentId}/full`,
-          },
-        ],
-      },
-    ];
-
-    const pathName = `/api/chat/media/outgoing/${encodeURIComponent(sessionKey)}/${attachmentId}/full`;
-    const first = await requestManagedImage({
-      stateDir,
-      pathName,
-      authResponse: { authMethod: "token" },
-      sessionEntry: { sessionId: "sess-main", sessionFile },
-      transcriptMessages,
-    });
-    const second = await requestManagedImage({
-      stateDir,
-      pathName,
-      authResponse: { authMethod: "token" },
-      sessionEntry: { sessionId: "sess-main", sessionFile },
-      transcriptMessages,
-    });
-
-    expect(first.result.statusCode).toBe(200);
-    expect(second.result.statusCode).toBe(200);
-    expect(readSessionMessagesMock).toHaveBeenCalledTimes(1);
-
-    await fs.writeFile(sessionFile, '{"message":{}}\n{"message":{"content":"updated"}}\n', "utf-8");
-
-    const third = await requestManagedImage({
-      stateDir,
-      pathName,
-      authResponse: { authMethod: "token" },
-      sessionEntry: { sessionId: "sess-main", sessionFile },
-      transcriptMessages,
-    });
-
-    expect(third.result.statusCode).toBe(200);
-    expect(readSessionMessagesMock).toHaveBeenCalledTimes(2);
-  });
-
-  it("reuses the session attachment index for archive-backed requests", async () => {
-    const { attachmentId, sessionKey } = await createFixture(stateDir);
-    const archiveFile = path.join(
-      stateDir,
-      "sessions",
-      "sess-main.jsonl.reset.2026-02-16T22-26-34.000Z",
-    );
-    await fs.mkdir(path.dirname(archiveFile), { recursive: true });
-    await fs.writeFile(archiveFile, '{"message":{}}\n', "utf-8");
-
-    const transcriptMessages = [
-      {
-        __openclaw: { id: "msg-1" },
-        content: [
-          {
-            type: "image",
-            url: `/api/chat/media/outgoing/${encodeURIComponent(sessionKey)}/${attachmentId}/full`,
-            openUrl: `/api/chat/media/outgoing/${encodeURIComponent(sessionKey)}/${attachmentId}/full`,
-          },
-        ],
-      },
-    ];
-
-    const pathName = `/api/chat/media/outgoing/${encodeURIComponent(sessionKey)}/${attachmentId}/full`;
-    const first = await requestManagedImage({
-      stateDir,
-      pathName,
-      authResponse: { authMethod: "token" },
-      sessionEntry: { sessionId: "sess-main" },
-      resolvedTranscriptPath: archiveFile,
-      transcriptMessages,
-    });
-    const second = await requestManagedImage({
-      stateDir,
-      pathName,
-      authResponse: { authMethod: "token" },
-      sessionEntry: { sessionId: "sess-main" },
-      resolvedTranscriptPath: archiveFile,
-      transcriptMessages,
-    });
-
-    expect(first.result.statusCode).toBe(200);
-    expect(second.result.statusCode).toBe(200);
-    expect(readSessionMessagesMock).toHaveBeenCalledTimes(1);
-  });
-
-  it("does not cache a session attachment index when the transcript changes during the read", async () => {
-    const { attachmentId, sessionKey } = await createFixture(stateDir);
-    const sessionFile = path.join(stateDir, "sessions", "sess-main.jsonl");
-    await fs.mkdir(path.dirname(sessionFile), { recursive: true });
-    await fs.writeFile(sessionFile, '{"message":{}}\n', "utf-8");
-
-    const transcriptMessages = [
-      {
-        __openclaw: { id: "msg-1" },
-        content: [
-          {
-            type: "image",
-            url: `/api/chat/media/outgoing/${encodeURIComponent(sessionKey)}/${attachmentId}/full`,
-            openUrl: `/api/chat/media/outgoing/${encodeURIComponent(sessionKey)}/${attachmentId}/full`,
-          },
-        ],
-      },
-    ];
-
-    let mutatedTranscript = false;
-    const pathName = `/api/chat/media/outgoing/${encodeURIComponent(sessionKey)}/${attachmentId}/full`;
-    const first = await requestManagedImage({
-      stateDir,
-      pathName,
-      authResponse: { authMethod: "token" },
-      sessionEntry: { sessionId: "sess-main", sessionFile },
-      transcriptMessages,
-      onReadTranscriptMessages: async () => {
-        if (!mutatedTranscript) {
-          mutatedTranscript = true;
-          await fs.appendFile(sessionFile, '{"message":{"content":"updated"}}\n', "utf-8");
-        }
-      },
-    });
-    const second = await requestManagedImage({
-      stateDir,
-      pathName,
-      authResponse: { authMethod: "token" },
-      sessionEntry: { sessionId: "sess-main", sessionFile },
-      transcriptMessages,
-    });
-
-    expect(first.result.statusCode).toBe(200);
-    expect(second.result.statusCode).toBe(200);
-    expect(readSessionMessagesMock).toHaveBeenCalledTimes(2);
-  });
 });
 
 describe("createManagedOutgoingImageBlocks", () => {
@@ -1374,8 +1422,8 @@ describe("createManagedOutgoingImageBlocks", () => {
   });
 
   afterEach(async () => {
+    await closeOpenClawStateDatabaseAsync();
     closeOpenClawStateDatabaseForTest();
-    setMediaStoreNetworkDepsForTest();
     await fs.rm(stateDir, { recursive: true, force: true });
   });
 
@@ -1398,7 +1446,7 @@ describe("createManagedOutgoingImageBlocks", () => {
     const attachmentId = requireAttachmentIdFromUrl(block.url);
     expect(block.artifactId).toBe(`${MANAGED_OUTGOING_IMAGE_ARTIFACT_ID_PREFIX}${attachmentId}`);
     expect(block.sizeBytes).toBe(Buffer.from(TINY_PNG_BASE64, "base64").byteLength);
-    const record = readManagedImageRecord(attachmentId, stateDir);
+    const record = await readManagedImageRecord(attachmentId, stateDir);
     expect(record?.original.mediaSubdir).toBe(MANAGED_OUTGOING_ORIGINALS_SUBDIR);
     expect(record?.original.mediaId).toMatch(/\.png$/);
   });
@@ -1419,7 +1467,9 @@ describe("createManagedOutgoingImageBlocks", () => {
       const block = requireBlock(blocks);
       const attachmentId = requireAttachmentIdFromUrl(block.url);
 
-      expect(readManagedImageRecord(attachmentId, stateDir)?.original.filename).toBe(expectedName);
+      expect((await readManagedImageRecord(attachmentId, stateDir))?.original.filename).toBe(
+        expectedName,
+      );
 
       const { result } = await requestManagedImage({
         stateDir,
@@ -1465,7 +1515,7 @@ describe("createManagedOutgoingImageBlocks", () => {
       });
       const attachmentId = requireAttachmentIdFromUrl(block.url);
       expect(block.artifactId).toBe(`${MANAGED_OUTGOING_MEDIA_ARTIFACT_ID_PREFIX}${attachmentId}`);
-      expect(readManagedImageRecord(attachmentId, stateDir)?.original).toMatchObject({
+      expect((await readManagedImageRecord(attachmentId, stateDir))?.original).toMatchObject({
         contentType,
         width: null,
         height: null,
@@ -1511,7 +1561,8 @@ describe("createManagedOutgoingImageBlocks", () => {
 
       expect(block).toMatchObject({ type: kind, fileName: expectedName });
       expect(
-        readManagedImageRecord(requireAttachmentIdFromUrl(pathName), stateDir)?.original.filename,
+        (await readManagedImageRecord(requireAttachmentIdFromUrl(pathName), stateDir))?.original
+          .filename,
       ).toBe(expectedName);
 
       const { result } = await requestManagedImage({
@@ -1642,7 +1693,7 @@ describe("createManagedOutgoingImageBlocks", () => {
         },
       },
     ]);
-    expect(listManagedImageRecordEntries({ stateDir })).toEqual([]);
+    expect(await listManagedImageRecordEntries({ stateDir })).toEqual([]);
     await expectPathMissing(path.join(stateDir, "media", "outgoing", "originals"));
   });
 
@@ -1784,8 +1835,8 @@ describe("createManagedOutgoingImageBlocks", () => {
         expect(JSON.stringify(block)).not.toContain("preview");
 
         const attachmentId = requireAttachmentIdFromUrl(block.url);
-        const record = readManagedImageRecord(attachmentId, stateDir);
-        const originalPath = requireManagedOriginalPath(stateDir, attachmentId);
+        const record = await readManagedImageRecord(attachmentId, stateDir);
+        const originalPath = await requireManagedOriginalPath(stateDir, attachmentId);
         expect(record?.original.filename).toMatch(/\.png$/);
         expect(originalPath).not.toBe(sourcePath);
         expect(originalPath).toContain(path.join(stateDir, "media", "outgoing", "originals"));
@@ -1806,22 +1857,21 @@ describe("createManagedOutgoingImageBlocks", () => {
       upstream.listen(0, "127.0.0.1", resolve);
     });
     const address = upstream.address() as AddressInfo;
-    setMediaStoreNetworkDepsForTest({
-      resolvePinnedHostname: async (hostname) => ({
-        hostname,
-        addresses: ["127.0.0.1"],
-        lookup: createPinnedLookup({ hostname, addresses: ["127.0.0.1"] }),
-      }),
-    });
 
     try {
       await withEnvAsync({ OPENCLAW_STATE_DIR: stateDir }, async () => {
         const sourceUrl = `http://127.0.0.1:${address.port}/remote-cat.png?sig=secret`;
-        const blocks = await createManagedOutgoingImageBlocks({
-          stateDir,
-          sessionKey: "agent:main:main",
-          mediaUrls: [sourceUrl],
-        });
+        const matchedUrls: string[] = [];
+        const blocks = await withStoreRemoteFixture(
+          { url: sourceUrl, onMatch: (url) => matchedUrls.push(url) },
+          () =>
+            createManagedOutgoingImageBlocks({
+              stateDir,
+              sessionKey: "agent:main:main",
+              mediaUrls: [sourceUrl],
+            }),
+        );
+        expect(matchedUrls).toEqual([sourceUrl]);
 
         expect(blocks).toHaveLength(1);
         const block = requireBlock(blocks);
@@ -1834,15 +1884,14 @@ describe("createManagedOutgoingImageBlocks", () => {
         expect(JSON.stringify(block)).not.toContain("sig=secret");
 
         const attachmentId = requireAttachmentIdFromUrl(block.url);
-        const record = readManagedImageRecord(attachmentId, stateDir);
-        const originalPath = requireManagedOriginalPath(stateDir, attachmentId);
+        const record = await readManagedImageRecord(attachmentId, stateDir);
+        const originalPath = await requireManagedOriginalPath(stateDir, attachmentId);
         expect(originalPath).toContain(path.join(stateDir, "media", "outgoing", "originals"));
         expect(JSON.stringify(record)).not.toContain("127.0.0.1");
         expect(JSON.stringify(record)).not.toContain("sig=secret");
         expect(await fs.readFile(originalPath)).toEqual(imageBuffer);
       });
     } finally {
-      setMediaStoreNetworkDepsForTest();
       await new Promise<void>((resolve, reject) => {
         upstream.close((error) => (error ? reject(error) : resolve()));
       });
@@ -1875,7 +1924,7 @@ describe("createManagedOutgoingImageBlocks", () => {
           });
 
           const attachmentId = requireAttachmentIdFromUrl(blocks[0]?.url);
-          const record = readManagedImageRecord(attachmentId, splitStateDir);
+          const record = await readManagedImageRecord(attachmentId, splitStateDir);
           if (!record) {
             throw new Error(`expected managed image record ${attachmentId}`);
           }
@@ -1909,6 +1958,7 @@ describe("createManagedOutgoingImageBlocks", () => {
         },
       );
     } finally {
+      await closeOpenClawStateDatabaseAsync();
       closeOpenClawStateDatabaseForTest();
       await fs.rm(openClawHome, { recursive: true, force: true });
       await fs.rm(externalConfigDir, { recursive: true, force: true });
@@ -1940,18 +1990,51 @@ describe("createManagedOutgoingImageBlocks", () => {
     ).rejects.toThrow(/0MB limit|32 bytes|byte limit/i);
   });
 
-  it("adds a warning block when an image is resized to fit limits", async () => {
-    const blocks = await createManagedOutgoingImageBlocks({
-      sessionKey: "agent:main:main",
-      mediaUrls: [await createPngDataUrl(200, 120)],
-      stateDir,
-      limits: { maxWidth: 64, maxHeight: 64, maxPixels: 4096 },
-    });
+  it.each([
+    { orientation: undefined, dimensions: "200×120" },
+    { orientation: 5, dimensions: "120×200" },
+    { orientation: 6, dimensions: "120×200" },
+    { orientation: 7, dimensions: "120×200" },
+    { orientation: 8, dimensions: "120×200" },
+  ])(
+    "reports display dimensions in resize warnings for orientation $orientation",
+    async ({ orientation, dimensions }) => {
+      let mediaUrl = await createPngDataUrl(200, 120);
+      if (orientation !== undefined) {
+        const jpeg = await resizeToJpeg({
+          buffer: createSolidPngBuffer(200, 120, { r: 24, g: 64, b: 128 }),
+          maxSide: 200,
+          quality: 80,
+        });
+        // EXIF IFD0 contains one SHORT orientation tag; pixel axes remain 200×120.
+        const exif = Buffer.from(
+          "ffe1002245786966000049492a0008000000010012010300010000000100000000000000",
+          "hex",
+        );
+        exif.writeUInt16LE(orientation, 28);
+        const rotated = Buffer.concat([jpeg.subarray(0, 2), exif, jpeg.subarray(2)]);
+        expect(readImageProbeFromHeader(rotated)).toMatchObject({
+          width: 200,
+          height: 120,
+          orientation,
+        });
+        mediaUrl = `data:image/jpeg;base64,${rotated.toString("base64")}`;
+      }
+      const blocks = await createManagedOutgoingImageBlocks({
+        sessionKey: "agent:main:main",
+        mediaUrls: [mediaUrl],
+        stateDir,
+        limits: { maxWidth: 64, maxHeight: 64, maxPixels: 4096 },
+      });
 
-    expect(blocks).toHaveLength(2);
-    expect(blocks[0]?.type).toBe("image");
-    expect(requireBlock(blocks, 1).type).toBe("text");
-  });
+      expect(blocks).toHaveLength(2);
+      expect(blocks[0]?.type).toBe("image");
+      expect(requireBlock(blocks, 1)).toMatchObject({
+        type: "text",
+        text: expect.stringContaining(`resized from ${dimensions} to `),
+      });
+    },
+  );
 
   it("updates generated image filenames to the actual format after resizing", async () => {
     const blocks = await createManagedOutgoingImageBlocks({
@@ -1962,7 +2045,7 @@ describe("createManagedOutgoingImageBlocks", () => {
       limits: { maxWidth: 64, maxHeight: 64, maxPixels: 4096 },
     });
     const block = requireBlock(blocks);
-    const record = readManagedImageRecord(requireAttachmentIdFromUrl(block.url), stateDir);
+    const record = await readManagedImageRecord(requireAttachmentIdFromUrl(block.url), stateDir);
 
     expect(record?.original.contentType).toBe("image/jpeg");
     expect(record?.original.filename).toBe("generated-poster.jpg");
@@ -2097,7 +2180,7 @@ describe("createManagedOutgoingImageBlocks", () => {
       },
     ]);
     expect(onPrepareError).toHaveBeenCalledOnce();
-    expect(listManagedImageRecordEntries({ stateDir })).toEqual([]);
+    expect(await listManagedImageRecordEntries({ stateDir })).toEqual([]);
     const originalsDir = path.join(stateDir, "media", MANAGED_OUTGOING_ORIGINALS_SUBDIR);
     await expectPathMissing(originalsDir);
   });
@@ -2160,11 +2243,11 @@ describe("createManagedOutgoingImageBlocks", () => {
       }),
     ).rejects.toThrow(/could not be prepared/u);
 
-    expect(listManagedImageRecordEntries({ stateDir })).toEqual([]);
+    expect(await listManagedImageRecordEntries({ stateDir })).toEqual([]);
   });
 
   it("accepts URL images up to the configured managed-image byte limit", async () => {
-    const imageBuffer = await createNoisyPngBuffer(1600, 1200);
+    const imageBuffer = createNoisyPngBuffer(1600, 1200);
     expect(imageBuffer.byteLength).toBeGreaterThan(5 * 1024 * 1024);
     expect(imageBuffer.byteLength).toBeLessThan(DEFAULT_MANAGED_IMAGE_ATTACHMENT_LIMITS.maxBytes);
 
@@ -2177,27 +2260,26 @@ describe("createManagedOutgoingImageBlocks", () => {
       server.listen(0, "127.0.0.1", resolve);
     });
     const address = server.address() as AddressInfo;
-    setMediaStoreNetworkDepsForTest({
-      resolvePinnedHostname: async (hostname) => ({
-        hostname,
-        addresses: ["127.0.0.1"],
-        lookup: createPinnedLookup({ hostname, addresses: ["127.0.0.1"] }),
-      }),
-    });
 
     try {
       await withEnvAsync({ OPENCLAW_STATE_DIR: stateDir }, async () => {
-        const blocks = await createManagedOutgoingImageBlocks({
-          sessionKey: "agent:main:main",
-          mediaUrls: [`http://127.0.0.1:${address.port}/large-image.png`],
-          stateDir,
-        });
+        const sourceUrl = `http://127.0.0.1:${address.port}/large-image.png`;
+        const matchedUrls: string[] = [];
+        const blocks = await withStoreRemoteFixture(
+          { url: sourceUrl, onMatch: (url) => matchedUrls.push(url) },
+          () =>
+            createManagedOutgoingImageBlocks({
+              sessionKey: "agent:main:main",
+              mediaUrls: [sourceUrl],
+              stateDir,
+            }),
+        );
+        expect(matchedUrls).toEqual([sourceUrl]);
 
         expect(blocks).toHaveLength(1);
         expect(requireBlock(blocks).type).toBe("image");
       });
     } finally {
-      setMediaStoreNetworkDepsForTest();
       await new Promise<void>((resolve, reject) => {
         server.close((error) => (error ? reject(error) : resolve()));
       });
@@ -2340,6 +2422,31 @@ describe("createManagedOutgoingImageBlocks", () => {
     });
   });
 
+  it("prepares advertised PowerPoint documents as managed attachments", async () => {
+    const pptxPath = path.join(stateDir, "deck.pptx");
+    await fs.writeFile(pptxPath, Buffer.from("PK\x03\x04 pptx placeholder"));
+
+    const blocks = await createManagedOutgoingImageBlocks({
+      sessionKey: "agent:main:main",
+      mediaUrls: [pptxPath],
+      stateDir,
+      localRoots: [stateDir],
+      allowLocalNonImage: true,
+      messageId: "msg-pptx",
+    });
+
+    expect(blocks).toEqual([
+      {
+        type: "attachment",
+        attachment: expect.objectContaining({
+          kind: "document",
+          label: "deck.pptx",
+          mimeType: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        }),
+      },
+    ]);
+  });
+
   it("does not apply the configured image cap to managed audio", async () => {
     const audioPath = path.join(stateDir, "large-audio.mp3");
     await fs.writeFile(audioPath, Buffer.alloc(2048, 1));
@@ -2420,6 +2527,7 @@ describe("attachManagedOutgoingImagesToMessage", () => {
   });
 
   afterEach(async () => {
+    await closeOpenClawStateDatabaseAsync();
     closeOpenClawStateDatabaseForTest();
     await fs.rm(stateDir, { recursive: true, force: true });
   });
@@ -2438,7 +2546,7 @@ describe("attachManagedOutgoingImagesToMessage", () => {
     });
 
     const attachmentId = requireAttachmentIdFromUrl(blocks[0]?.url);
-    const record = readManagedImageRecord(attachmentId, stateDir);
+    const record = await readManagedImageRecord(attachmentId, stateDir);
     expect(record?.messageId).toBe("msg-committed");
     expect(record?.retentionClass).toBe("history");
     expect(typeof record?.updatedAt).toBe("string");
@@ -2456,6 +2564,7 @@ describe("cleanupManagedOutgoingImageRecords", () => {
 
   afterEach(async () => {
     closeOpenClawAgentDatabasesForTest();
+    await closeOpenClawStateDatabaseAsync();
     closeOpenClawStateDatabaseForTest();
     await fs.rm(stateDir, { recursive: true, force: true });
   });
@@ -2503,7 +2612,7 @@ describe("cleanupManagedOutgoingImageRecords", () => {
         stateDir,
       }),
     ).toBe(true);
-    const attached = readManagedImageRecord(fixture.attachmentId, stateDir);
+    const attached = await readManagedImageRecord(fixture.attachmentId, stateDir);
     expect(attached?.messageId).toBe("msg-late");
     expect(attached?.retentionClass).toBe("history");
   });
@@ -2515,10 +2624,13 @@ describe("cleanupManagedOutgoingImageRecords", () => {
       stateDir,
     });
     const attachmentId = requireAttachmentIdFromUrl(blocks[0]?.url);
-    const record = readManagedImageRecord(attachmentId, stateDir);
+    const record = await readManagedImageRecord(attachmentId, stateDir);
     if (!record) {
       throw new Error("expected pending managed media record");
     }
+    const queueContext = captureOpenClawStateWorkerContext({
+      env: { ...process.env, OPENCLAW_STATE_DIR: stateDir },
+    });
     const queueId = await enqueueSessionDelivery(
       {
         kind: "agentTurn",
@@ -2530,7 +2642,7 @@ describe("cleanupManagedOutgoingImageRecords", () => {
           "/tmp/generated.png": blocks as Array<Record<string, unknown>>,
         },
       },
-      stateDir,
+      queueContext,
     );
     const afterTtl = Date.parse(record.createdAt) + 16 * 60 * 1000;
 
@@ -2538,7 +2650,7 @@ describe("cleanupManagedOutgoingImageRecords", () => {
       cleanupManagedOutgoingImageRecords({ stateDir, nowMs: afterTtl }),
     ).resolves.toEqual({ deletedRecordCount: 0, deletedFileCount: 0, retainedCount: 1 });
 
-    await completeSessionDelivery(queueId, stateDir);
+    await completeSessionDelivery(queueId, queueContext);
     await expect(
       cleanupManagedOutgoingImageRecords({ stateDir, nowMs: afterTtl }),
     ).resolves.toEqual({ deletedRecordCount: 1, deletedFileCount: 1, retainedCount: 0 });
@@ -2556,7 +2668,7 @@ describe("cleanupManagedOutgoingImageRecords", () => {
     });
 
     expect(result).toEqual({ deletedRecordCount: 1, deletedFileCount: 1, retainedCount: 0 });
-    expect(readManagedImageRecord(fixture.attachmentId, stateDir)).toBeNull();
+    expect(await readManagedImageRecord(fixture.attachmentId, stateDir)).toBeNull();
     await expectPathMissing(fixture.originalPath);
   });
 
@@ -2577,7 +2689,7 @@ describe("cleanupManagedOutgoingImageRecords", () => {
     }
 
     expect(failed).toEqual({ deletedRecordCount: 0, deletedFileCount: 0, retainedCount: 1 });
-    expect(readManagedImageRecord(fixture.attachmentId, stateDir)).toBeNull();
+    expect(await readManagedImageRecord(fixture.attachmentId, stateDir)).toBeNull();
     await expect(fs.access(fixture.originalPath)).resolves.toBeUndefined();
 
     const retried = await cleanupManagedOutgoingImageRecords({ stateDir });
@@ -2677,7 +2789,7 @@ describe("cleanupManagedOutgoingImageRecords", () => {
     const result = await cleanupManagedOutgoingImageRecords({ stateDir });
 
     expect(result).toEqual({ deletedRecordCount: 0, deletedFileCount: 0, retainedCount: 1 });
-    expect(readManagedImageRecord(fixture.attachmentId, stateDir)).not.toBeNull();
+    expect(await readManagedImageRecord(fixture.attachmentId, stateDir)).not.toBeNull();
     await expect(fs.access(fixture.originalPath)).resolves.toBeUndefined();
     expect(readSessionMessagesMock).not.toHaveBeenCalled();
   });
@@ -2701,7 +2813,7 @@ describe("cleanupManagedOutgoingImageRecords", () => {
     );
 
     expect(result).toEqual({ deletedRecordCount: 0, deletedFileCount: 0, retainedCount: 1 });
-    expect(readManagedImageRecord(fixture.attachmentId, stateDir)).not.toBeNull();
+    expect(await readManagedImageRecord(fixture.attachmentId, stateDir)).not.toBeNull();
     await expect(fs.access(fixture.originalPath)).resolves.toBeUndefined();
     expect(readSessionMessagesMock).not.toHaveBeenCalled();
   });
@@ -2728,7 +2840,7 @@ describe("cleanupManagedOutgoingImageRecords", () => {
     );
 
     expect(result).toEqual({ deletedRecordCount: 0, deletedFileCount: 0, retainedCount: 1 });
-    expect(readManagedImageRecord(fixture.attachmentId, stateDir)).not.toBeNull();
+    expect(await readManagedImageRecord(fixture.attachmentId, stateDir)).not.toBeNull();
     await expect(fs.access(fixture.originalPath)).resolves.toBeUndefined();
     expect(readSessionMessagesMock).not.toHaveBeenCalled();
   });
@@ -2746,7 +2858,7 @@ describe("cleanupManagedOutgoingImageRecords", () => {
     );
 
     expect(result).toEqual({ deletedRecordCount: 0, deletedFileCount: 0, retainedCount: 1 });
-    expect(readManagedImageRecord(fixture.attachmentId, stateDir)).not.toBeNull();
+    expect(await readManagedImageRecord(fixture.attachmentId, stateDir)).not.toBeNull();
     await expect(fs.access(fixture.originalPath)).resolves.toBeUndefined();
     expect(readSessionMessagesMock).not.toHaveBeenCalled();
   });
@@ -2776,7 +2888,7 @@ describe("cleanupManagedOutgoingImageRecords", () => {
     );
 
     expect(result).toEqual({ deletedRecordCount: 0, deletedFileCount: 0, retainedCount: 1 });
-    expect(readManagedImageRecord(fixture.attachmentId, stateDir)).not.toBeNull();
+    expect(await readManagedImageRecord(fixture.attachmentId, stateDir)).not.toBeNull();
     await expect(fs.access(fixture.originalPath)).resolves.toBeUndefined();
     expect(loadSessionEntryMock).not.toHaveBeenCalled();
     expect(readSessionMessagesMock).not.toHaveBeenCalled();
@@ -2809,7 +2921,7 @@ describe("cleanupManagedOutgoingImageRecords", () => {
     );
 
     expect(result).toEqual({ deletedRecordCount: 0, deletedFileCount: 0, retainedCount: 1 });
-    expect(readManagedImageRecord(fixture.attachmentId, stateDir)).not.toBeNull();
+    expect(await readManagedImageRecord(fixture.attachmentId, stateDir)).not.toBeNull();
     await expect(fs.access(fixture.originalPath)).resolves.toBeUndefined();
     expect(loadSessionEntryMock).not.toHaveBeenCalled();
     expect(readSessionMessagesMock).not.toHaveBeenCalled();
@@ -2826,7 +2938,7 @@ describe("cleanupManagedOutgoingImageRecords", () => {
     );
 
     expect(result).toEqual({ deletedRecordCount: 0, deletedFileCount: 0, retainedCount: 1 });
-    expect(readManagedImageRecord(fixture.attachmentId, stateDir)).not.toBeNull();
+    expect(await readManagedImageRecord(fixture.attachmentId, stateDir)).not.toBeNull();
     await expect(fs.access(fixture.originalPath)).resolves.toBeUndefined();
     expect(loadSessionEntryMock).not.toHaveBeenCalled();
     expect(readSessionMessagesMock).not.toHaveBeenCalled();
@@ -2855,7 +2967,7 @@ describe("cleanupManagedOutgoingImageRecords", () => {
     );
 
     expect(result).toEqual({ deletedRecordCount: 0, deletedFileCount: 0, retainedCount: 1 });
-    expect(readManagedImageRecord(fixture.attachmentId, stateDir)).not.toBeNull();
+    expect(await readManagedImageRecord(fixture.attachmentId, stateDir)).not.toBeNull();
     await expect(fs.access(fixture.originalPath)).resolves.toBeUndefined();
     expect(loadSessionEntryMock).not.toHaveBeenCalled();
     expect(readSessionMessagesMock).not.toHaveBeenCalled();
@@ -2898,7 +3010,7 @@ describe("cleanupManagedOutgoingImageRecords", () => {
     );
 
     expect(result).toEqual({ deletedRecordCount: 1, deletedFileCount: 1, retainedCount: 0 });
-    expect(readManagedImageRecord(fixture.attachmentId, stateDir)).toBeNull();
+    expect(await readManagedImageRecord(fixture.attachmentId, stateDir)).toBeNull();
     await expectPathMissing(fixture.originalPath);
   });
 
@@ -2931,7 +3043,7 @@ describe("cleanupManagedOutgoingImageRecords", () => {
     );
 
     expect(result).toEqual({ deletedRecordCount: 0, deletedFileCount: 0, retainedCount: 1 });
-    expect(readManagedImageRecord(fixture.attachmentId, stateDir)).not.toBeNull();
+    expect(await readManagedImageRecord(fixture.attachmentId, stateDir)).not.toBeNull();
     await expect(fs.access(fixture.originalPath)).resolves.toBeUndefined();
     expect(loadSessionEntryMock).not.toHaveBeenCalled();
     expect(readSessionMessagesMock).not.toHaveBeenCalled();
@@ -3202,7 +3314,7 @@ describe("cleanupManagedOutgoingImageRecords", () => {
     });
 
     expect(result).toEqual({ deletedRecordCount: 0, deletedFileCount: 0, retainedCount: 1 });
-    expect(readManagedImageRecord(fixture.attachmentId, stateDir)).not.toBeNull();
+    expect(await readManagedImageRecord(fixture.attachmentId, stateDir)).not.toBeNull();
     await expect(fs.access(fixture.originalPath)).resolves.toBeUndefined();
     expect(loadSessionEntryMock).not.toHaveBeenCalled();
     expect(readSessionMessagesMock).not.toHaveBeenCalled();

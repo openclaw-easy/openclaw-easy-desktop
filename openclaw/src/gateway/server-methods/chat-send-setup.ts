@@ -3,7 +3,10 @@ import type { SessionGoalOperation } from "../../config/sessions/goals-operation
 import { admitChatSend } from "./chat-send-admission.js";
 import { runChatSendPreAdmission } from "./chat-send-pre-admission.js";
 import { normalizeChatSendRequest } from "./chat-send-request.js";
-import { prepareChatSendSession } from "./chat-send-session.js";
+import {
+  prepareChatSendNativeRuntimeRestriction,
+  prepareChatSendSession,
+} from "./chat-send-session.js";
 import type { GatewayRequestHandlerOptions } from "./types.js";
 
 /** Normalize, prepare, and exclusively admit one new chat.send request. */
@@ -13,10 +16,16 @@ export async function prepareAndAdmitChatSend(
     respond,
     context,
     client,
+    hasCurrentClientAuthority,
     sessionMutationAuthorization,
   }: Pick<
     GatewayRequestHandlerOptions,
-    "params" | "respond" | "context" | "client" | "sessionMutationAuthorization"
+    | "params"
+    | "respond"
+    | "context"
+    | "client"
+    | "hasCurrentClientAuthority"
+    | "sessionMutationAuthorization"
   >,
   onAdmissionOwned?: () => Promise<boolean>,
   options?: {
@@ -24,6 +33,15 @@ export async function prepareAndAdmitChatSend(
     goalResume?: SessionGoalOperation & { action: "resume" };
   },
 ) {
+  const assertCurrent =
+    sessionMutationAuthorization || hasCurrentClientAuthority
+      ? () => {
+          sessionMutationAuthorization?.assertCurrent();
+          if (hasCurrentClientAuthority?.() === false) {
+            throw new Error("Gateway caller authority is no longer active.");
+          }
+        }
+      : undefined;
   const normalizedRequest = normalizeChatSendRequest({
     params,
     client,
@@ -57,15 +75,45 @@ export async function prepareAndAdmitChatSend(
     );
     return undefined;
   }
+  if (normalizedRequest.value.mentions) {
+    const mentions = context.mentionInbox?.validateRecipients(
+      client,
+      preparedSession.value.entry
+        ? { sessionKey: preparedSession.value.sessionKey, agentId: preparedSession.value.agentId }
+        : { agentId: preparedSession.value.agentId },
+      normalizedRequest.value.mentions.map((mention) => mention.profileId),
+    );
+    if (!mentions?.ok) {
+      respond(
+        false,
+        undefined,
+        mentions?.error ??
+          errorShape(
+            ErrorCodes.UNAVAILABLE,
+            "Human mentions are unavailable; reconnect and retry.",
+          ),
+      );
+      return undefined;
+    }
+  }
   const shouldAdmit = await runChatSendPreAdmission({
     request: normalizedRequest.value,
     session: preparedSession.value,
     respond,
     context,
     client,
-    assertCurrent: sessionMutationAuthorization?.assertCurrent,
+    assertCurrent,
   });
   if (!shouldAdmit) {
+    return undefined;
+  }
+  const nativeRestriction = prepareChatSendNativeRuntimeRestriction({
+    request: normalizedRequest.value,
+    session: preparedSession.value,
+    client,
+  });
+  if (nativeRestriction) {
+    respond(false, undefined, nativeRestriction);
     return undefined;
   }
   const admitted = await admitChatSend({
@@ -75,6 +123,8 @@ export async function prepareAndAdmitChatSend(
     context,
     client,
     onAdmissionOwned,
+    hasCurrentClientAuthority,
+    assertCurrent,
   });
   if (!admitted.ok) {
     return undefined;

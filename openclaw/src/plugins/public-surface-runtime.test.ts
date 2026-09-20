@@ -1,13 +1,13 @@
 /** Verifies public-surface runtime artifact loading for bundled plugins. */
 import fs from "node:fs";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
 import {
   PUBLIC_SURFACE_SOURCE_EXTENSIONS,
-  normalizeBundledPluginArtifactSubpath,
   resolveBundledPluginPublicSurfacePath,
   resolveBundledPluginSourcePublicSurfacePath,
+  resolvePluginRootPublicSurfacePath,
 } from "./public-surface-runtime.js";
 
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
@@ -69,6 +69,27 @@ describe("bundled plugin public surface runtime", () => {
       ".cts",
       ".cjs",
     ]);
+  });
+
+  it("accepts a public surface whose Windows root and entry use physical aliases", () => {
+    const parent = fs.realpathSync(tempDirs.make("openclaw-public-surface-alias-"));
+    const root = path.join(parent, "canonical-root");
+    const alias = path.join(parent, "root-alias");
+    const entrySource = path.join(root, "index.js");
+    const publicSurface = path.join(root, "api.js");
+    fs.mkdirSync(root);
+    fs.writeFileSync(entrySource, "export default {};\n");
+    fs.writeFileSync(publicSurface, "export {};\n");
+    fs.symlinkSync(root, alias, process.platform === "win32" ? "junction" : "dir");
+    vi.spyOn(process, "platform", "get").mockReturnValue("win32");
+
+    expect(
+      resolvePluginRootPublicSurfacePath({
+        pluginRoot: alias,
+        entrySource,
+        artifactBasename: "api.js",
+      }),
+    ).toBe(publicSurface);
   });
 
   it.each(["my-ngc:nvidia", "../outside", "..\\outside", ".", ".."])(
@@ -212,30 +233,39 @@ describe("bundled plugin public surface runtime", () => {
   });
 
   it("allows plugin-local nested artifact paths", () => {
-    expect(normalizeBundledPluginArtifactSubpath("src/outbound-adapter.js")).toBe(
-      "src/outbound-adapter.js",
-    );
-    expect(normalizeBundledPluginArtifactSubpath("./test-api.js")).toBe("test-api.js");
+    const sourceRoot = tempDirs.make("openclaw-local-public-surface-");
+    for (const artifactBasename of ["src/outbound-adapter.js", "./test-api.js"]) {
+      const modulePath = path.resolve(sourceRoot, "demo", artifactBasename);
+      fs.mkdirSync(path.dirname(modulePath), { recursive: true });
+      fs.writeFileSync(modulePath, "export {};\n");
+
+      expect(
+        resolveBundledPluginSourcePublicSurfacePath({
+          sourceRoot,
+          dirName: "demo",
+          artifactBasename,
+        }),
+      ).toBe(modulePath);
+    }
   });
 
   it("rejects artifact paths that escape the plugin root", () => {
-    expect(() => normalizeBundledPluginArtifactSubpath("../outside.js")).toThrow(
-      /must stay plugin-local/,
-    );
-    expect(() => normalizeBundledPluginArtifactSubpath("src/../outside.js")).toThrow(
-      /must stay plugin-local/,
-    );
-    expect(() => normalizeBundledPluginArtifactSubpath("/tmp/outside.js")).toThrow(
-      /must stay plugin-local/,
-    );
-    expect(() => normalizeBundledPluginArtifactSubpath("..\\outside.js")).toThrow(
-      /must stay plugin-local/,
-    );
-    expect(() => normalizeBundledPluginArtifactSubpath("C:outside.js")).toThrow(
-      /must stay plugin-local/,
-    );
-    expect(() => normalizeBundledPluginArtifactSubpath("src/C:outside.js")).toThrow(
-      /must stay plugin-local/,
-    );
+    const sourceRoot = tempDirs.make("openclaw-local-public-surface-");
+    for (const artifactBasename of [
+      "../outside.js",
+      "src/../outside.js",
+      "/tmp/outside.js",
+      "..\\outside.js",
+      "C:outside.js",
+      "src/C:outside.js",
+    ]) {
+      expect(() =>
+        resolveBundledPluginSourcePublicSurfacePath({
+          sourceRoot,
+          dirName: "demo",
+          artifactBasename,
+        }),
+      ).toThrow(/must stay plugin-local/);
+    }
   });
 });

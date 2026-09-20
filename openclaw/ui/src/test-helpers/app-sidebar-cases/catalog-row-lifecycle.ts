@@ -23,6 +23,7 @@ describe("AppSidebar catalog row lifecycle", () => {
       )!;
       adoptedRow.label = label;
       adoptedRow.displayName = "Captured native title";
+      adoptedRow.boardFace = "dashboard";
       const { sidebar } = await mountSidebar(
         createGateway({} as GatewayBrowserClient),
         sessions.sessions,
@@ -38,6 +39,7 @@ describe("AppSidebar catalog row lifecycle", () => {
       expect(row?.querySelector("[data-session-menu]")?.getAttribute("aria-label")).toContain(
         expected,
       );
+      expect(row?.querySelector("a")?.getAttribute("href")).toBe("/dashboard/main/adopted-title");
     },
   );
   it("uses catalog colors only until the live session owns the row", async () => {
@@ -98,6 +100,83 @@ describe("AppSidebar catalog row lifecycle", () => {
     expect(document.activeElement).toBe(adoptedMenu);
   });
 
+  it.each([
+    { catalogArchive: false, sessionArchive: true, canDelete: false },
+    { catalogArchive: true, sessionArchive: false, canDelete: false },
+    { catalogArchive: true, sessionArchive: true, canDelete: true },
+  ])(
+    "preserves native menus when catalog archive=$catalogArchive and session archive=$sessionArchive",
+    async ({ catalogArchive, sessionArchive, canDelete }) => {
+      const adoptedKey = "agent:main:adopted-menu-triggers";
+      const { sidebar } = await mountSidebar(
+        createGateway({} as GatewayBrowserClient),
+        createSessions("main", ["agent:main:main", adoptedKey]),
+      );
+      const catalogs = catalogPage([
+        {
+          threadId: "thread-adopted-menu-triggers",
+          name: "Adopted menu",
+          sessionKey: adoptedKey,
+        },
+      ]).catalogs;
+      catalogs[0]!.capabilities.archive = catalogArchive;
+      const catalogSession = catalogs[0]!.hosts[0]!.sessions[0]!;
+      catalogSession.canArchive = sessionArchive;
+      catalogSession.canOpenTerminal = true;
+      sidebar.terminalAvailable = true;
+      sidebar.sessionData.sessionCatalogs = catalogs;
+      sidebar.sessionData.requestSessionDataUpdate();
+      await sidebar.updateComplete;
+
+      const row = sidebar.querySelector<HTMLElement>(`[data-session-key="${adoptedKey}"]`);
+      const menuButton = row?.querySelector<HTMLButtonElement>('[data-session-menu="true"]');
+      if (!row || !menuButton) {
+        throw new Error("expected adopted row menu button");
+      }
+      const expectCatalogMenu = () => {
+        const menu = sidebar.querySelector("openclaw-catalog-session-menu");
+        expect(menu).not.toBeNull();
+        expect(menu?.querySelector('wa-dropdown-item[value="viewer"]')).not.toBeNull();
+        expect(menu?.querySelector('wa-dropdown-item[value="terminal"]')).not.toBeNull();
+        expect(
+          menu?.querySelector('wa-dropdown-item[value="terminal"]')?.hasAttribute("disabled"),
+        ).toBe(false);
+        expect(menu?.querySelector('wa-dropdown-item[value="delete"]') !== null).toBe(canDelete);
+      };
+
+      menuButton.click();
+      await sidebar.updateComplete;
+      expectCatalogMenu();
+
+      menuButton.click();
+      await sidebar.updateComplete;
+      expect(sidebar.querySelector("openclaw-catalog-session-menu")).toBeNull();
+
+      for (const event of [
+        new MouseEvent("contextmenu", {
+          bubbles: true,
+          cancelable: true,
+          clientX: 20,
+          clientY: 30,
+        }),
+        new KeyboardEvent("keydown", { key: "ContextMenu", bubbles: true, cancelable: true }),
+        new KeyboardEvent("keydown", {
+          key: "F10",
+          shiftKey: true,
+          bubbles: true,
+          cancelable: true,
+        }),
+      ]) {
+        row.dispatchEvent(event);
+        await sidebar.updateComplete;
+        expectCatalogMenu();
+        document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+        await sidebar.updateComplete;
+        expect(sidebar.querySelector("openclaw-catalog-session-menu")).toBeNull();
+      }
+    },
+  );
+
   it("clears marquee state when a catalog label changes", async () => {
     const gateway = createGateway({} as GatewayBrowserClient);
     const { sidebar } = await mountSidebar(gateway, createSessions("main", ["agent:main:main"]));
@@ -109,13 +188,15 @@ describe("AppSidebar catalog row lifecycle", () => {
       await sidebar.updateComplete;
     };
     await setLabel("A long catalog session title");
-    const oldLabel = sidebar.querySelector<HTMLElement>(".hover-marquee");
+    const labelSelector = "[data-catalog-session-key] .sidebar-recent-session__name";
+    const oldLabel = sidebar.querySelector<HTMLElement>(labelSelector);
+    expect(oldLabel?.textContent).toBe("A long catalog session title");
     oldLabel?.classList.add("hover-marquee--scrolling");
     oldLabel?.style.setProperty("--hover-marquee-shift", "-80px");
     await setLabel("Short");
 
-    const updatedLabel = sidebar.querySelector<HTMLElement>(".hover-marquee");
-    expect(updatedLabel).not.toBe(oldLabel);
+    const updatedLabel = sidebar.querySelector<HTMLElement>(labelSelector);
+    expect(updatedLabel?.textContent).toBe("Short");
     expect(updatedLabel?.classList.contains("hover-marquee--scrolling")).toBe(false);
     expect(updatedLabel?.style.getPropertyValue("--hover-marquee-shift")).toBe("");
   });

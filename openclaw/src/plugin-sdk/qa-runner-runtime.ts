@@ -1,10 +1,8 @@
 // QA runner runtime helpers expose plugin QA scenarios through the CLI command surface.
 import type { Command } from "commander";
-import type { PluginManifestRecord } from "../plugins/manifest-registry.js";
-import {
-  loadBundledPluginManifestRegistry,
-  loadPluginManifestRegistryCore,
-} from "../plugins/manifest-registry.js";
+import { loadBundledPluginManifestRegistry } from "../plugins/manifest-registry-build.js";
+import { loadPluginManifestRegistryCore } from "../plugins/manifest-registry.js";
+import type { PluginManifestRecord } from "../plugins/manifest-registry.types.js";
 import type { OpenClawConfig } from "./config-contracts.js";
 import {
   loadBundledPluginPublicSurfaceModuleSync,
@@ -19,6 +17,7 @@ import type {
 } from "./qa-channel-protocol.js";
 
 type QaRunnerTransportPolicy = {
+  directMessageOnly?: true;
   requireGroupMention?: true;
   senderAllowlist?: readonly string[];
   topLevelReplies?: true;
@@ -115,6 +114,14 @@ type QaRunnerTransportFlowPreparationInput = {
   timeoutMs: number;
 };
 
+export type QaRunnerTransportArtifacts = {
+  artifacts: readonly {
+    kind: "channel-capability-matrix" | "channel-driver-smoke";
+    path: string;
+  }[];
+  reportNotes?: readonly string[];
+};
+
 type QaRunnerTransportAdapterDefinition = {
   id: string;
   label: string;
@@ -154,16 +161,21 @@ type QaRunnerTransportAdapterDefinition = {
     timeoutMs?: number;
     pollIntervalMs?: number;
   }) => Promise<void>;
-  buildAgentDelivery: (params: { target: string }) => {
+  buildAgentDelivery: (params: { target: string; threadId?: string }) => {
     channel: string;
     to?: string;
     replyChannel: string;
     replyTo: string;
+    threadId?: string;
   };
   createRuntimeEnvPatch?: () => NodeJS.ProcessEnv;
+  createRuntimePreloads?: () => readonly string[];
   prepareFlow?: (
     input: QaRunnerTransportFlowPreparationInput,
   ) => Promise<Record<string, unknown> | void>;
+  captureArtifacts?: (params: {
+    outputDir: string;
+  }) => Promise<QaRunnerTransportArtifacts | undefined>;
   handleAction: (params: {
     action: "delete" | "edit" | "react" | "thread-create";
     args: Record<string, unknown>;
@@ -208,6 +220,8 @@ export type QaRunnerCliRegistration = {
 
 /** Normalized options passed from live-transport QA CLIs into lane runners. */
 export type LiveTransportQaCommandOptions = {
+  channelDriver?: string;
+  concurrency?: number;
   repoRoot?: string;
   outputDir?: string;
   providerMode?: string;
@@ -241,6 +255,8 @@ export type LiveTransportQaSuiteCommandOptions = {
 };
 
 type LiveTransportQaCommanderOptions = {
+  channelDriver?: string;
+  concurrency?: number;
   repoRoot?: string;
   outputDir?: string;
   providerMode?: string;
@@ -270,12 +286,22 @@ export type LiveTransportQaCredentialCliOptions = {
 /** Declarative command metadata and runner used to install a live-transport QA CLI. */
 export type LiveTransportQaCliRegistrationOptions = {
   commandName: string;
+  concurrency?: {
+    help: string;
+    parse: (value: string) => number;
+  };
   credentialFileHelp?: string;
   credentialOptions?: LiveTransportQaCredentialCliOptions;
   defaultProviderMode: string;
   description: string;
   providerModeHelp: string;
+  /** When set, registers `--list-scenarios` with this help text. */
   listScenariosHelp?: string;
+  /**
+   * Preserve the standard command payload shape when selection flags are inactive.
+   * Specialized registrations may leave this false to preserve their legacy option shape.
+   */
+  normalizeInactiveSelectionOptions?: boolean;
   outputDirHelp: string;
   profileHelp?: string;
   failFastHelp?: string;
@@ -302,8 +328,32 @@ function collectLiveTransportQaStringOption(value: string, previous: string[]) {
 
 function mapLiveTransportQaCommanderOptions(
   opts: LiveTransportQaCommanderOptions,
+  normalizeInactiveSelectionOptions: boolean,
 ): LiveTransportQaCommandOptions {
+  if (!normalizeInactiveSelectionOptions) {
+    return {
+      ...(opts.channelDriver ? { channelDriver: opts.channelDriver } : {}),
+      concurrency: opts.concurrency,
+      repoRoot: opts.repoRoot,
+      outputDir: opts.outputDir,
+      providerMode: opts.providerMode,
+      primaryModel: opts.model,
+      alternateModel: opts.altModel,
+      fastMode: opts.fast,
+      allowFailures: opts.allowFailures,
+      failFast: opts.failFast,
+      profile: opts.profile,
+      scenarioIds: opts.scenario,
+      listScenarios: opts.listScenarios,
+      sutAccountId: opts.sutAccount,
+      credentialFile: opts.credentialFile,
+      credentialSource: opts.credentialSource,
+      credentialRole: opts.credentialRole,
+    };
+  }
   return {
+    ...(opts.channelDriver ? { channelDriver: opts.channelDriver } : {}),
+    ...(opts.concurrency !== undefined ? { concurrency: opts.concurrency } : {}),
     repoRoot: opts.repoRoot,
     outputDir: opts.outputDir,
     providerMode: opts.providerMode,
@@ -314,14 +364,13 @@ function mapLiveTransportQaCommanderOptions(
     failFast: opts.failFast,
     profile: opts.profile,
     scenarioIds: opts.scenario,
-    listScenarios: opts.listScenarios,
+    listScenarios: opts.listScenarios || undefined,
     sutAccountId: opts.sutAccount,
-    credentialFile: opts.credentialFile,
+    ...(opts.credentialFile ? { credentialFile: opts.credentialFile } : {}),
     credentialSource: opts.credentialSource,
     credentialRole: opts.credentialRole,
   };
 }
-
 function registerLiveTransportQaCli(
   params: LiveTransportQaCliRegistrationOptions & {
     qa: Command;
@@ -338,6 +387,10 @@ function registerLiveTransportQaCli(
     .option("--alt-model <ref>", "Alternate provider/model ref")
     .option("--scenario <id>", params.scenarioHelp, collectLiveTransportQaStringOption, [])
     .option("--fast", "Enable provider fast mode where supported");
+
+  if (params.concurrency) {
+    command.option("--concurrency <count>", params.concurrency.help, params.concurrency.parse);
+  }
 
   if (params.allowFailuresHelp) {
     command.option("--allow-failures", params.allowFailuresHelp, false);
@@ -373,7 +426,13 @@ function registerLiveTransportQaCli(
   }
 
   command.action(async (opts: LiveTransportQaCommanderOptions) => {
-    await params.run(mapLiveTransportQaCommanderOptions(opts));
+    // The collector drops blanks; explicit selection must not broaden into a default run.
+    if (command.getOptionValueSource("scenario") === "cli" && opts.scenario?.length === 0) {
+      throw new Error("--scenario must name at least one non-empty scenario id.");
+    }
+    await params.run(
+      mapLiveTransportQaCommanderOptions(opts, params.normalizeInactiveSelectionOptions === true),
+    );
   });
 }
 

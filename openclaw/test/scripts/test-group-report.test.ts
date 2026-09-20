@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { expectDefined } from "@openclaw/normalization-core";
-import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   buildGroupedTestComparison,
   buildGroupedTestReport,
@@ -25,6 +25,7 @@ import {
   spawnText,
 } from "../../scripts/test-group-report.mts";
 import { withEnv } from "../../src/test-utils/env.js";
+import { killPidIfAlive } from "../../src/test-utils/process-tree.js";
 import {
   isProcessAlive,
   waitForChildClose,
@@ -33,9 +34,10 @@ import {
   waitForPidFile,
 } from "../helpers/process-wait.js";
 import { startProcessWatchdogFixture } from "../helpers/process-watchdog.js";
-import { cleanupTempDirs, makeTempDir } from "../helpers/temp-dir.js";
+import { cleanupTempDirs, makeTempDir, useAutoCleanupTempDirTracker } from "../helpers/temp-dir.js";
 
 const tempDirs = new Set<string>();
+const cliTempDirs = useAutoCleanupTempDirTracker(afterEach);
 const tsxImport = import.meta.resolve("tsx");
 
 afterAll(() => {
@@ -102,6 +104,44 @@ describe("scripts/test-group-report grouping", () => {
 });
 
 describe("scripts/test-group-report aggregation", () => {
+  it("profiles a selected test through the real Node wrapper", async () => {
+    const root = cliTempDirs.make("openclaw-test-group-report-cli-");
+    const output = path.join(root, "group-report.json");
+    const target = "src/shared/human-list.test.ts";
+    const result = await spawnText(
+      process.execPath,
+      [
+        "--import",
+        "./scripts/tsx.mjs",
+        "scripts/test-group-report.mts",
+        "--config",
+        "test/vitest/vitest.unit-fast.config.ts",
+        "--no-rss",
+        "--output",
+        output,
+        "--",
+        target,
+      ],
+      {
+        env: {
+          ...process.env,
+          NODE_OPTIONS: "--max-old-space-size=512",
+          OPENCLAW_VITEST_ENABLE_MAGLEV: "0",
+          OPENCLAW_VITEST_INCLUDE_FILE: undefined,
+          OPENCLAW_VITEST_FS_MODULE_CACHE_PATH: path.join(root, "cache"),
+        },
+        timeoutMs: 60_000,
+      },
+    );
+
+    expect(result.status, result.output).toBe(0);
+    expect(JSON.parse(fs.readFileSync(output, "utf8"))).toMatchObject({
+      totals: { fileCount: 1, testCount: expect.any(Number) },
+      topFiles: [expect.objectContaining({ file: target })],
+      runs: [expect.objectContaining({ status: 0 })],
+    });
+  });
+
   it("aggregates file durations by group and config", () => {
     const report = buildGroupedTestReport({
       groupBy: "area",
@@ -727,6 +767,9 @@ describe("scripts/test-group-report arg parsing", () => {
         "--allow-failures",
         "--",
         "--maxWorkers=1",
+        "--",
+        "--limit",
+        "99",
       ]),
     ).toStrictEqual({
       allowFailures: true,
@@ -743,7 +786,7 @@ describe("scripts/test-group-report arg parsing", () => {
       rss: process.platform !== "win32",
       timeoutMs: 1800000,
       topFiles: 25,
-      vitestArgs: ["--maxWorkers=1"],
+      vitestArgs: ["--maxWorkers=1", "--", "--limit", "99"],
     });
   });
 
@@ -796,6 +839,51 @@ describe("scripts/test-group-report arg parsing", () => {
       killGraceMs: 250,
       timeoutMs: 5000,
     });
+  });
+
+  it("keeps repeated boolean controls idempotent", () => {
+    expect(
+      parseTestGroupReportArgs([
+        "--help",
+        "--help",
+        "--allow-failures",
+        "--allow-failures",
+        "--full-suite",
+        "--full-suite",
+        "--no-rss",
+        "--no-rss",
+      ]),
+    ).toMatchObject({
+      allowFailures: true,
+      fullSuite: true,
+      help: true,
+      rss: false,
+    });
+  });
+
+  it.each([
+    "--config=a.ts",
+    "--compare=before.json",
+    "--report=a.json",
+    "--group-by=area",
+    "--output=report.json",
+    "--limit=5",
+    "--max-test-ms=100",
+    "--timeout-ms=1000",
+    "--kill-grace-ms=100",
+    "--concurrency=2",
+    "--top-files=5",
+  ])("rejects split-option inline form %s", (arg) => {
+    expect(() => parseTestGroupReportArgs([arg])).toThrow(`Unknown option: ${arg}`);
+  });
+
+  it("does not let help short-circuit later parse errors", () => {
+    expect(() => parseTestGroupReportArgs(["--help", "--unknown"])).toThrow(
+      "Unknown option: --unknown",
+    );
+    expect(() => parseTestGroupReportArgs(["--help", "--limit"])).toThrow(
+      "--limit requires a value",
+    );
   });
 
   it("rejects malformed positive integer flags", () => {
@@ -882,6 +970,31 @@ describe("scripts/test-group-report arg parsing", () => {
       "a.json",
       "b.json",
     ]);
+  });
+
+  it("validates a repeated value before reporting a duplicate", () => {
+    for (const flag of [
+      "--limit",
+      "--top-files",
+      "--max-test-ms",
+      "--timeout-ms",
+      "--kill-grace-ms",
+      "--concurrency",
+    ]) {
+      expect(() => parseTestGroupReportArgs([flag, "5", flag])).toThrow(`${flag} requires a value`);
+      expect(() => parseTestGroupReportArgs([flag, "5", flag, "20x"])).toThrow(
+        `${flag} must be a positive integer`,
+      );
+    }
+    expect(() =>
+      parseTestGroupReportArgs([
+        "--compare",
+        "before.json",
+        "after.json",
+        "--compare",
+        "second-before.json",
+      ]),
+    ).toThrow("--compare requires a value");
   });
 });
 
@@ -1011,9 +1124,7 @@ describe("scripts/test-group-report child process guard", () => {
       });
       expect(parsed.output).toContain("sending SIGKILL");
     } finally {
-      if (childPid !== undefined && isProcessAlive(childPid)) {
-        process.kill(childPid, "SIGKILL");
-      }
+      killPidIfAlive(childPid);
       fs.rmSync(tempDir, { recursive: true, force: true });
     }
   });
@@ -1082,9 +1193,7 @@ describe("scripts/test-group-report child process guard", () => {
       if (runner?.pid && isProcessAlive(runner.pid)) {
         runner.kill("SIGKILL");
       }
-      if (childPid !== undefined && isProcessAlive(childPid)) {
-        process.kill(childPid, "SIGKILL");
-      }
+      killPidIfAlive(childPid);
       fs.rmSync(tempDir, { recursive: true, force: true });
     }
   });
@@ -1140,8 +1249,8 @@ describe("scripts/test-group-report child process guard", () => {
       try {
         await releaseAndWait();
       } finally {
-        if (childPid !== undefined && isProcessAlive(childPid)) {
-          process.kill(childPid, "SIGKILL");
+        if (childPid !== undefined) {
+          killPidIfAlive(childPid);
           await waitForDead(childPid, 2_000);
         }
       }

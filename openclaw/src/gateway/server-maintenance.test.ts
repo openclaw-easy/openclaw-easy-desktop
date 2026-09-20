@@ -2,8 +2,10 @@
 // stale chat buffers, expired runs, health summaries, and timer disposal.
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { managedWorktrees } from "../agents/worktrees/service.js";
+import type { OpenClawConfig } from "../config/types.openclaw.js";
 import {
   isGatewayWorkAdmissionClosed,
+  onGatewaySuspendAdmissionChange,
   resetGatewayWorkAdmission,
   tryBeginGatewayRootWorkAdmission,
 } from "../process/gateway-work-admission.js";
@@ -13,6 +15,7 @@ import type { HealthSummary } from "./health/types.js";
 import { createChatAbortMarker } from "./server-chat-state.js";
 import { DEDUPE_MAX, DEDUPE_TTL_MS, TICK_INTERVAL_MS } from "./server-constants.js";
 import { pendingChatSendDedupeKey } from "./server-shared.js";
+import * as staleInstall from "./stale-install.js";
 import { createGatewayMaintenanceStateForTest } from "./test-helpers.maintenance-state.js";
 
 const cleanOldMediaMock = vi.fn(async () => {});
@@ -23,30 +26,11 @@ const cleanupManagedOutgoingMediaRecordsMock = vi.fn(async () => ({
   deletedFileCount: 0,
   retainedCount: 0,
 }));
-const pruneExpiredDeliveryQueueTombstonesMock = vi.fn();
 const pruneExpiredDevicePairSetupCompletionsMock = vi.fn(async () => 0);
-const pruneOrphanedDeliveryQueueMediaMock = vi.fn(async () => undefined);
 
 vi.mock("../infra/device-bootstrap.js", () => ({
   pruneExpiredDevicePairSetupCompletions: pruneExpiredDevicePairSetupCompletionsMock,
 }));
-
-vi.mock("../infra/delivery-queue-sqlite.js", async () => {
-  const actual = await vi.importActual<typeof import("../infra/delivery-queue-sqlite.js")>(
-    "../infra/delivery-queue-sqlite.js",
-  );
-  return {
-    ...actual,
-    pruneExpiredDeliveryQueueTombstones: pruneExpiredDeliveryQueueTombstonesMock,
-  };
-});
-
-vi.mock("../infra/outbound/delivery-queue-media-spool.js", async () => {
-  const actual = await vi.importActual<
-    typeof import("../infra/outbound/delivery-queue-media-spool.js")
-  >("../infra/outbound/delivery-queue-media-spool.js");
-  return { ...actual, pruneOrphanedDeliveryQueueMedia: pruneOrphanedDeliveryQueueMediaMock };
-});
 
 vi.mock("../media/store.js", async () => {
   const actual = await vi.importActual<typeof import("../media/store.js")>("../media/store.js");
@@ -98,7 +82,7 @@ function seedStaleRunBuffers(deps: MaintenanceTimerDeps, runId: string): void {
     rawBuffer: "raw buffer",
     bufferUpdatedAt: staleRunTimestamp(),
     deltaSentAt: staleRunTimestamp(),
-    assistantScope: { itemId: "assistant-1", prefix: "" },
+    assistantScope: { itemId: "assistant-1", prefix: "", boundaryNewlines: 0, separatorLength: 0 },
     deltaLastBroadcastText: "buffer",
   });
 }
@@ -109,7 +93,7 @@ function expectStaleRunBuffersPresent(deps: MaintenanceTimerDeps, runId: string)
     rawBuffer: "raw buffer",
     bufferUpdatedAt: expect.any(Number),
     deltaSentAt: expect.any(Number),
-    assistantScope: { itemId: "assistant-1", prefix: "" },
+    assistantScope: { itemId: "assistant-1", prefix: "", boundaryNewlines: 0, separatorLength: 0 },
     deltaLastBroadcastText: "buffer",
   });
 }
@@ -160,6 +144,7 @@ async function stopMaintenanceTimers(timers: {
   dedupeCleanup: NodeJS.Timeout;
   startMediaCleanup: () => void;
   stopMediaCleanup: () => Promise<"drained" | "timed-out">;
+  stopSessionColdStorageMaintenance: () => Promise<void>;
   worktreeCleanup: NodeJS.Timeout;
 }) {
   clearInterval(timers.tickInterval);
@@ -167,6 +152,7 @@ async function stopMaintenanceTimers(timers: {
   clearInterval(timers.dedupeCleanup);
   clearInterval(timers.worktreeCleanup);
   await timers.stopMediaCleanup();
+  await timers.stopSessionColdStorageMaintenance();
 }
 
 describe("startGatewayMaintenanceTimers", () => {
@@ -186,8 +172,9 @@ describe("startGatewayMaintenanceTimers", () => {
     });
   });
 
-  it("defers a thaw restart behind active work and retries a failed idle pass", async () => {
+  it("leaves admission untouched on busy thaw ticks and retries a failed idle pass", async () => {
     vi.useFakeTimers();
+    vi.spyOn(process, "cpuUsage").mockReturnValue({ user: 0, system: 0 });
     vi.setSystemTime(new Date("2026-03-22T00:00:00Z"));
     resetGatewayWorkAdmission();
     let activeChatRuns = 1;
@@ -209,31 +196,48 @@ describe("startGatewayMaintenanceTimers", () => {
       },
     });
 
-    vi.setSystemTime(Date.now() + TICK_INTERVAL_MS + 45_000);
-    await vi.advanceTimersByTimeAsync(TICK_INTERVAL_MS);
-    expect(restartRunningChannels).not.toHaveBeenCalled();
-    expect(isGatewayWorkAdmissionClosed()).toBe(false);
+    const phases: string[] = [];
+    const unsubscribe = onGatewaySuspendAdmissionChange((phase) => phases.push(phase));
+    try {
+      vi.setSystemTime(Date.now() + TICK_INTERVAL_MS + 45_000);
+      await vi.advanceTimersByTimeAsync(TICK_INTERVAL_MS);
+      expect(restartRunningChannels).not.toHaveBeenCalled();
+      expect(isGatewayWorkAdmissionClosed()).toBe(false);
+      await vi.advanceTimersByTimeAsync(TICK_INTERVAL_MS);
+      expect(phases).toEqual([]);
 
-    activeChatRuns = 0;
-    await vi.advanceTimersByTimeAsync(TICK_INTERVAL_MS);
-    expect(restartRunningChannels).toHaveBeenCalledOnce();
-    expect(isGatewayWorkAdmissionClosed()).toBe(false);
+      activeChatRuns = 0;
+      await vi.advanceTimersByTimeAsync(TICK_INTERVAL_MS);
+      expect(restartRunningChannels).toHaveBeenCalledOnce();
+      expect(isGatewayWorkAdmissionClosed()).toBe(false);
 
-    restartSucceeds = true;
-    await vi.advanceTimersByTimeAsync(TICK_INTERVAL_MS);
-    expect(restartRunningChannels).toHaveBeenCalledTimes(2);
-    expect(restartRunningChannels.mock.calls.map(([mode]) => mode)).toEqual([
-      "deferred-retry",
-      "deferred-retry",
-    ]);
-    expect(isGatewayWorkAdmissionClosed()).toBe(false);
+      restartSucceeds = true;
+      await vi.advanceTimersByTimeAsync(TICK_INTERVAL_MS);
+      expect(restartRunningChannels).toHaveBeenCalledTimes(2);
+      expect(restartRunningChannels.mock.calls.map(([mode]) => mode)).toEqual([
+        "deferred-retry",
+        "deferred-retry",
+      ]);
+      expect(isGatewayWorkAdmissionClosed()).toBe(false);
 
-    await stopMaintenanceTimers(timers);
-    resetGatewayWorkAdmission();
+      expect(phases).toEqual([
+        "preparing",
+        "prepared",
+        "accepting",
+        "preparing",
+        "prepared",
+        "accepting",
+      ]);
+    } finally {
+      unsubscribe();
+      await stopMaintenanceTimers(timers);
+      resetGatewayWorkAdmission();
+    }
   });
 
-  it("reopens admission when thaw active-work inspection fails", async () => {
+  it("leaves admission open when thaw active-work inspection fails", async () => {
     vi.useFakeTimers();
+    vi.spyOn(process, "cpuUsage").mockReturnValue({ user: 0, system: 0 });
     vi.setSystemTime(new Date("2026-03-22T00:00:00Z"));
     const restartRunningChannels = vi.fn(async () => true);
     const logHealth = { info: vi.fn(), error: vi.fn() };
@@ -275,7 +279,7 @@ describe("startGatewayMaintenanceTimers", () => {
     const { startGatewayMaintenanceTimers } = await import("./server-maintenance.js");
     const timers = startGatewayMaintenanceTimers({
       ...createMaintenanceTimerDeps(),
-      mediaCleanupTtlMs: MEDIA_CLEANUP_TTL_MS,
+      getRuntimeConfig: () => ({ attachments: { ttlHours: 24 } }),
     });
 
     await vi.advanceTimersByTimeAsync(60 * 60_000);
@@ -374,38 +378,6 @@ describe("startGatewayMaintenanceTimers", () => {
     await stopMaintenanceTimers(timers);
   });
 
-  it("runs queue media cleanup at startup and hourly", async () => {
-    vi.useFakeTimers();
-    const { startGatewayMaintenanceTimers } = await import("./server-maintenance.js");
-    const deps = createMaintenanceTimerDeps();
-    const timers = startGatewayMaintenanceTimers(deps);
-
-    await vi.advanceTimersByTimeAsync(0);
-    expect(deps.runDeliveryQueueMediaGc).toHaveBeenCalledTimes(1);
-    await vi.advanceTimersByTimeAsync(60 * 60_000);
-    expect(deps.runDeliveryQueueMediaGc).toHaveBeenCalledTimes(2);
-    expect(pruneExpiredDeliveryQueueTombstonesMock).not.toHaveBeenCalled();
-
-    await stopMaintenanceTimers(timers);
-  });
-
-  it("runs tombstone expiry with default queue media cleanup at startup and hourly", async () => {
-    vi.useFakeTimers();
-    const { startGatewayMaintenanceTimers } = await import("./server-maintenance.js");
-    const { runDeliveryQueueMediaGc: _runDeliveryQueueMediaGc, ...deps } =
-      createMaintenanceTimerDeps();
-    const timers = startGatewayMaintenanceTimers(deps);
-
-    await vi.advanceTimersByTimeAsync(0);
-    expect(pruneExpiredDeliveryQueueTombstonesMock).toHaveBeenCalledTimes(1);
-    expect(pruneOrphanedDeliveryQueueMediaMock).toHaveBeenCalledTimes(1);
-    await vi.advanceTimersByTimeAsync(60 * 60_000);
-    expect(pruneExpiredDeliveryQueueTombstonesMock).toHaveBeenCalledTimes(2);
-    expect(pruneOrphanedDeliveryQueueMediaMock).toHaveBeenCalledTimes(2);
-
-    await stopMaintenanceTimers(timers);
-  });
-
   it("passes owner activity to default managed worktree cleanup", async () => {
     vi.useFakeTimers();
     const gc = vi.spyOn(managedWorktrees, "gc").mockResolvedValue({
@@ -420,20 +392,21 @@ describe("startGatewayMaintenanceTimers", () => {
     await Promise.resolve();
 
     expect(gc).toHaveBeenCalledWith({
-      limits: { maxCount: 30 },
+      limits: { maxCount: 100 },
       shouldProtectOwner: expect.any(Function),
       shouldRemoveOwner: expect.any(Function),
     });
     await stopMaintenanceTimers(timers);
   });
 
-  it("adds configured attachment cleanup to playback maintenance", async () => {
+  it("updates attachment cleanup policy between sweeps without restarting maintenance", async () => {
     vi.useFakeTimers();
     const { startGatewayMaintenanceTimers } = await import("./server-maintenance.js");
+    let config: OpenClawConfig = { attachments: { ttlHours: 24 } };
 
     const timers = startGatewayMaintenanceTimers({
       ...createMaintenanceTimerDeps(),
-      mediaCleanupTtlMs: MEDIA_CLEANUP_TTL_MS,
+      getRuntimeConfig: () => config,
     });
     timers.startMediaCleanup();
 
@@ -448,14 +421,21 @@ describe("startGatewayMaintenanceTimers", () => {
     await vi.waitFor(() => {
       expect(cleanupManagedOutgoingMediaRecordsMock).toHaveBeenCalled();
     });
+    config = { attachments: { ttlHours: 2 } };
     await vi.advanceTimersByTimeAsync(60 * 60_000);
     expect(prunePlaybackTranscodeCacheMock).toHaveBeenCalledTimes(2);
     expect(pruneOutboundMediaMock).not.toHaveBeenCalled();
     expect(cleanOldMediaMock).toHaveBeenCalledTimes(2);
-    expect(cleanOldMediaMock).toHaveBeenLastCalledWith(MEDIA_CLEANUP_TTL_MS, {
+    expect(cleanOldMediaMock).toHaveBeenLastCalledWith(2 * 60 * 60_000, {
       recursive: true,
       pruneEmptyDirs: true,
     });
+
+    config = {};
+    await vi.advanceTimersByTimeAsync(60 * 60_000);
+    expect(cleanOldMediaMock).toHaveBeenCalledTimes(2);
+    expect(pruneOutboundMediaMock).toHaveBeenCalledOnce();
+    expect(prunePlaybackTranscodeCacheMock).toHaveBeenCalledTimes(3);
 
     await stopMaintenanceTimers(timers);
   });
@@ -471,7 +451,7 @@ describe("startGatewayMaintenanceTimers", () => {
 
     const timers = startGatewayMaintenanceTimers({
       ...deps,
-      mediaCleanupTtlMs: MEDIA_CLEANUP_TTL_MS,
+      getRuntimeConfig: () => ({ attachments: { ttlHours: 24 } }),
     });
     timers.startMediaCleanup();
 
@@ -497,7 +477,7 @@ describe("startGatewayMaintenanceTimers", () => {
 
     const timers = startGatewayMaintenanceTimers({
       ...deps,
-      mediaCleanupTtlMs: MEDIA_CLEANUP_TTL_MS,
+      getRuntimeConfig: () => ({ attachments: { ttlHours: 24 } }),
     });
     timers.startMediaCleanup();
 
@@ -517,23 +497,25 @@ describe("startGatewayMaintenanceTimers", () => {
     await stopMaintenanceTimers(timers);
   });
 
-  it("broadcasts tick keepalives without dropIfSlow", async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(new Date("2026-04-12T00:00:00Z"));
-    const { startGatewayMaintenanceTimers } = await import("./server-maintenance.js");
+  it("broadcasts tick keepalives and checks installation replacement until the timer stops", async () => {
+    const { startGatewayMaintenanceTimers, deps } = await createTimedMaintenanceScenario();
     const broadcast = vi.fn();
+    const check = vi.spyOn(staleInstall, "checkGatewayInstallationReplacement").mockResolvedValue();
 
     const timers = startGatewayMaintenanceTimers({
-      ...createMaintenanceTimerDeps(),
+      ...deps,
       broadcast,
     });
 
     broadcast.mockClear();
-    await vi.advanceTimersByTimeAsync(30_000);
+    await vi.advanceTimersByTimeAsync(TICK_INTERVAL_MS);
 
     expect(broadcast).toHaveBeenCalledWith("tick", { ts: Date.now() });
+    expect(check).toHaveBeenCalledOnce();
 
     await stopMaintenanceTimers(timers);
+    await vi.advanceTimersByTimeAsync(TICK_INTERVAL_MS);
+    expect(check).toHaveBeenCalledOnce();
   });
 
   it("refreshes automatic health snapshots without live channel probes", async () => {
@@ -567,7 +549,7 @@ describe("startGatewayMaintenanceTimers", () => {
 
     const timers = startGatewayMaintenanceTimers({
       ...createMaintenanceTimerDeps(),
-      mediaCleanupTtlMs: MEDIA_CLEANUP_TTL_MS,
+      getRuntimeConfig: () => ({ attachments: { ttlHours: 24 } }),
     });
     timers.startMediaCleanup();
 
@@ -712,7 +694,7 @@ describe("startGatewayMaintenanceTimers", () => {
     const { startGatewayMaintenanceTimers } = await import("./server-maintenance.js");
     const timers = startGatewayMaintenanceTimers({
       ...createMaintenanceTimerDeps(),
-      mediaCleanupTtlMs: MEDIA_CLEANUP_TTL_MS,
+      getRuntimeConfig: () => ({ attachments: { ttlHours: 24 } }),
     });
     timers.startMediaCleanup();
     await vi.waitFor(() => {
@@ -788,49 +770,61 @@ describe("startGatewayMaintenanceTimers", () => {
     await stopMaintenanceTimers(timers);
   });
 
-  it("retains the timeout fence across gateway generations", async () => {
-    vi.useFakeTimers();
-    let resolveOldCleanup = () => {};
-    cleanupManagedOutgoingMediaRecordsMock.mockImplementationOnce(
-      () =>
-        new Promise((resolve) => {
-          resolveOldCleanup = () =>
-            resolve({ deletedRecordCount: 0, deletedFileCount: 0, retainedCount: 0 });
-        }),
-    );
-    const { startGatewayMaintenanceTimers } = await import("./server-maintenance.js");
-    const oldTimers = startGatewayMaintenanceTimers(createMaintenanceTimerDeps());
-    oldTimers.startMediaCleanup();
-    await vi.waitFor(() => {
-      expect(cleanupManagedOutgoingMediaRecordsMock).toHaveBeenCalledTimes(1);
-    });
-    const oldStopping = oldTimers.stopMediaCleanup();
-    await vi.advanceTimersByTimeAsync(5_000);
-    await expect(oldStopping).resolves.toBe("timed-out");
+  it.each(["managed", "queue"] as const)(
+    "retains the %s timeout fence across gateway generations",
+    async (kind) => {
+      vi.useFakeTimers();
+      const cleanup =
+        kind === "queue"
+          ? vi.fn(async () => ({
+              deletedRecordCount: 0,
+              deletedFileCount: 0,
+              retainedCount: 0,
+            }))
+          : cleanupManagedOutgoingMediaRecordsMock;
+      const createDeps = () => ({
+        ...createMaintenanceTimerDeps(),
+        ...(kind === "queue" ? { runDeliveryQueueMediaGc: cleanup } : {}),
+      });
+      let resolveOldCleanup = () => {};
+      cleanup.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveOldCleanup = () =>
+              resolve({ deletedRecordCount: 0, deletedFileCount: 0, retainedCount: 0 });
+          }),
+      );
+      const { startGatewayMaintenanceTimers } = await import("./server-maintenance.js");
+      const oldTimers = startGatewayMaintenanceTimers(createDeps());
+      oldTimers.startMediaCleanup();
+      await vi.waitFor(() => {
+        expect(cleanup).toHaveBeenCalledTimes(1);
+      });
+      const oldStopping = oldTimers.stopMediaCleanup();
+      await vi.advanceTimersByTimeAsync(5_000);
+      await expect(oldStopping).resolves.toBe("timed-out");
 
-    const restartedTimers = startGatewayMaintenanceTimers(createMaintenanceTimerDeps());
-    restartedTimers.startMediaCleanup();
-    await vi.advanceTimersByTimeAsync(0);
-    expect(cleanupManagedOutgoingMediaRecordsMock).toHaveBeenCalledTimes(1);
+      const restartedTimers = startGatewayMaintenanceTimers(createDeps());
+      restartedTimers.startMediaCleanup();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(cleanup).toHaveBeenCalledTimes(1);
 
-    resolveOldCleanup();
-    await vi.advanceTimersByTimeAsync(0);
-    await vi.waitFor(() => {
-      expect(cleanupManagedOutgoingMediaRecordsMock).toHaveBeenCalledTimes(2);
-    });
-    await expect(restartedTimers.stopMediaCleanup()).resolves.toBe("drained");
-    const settledTimers = startGatewayMaintenanceTimers(createMaintenanceTimerDeps());
-    await expect(settledTimers.stopMediaCleanup()).resolves.toBe("drained");
-    await stopMaintenanceTimers(oldTimers);
-    await stopMaintenanceTimers(restartedTimers);
-    await stopMaintenanceTimers(settledTimers);
-  });
+      resolveOldCleanup();
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.waitFor(() => {
+        expect(cleanup).toHaveBeenCalledTimes(2);
+      });
+      await expect(restartedTimers.stopMediaCleanup()).resolves.toBe("drained");
+      const settledTimers = startGatewayMaintenanceTimers(createDeps());
+      await expect(settledTimers.stopMediaCleanup()).resolves.toBe("drained");
+      await stopMaintenanceTimers(oldTimers);
+      await stopMaintenanceTimers(restartedTimers);
+      await stopMaintenanceTimers(settledTimers);
+    },
+  );
 
   it("keeps stale buffers for active runs that still have abort controllers", async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(new Date("2026-03-22T00:00:00Z"));
-    const { startGatewayMaintenanceTimers } = await import("./server-maintenance.js");
-    const deps = createMaintenanceTimerDeps();
+    const { startGatewayMaintenanceTimers, deps } = await createTimedMaintenanceScenario();
     const runId = "run-active";
     deps.chatAbortControllers.set(runId, createActiveRun("main"));
     seedStaleRunBuffers(deps, runId);
@@ -845,10 +839,7 @@ describe("startGatewayMaintenanceTimers", () => {
   });
 
   it("sweeps orphaned stale buffers once the abort controller is gone", async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(new Date("2026-03-22T00:00:00Z"));
-    const { startGatewayMaintenanceTimers } = await import("./server-maintenance.js");
-    const deps = createMaintenanceTimerDeps();
+    const { startGatewayMaintenanceTimers, deps } = await createTimedMaintenanceScenario();
     const runId = "run-orphaned";
     seedStaleRunBuffers(deps, runId);
 
@@ -862,10 +853,7 @@ describe("startGatewayMaintenanceTimers", () => {
   });
 
   it("sweeps orphaned stale agent throttle state once the abort controller is gone", async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(new Date("2026-03-22T00:00:00Z"));
-    const { startGatewayMaintenanceTimers } = await import("./server-maintenance.js");
-    const deps = createMaintenanceTimerDeps();
+    const { startGatewayMaintenanceTimers, deps } = await createTimedMaintenanceScenario();
     const runId = "run-agent-orphaned";
     seedBufferedAgentEvent(deps, runId);
     const agentText = deps.chatRunState.getOrCreate(runId).agentText?.assistant;
@@ -884,10 +872,7 @@ describe("startGatewayMaintenanceTimers", () => {
   });
 
   it("clears assistant snapshot scope when aborted runs age out", async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(new Date("2026-03-22T00:00:00Z"));
-    const { startGatewayMaintenanceTimers } = await import("./server-maintenance.js");
-    const deps = createMaintenanceTimerDeps();
+    const { startGatewayMaintenanceTimers, deps } = await createTimedMaintenanceScenario();
     const runId = "run-aborted";
     deps.chatRunState.getOrCreate(runId).abortMarker = createChatAbortMarker(staleRunTimestamp());
     seedStaleRunBuffers(deps, runId);
@@ -910,10 +895,7 @@ describe("startGatewayMaintenanceTimers", () => {
   });
 
   it("sweeps orphaned raw buffers that never emitted a delta", async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(new Date("2026-03-22T00:00:00Z"));
-    const { startGatewayMaintenanceTimers } = await import("./server-maintenance.js");
-    const deps = createMaintenanceTimerDeps();
+    const { startGatewayMaintenanceTimers, deps } = await createTimedMaintenanceScenario();
     const runId = "run-raw-only";
     Object.assign(deps.chatRunState.getOrCreate(runId), {
       rawBuffer: "suppressed raw buffer",
@@ -1044,10 +1026,7 @@ describe("startGatewayMaintenanceTimers", () => {
   });
 
   it("aborts active runs with invalid expiry timestamps", async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(new Date("2026-03-22T00:00:00Z"));
-    const { startGatewayMaintenanceTimers } = await import("./server-maintenance.js");
-    const deps = createMaintenanceTimerDeps();
+    const { startGatewayMaintenanceTimers, deps } = await createTimedMaintenanceScenario();
     const runId = "run-invalid-expiry";
     const activeRun = createActiveRun("main");
     activeRun.expiresAtMs = Number.POSITIVE_INFINITY;
@@ -1064,10 +1043,7 @@ describe("startGatewayMaintenanceTimers", () => {
   });
 
   it("recovers a wedged terminal-pending run whose projection clear never ran", async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(new Date("2026-03-22T00:00:00Z"));
-    const { startGatewayMaintenanceTimers } = await import("./server-maintenance.js");
-    const deps = createMaintenanceTimerDeps();
+    const { startGatewayMaintenanceTimers, deps } = await createTimedMaintenanceScenario();
     const runId = "run-wedged-terminal-pending";
     const wedgedRun = createActiveRun("main");
     wedgedRun.expiresAtMs = Date.now() - 1;
@@ -1086,10 +1062,7 @@ describe("startGatewayMaintenanceTimers", () => {
   });
 
   it("keeps a fresh terminal-pending run for its async projection owner", async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(new Date("2026-03-22T00:00:00Z"));
-    const { startGatewayMaintenanceTimers } = await import("./server-maintenance.js");
-    const deps = createMaintenanceTimerDeps();
+    const { startGatewayMaintenanceTimers, deps } = await createTimedMaintenanceScenario();
     const runId = "run-fresh-terminal-pending";
     const freshRun = createActiveRun("main");
     freshRun.expiresAtMs = Date.now() - 1;
@@ -1107,10 +1080,7 @@ describe("startGatewayMaintenanceTimers", () => {
   });
 
   it("converts expired stalled terminal persistence into a recovery candidate", async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(new Date("2026-03-22T00:00:00Z"));
-    const { startGatewayMaintenanceTimers } = await import("./server-maintenance.js");
-    const deps = createMaintenanceTimerDeps();
+    const { startGatewayMaintenanceTimers, deps } = await createTimedMaintenanceScenario();
     const runId = "run-terminal-persistence";
     const terminalRun = createActiveRun("main");
     terminalRun.expiresAtMs = Date.now() - 1;
@@ -1142,10 +1112,7 @@ describe("startGatewayMaintenanceTimers", () => {
   });
 
   it("reaps expired inactive registrations without emitting a timeout abort", async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(new Date("2026-03-22T00:00:00Z"));
-    const { startGatewayMaintenanceTimers } = await import("./server-maintenance.js");
-    const deps = createMaintenanceTimerDeps();
+    const { startGatewayMaintenanceTimers, deps } = await createTimedMaintenanceScenario();
     const runId = "run-terminal-persisted";
     const terminalRun = createActiveRun("main");
     terminalRun.expiresAtMs = Date.now() - 1;
@@ -1162,10 +1129,7 @@ describe("startGatewayMaintenanceTimers", () => {
   });
 
   it("evicts an expired non-abortable active run instead of retrying forever", async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(new Date("2026-03-22T00:00:00Z"));
-    const { startGatewayMaintenanceTimers } = await import("./server-maintenance.js");
-    const deps = createMaintenanceTimerDeps();
+    const { startGatewayMaintenanceTimers, deps } = await createTimedMaintenanceScenario();
     const runId = "run-unabortable";
     const wedged = createActiveRun("main");
     wedged.expiresAtMs = Date.now() - 1;

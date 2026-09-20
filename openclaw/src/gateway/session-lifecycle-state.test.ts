@@ -16,8 +16,14 @@ const loggerMocks = vi.hoisted(() => ({
   warn: vi.fn(),
 }));
 
+// Lifecycle projection formats stored failures without initializing provider runtime.
+vi.mock("../plugins/loader-runtime-load.js", () => {
+  throw new Error("Session lifecycle presentation imported plugin runtime ownership");
+});
+
 vi.mock("../config/sessions/session-accessor.js", () => ({
   patchSessionEntryCore: persistenceMocks.updateSessionEntry,
+  appendSessionTranscriptReport: vi.fn(async () => ({ ok: true, value: undefined })),
 }));
 
 vi.mock("./session-utils.js", () => ({
@@ -29,6 +35,7 @@ vi.mock("../logging/subsystem.js", () => ({
 }));
 
 import {
+  deriveGatewaySessionLifecycleProjectionPatch,
   isStaleLifecycleEventForSession,
   persistGatewaySessionLifecycleEvent,
 } from "./session-lifecycle-state.js";
@@ -527,6 +534,39 @@ describe("session lifecycle state", () => {
     });
   });
 
+  it("settles a hard timeout even when shutdown already marked the run for recovery", async () => {
+    const lifecycleGeneration = getAgentEventLifecycleGeneration();
+    const persisted = await persistLifecycle(
+      {
+        sessionId: "session-id",
+        updatedAt: 1_000,
+        startedAt: 1_000,
+        lifecycleRunId: "timed-out-run",
+        status: "running",
+        abortedLastRun: true,
+        restartRecoveryRuns: [{ runId: "timed-out-run", lifecycleGeneration }],
+        mainRestartRecovery: { cycleId: "cycle-1", revision: 2, chargedAttempts: 2 },
+      },
+      {
+        ts: 2_000,
+        sessionId: "session-id",
+        runId: "timed-out-run",
+        lifecycleGeneration,
+        data: {
+          phase: "error",
+          aborted: true,
+          stopReason: "restart",
+          timeoutPhase: "provider",
+          providerStarted: true,
+          endedAt: 2_000,
+        },
+      },
+    );
+    expect(persisted).toMatchObject({ status: "timeout", abortedLastRun: false, endedAt: 2_000 });
+    expect(persisted.restartRecoveryRuns).toBeUndefined();
+    expect(persisted.mainRestartRecovery).toBeUndefined();
+  });
+
   it("ignores an unidentified completion while recovery remains pending", async () => {
     const persisted = await persistLifecycle(
       {
@@ -890,5 +930,36 @@ describe("session lifecycle state", () => {
       }),
     ).rejects.toThrow("terminal authority retired");
     expect(storedEntry.status).toBe("running");
+  });
+});
+
+it("keeps a suppressed lifecycle projection empty while preserving intentional field clears", () => {
+  const current: SessionEntry = {
+    sessionId: "projection-recovery",
+    updatedAt: 1_000,
+    startedAt: 900,
+    status: "running",
+    lifecycleRunId: "foreground-run",
+    abortedLastRun: true,
+    restartRecoveryRuns: [{ runId: "restart-run", lifecycleGeneration: "pre-restart" }],
+    mainRestartRecovery: { cycleId: "cycle-1", revision: 2, chargedAttempts: 2 },
+  };
+  const suppressed = deriveGatewaySessionLifecycleProjectionPatch({
+    entry: current,
+    event: { ts: 2_000, sessionId: current.sessionId, data: { phase: "end", endedAt: 1_800 } },
+  });
+  expect({ ...current, ...suppressed }).toStrictEqual(current);
+  expect(suppressed).toStrictEqual({});
+
+  const next = deriveGatewaySessionLifecycleProjectionPatch({
+    entry: { status: "done", endedAt: 1_800, runtimeMs: 900 },
+    event: { ts: 2_100, runId: "new-run", data: { phase: "start", startedAt: 2_100 } },
+  });
+  expect(next.status).toBe("running");
+  expect(Object.hasOwn(next, "endedAt")).toBe(true);
+  expect(Object.hasOwn(next, "runtimeMs")).toBe(true);
+  expect({ endedAt: 1_800, runtimeMs: 900, ...next }).toMatchObject({
+    endedAt: undefined,
+    runtimeMs: undefined,
   });
 });

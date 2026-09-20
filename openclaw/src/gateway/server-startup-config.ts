@@ -11,6 +11,11 @@ import { measureDiagnosticsTimelineSpan } from "../infra/diagnostics-timeline.js
 import type { PluginManifestRegistry } from "../plugins/manifest-registry.js";
 import type { PluginMetadataSnapshot } from "../plugins/plugin-metadata-snapshot.js";
 import {
+  describeSecretResolutionOperatorDiagnostic,
+  describeSecretResolutionOperatorRecovery,
+  isSecretResolutionError,
+} from "../secrets/resolve-errors.js";
+import {
   classifySecretResolutionErrorDegradations,
   isRetryableSecretDegradationReason,
   listSecretResolutionErrorOwners,
@@ -37,7 +42,6 @@ import {
 } from "../secrets/runtime-state.js";
 import { logRuntimeSecretWarnings } from "../secrets/runtime-warning-log.js";
 import { createLazyPromise } from "../shared/lazy-runtime.js";
-import type { ChannelAutostartSuppression } from "./server-channels.js";
 import {
   applyGatewayAuthOverridesForStartupPreflight,
   assertRuntimeGatewayAuthNotKnownWeak,
@@ -51,12 +55,10 @@ import {
   logPreparedSecretDegradations,
   logThrownSecretDegradations,
 } from "./server-startup-secret-diagnostics.js";
-import {
-  resolveGatewayStartupSecretProjection,
-  resolveGatewayStartupSourceConfig,
-} from "./server-startup-secret-surfaces.js";
+import { resolveGatewayStartupSourceConfig } from "./server-startup-secret-surfaces.js";
 import { ensureGatewayStartupAuth } from "./startup-auth.js";
 export {
+  applyGatewayAuthOverridesForStartupPreflight,
   loadGatewayStartupConfigSnapshot,
   type GatewayStartupConfigSnapshotLoadResult,
 } from "./server-startup-config-helpers.js";
@@ -107,6 +109,7 @@ export type ActivateRuntimeSecrets = ((
     params: RuntimeSecretsActivationParams,
     onActivated?: () => void | Promise<void>,
     canActivate?: () => boolean,
+    checkpoint?: () => Promise<void>,
   ) => Promise<PreparedRuntimeSecretsSnapshot | null>;
 };
 
@@ -139,7 +142,6 @@ export function createRuntimeSecretsActivator(params: {
   activateRuntimeSecretsSnapshot?: ActivateRuntimeSecretsSnapshot;
   manifestRegistry?: Pick<PluginManifestRegistry, "plugins">;
   pluginMetadataSnapshot?: Pick<PluginMetadataSnapshot, "plugins" | "manifestRegistry">;
-  channelAutostartSuppression?: ChannelAutostartSuppression | null;
 }): ActivateRuntimeSecrets {
   let secretsDegraded = false;
   let degradationGeneration = 0;
@@ -188,8 +190,7 @@ export function createRuntimeSecretsActivator(params: {
     ) {
       return;
     }
-    const recoveredMessage =
-      "Secret resolution recovered; runtime remained on last-known-good during the outage.";
+    const recoveredMessage = "Secret resolution recovered.";
     params.logSecrets.info(`[SECRETS_RELOADER_RECOVERED] ${recoveredMessage}`);
     params.emitStateEvent("SECRETS_RELOADER_RECOVERED", recoveredMessage, config);
     secretsDegraded = false;
@@ -344,6 +345,12 @@ export function createRuntimeSecretsActivator(params: {
       }
     }
     if (activationParams.reason === "startup") {
+      if (isSecretResolutionError(err) && err.code === "SECRET_REF_REDACTED_VALUE") {
+        throw new Error(
+          `Startup failed: ${describeSecretResolutionOperatorDiagnostic(err)}. ${describeSecretResolutionOperatorRecovery(err)}.`,
+          { cause: err },
+        );
+      }
       if (degradations.length > 0) {
         throw new Error("Startup failed: required secrets are unavailable.");
       }
@@ -358,12 +365,10 @@ export function createRuntimeSecretsActivator(params: {
     await runWithSecretsActivationLock(async () => {
       let activationSourceConfig = config;
       try {
-        const { sourceConfig, assignmentConfig } = resolveGatewayStartupSecretProjection({
+        const sourceConfig = resolveGatewayStartupSourceConfig(
           config,
-          reason: activationParams.reason,
-          channelAutostartSuppression: params.channelAutostartSuppression,
-          ...(activationParams.env ? { env: activationParams.env } : {}),
-        });
+          activationParams.env ?? process.env,
+        );
         activationSourceConfig = sourceConfig;
         const startupPreflight =
           activationParams.reason === "startup" || activationParams.reason === "restart-check";
@@ -371,8 +376,7 @@ export function createRuntimeSecretsActivator(params: {
           activationParams.reason === "startup" &&
           activationParams.activate &&
           !params.prepareRuntimeSecretsSnapshot &&
-          !params.activateRuntimeSecretsSnapshot &&
-          assignmentConfig === undefined
+          !params.activateRuntimeSecretsSnapshot
         ) {
           const startupEnv = activationParams.env ?? process.env;
           const fastPath = hasLegacyAuthProfileSourcesForStartup({
@@ -423,7 +427,6 @@ export function createRuntimeSecretsActivator(params: {
           () =>
             prepareRuntimeSecretsSnapshot({
               config: sourceConfig,
-              ...(assignmentConfig !== undefined ? { assignmentConfig } : {}),
               allowUnavailableSecretOwners,
               ...(activationParams.env ? { env: activationParams.env } : {}),
               includeAuthStoreRefs: activationParams.includeAuthStoreRefs,
@@ -470,6 +473,7 @@ export function createRuntimeSecretsActivator(params: {
     activationParams,
     onActivated,
     canActivate,
+    checkpoint,
   ) => {
     // Resolve the lazy activator before entering the compare-and-activate
     // section so no await separates revision ownership from state publication.
@@ -486,6 +490,9 @@ export function createRuntimeSecretsActivator(params: {
         : await loadActivateRuntimeSecretsSnapshot()
       : undefined;
     return await runWithSecretsActivationLock(async () => {
+      // Resolve source observations inside the lock, then recheck every revision.
+      // No await may separate these final guards from activation/publication.
+      await checkpoint?.();
       if (
         getActiveSecretsRuntimeSnapshotRevisionState() !== expectedRevision ||
         !hasCurrentAuthStoreCredentialsRevision(snapshot) ||
@@ -613,7 +620,6 @@ export async function prepareGatewayStartupConfig(params: {
   authOverride?: GatewayAuthConfig;
   tailscaleOverride?: GatewayTailscaleConfig;
   activateRuntimeSecrets: ActivateRuntimeSecrets;
-  persistStartupAuth?: boolean;
   log?: GatewayStartupLog;
   measure?: GatewayStartupConfigMeasure;
 }): Promise<Awaited<ReturnType<typeof ensureGatewayStartupAuth>>> {
@@ -697,8 +703,6 @@ export async function prepareGatewayStartupConfig(params: {
       authOverride: preflightAuthOverride,
       tailscaleOverride: params.tailscaleOverride,
       warn: params.log?.warn,
-      persist: params.persistStartupAuth ?? false,
-      baseHash: params.configSnapshot.hash,
     }),
   );
   const runtimeStartupConfig = await measure("config.auth.runtime-startup-overrides", () =>

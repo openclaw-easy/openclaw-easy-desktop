@@ -8,6 +8,7 @@ import {
   WORKER_RPC_SET_VERSION,
 } from "../../../packages/gateway-protocol/src/schema/worker-admission.js";
 import { WORKER_PROTOCOL_MAX_INFERENCE_PAYLOAD_BYTES } from "../../../packages/gateway-protocol/src/schema/worker-inference.js";
+import { formatErrorMessage } from "../../infra/errors.js";
 import { NODE_WORKER_CAPACITY_EXHAUSTED_ERROR_CODE } from "../../infra/node-commands.js";
 import { NODE_WORKER_SUPERVISOR_PROTOCOL_FEATURE } from "../../infra/node-runner-inventory.js";
 import {
@@ -42,7 +43,12 @@ function nodeProof(connId = "conn-1", available = 2): NodeWorkerSupervisorNodePr
     clientId: GATEWAY_CLIENT_IDS.NODE_HOST,
     clientMode: GATEWAY_CLIENT_MODES.NODE,
     protocolFeature: NODE_WORKER_SUPERVISOR_PROTOCOL_FEATURE,
-    workerHost: { enabled: true, capacity: { total: 2, available }, environmentSession: 1 },
+    workerHost: {
+      enabled: true,
+      capacity: { total: 2, available },
+      environmentSession: 1,
+      capturedExecPolicy: true,
+    },
     commands: ["system.run"],
   };
 }
@@ -122,7 +128,15 @@ function transportWith(
   invoke: NodeWorkerSupervisorTransport["invoke"],
   listCurrentNodes: NodeWorkerSupervisorTransport["listCurrentNodes"] = async () => [nodeProof()],
 ): NodeWorkerSupervisorTransport {
-  return { invoke, isCurrent: () => true, listCurrentNodes, hasCurrentRunner: () => true };
+  return {
+    invoke,
+    isCurrent: () => true,
+    async getCurrentNode(nodeId) {
+      return (await this.listCurrentNodes()).find((node) => node.nodeId === nodeId);
+    },
+    listCurrentNodes,
+    hasCurrentRunner: () => true,
+  };
 }
 
 function launchRequest(input = launchInput()) {
@@ -354,26 +368,80 @@ describe("node worker launch adapter", () => {
     },
   );
 
-  it("reports offline availability when the dispatch grace expires", async () => {
-    vi.useFakeTimers();
-    const onDispatchReady = vi.fn();
-    const invoke = vi.fn<NodeWorkerSupervisorTransport["invoke"]>();
-    const adapter = createNodeWorkerLaunchAdapter({
-      getTransport: () => transportWith(invoke, async () => []),
-    });
-    try {
-      const launch = adapter
-        .launch({ ...launchRequest(), timeoutMs: 30_000, onDispatchReady })
-        .catch((error: unknown) => error);
-      await vi.runAllTimersAsync();
+  it.each([
+    {
+      name: "timer expiry",
+      clockOnly: false,
+      timeoutMs: 30_000,
+      abort: false,
+      expected: { code: "runner-offline" },
+    },
+    {
+      name: "clock expiry before timer callback",
+      clockOnly: true,
+      timeoutMs: 30_000,
+      abort: false,
+      expected: { code: "runner-offline" },
+    },
+    {
+      name: "shorter launch deadline",
+      clockOnly: true,
+      timeoutMs: 5_000,
+      abort: false,
+      expected: { message: "node worker launch timed out" },
+    },
+    {
+      name: "equal launch deadline",
+      clockOnly: true,
+      timeoutMs: 10_000,
+      abort: false,
+      expected: { message: "node worker launch timed out" },
+    },
+    {
+      name: "caller cancellation",
+      clockOnly: true,
+      timeoutMs: 30_000,
+      abort: true,
+      expected: { message: "caller cancelled" },
+    },
+  ])(
+    "preserves pre-dispatch failure identity after $name",
+    async ({ clockOnly, timeoutMs, abort, expected }) => {
+      vi.useFakeTimers();
+      let nowMs = 0;
+      const controller = new AbortController();
+      const onDispatchReady = vi.fn();
+      const invoke = vi.fn<NodeWorkerSupervisorTransport["invoke"]>();
+      const adapter = createNodeWorkerLaunchAdapter({
+        getTransport: () => transportWith(invoke, async () => []),
+        ...(clockOnly
+          ? {
+              now: () => nowMs,
+              sleep: async () => {
+                nowMs += 10_000;
+                if (abort) {
+                  controller.abort(new Error("caller cancelled"));
+                }
+              },
+            }
+          : {}),
+      });
+      try {
+        const launch = adapter
+          .launch({ ...launchRequest(), timeoutMs, onDispatchReady, signal: controller.signal })
+          .catch((error: unknown) => error);
+        if (!clockOnly) {
+          await vi.runAllTimersAsync();
+        }
 
-      expect(await launch).toMatchObject({ code: "runner-offline" });
-      expect(invoke).not.toHaveBeenCalled();
-      expect(onDispatchReady).not.toHaveBeenCalled();
-    } finally {
-      vi.useRealTimers();
-    }
-  });
+        expect(await launch).toMatchObject(expected);
+        expect(invoke).not.toHaveBeenCalled();
+        expect(onDispatchReady).not.toHaveBeenCalled();
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
 
   it("dispatches a bound environment at capacity so its retained worker can reuse the slot", async () => {
     const input = launchInput();
@@ -390,17 +458,20 @@ describe("node worker launch adapter", () => {
     expect(invoke).toHaveBeenCalledOnce();
   });
 
-  it("requires environment lifetime support before dispatching a turn", async () => {
-    const node = nodeProof();
-    delete node.workerHost.environmentSession;
-    const invoke = vi.fn<NodeWorkerSupervisorTransport["invoke"]>();
-    const adapter = createNodeWorkerLaunchAdapter({
-      getTransport: () => transportWith(invoke, async () => [node]),
-    });
+  it.each(["environmentSession", "capturedExecPolicy"] as const)(
+    "requires %s support before dispatching a turn",
+    async (feature) => {
+      const node = nodeProof();
+      delete node.workerHost[feature];
+      const invoke = vi.fn<NodeWorkerSupervisorTransport["invoke"]>();
+      const adapter = createNodeWorkerLaunchAdapter({
+        getTransport: () => transportWith(invoke, async () => [node]),
+      });
 
-    await expect(adapter.launch(launchRequest())).rejects.toThrow("openclaw update");
-    expect(invoke).not.toHaveBeenCalled();
-  });
+      await expect(adapter.launch(launchRequest())).rejects.toThrow("openclaw update");
+      expect(invoke).not.toHaveBeenCalled();
+    },
+  );
 
   it("reacquires the node and replays the identical launch after ambiguous disconnect", async () => {
     const input = launchInput();
@@ -546,6 +617,76 @@ describe("node worker launch adapter", () => {
       "worker.launch.v1",
       "worker.cancel.v1",
     ]);
+  });
+
+  it.each(["launch", "status", "cancel"] as const)(
+    "preserves the node rejection and command when %s fails",
+    async (failedCommand) => {
+      const input = launchInput();
+      const rejection = "INVALID_REQUEST: prepared workspace binding is missing";
+      const cancellationRejection = "INVALID_REQUEST: cancellation identity is invalid";
+      const invoke = vi.fn<NodeWorkerSupervisorTransport["invoke"]>(async (request) => {
+        if (request.command === "worker.cancel.v1") {
+          return failedCommand === "cancel"
+            ? { ok: false, error: { code: "INVALID_REQUEST", message: cancellationRejection } }
+            : wire(receipt(input, "cancelled"));
+        }
+        request.onDispatchReady?.("invoke-1");
+        if (request.command === "worker.launch.v1" && failedCommand === "status") {
+          return wire(receipt(input, "running"));
+        }
+        return { ok: false, error: { code: "INVALID_REQUEST", message: rejection } };
+      });
+      const adapter = createNodeWorkerLaunchAdapter({
+        getTransport: () => transportWith(invoke),
+        sleep: async () => {},
+      });
+
+      const error: unknown = await adapter
+        .launch(launchRequest(input))
+        .catch((failure: unknown) => failure);
+      expect(error).toBeInstanceOf(Error);
+      const diagnostic = formatErrorMessage(error);
+      expect(diagnostic).toContain(rejection);
+      expect(diagnostic).toContain(`worker.${failedCommand}.v1`);
+      if (failedCommand === "cancel") {
+        expect(diagnostic).toContain(cancellationRejection);
+        expect(diagnostic).toContain("cancellation could not be confirmed");
+      }
+      expect(invoke.mock.calls.at(-1)?.[0].command).toBe("worker.cancel.v1");
+    },
+  );
+
+  it("bounds and redacts node rejection details before exposing the launch error", async () => {
+    const input = launchInput();
+    const secret = "synthetic-worker-launch-secret-value";
+    const invoke = vi.fn<NodeWorkerSupervisorTransport["invoke"]>(async (request) => {
+      if (request.command === "worker.cancel.v1") {
+        return wire(receipt(input, "cancelled"));
+      }
+      request.onDispatchReady?.("invoke-1");
+      return {
+        ok: false,
+        error: {
+          code: "INVALID_REQUEST",
+          message: `invalid descriptor token=${secret}\n${"x".repeat(2_048)}; field assignment is invalid`,
+        },
+      };
+    });
+    const adapter = createNodeWorkerLaunchAdapter({ getTransport: () => transportWith(invoke) });
+
+    const error: unknown = await adapter
+      .launch(launchRequest(input))
+      .catch((failure: unknown) => failure);
+    expect(error).toBeInstanceOf(Error);
+    if (!(error instanceof Error)) {
+      throw new Error("expected a launch error");
+    }
+    expect(error.message).toContain("invalid descriptor");
+    expect(error.message).toContain("field assignment is invalid");
+    expect(error.message).not.toContain(secret);
+    expect(error.message).not.toContain("\n");
+    expect(error.message.length).toBeLessThanOrEqual(1_024);
   });
 
   it("retries a timed-out launch RPC within the overall deadline", async () => {
@@ -758,9 +899,17 @@ describe("node worker launch adapter", () => {
       },
     });
 
-    await expect(
-      adapter.launch({ ...launchRequest(input), signal: controller.signal }),
-    ).rejects.toThrow("node worker launch failed and cancellation could not be confirmed");
+    const failure: unknown = await adapter
+      .launch({ ...launchRequest(input), signal: controller.signal })
+      .catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(Error);
+    const diagnostic = formatErrorMessage(failure);
+    expect(diagnostic).toContain(
+      "node worker launch failed and cancellation could not be confirmed",
+    );
+    expect(diagnostic).toContain(
+      "node worker cancellation did not produce a terminal receipt before its deadline",
+    );
     expect(
       invoke.mock.calls.filter(([request]) => request.command === "worker.cancel.v1"),
     ).toHaveLength(1);

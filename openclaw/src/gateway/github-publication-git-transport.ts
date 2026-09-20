@@ -1,32 +1,42 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import type { WorktreeGitPolicy } from "../agents/worktrees/checkout-git-config.js";
+import { splitNullBuffer } from "../agents/worktrees/git-path-inventory.js";
+import { gitNullConfigPath } from "../infra/git-exec.js";
+import { retryableGitNetworkOperation, withGitNetworkRetry } from "../infra/git-network-retry.js";
 import { runCommandBuffered } from "../process/exec.js";
 import { githubPublicationUnsafeConfigArgs } from "./github-publication-base.js";
 
 type GitCommandOptions = {
   cwd?: string;
   env?: NodeJS.ProcessEnv;
-  input?: string;
+  input?: string | Buffer;
   maxOutputBytes?: number;
+  beforeRun?: () => void;
 };
 type GitCommandResult = { code: number | null; stdout: Buffer };
 
 export async function runPublicationCommand(argv: string[], options: GitCommandOptions = {}) {
-  return await runCommandBuffered(argv, {
-    ...(options.cwd ? { cwd: options.cwd } : {}),
-    env: {
-      ...(options.env ?? process.env),
-      GIT_NO_REPLACE_OBJECTS: "1",
-      // Pin every command against repository hooks; explicit hook-disabling -c flags stay stronger.
-      GIT_CONFIG_COUNT: "1",
-      GIT_CONFIG_KEY_0: "core.hooksPath",
-      GIT_CONFIG_VALUE_0: os.devNull,
-    },
-    ...(options.input !== undefined ? { input: options.input } : {}),
-    timeoutMs: 60_000,
-    maxOutputBytes: options.maxOutputBytes ?? 256 * 1024,
-  });
+  return await withGitNetworkRetry(
+    argv[0] === "git" ? retryableGitNetworkOperation(argv.slice(1)) : undefined,
+    { timeoutMs: 60_000, beforeRun: options.beforeRun },
+    (timeoutMs) =>
+      runCommandBuffered(argv, {
+        ...(options.cwd ? { cwd: options.cwd } : {}),
+        env: {
+          ...(options.env ?? process.env),
+          GIT_NO_REPLACE_OBJECTS: "1",
+          // Pin every command against repository hooks; explicit hook-disabling -c flags stay stronger.
+          GIT_CONFIG_COUNT: "1",
+          GIT_CONFIG_KEY_0: "core.hooksPath",
+          GIT_CONFIG_VALUE_0: os.devNull,
+        },
+        ...(options.input !== undefined ? { input: options.input } : {}),
+        timeoutMs,
+        maxOutputBytes: options.maxOutputBytes ?? 256 * 1024,
+      }),
+  );
 }
 
 export async function requirePublicationCommand(
@@ -40,6 +50,34 @@ export async function requirePublicationCommand(
   return result.stdout.toString("utf8").trim();
 }
 
+// Guard ordinary steps on both sides of the await. Effects whose observations
+// must survive revocation use the raw transport and record before rechecking.
+export function createGitHubPublicationCommandRunner(assertCurrent?: () => void) {
+  const step = async <T>(operation: () => Promise<T>): Promise<T> => {
+    assertCurrent?.();
+    const result = await operation();
+    assertCurrent?.();
+    return result;
+  };
+  const run = async (argv: string[], options: GitCommandOptions = {}) => {
+    const result = await runPublicationCommand(argv, { ...options, beforeRun: assertCurrent });
+    assertCurrent?.();
+    return result;
+  };
+  return {
+    step,
+    run,
+    require: async (argv: string[], options: GitCommandOptions = {}) => {
+      const result = await requirePublicationCommand(argv, {
+        ...options,
+        beforeRun: assertCurrent,
+      });
+      assertCurrent?.();
+      return result;
+    },
+  };
+}
+
 // A recursive tree listing scales with repository size (openclaw itself is
 // ~3.3MB), far past the default per-command cap above. Without this explicit
 // bound the attribute scan dies as an output-limit "verification" failure on
@@ -48,9 +86,12 @@ const TREE_LISTING_MAX_OUTPUT_BYTES = 64 * 1024 * 1024;
 
 export async function assertSafeGitPublicationWorkspace(
   cwd: string,
-  run: (argv: string[], options?: GitCommandOptions) => Promise<GitCommandResult>,
+  run: (argv: string[], options?: Omit<GitCommandOptions, "input">) => Promise<GitCommandResult>,
 ): Promise<void> {
-  const isolatedConfig = { GIT_CONFIG_GLOBAL: os.devNull, GIT_CONFIG_SYSTEM: os.devNull };
+  const isolatedConfig = {
+    GIT_CONFIG_GLOBAL: gitNullConfigPath(),
+    GIT_CONFIG_SYSTEM: gitNullConfigPath(),
+  };
   const [localUnsafe, worktreeConfig] = await Promise.all([
     run(githubPublicationUnsafeConfigArgs("--local"), { cwd, env: isolatedConfig }),
     run(
@@ -116,20 +157,29 @@ async function readOptionalAttributeFile(file: string): Promise<Buffer | undefin
   }
 }
 
-async function assertGitHubPublicationTreeHasNoFilters(
+export async function readGitHubPublicationTree(
   cwd: string,
   workspaceTree: string,
-  run: (argv: string[], options?: GitCommandOptions) => Promise<GitCommandResult>,
-): Promise<void> {
+  run: (argv: string[], options?: Omit<GitCommandOptions, "input">) => Promise<GitCommandResult>,
+): Promise<Buffer> {
   const listing = await run(["git", "ls-tree", "-r", "-z", "--full-tree", workspaceTree], {
     cwd,
     maxOutputBytes: TREE_LISTING_MAX_OUTPUT_BYTES,
   });
   if (listing.code !== 0) {
-    throw new Error("GitHub publication workspace attributes could not be verified.");
+    throw new Error("GitHub publication workspace tree could not be verified.");
   }
+  return listing.stdout;
+}
+
+async function assertGitHubPublicationTreeHasNoFilters(
+  cwd: string,
+  workspaceTree: string,
+  run: (argv: string[], options?: Omit<GitCommandOptions, "input">) => Promise<GitCommandResult>,
+): Promise<void> {
+  const listing = await readGitHubPublicationTree(cwd, workspaceTree, run);
   const attributeObjects = new Set<string>();
-  for (const record of listing.stdout.toString("latin1").split("\0")) {
+  for (const record of listing.toString("latin1").split("\0")) {
     const tab = record.indexOf("\t");
     if (tab < 0) {
       continue;
@@ -186,71 +236,111 @@ export async function captureGitHubPublicationWorkspaceSnapshot(params: {
   cwd: string;
   assertCurrent?: () => void;
 }): Promise<{ sourceHeadCommit: string; sourceIndexTree: string; workspaceTree: string }> {
-  const step = async <T>(operation: () => Promise<T>): Promise<T> => {
-    params.assertCurrent?.();
-    const result = await operation();
-    params.assertCurrent?.();
-    return result;
-  };
+  const { withSettledLocalWorkspacePath } =
+    await import("./worker-environments/local-workspace-projection.js");
+  return await withSettledLocalWorkspacePath(params, async (custody) => {
+    const admittedPaths = await custody?.canonicalPaths();
+    const bound = {
+      ...params,
+      assertCurrent: () => {
+        params.assertCurrent?.();
+        custody?.assertCurrent();
+      },
+    };
+    const [{ findLiveRegistryWorktreeByPath }, { withManagedWorktreeGit }, { getRuntimeConfig }] =
+      await Promise.all([
+        import("../agents/worktrees/registry.js"),
+        import("../agents/worktrees/checkout-policy.js"),
+        import("../config/config.js"),
+      ]);
+    const record = findLiveRegistryWorktreeByPath(process.env, params.cwd);
+    return record
+      ? await withManagedWorktreeGit(
+          {
+            record,
+            env: process.env,
+            getConfig: getRuntimeConfig,
+            beforeRun: bound.assertCurrent,
+          },
+          (git) =>
+            captureSettledGitHubPublicationWorkspaceSnapshot(
+              bound,
+              git.sourceOnly ? git : undefined,
+              admittedPaths,
+            ),
+        )
+      : await captureSettledGitHubPublicationWorkspaceSnapshot(bound, undefined, admittedPaths);
+  });
+}
+
+async function captureSettledGitHubPublicationWorkspaceSnapshot(
+  params: {
+    cwd: string;
+    assertCurrent?: () => void;
+  },
+  policy?: WorktreeGitPolicy,
+  admittedPaths?: ReadonlySet<string>,
+): Promise<{ sourceHeadCommit: string; sourceIndexTree: string; workspaceTree: string }> {
+  const { step, require: command } = createGitHubPublicationCommandRunner(params.assertCurrent);
+  const git = (args: string[], env?: NodeJS.ProcessEnv, input?: string | Buffer) =>
+    policy
+      ? step(() =>
+          policy.require(params.cwd, args, { env, input, beforeRun: params.assertCurrent }),
+        )
+      : command(
+          ["git", "-c", `core.hooksPath=${os.devNull}`, "-c", "core.fsmonitor=false", ...args],
+          {
+            cwd: params.cwd,
+            env,
+            input,
+          },
+        );
   await step(() => assertSafeGitPublicationWorkspace(params.cwd, runPublicationCommand));
-  const sourceHeadCommit = await step(
-    async () =>
-      await requirePublicationCommand(["git", "rev-parse", "--verify", "HEAD^{commit}"], {
-        cwd: params.cwd,
-      }),
-  );
-  const sourceIndexTree = await step(
-    async () =>
-      await requirePublicationCommand(
-        ["git", "-c", `core.hooksPath=${os.devNull}`, "-c", "core.fsmonitor=false", "write-tree"],
-        { cwd: params.cwd },
-      ),
-  );
+  const sourceHeadCommit = await command(["git", "rev-parse", "--verify", "HEAD^{commit}"], {
+    cwd: params.cwd,
+  });
+  const index = path.resolve(params.cwd, await git(["rev-parse", "--git-path", "index"]));
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-github-snapshot-"));
   try {
-    const env: NodeJS.ProcessEnv = {
+    const env = {
       GIT_ATTR_NOSYSTEM: "1",
-      GIT_CONFIG_GLOBAL: os.devNull,
-      GIT_CONFIG_SYSTEM: os.devNull,
+      GIT_CONFIG_GLOBAL: gitNullConfigPath(),
+      GIT_CONFIG_SYSTEM: gitNullConfigPath(),
       GIT_INDEX_FILE: path.join(tempDir, "index"),
     };
-    await step(async () => {
-      await requirePublicationCommand(
-        [
-          "git",
-          "-c",
-          `core.hooksPath=${os.devNull}`,
-          "-c",
-          "core.fsmonitor=false",
-          "read-tree",
-          sourceHeadCommit,
-        ],
-        { cwd: params.cwd, env },
+    // Preserve staged path inventory, and keep write-tree cache updates off the real index.
+    const indexStat = await step(() => fs.stat(index, { bigint: true }));
+    await step(() => fs.copyFile(index, env.GIT_INDEX_FILE));
+    // A newer copy timestamp hides racy-clean edits. Round down so lost precision only adds reads.
+    const indexTimestamp = Number(indexStat.mtimeNs / 1_000_000_000n);
+    await step(() => fs.utimes(env.GIT_INDEX_FILE, indexTimestamp, indexTimestamp));
+    const sourceIndexTree = await git(["write-tree"], env);
+    // Ordinary staging preserves unchanged blobs; renormalization would rewrite unrelated CRLF files.
+    await git(["-c", `core.attributesFile=${os.devNull}`, "add", "-A"], env);
+    let workspaceTree = await git(["write-tree"], env);
+    if (admittedPaths) {
+      // Staging must not turn guest-edited ignore rules into host admission.
+      // Prune only the private publication index; canonical archive and host
+      // index custody are unchanged. This also handles directory replacements
+      // without recursive pathspecs enrolling unowned descendants.
+      const staged = await step(() =>
+        readGitHubPublicationTree(params.cwd, workspaceTree, runPublicationCommand),
       );
-    });
-    await step(async () => {
-      await requirePublicationCommand(
-        [
-          "git",
-          "-c",
-          `core.attributesFile=${os.devNull}`,
-          "-c",
-          `core.hooksPath=${os.devNull}`,
-          "-c",
-          "core.fsmonitor=false",
-          "add",
-          "-A",
-        ],
-        { cwd: params.cwd, env },
+      const admitted = new Set(
+        [...admittedPaths].map((entry) => Buffer.from(entry).toString("hex")),
       );
-    });
-    const workspaceTree = await step(
-      async () =>
-        await requirePublicationCommand(
-          ["git", "-c", `core.hooksPath=${os.devNull}`, "-c", "core.fsmonitor=false", "write-tree"],
-          { cwd: params.cwd, env },
-        ),
-    );
+      const excluded = splitNullBuffer(staged)
+        .map((record) => record.subarray(record.indexOf(9) + 1))
+        .filter((entry) => !admitted.has(entry.toString("hex")));
+      if (excluded.length) {
+        await git(
+          ["update-index", "--force-remove", "-z", "--stdin"],
+          env,
+          Buffer.concat(excluded.flatMap((entry) => [entry, Buffer.from([0])])),
+        );
+        workspaceTree = await git(["write-tree"], env);
+      }
+    }
     await step(() =>
       assertGitHubPublicationTreeHasNoFilters(params.cwd, workspaceTree, runPublicationCommand),
     );

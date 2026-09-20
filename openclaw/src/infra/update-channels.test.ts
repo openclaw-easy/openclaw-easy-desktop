@@ -13,46 +13,46 @@ import {
 
 describe("update-channels tag detection", () => {
   it.each([
-    { tag: "v2026.2.24-beta.1", beta: true },
-    { tag: "v2026.2.24.beta.1", beta: true },
-    { tag: "v2026.2.24-BETA-1", beta: true },
-    { tag: "v2026.2.24-alpha.1", beta: false },
-    { tag: "v2026.2.24-next.1", beta: false },
-    { tag: "v2026.2.24-1", beta: false },
-    { tag: "v2026.2.24-alphabeta.1", beta: false },
-    { tag: "v2026.2.24", beta: false },
-  ])("classifies $tag", ({ tag, beta }) => {
+    ["v2026.2.24-beta.1", true],
+    ["v2026.2.24.beta.1", true],
+    ["v2026.2.24-BETA-1", true],
+    ["v2026.2.24-alpha.1", false],
+    ["v2026.2.24-next.1", false],
+    ["v2026.2.24-1", false],
+    ["v2026.2.24-alphabeta.1", false],
+    ["v2026.2.24", false],
+  ])("classifies %s", (tag, beta) => {
     expect(isBetaTag(tag)).toBe(beta);
   });
 
   it.each([
-    { tag: "v2026.2.24-alpha.1", stable: false },
-    { tag: "v2026.2.24-beta.1", stable: false },
-    { tag: "v2026.2.24-rc.1", stable: false },
-    { tag: "v2026.2.24-preview.1", stable: false },
-    { tag: "v2026.2.24-custom.1", stable: false },
-    { tag: "v2026.2.24-1", stable: true },
-    { tag: "v1.0.1-1", stable: true },
-    { tag: "v2026.2.24", stable: true },
-  ])("stable classification for $tag", ({ tag, stable }) => {
+    ["v2026.2.24-alpha.1", false],
+    ["v2026.2.24-beta.1", false],
+    ["v2026.2.24-rc.1", false],
+    ["v2026.2.24-preview.1", false],
+    ["v2026.2.24-custom.1", false],
+    ["v2026.2.24-1", true],
+    ["v1.0.1-1", true],
+    ["v2026.2.24", true],
+  ])("stable classification for %s", (tag, stable) => {
     expect(isStableTag(tag)).toBe(stable);
   });
 });
 
 describe("normalizeUpdateChannel", () => {
   it.each([
-    { value: "stable", expected: "stable" },
-    { value: " extended-stable ", expected: "extended-stable" },
-    { value: " BETA ", expected: "beta" },
-    { value: "Dev", expected: "dev" },
-    { value: "", expected: null },
-    { value: "daily", expected: null },
-    { value: " nightly ", expected: null },
-    { value: null, expected: null },
-    { value: undefined, expected: null },
-  ] satisfies Array<{ value: string | null | undefined; expected: UpdateChannel | null }>)(
+    ["stable", "stable"],
+    [" extended-stable ", "extended-stable"],
+    [" BETA ", "beta"],
+    ["Dev", "dev"],
+    ["", null],
+    ["daily", null],
+    [" nightly ", null],
+    [null, null],
+    [undefined, null],
+  ] satisfies Array<[string | null | undefined, UpdateChannel | null]>)(
     "normalizes %j",
-    ({ value, expected }) => {
+    (value, expected) => {
       expect(normalizeUpdateChannel(value)).toBe(expected);
     },
   );
@@ -60,16 +60,13 @@ describe("normalizeUpdateChannel", () => {
 
 describe("channelToNpmTag", () => {
   it.each([
-    { channel: "stable", expected: "latest" },
-    { channel: "extended-stable", expected: "extended-stable" },
-    { channel: "beta", expected: "beta" },
-    { channel: "dev", expected: "dev" },
-  ] satisfies Array<{ channel: UpdateChannel; expected: string }>)(
-    "maps $channel to $expected",
-    ({ channel, expected }) => {
-      expect(channelToNpmTag(channel)).toBe(expected);
-    },
-  );
+    ["stable", "latest"],
+    ["extended-stable", "extended-stable"],
+    ["beta", "beta"],
+    ["dev", "dev"],
+  ] satisfies Array<[UpdateChannel, string]>)("maps %s to %s", (channel, expected) => {
+    expect(channelToNpmTag(channel)).toBe(expected);
+  });
 });
 
 describe("resolveEffectiveUpdateChannel", () => {
@@ -84,9 +81,17 @@ describe("resolveEffectiveUpdateChannel", () => {
       expected: { channel: "beta", source: "config" },
     },
     {
-      name: "uses installed beta version over stale stable config",
+      name: "keeps configured stable after a one-off beta package update",
       params: {
         configChannel: "stable" as const,
+        currentVersion: "2026.5.2-beta.1",
+        installKind: "package" as const,
+      },
+      expected: { channel: "stable", source: "config" },
+    },
+    {
+      name: "uses installed beta version without a configured channel",
+      params: {
         currentVersion: "2026.5.2-beta.1",
         installKind: "package" as const,
       },
@@ -182,7 +187,7 @@ describe("resolveUpdateChannelDisplay labels", () => {
 });
 
 describe("resolveUpdateChannelDisplay", () => {
-  it("labels stale stable config on a beta install from the installed version", () => {
+  it("shows the configured stable channel after a one-off beta package update", () => {
     expect(
       resolveUpdateChannelDisplay({
         configChannel: "stable",
@@ -190,9 +195,9 @@ describe("resolveUpdateChannelDisplay", () => {
         installKind: "package",
       }),
     ).toEqual({
-      channel: "beta",
-      source: "installed-version",
-      label: "beta (installed version)",
+      channel: "stable",
+      source: "config",
+      label: "stable (config)",
     });
   });
 
@@ -238,18 +243,15 @@ describe("resolveUpdateChannelDisplay", () => {
 
 describe("resolveRegistryUpdateChannel", () => {
   it.each([
-    { currentVersion: "2026.6.32", expected: "stable" },
-    { currentVersion: "2026.6.33", expected: "stable" },
-    { currentVersion: "2026.6.34", expected: "stable" },
-    { currentVersion: "2026.6.33-1", expected: "stable" },
-    { currentVersion: "1.33.1", expected: "stable" },
-    { currentVersion: "1.6.33", expected: "stable" },
-  ] as const)(
-    "does not infer a package-only channel for $currentVersion",
-    ({ currentVersion, expected }) => {
-      expect(resolveRegistryUpdateChannel({ currentVersion })).toBe(expected);
-    },
-  );
+    ["2026.6.32", "stable"],
+    ["2026.6.33", "stable"],
+    ["2026.6.34", "stable"],
+    ["2026.6.33-1", "stable"],
+    ["1.33.1", "stable"],
+    ["1.6.33", "stable"],
+  ] as const)("does not infer a package-only channel for %s", (currentVersion, expected) => {
+    expect(resolveRegistryUpdateChannel({ currentVersion })).toBe(expected);
+  });
 
   it("queries beta when the installed version is beta even if config is stale stable", () => {
     expect(

@@ -1,17 +1,22 @@
 import { createHash, randomBytes } from "node:crypto";
+import fsSync from "node:fs";
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
-import { FsSafeError, root as openFsSafeRoot } from "../../infra/fs-safe.js";
+import { root as openFsSafeRoot } from "../../infra/fs-safe.js";
+import { resolvePreferredOpenClawTmpDir } from "../../infra/tmp-openclaw-dir.js";
 import {
   createStagedInputPathMatcher,
   stagedInputDirectoriesFromEntries,
   isStagedInputPath,
   stagedInputPathDirectory,
 } from "../../media/staged-inputs.js";
-import { runCommandBuffered, runCommandWithTimeout } from "../../process/exec.js";
+import { runCommandBuffered, runCommandWithTimeout, runExec } from "../../process/exec.js";
+import { runTasksWithConcurrency } from "../../utils/run-with-concurrency.js";
+import { sameEntry } from "./workspace-manifest-comparison.js";
+import { readWorkspaceNodes } from "./workspace-manifest-worker.js";
 import {
   MAX_RECONCILIATION_FILE_BYTES,
+  MAX_RECONCILIATION_PACK_BYTES,
   MAX_RECONCILIATION_TOTAL_BYTES,
   type WorkerWorkspaceManifestEntry,
   type WorkerWorkspaceReconciliationJournal,
@@ -27,13 +32,13 @@ import {
   reconciliationEntries,
 } from "./workspace-reconcile-derived-paths.js";
 import {
-  absoluteEntryMatches,
   clearTemporaryWorkspace,
   directoryContainsOnlyDerivedWorkspaceEntries,
   directoryContainsOnlyJournalPaths,
   entryMatches,
   localPath,
   readWorkspaceTreeFile,
+  removeEmptyWorkspaceDirectory,
 } from "./workspace-reconcile-fs.js";
 
 const PATCH_TIMEOUT_MS = 10 * 60_000;
@@ -81,9 +86,26 @@ async function materializeSnapshotEntry(params: {
     throw new Error(`Cloud workspace snapshot content is missing: ${params.entry.path}`);
   }
   await fs.chmod(target, params.entry.mode);
-  if (!(await absoluteEntryMatches(target, params.entry))) {
-    throw new Error(`Cloud workspace staged payload is invalid: ${params.entry.path}`);
+}
+
+async function materializeSnapshotEntries(params: {
+  root: string;
+  sourceRoot: string;
+  entries: WorkerWorkspaceManifestEntry[];
+}): Promise<void> {
+  const result = await runTasksWithConcurrency({
+    tasks: params.entries.map((entry) => () => materializeSnapshotEntry({ ...params, entry })),
+    limit: 4,
+    errorMode: "stop",
+  });
+  if (result.hasError) {
+    throw result.firstError;
   }
+  await assertWorkspaceMatchesManifest({
+    root: params.root,
+    manifest: { version: 1, baseCommit: null, entries: params.entries },
+    entries: params.entries,
+  });
 }
 
 async function writeRawWorkspaceTree(params: {
@@ -92,53 +114,126 @@ async function writeRawWorkspaceTree(params: {
 }): Promise<string> {
   // fast-import writes the authenticated bytes directly. A working-tree/index
   // snapshot would apply user attributes, encodings, and clean filters.
-  const blobs: Array<{ entry: WorkerWorkspaceManifestEntry; mark: number; content: Uint8Array }> =
-    [];
-  let mark = 1;
-  // Delta entries were selected against a complete manifest; their marker may be unchanged.
-  for (const entry of params.entries.toSorted((left, right) =>
-    left.path.localeCompare(right.path),
-  )) {
-    const content =
-      entry.type === "symlink"
-        ? Buffer.from(entry.target)
-        : await fs.readFile(localPath(params.repositoryRoot, entry.path));
-    blobs.push({ entry, mark, content });
-    mark += 1;
-  }
+  const entries = params.entries.toSorted((left, right) => left.path.localeCompare(right.path));
   const ref = `refs/heads/openclaw-snapshot-${randomBytes(16).toString("hex")}`;
-  const chunks: Uint8Array[] = [];
-  for (const blob of blobs) {
-    chunks.push(Buffer.from(`blob\nmark :${blob.mark}\ndata ${blob.content.byteLength}\n`));
-    chunks.push(blob.content, Buffer.from("\n"));
+  const inputPath = path.join(params.repositoryRoot, ".git", "snapshot-input");
+  try {
+    const output = await fs.open(inputPath, "wx", 0o600);
+    try {
+      for (const [index, entry] of entries.entries()) {
+        const content =
+          entry.type === "symlink"
+            ? Buffer.from(entry.target)
+            : await fs.readFile(localPath(params.repositoryRoot, entry.path));
+        await output.writeFile(
+          Buffer.concat([
+            Buffer.from(`blob\nmark :${index + 1}\ndata ${content.byteLength}\n`),
+            content,
+            Buffer.from("\n"),
+          ]),
+        );
+      }
+      await output.writeFile(
+        `commit ${ref}\ncommitter OpenClaw <noreply@openclaw.ai> 0 +0000\ndata 0\ndeleteall\n`,
+      );
+      for (let offset = 0; offset < entries.length; offset += 256) {
+        await output.writeFile(
+          entries
+            .slice(offset, offset + 256)
+            .map((entry, index) => {
+              const mode =
+                entry.type === "symlink"
+                  ? "120000"
+                  : (entry.mode & 0o111) !== 0
+                    ? "100755"
+                    : "100644";
+              return `M ${mode} :${offset + index + 1} ${JSON.stringify(entry.path)}\n`;
+            })
+            .join(""),
+        );
+      }
+      await output.writeFile("done\n");
+    } finally {
+      await output.close();
+    }
+    const input = await fs.open(inputPath, "r");
+    try {
+      await runExec("git", ["-C", params.repositoryRoot, "fast-import", "--quiet"], {
+        stdinFileDescriptor: input.fd,
+        timeoutMs: PATCH_TIMEOUT_MS,
+        maxBuffer: 1024 * 1024,
+      });
+    } finally {
+      await input.close();
+    }
+    return await requireGit(params.repositoryRoot, ["rev-parse", `${ref}^{tree}`]);
+  } finally {
+    await fs.rm(inputPath, { force: true });
   }
-  chunks.push(
-    Buffer.from(
-      `commit ${ref}\ncommitter OpenClaw <noreply@openclaw.ai> 0 +0000\ndata 0\ndeleteall\n`,
-    ),
-  );
-  for (const blob of blobs) {
-    const mode =
-      blob.entry.type === "symlink"
-        ? "120000"
-        : (blob.entry.mode & 0o111) !== 0
-          ? "100755"
-          : "100644";
-    chunks.push(Buffer.from(`M ${mode} :${blob.mark} ${JSON.stringify(blob.entry.path)}\n`));
+}
+
+async function readWorkspacePatch(
+  root: string,
+  baseTree: string,
+  currentTree: string,
+): Promise<Uint8Array> {
+  const patchPath = path.join(root, ".git", "workspace.patch");
+  const output = await fs.open(patchPath, "wx", 0o600);
+  let bytes = 0;
+  let limitExceeded = false;
+  try {
+    const diff = await runCommandWithTimeout(
+      [
+        "git",
+        "-C",
+        root,
+        "diff",
+        "--binary",
+        "--full-index",
+        "--no-renames",
+        baseTree,
+        currentTree,
+        "--",
+      ],
+      {
+        timeoutMs: PATCH_TIMEOUT_MS,
+        killProcessTree: true,
+        outputCapture: { stdout: "discard", stderr: "head" },
+        maxOutputBytes: { stdout: MAX_RECONCILIATION_TOTAL_BYTES, stderr: 1024 * 1024 },
+        terminateOnOutputLimit: true,
+        onOutputChunk: (chunk, stream) => {
+          if (stream !== "stdout") {
+            return true;
+          }
+          if (bytes + chunk.byteLength > MAX_RECONCILIATION_TOTAL_BYTES) {
+            limitExceeded = true;
+            return false;
+          }
+          // The observer is synchronous: finish each bounded write before accepting
+          // more output, and join Git before closing its destination.
+          let offset = 0;
+          while (offset < chunk.byteLength) {
+            const written = fsSync.writeSync(output.fd, chunk, offset, chunk.byteLength - offset);
+            if (written === 0) {
+              throw new Error("Cloud workspace patch write made no progress");
+            }
+            offset += written;
+          }
+          bytes += chunk.byteLength;
+          return true;
+        },
+      },
+    );
+    if (limitExceeded) {
+      throw new Error("Cloud workspace patch exceeds its byte limit");
+    }
+    if (diff.termination !== "exit" || diff.code !== 0) {
+      throw new Error(diff.stderr.trim() || "git diff failed");
+    }
+  } finally {
+    await output.close();
   }
-  chunks.push(Buffer.from("done\n"));
-  const imported = await runCommandBuffered(
-    ["git", "-C", params.repositoryRoot, "fast-import", "--quiet"],
-    {
-      input: Buffer.concat(chunks),
-      timeoutMs: PATCH_TIMEOUT_MS,
-      maxOutputBytes: { stdout: 1024 * 1024, stderr: 1024 * 1024 },
-    },
-  );
-  if (imported.termination !== "exit" || imported.code !== 0) {
-    throw new Error(imported.stderr.toString("utf8").trim() || "git fast-import failed");
-  }
-  return await requireGit(params.repositoryRoot, ["rev-parse", `${ref}^{tree}`]);
+  return await fs.readFile(patchPath);
 }
 
 export async function createWorkspacePatch(params: {
@@ -147,26 +242,30 @@ export async function createWorkspacePatch(params: {
   baseEntries: WorkerWorkspaceManifestEntry[];
   appliedEntries: WorkerWorkspaceManifestEntry[];
 }): Promise<{ patch: Uint8Array; baseTree: string; basePack: Uint8Array }> {
-  const temporary = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-workspace-patch-"));
+  const temporary = await fs.mkdtemp(
+    path.join(resolvePreferredOpenClawTmpDir(), "openclaw-workspace-patch-"),
+  );
   try {
     // Rollback journals have a fixed SHA-1 object-id contract. Do not inherit
     // user or process defaults that can switch temporary repositories to SHA-256.
     await requireGit(temporary, ["init", "--quiet", "--object-format=sha1"]);
     let bytes = 0;
     for (const entry of params.baseEntries) {
-      let content: Uint8Array | undefined;
       if (entry.type === "file") {
         if (entry.size > MAX_RECONCILIATION_FILE_BYTES) {
           throw new Error(`Cloud workspace rollback file is too large: ${entry.path}`);
         }
-        content = await fs.readFile(localPath(params.root, entry.path));
-        bytes += content.byteLength;
       }
+      bytes += entry.type === "file" ? entry.size : Buffer.byteLength(entry.target);
       if (bytes > MAX_RECONCILIATION_TOTAL_BYTES) {
         throw new Error("Cloud workspace rollback exceeds its byte limit");
       }
-      await materializeSnapshotEntry({ root: temporary, entry, content });
     }
+    await materializeSnapshotEntries({
+      root: temporary,
+      sourceRoot: params.root,
+      entries: params.baseEntries,
+    });
     const baseTree = await writeRawWorkspaceTree({
       repositoryRoot: temporary,
       entries: params.baseEntries,
@@ -177,7 +276,7 @@ export async function createWorkspacePatch(params: {
         input: Buffer.from(`${baseTree}\n`),
         timeoutMs: PATCH_TIMEOUT_MS,
         maxOutputBytes: {
-          stdout: MAX_RECONCILIATION_TOTAL_BYTES + 1,
+          stdout: MAX_RECONCILIATION_PACK_BYTES + 1,
           stderr: 1024 * 1024,
         },
       },
@@ -185,53 +284,21 @@ export async function createWorkspacePatch(params: {
     if (packed.termination !== "exit" || packed.code !== 0) {
       throw new Error(packed.stderr.toString("utf8").trim() || "git pack-objects failed");
     }
-    if (packed.stdout.byteLength > MAX_RECONCILIATION_TOTAL_BYTES) {
+    if (packed.stdout.byteLength > MAX_RECONCILIATION_PACK_BYTES) {
       throw new Error("Cloud workspace recovery snapshot exceeds its byte limit");
     }
-    for (const name of await fs.readdir(temporary)) {
-      if (name !== ".git") {
-        await fs.rm(path.join(temporary, name), { recursive: true, force: true });
-      }
-    }
-    for (const entry of params.appliedEntries) {
-      await materializeSnapshotEntry({
-        root: temporary,
-        entry,
-        sourceRoot: params.stagingRoot,
-      });
-    }
+    await clearTemporaryWorkspace(temporary);
+    await materializeSnapshotEntries({
+      root: temporary,
+      sourceRoot: params.stagingRoot,
+      entries: params.appliedEntries,
+    });
     const appliedTree = await writeRawWorkspaceTree({
       repositoryRoot: temporary,
       entries: params.appliedEntries,
     });
-    const diff = await runCommandBuffered(
-      [
-        "git",
-        "-C",
-        temporary,
-        "diff",
-        "--binary",
-        "--full-index",
-        "--no-renames",
-        baseTree,
-        appliedTree,
-        "--",
-      ],
-      {
-        timeoutMs: PATCH_TIMEOUT_MS,
-        maxOutputBytes: {
-          stdout: MAX_RECONCILIATION_TOTAL_BYTES + 1,
-          stderr: 1024 * 1024,
-        },
-      },
-    );
-    if (diff.termination !== "exit" || diff.code !== 0) {
-      throw new Error(diff.stderr.toString("utf8").trim() || "git diff failed");
-    }
-    if (diff.stdout.byteLength > MAX_RECONCILIATION_TOTAL_BYTES) {
-      throw new Error("Cloud workspace patch exceeds its byte limit");
-    }
-    return { patch: diff.stdout, baseTree, basePack: packed.stdout };
+    const patch = await readWorkspacePatch(temporary, baseTree, appliedTree);
+    return { patch, baseTree, basePack: packed.stdout };
   } finally {
     await fs.rm(temporary, { recursive: true, force: true });
   }
@@ -246,12 +313,17 @@ export async function applyWorkspacePatch(params: {
     return;
   }
   // Run no-index with discovery disabled so workspace .gitattributes and
-  // repository filter config cannot reinterpret authenticated patch bytes.
-  const temporary = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-no-git-"));
+  // repository filters cannot reinterpret authenticated bytes. Disable inherited
+  // autocrlf too: no-index still runs Git's working-tree newline conversion.
+  const temporary = await fs.mkdtemp(
+    path.join(resolvePreferredOpenClawTmpDir(), "openclaw-no-git-"),
+  );
   try {
     await requireGit(
       params.root,
       [
+        "-c",
+        "core.autocrlf=false",
         "apply",
         "--no-index",
         "--binary",
@@ -268,7 +340,7 @@ export async function applyWorkspacePatch(params: {
 
 function validateJournalSnapshot(journal: WorkerWorkspaceReconciliationJournal): void {
   if (
-    journal.basePack.byteLength > MAX_RECONCILIATION_TOTAL_BYTES ||
+    journal.basePack.byteLength > MAX_RECONCILIATION_PACK_BYTES ||
     !/^[a-f0-9]{40}$/u.test(journal.baseTree) ||
     createHash("sha256").update(journal.basePack).digest("hex") !== journal.basePackSha256
   ) {
@@ -277,7 +349,9 @@ function validateJournalSnapshot(journal: WorkerWorkspaceReconciliationJournal):
 }
 
 async function createWorkspaceRecoveryPatch(params: WorkspaceRecoveryContext): Promise<Uint8Array> {
-  const temporary = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-workspace-recovery-"));
+  const temporary = await fs.mkdtemp(
+    path.join(resolvePreferredOpenClawTmpDir(), "openclaw-workspace-recovery-"),
+  );
   try {
     await requireGit(temporary, ["init", "--quiet", "--object-format=sha1"]);
     await requireGit(temporary, ["index-pack", "--stdin"], params.journal.basePack);
@@ -295,10 +369,10 @@ async function createWorkspaceRecoveryPatch(params: WorkspaceRecoveryContext): P
       }
     }
     const actualEntries: WorkerWorkspaceManifestEntry[] = [];
+    const actualNodes = await readWorkspaceNodes(params.root, [...paths]);
     for (const entryPath of [...paths].toSorted()) {
-      const absolute = localPath(params.root, entryPath);
-      const stats = await fs.lstat(absolute).catch(() => undefined);
-      if (!stats) {
+      const actual = actualNodes.get(entryPath);
+      if (!actual) {
         const baseEntry = baseByPath.get(entryPath);
         const appliedEntry = appliedByPath.get(entryPath);
         if (baseEntry && appliedEntry) {
@@ -312,17 +386,16 @@ async function createWorkspaceRecoveryPatch(params: WorkspaceRecoveryContext): P
       }
       const baseEntry = baseByPath.get(entryPath);
       const appliedEntry = appliedByPath.get(entryPath);
-      if (baseEntry && (await entryMatches(params.root, baseEntry))) {
+      if (baseEntry && sameEntry(actual, baseEntry)) {
         actualEntries.push(baseEntry);
         continue;
       }
-      if (appliedEntry && (await entryMatches(params.root, appliedEntry))) {
+      if (appliedEntry && sameEntry(actual, appliedEntry)) {
         actualEntries.push(appliedEntry);
         continue;
       }
       const isJournalDirectory =
-        stats.isDirectory() &&
-        !stats.isSymbolicLink() &&
+        actual.type === "directory" &&
         ((directories.has(entryPath) &&
           (await directoryContainsOnlyJournalPaths(
             params.root,
@@ -342,13 +415,11 @@ async function createWorkspaceRecoveryPatch(params: WorkspaceRecoveryContext): P
         );
       }
     }
-    for (const entry of actualEntries) {
-      await materializeSnapshotEntry({
-        root: temporary,
-        entry,
-        sourceRoot: params.root,
-      });
-    }
+    await materializeSnapshotEntries({
+      root: temporary,
+      sourceRoot: params.root,
+      entries: actualEntries,
+    });
     const actualTree = await writeRawWorkspaceTree({
       repositoryRoot: temporary,
       entries: actualEntries,
@@ -367,40 +438,18 @@ async function createWorkspaceRecoveryPatch(params: WorkspaceRecoveryContext): P
             : undefined;
         await materializeSnapshotEntry({ root: temporary, entry, content });
       }
+      await assertWorkspaceMatchesManifest({
+        root: temporary,
+        manifest: { version: 1, baseCommit: null, entries: baseEntries },
+        entries: baseEntries,
+      });
       recoveryBaseTree = await writeRawWorkspaceTree({
         repositoryRoot: temporary,
         entries: baseEntries,
       });
       await clearTemporaryWorkspace(temporary);
     }
-    const diff = await runCommandBuffered(
-      [
-        "git",
-        "-C",
-        temporary,
-        "diff",
-        "--binary",
-        "--full-index",
-        "--no-renames",
-        actualTree,
-        recoveryBaseTree,
-        "--",
-      ],
-      {
-        timeoutMs: PATCH_TIMEOUT_MS,
-        maxOutputBytes: {
-          stdout: MAX_RECONCILIATION_TOTAL_BYTES + 1,
-          stderr: 1024 * 1024,
-        },
-      },
-    );
-    if (diff.termination !== "exit" || diff.code !== 0) {
-      throw new Error(diff.stderr.toString("utf8").trim() || "git recovery diff failed");
-    }
-    if (diff.stdout.byteLength > MAX_RECONCILIATION_TOTAL_BYTES) {
-      throw new Error("Cloud workspace recovery patch exceeds its byte limit");
-    }
-    return diff.stdout;
+    return await readWorkspacePatch(temporary, actualTree, recoveryBaseTree);
   } finally {
     await fs.rm(temporary, { recursive: true, force: true });
   }
@@ -546,30 +595,7 @@ async function restoreWorkspaceJournalDirectories(params: WorkspaceRecoveryConte
     if (baseDirectoryPaths.has(entryPath) || baseEntryPaths.has(entryPath)) {
       continue;
     }
-    let children: string[];
-    try {
-      children = await workspaceRoot.list(entryPath);
-    } catch (error) {
-      if (error instanceof FsSafeError && ["not-found", "path-alias"].includes(error.code)) {
-        continue;
-      }
-      throw error;
-    }
-    if (children.length > 0) {
-      continue;
-    }
-    try {
-      await workspaceRoot.remove(entryPath);
-    } catch (error) {
-      if (error instanceof FsSafeError && ["not-found", "path-alias"].includes(error.code)) {
-        continue;
-      }
-      const racedChildren = await workspaceRoot.list(entryPath).catch(() => undefined);
-      if (racedChildren?.length) {
-        continue;
-      }
-      throw error;
-    }
+    await removeEmptyWorkspaceDirectory(workspaceRoot, entryPath);
   }
 }
 

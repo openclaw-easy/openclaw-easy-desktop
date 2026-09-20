@@ -26,6 +26,7 @@ import { createNodeDesktopService } from "./node-source.js";
 import { createNodeDesktopStreamBroker } from "./node-stream-broker.js";
 import { handleDesktopObserveUpgrade } from "./observe-bridge.js";
 import { createDesktopSessionRegistry } from "./session-registry.js";
+import { SocketReader } from "./socket-reader.test-support.js";
 
 const VERSION = Buffer.from("RFB 003.008\n", "ascii");
 const cleanups: Array<() => Promise<void>> = [];
@@ -39,35 +40,6 @@ function handleExpectedPeerTeardownError(error: NodeJS.ErrnoException): void {
 afterEach(async () => {
   await Promise.all(cleanups.splice(0).map((cleanup) => cleanup()));
 });
-
-class SocketReader {
-  private buffered = Buffer.alloc(0);
-  private readonly waiters = new Set<() => void>();
-
-  constructor(socket: net.Socket) {
-    socket.on("data", (chunk) => {
-      this.buffered = Buffer.concat([
-        this.buffered,
-        Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk),
-      ]);
-      for (const waiter of this.waiters) {
-        waiter();
-      }
-      this.waiters.clear();
-    });
-  }
-
-  async readExactly(length: number): Promise<Buffer> {
-    while (this.buffered.length < length) {
-      await new Promise<void>((resolve) => {
-        this.waiters.add(resolve);
-      });
-    }
-    const value = this.buffered.subarray(0, length);
-    this.buffered = this.buffered.subarray(length);
-    return value;
-  }
-}
 
 class WebSocketReader {
   private readonly chunks: Buffer[] = [];
@@ -109,12 +81,11 @@ async function startRfbHarness(
   const peers = new Set<net.Socket>();
   let connectionCount = 0;
   let completedStreams = 0;
-  let resolveCompletion!: () => void;
-  let rejectCompletion!: (error: Error) => void;
-  const completion = new Promise<void>((resolve, reject) => {
-    resolveCompletion = resolve;
-    rejectCompletion = reject;
-  });
+  const {
+    promise: completion,
+    resolve: resolveCompletion,
+    reject: rejectCompletion,
+  } = createDeferred();
   const server = net.createServer((socket) => {
     peers.add(socket);
     socket.once("close", () => peers.delete(socket));
@@ -437,6 +408,7 @@ describe("worker environment node desktop observe integration", () => {
         }
       });
       const transport: NodeWorkerSupervisorTransport = {
+        getCurrentNode: async (nodeId) => (proof.nodeId === nodeId ? proof : undefined),
         listCurrentNodes: async () => [proof],
         hasCurrentRunner: (nodeId) => nodeId === proof.nodeId,
         isCurrent: (candidate) =>

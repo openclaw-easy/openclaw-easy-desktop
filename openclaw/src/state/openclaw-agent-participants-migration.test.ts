@@ -7,9 +7,11 @@ import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
 import {
   closeOpenClawAgentDatabasesForTest,
   ensureOpenClawAgentDatabaseSchema,
+  OPENCLAW_AGENT_SCHEMA_VERSION,
   openOpenClawAgentDatabase,
   withAgentDatabaseMaintenanceLease,
 } from "./openclaw-agent-db.js";
+import { removeCanonicalValidationFromHistoricalAgentFixture } from "./openclaw-agent-db.test-support.js";
 import { withLegacySessionParticipantsSchema } from "./openclaw-agent-participants-migration.js";
 import { sessionParticipantsSchemaSql } from "./openclaw-agent-session-participants-schema.js";
 
@@ -30,6 +32,7 @@ describe("participant identity migration", () => {
     await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
       const initial = openOpenClawAgentDatabase({ agentId: "main", env: state.env });
       const databasePath = initial.path;
+      removeCanonicalValidationFromHistoricalAgentFixture(initial.db);
       initial.db.exec(
         "DROP TABLE session_participants; PRAGMA user_version = 17; UPDATE schema_meta SET schema_version = 17;",
       );
@@ -40,7 +43,9 @@ describe("participant identity migration", () => {
       );
       expect(result.skipped).toBe(false);
       const reopened = openOpenClawAgentDatabase({ agentId: "main", env: state.env });
-      expect(reopened.db.prepare("PRAGMA user_version").get()?.user_version).toBe(19);
+      expect(reopened.db.prepare("PRAGMA user_version").get()?.user_version).toBe(
+        OPENCLAW_AGENT_SCHEMA_VERSION,
+      );
     });
   });
 
@@ -48,6 +53,7 @@ describe("participant identity migration", () => {
     await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
       const initial = openOpenClawAgentDatabase({ agentId: "main", env: state.env });
       const databasePath = initial.path;
+      removeCanonicalValidationFromHistoricalAgentFixture(initial.db);
       initial.db.exec(`
         DROP TABLE session_participants;
         PRAGMA user_version = 17;
@@ -74,10 +80,15 @@ describe("participant identity migration", () => {
         },
       });
       expect(result.targets[0]?.corruptRecovery).toBeUndefined();
-      expect(result.totals.issues).toBe(0);
+      expect(
+        result.totals.issues,
+        JSON.stringify(result.targets.flatMap((target) => target.issues)),
+      ).toBe(0);
       const database = openNodeSqliteDatabase(databasePath, { readOnly: true });
       try {
-        expect(database.prepare("PRAGMA user_version").get()?.user_version).toBe(19);
+        expect(database.prepare("PRAGMA user_version").get()?.user_version).toBe(
+          OPENCLAW_AGENT_SCHEMA_VERSION,
+        );
         expect(
           database
             .prepare("SELECT value_json FROM cache_entries WHERE scope = 'participant-proof'")
@@ -100,6 +111,7 @@ describe("participant identity migration", () => {
         );
         const initial = openOpenClawAgentDatabase({ agentId: "main", env: state.env });
         const databasePath = initial.path;
+        removeCanonicalValidationFromHistoricalAgentFixture(initial.db);
         initial.db.exec(
           "DROP TABLE session_participants; PRAGMA user_version = 17; UPDATE schema_meta SET schema_version = 17;",
         );
@@ -135,7 +147,9 @@ describe("participant identity migration", () => {
           if (scenario === "absent") {
             await migration;
             expect(database.prepare("SELECT * FROM session_participants").all()).toEqual([]);
-            expect(database.prepare("PRAGMA user_version").get()?.user_version).toBe(19);
+            expect(database.prepare("PRAGMA user_version").get()?.user_version).toBe(
+              OPENCLAW_AGENT_SCHEMA_VERSION,
+            );
           } else {
             await expect(migration).rejects.toThrow(
               scenario === "rollback"
@@ -186,6 +200,7 @@ describe("participant identity migration", () => {
       await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
         const initial = openOpenClawAgentDatabase({ agentId: "main", env: state.env });
         const databasePath = initial.path;
+        removeCanonicalValidationFromHistoricalAgentFixture(initial.db);
         initial.db.exec(
           `DROP TABLE session_participants; PRAGMA user_version = ${version}; UPDATE schema_meta SET schema_version = ${version};`,
         );
@@ -214,6 +229,7 @@ describe("participant identity migration", () => {
       );
       const initial = openOpenClawAgentDatabase({ agentId: "main", env: state.env });
       const databasePath = initial.path;
+      removeCanonicalValidationFromHistoricalAgentFixture(initial.db);
       initial.db.exec("DROP TABLE session_participants;");
       initial.db.exec(withLegacySessionParticipantsSchema(sessionParticipantsSchemaSql()));
       const kinds = [
@@ -293,6 +309,7 @@ describe("participant identity migration", () => {
         );
         const initial = openOpenClawAgentDatabase({ agentId: "main", env: state.env });
         const databasePath = initial.path;
+        removeCanonicalValidationFromHistoricalAgentFixture(initial.db);
         initial.db.exec(`
           DROP TABLE session_participants;
           CREATE TABLE session_participants (
@@ -340,10 +357,12 @@ describe("participant identity migration", () => {
               last_prompted_at: null,
             }),
           ]);
-          expect(database.prepare("PRAGMA user_version").get()?.user_version).toBe(19);
+          expect(database.prepare("PRAGMA user_version").get()?.user_version).toBe(
+            OPENCLAW_AGENT_SCHEMA_VERSION,
+          );
           expect(
             database.prepare("SELECT schema_version FROM schema_meta").get()?.schema_version,
-          ).toBe(19);
+          ).toBe(OPENCLAW_AGENT_SCHEMA_VERSION);
           expect(
             database
               .prepare("SELECT entry_json FROM session_nodes WHERE session_key = ?")

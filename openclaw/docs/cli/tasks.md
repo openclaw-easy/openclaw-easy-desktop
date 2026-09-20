@@ -3,7 +3,7 @@ summary: "CLI reference for `openclaw tasks` (background task ledger and Task Fl
 read_when:
   - You want to inspect, audit, or cancel background task records
   - You are documenting Task Flow commands under `openclaw tasks flow`
-title: "`openclaw tasks`"
+title: "Tasks"
 doc-schema-version: 1
 ---
 
@@ -120,8 +120,8 @@ Task Flow records. Lost tasks retained until `cleanupAfter` are warnings;
 expired or unstamped lost tasks are errors.
 
 `--code` accepts task codes (`stale_queued`, `stale_running`, `lost`,
-`delivery_failed`, `missing_cleanup`, `inconsistent_timestamps`) and Task
-Flow codes (`restore_failed`, `stale_waiting`, `stale_blocked`,
+`delivery_failed`, `missing_cleanup`, `inconsistent_timestamps`) and additional
+Task Flow codes (`restore_failed`, `stale_waiting`, `stale_blocked`,
 `cancel_stuck`, `missing_linked_tasks`, `blocked_task_missing`). See
 [Background Tasks](/automation/tasks) for severity and trigger detail per
 code.

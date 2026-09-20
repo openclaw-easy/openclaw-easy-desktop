@@ -8,11 +8,11 @@ import {
 } from "openclaw/plugin-sdk/agent-harness-runtime";
 import { resolveCodexMcpToolOverridesForAgent } from "openclaw/plugin-sdk/codex-mcp-projection";
 import { prepareCodexAppServerAuthBinding } from "./auth-binding.js";
+import { resolveCodexAppServerAuthAccountCacheKey } from "./auth-bridge.js";
 import {
-  resolveCodexAppServerAuthAccountCacheKey,
   resolveCodexAppServerFallbackApiKeyCacheKey,
   resolveCodexAppServerPreparedApiKeyCacheKey,
-} from "./auth-bridge.js";
+} from "./auth-cache-key.js";
 import { isCodexSandboxExecServerEnabled } from "./config.js";
 import {
   resolveCodexAppServerHookChannelId,
@@ -26,8 +26,9 @@ import {
   buildLegacyScheduledCodexAppRecoveryPrompt,
 } from "./scheduled-app-authority.js";
 import { canResolveScheduledConfiguredMcpCreatorAuthority } from "./scheduled-configured-mcp-authority.js";
+import { fingerprintJsonObject } from "./thread-fingerprints.js";
 import { resolveCodexAppServerThreadModelSelection } from "./thread-lifecycle.js";
-import { resolveCodexWebSearchPlan } from "./web-search.js";
+import { resolveCodexWebSearchPlan, type CodexNativeWebSearchSupport } from "./web-search.js";
 
 function resolveCodexAttemptBundleManifestRegistry(
   preparedModelRuntime: EmbeddedRunAttemptParams["preparedModelRuntime"],
@@ -172,6 +173,7 @@ export async function prepareCodexAttemptRuntime(connection: CodexAttemptConnect
   );
   const bundleMcpThreadConfig = await loadCodexBundleMcpThreadConfig({
     workspaceDir: effectiveWorkspace,
+    agentId: sessionAgentId,
     cfg: params.config,
     toolsEnabled: usesSupervisionConnection || supportsModelTools(params.model),
     disableTools: params.disableTools,
@@ -183,7 +185,7 @@ export async function prepareCodexAttemptRuntime(connection: CodexAttemptConnect
     params.trigger === "cron" &&
     params.scheduledToolPolicy !== undefined &&
     Array.isArray(params.toolsAllow);
-  const ownsScheduledConfiguredMcpSurface =
+  const scheduledConfiguredMcpSurface =
     authenticatedScheduledMode &&
     (bundleMcpThreadConfig.staticServerNames.length > 0 ||
       mutable.startupBinding?.configuredMcpOwnershipVersion === 1);
@@ -192,6 +194,10 @@ export async function prepareCodexAttemptRuntime(connection: CodexAttemptConnect
   // capability; do not promote that fact to general sender ownership.
   const hasFreshCreatorAuthority =
     cronCreatorAuthorityCapability?.active === true &&
+    !(
+      cronCreatorAuthorityCapability.managementEntitlement &&
+      cronCreatorAuthorityCapability.callerOrigin.kind === "unknown"
+    ) &&
     cronCreatorAuthorityCapability.runId === params.runId &&
     !cronCreatorAuthorityCapability.signal.aborted;
   const mayResolveScheduledConfiguredMcpCreatorAuthority =
@@ -223,34 +229,57 @@ export async function prepareCodexAttemptRuntime(connection: CodexAttemptConnect
     sandbox,
     { agentId: policyAgentId, runtimeSessionKey: sandboxSessionKey, sandboxExecServerEnabled },
   );
+  const configuredMcpSurface = scheduledConfiguredMcpSurface
+    ? "scheduled"
+    : !nativeToolSurfaceEnabled && bundleMcpThreadConfig.staticServerNames.length > 0
+      ? "transient"
+      : undefined;
   preDynamicStartupStages.mark("native-tool-surface");
-  const nativeProviderWebSearchSupport =
-    resolveCodexWebSearchPlan({
+  const webSearchPlan = resolveCodexWebSearchPlan({
+    config: params.config,
+    disableTools: params.disableTools,
+    nativeToolSurfaceEnabled,
+  });
+  const supervisedSearchFingerprint =
+    usesSupervisionConnection && !mutable.startupBinding?.pendingSupervisionBranch
+      ? mutable.startupBinding?.webSearchThreadConfigFingerprint
+      : undefined;
+  let nativeProviderWebSearchSupport: CodexNativeWebSearchSupport;
+  // The bound thread owns its established search policy, not the daemon's current
+  // provider defaults. Explicit OpenClaw policy changes still pass the lifecycle checks.
+  if (
+    webSearchPlan.kind !== "native-hosted" ||
+    supervisedSearchFingerprint ===
+      fingerprintJsonObject(resolveCodexWebSearchPlan({ disableTools: true }).threadConfig)
+  ) {
+    nativeProviderWebSearchSupport = "unsupported";
+  } else if (supervisedSearchFingerprint === fingerprintJsonObject(webSearchPlan.threadConfig)) {
+    nativeProviderWebSearchSupport = "supported";
+  } else {
+    nativeProviderWebSearchSupport = await resolveCodexProviderWebSearchSupport({
+      clientFactory: attemptClientFactory,
+      appServer,
+      authProfileId: startupClientAuthProfileId,
+      preparedAuth: startupPreparedAuth,
+      agentDir,
       config: params.config,
-      disableTools: params.disableTools,
-      nativeToolSurfaceEnabled,
-    }).kind === "native-hosted"
-      ? await resolveCodexProviderWebSearchSupport({
-          clientFactory: attemptClientFactory,
-          appServer,
-          authProfileId: startupClientAuthProfileId,
-          preparedAuth: startupPreparedAuth,
-          agentDir,
-          config: params.config,
-          modelProviderOverride: usesSupervisionConnection
-            ? mutable.startupBinding?.modelProvider
-            : resolveCodexAppServerThreadModelSelection({
-                provider: params.provider,
-                model: params.modelId,
-                binding: mutable.startupBinding,
-                authProfileId: startupAuthProfileId,
-                authProfileStore: attemptAuthProfileStore,
-                agentDir,
-                config: params.config,
-              }).modelProvider,
-          signal: runAbortController.signal,
-        })
-      : "unsupported";
+      expectedNativeModelProvider: usesSupervisionConnection
+        ? mutable.startupBinding?.modelProvider
+        : undefined,
+      modelProviderOverride: usesSupervisionConnection
+        ? undefined
+        : resolveCodexAppServerThreadModelSelection({
+            provider: params.provider,
+            model: params.modelId,
+            binding: mutable.startupBinding,
+            authProfileId: startupAuthProfileId,
+            authProfileStore: attemptAuthProfileStore,
+            agentDir,
+            config: params.config,
+          }).modelProvider,
+      signal: runAbortController.signal,
+    });
+  }
   preDynamicStartupStages.mark("provider-capabilities");
   for (const diagnostic of bundleMcpThreadConfig.diagnostics) {
     embeddedAgentLog.warn(`bundle-mcp: ${diagnostic.pluginId}: ${diagnostic.message}`);
@@ -281,7 +310,7 @@ export async function prepareCodexAttemptRuntime(connection: CodexAttemptConnect
     bundleMcpThreadConfig,
     bundleManifestRegistry,
     authenticatedScheduledMode,
-    ownsScheduledConfiguredMcpSurface,
+    configuredMcpSurface,
     canResolveScheduledConfiguredMcpCreatorAuthority:
       mayResolveScheduledConfiguredMcpCreatorAuthority,
     codexMcpToolOverrides,

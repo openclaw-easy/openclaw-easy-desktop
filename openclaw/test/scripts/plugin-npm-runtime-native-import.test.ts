@@ -50,7 +50,10 @@ function fixture(format = "esm", declaration = "peerDependencies") {
       version: "1.0.0",
       type: "module",
       optionalDependencies: { "fixture-dep": "1.0.0" },
-      [declaration]: { openclaw: "*" },
+      [declaration]: {
+        ...(declaration === "optionalDependencies" ? { "fixture-dep": "1.0.0" } : {}),
+        openclaw: "*",
+      },
       openclaw: {
         extensions: ["./index.ts"],
         build: { runtimeFormat: format },
@@ -125,10 +128,59 @@ function snapshot(root: string, directories: string[]) {
 
 describe("explicit source native-import preparation", () => {
   it.each([
+    { argv: ["--prepare-native-import", "extensions/demo", ""] },
+    { argv: ["extensions/demo", "", "--prepare-native-import"] },
+    { argv: ["extensions/demo", "", "--prepare-native-import", "--unexpected"] },
+  ])("rejects excess preparation argv $argv before changing the host link", ({ argv }) => {
+    const { root, packageDir } = fixture();
+    const before = snapshot(root, ["."]);
+    const result = runCli(root, argv);
+
+    expect(result.error, result.stderr).toBeUndefined();
+    expect(result.status, result.stderr).toBe(1);
+    expect(result.stderr).toContain("unexpected plugin npm runtime build argument");
+    expect(fs.existsSync(path.join(packageDir, "node_modules"))).toBe(false);
+    expect(fs.existsSync(path.join(root, "executed"))).toBe(false);
+    expect(snapshot(root, ["."])).toEqual(before);
+  });
+
+  it("rejects excess build argv through the public shim without compiling", () => {
+    const { root } = fixture();
+    const packageDir = path.join(root, "javascript-only");
+    writeFile(
+      packageDir,
+      "package.json",
+      JSON.stringify({
+        name: "@openclaw/arity-js-fixture",
+        version: "1.0.0",
+        type: "module",
+        openclaw: { extensions: ["./index.js"] },
+      }),
+    );
+    writeFile(packageDir, "index.js", 'throw new Error("JS-only argv proof must not execute");\n');
+    writeFile(packageDir, "dist/sentinel.js", "keep\n");
+    const before = snapshot(root, ["."]);
+    const valid = runCli(root, [packageDir]);
+
+    expect(valid.error, valid.stderr).toBeUndefined();
+    expect(valid.status, valid.stderr).toBe(0);
+    expect(snapshot(root, ["."])).toEqual(before);
+
+    const result = runCli(root, [packageDir, "", "--unexpected"]);
+
+    expect(result.error, result.stderr).toBeUndefined();
+    expect(result.status, result.stderr).toBe(1);
+    expect(result.stderr).toContain("unexpected plugin npm runtime build argument");
+    expect(snapshot(root, ["."])).toEqual(before);
+  });
+
+  it.each([
     ["esm", "peerDependencies"],
     ["cjs", "peerDependencies"],
     ["esm", "dependencies"],
     ["cjs", "dependencies"],
+    ["esm", "optionalDependencies"],
+    ["cjs", "optionalDependencies"],
   ])("prepares %s output with a missing %s host link without rebuilding", (format, declaration) => {
     const { root, packageDir, entry } = fixture(format, declaration);
     const compiled = runCli(root, ["extensions/demo"]);
@@ -164,16 +216,13 @@ describe("explicit source native-import preparation", () => {
     expect(snapshot(root, directories)).toEqual(before);
   });
 
-  it.each(["devDependencies", "optionalDependencies"])(
-    "does not infer a host declaration from %s or publication metadata",
-    (declaration) => {
-      const { root, packageDir } = fixture("esm", declaration);
-      const result = runCli(root, ["--prepare-native-import", "extensions/demo"]);
-      expect(result.status).toBe(1);
-      expect(result.stderr).toMatch(/does not declare openclaw/u);
-      expect(fs.existsSync(path.join(packageDir, "node_modules"))).toBe(false);
-    },
-  );
+  it("does not infer a host declaration from devDependencies or publication metadata", () => {
+    const { root, packageDir } = fixture("esm", "devDependencies");
+    const result = runCli(root, ["--prepare-native-import", "extensions/demo"]);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toMatch(/does not declare openclaw/u);
+    expect(fs.existsSync(path.join(packageDir, "node_modules"))).toBe(false);
+  });
 
   it.each([
     "outside package",

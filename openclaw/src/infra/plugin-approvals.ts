@@ -1,7 +1,7 @@
 // Defines plugin approval request/resolution payloads and actions.
 import { truncateUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
 import { summarizeApprovalScope, type ApprovalScope } from "./approval-scope.js";
-import type { ExecApprovalDecision } from "./exec-approvals.js";
+import type { ExecApprovalDecision } from "./exec-approvals-core.js";
 
 // Plugin approval types and renderers mirror exec approval decisions while
 // keeping plugin-facing request text and action metadata separate.
@@ -12,6 +12,22 @@ export type PluginApprovalActionView = {
   command: string;
   decision?: ExecApprovalDecision;
   style?: "primary" | "secondary" | "success" | "danger";
+};
+
+/** Gateway-minted placement identity; plugin and RPC callers never supply this authority. */
+type PluginApprovalPlacementGrantBinding = {
+  pluginId: string;
+  command: string;
+  approvalScope: string;
+  agentId: string;
+  sessionKey: string;
+  sessionId: string;
+  nodeId: string;
+  pairingGeneration: string;
+  environmentId: string;
+  ownerEpoch: number;
+  placementGeneration: number;
+  cwd: string;
 };
 
 /** Request payload supplied by plugin approval callers. */
@@ -25,12 +41,21 @@ export type PluginApprovalRequestPayload = {
   scope?: ApprovalScope | null;
   toolName?: string | null;
   toolCallId?: string | null;
+  /** Exact MCP persistence intent; the host separately binds live tool-call proof. */
+  mcpTool?: { server: string; tool: string };
   allowedDecisions?: readonly ExecApprovalDecision[] | null;
+  /** Trusted in-process metadata; public Gateway callers cannot submit this field. */
+  externalResolution?: {
+    label: string;
+    decisions?: readonly ("allow-once" | "allow-always")[];
+  } | null;
   actions?: readonly PluginApprovalActionView[] | null;
   agentId?: string | null;
   sessionKey?: string | null;
   /** Host-derived source run; never accepted from plugin approval RPC params. */
   runId?: string | null;
+  /** Host-derived grant binding; never accepted from plugin approval RPC params. */
+  placementGrant?: PluginApprovalPlacementGrantBinding | null;
   turnSourceChannel?: string | null;
   turnSourceTo?: string | null;
   turnSourceAccountId?: string | null;

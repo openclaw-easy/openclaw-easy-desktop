@@ -6,6 +6,7 @@ import { SILENT_REPLY_TOKEN } from "../../auto-reply/tokens.js";
 import type { CliDeps } from "../../cli/outbound-send-deps.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { createLazyImportLoader } from "../../shared/lazy-promise.js";
+import type { SkillSnapshot } from "../../skills/types.js";
 import type {
   CronAgentExecutionPhaseUpdate,
   CronAgentExecutionStarted,
@@ -29,6 +30,11 @@ export type RunCronAgentTurnParams = {
   sessionKey: string;
   agentId?: string;
   lane?: string;
+  executionIdentity?: import("../service/state.js").CronExecutionIdentityAdmission;
+  /** Host-only root for system-owned turns; never persisted in cron state. */
+  executionRoot?: string;
+  /** Explicit instruction set for a host-owned turn, including an empty review context. */
+  skillsSnapshot?: SkillSnapshot;
 };
 
 export function resolveCronAgentTurnMessage(input: RunCronAgentTurnParams): string {

@@ -9,8 +9,12 @@ import {
 } from "../../api/gateway.ts";
 import type { SessionsListResult } from "../../api/types.ts";
 import { waitForFast } from "../../test-helpers/wait-for.ts";
-import { createSessionCapability, reconcileSessionRunTerminal } from "./index.ts";
-import { createGatewayHarness, sessionsResult } from "./session-capability.test-support.ts";
+import { reconcileSessionRunTerminal } from "./index.ts";
+import {
+  createGatewayHarness,
+  createTestSessionCapability,
+  sessionsResult,
+} from "./session-capability.test-support.ts";
 
 function sessionChangedEvent(key: string): GatewayEventFrame {
   return {
@@ -38,7 +42,7 @@ describe("createSessionCapability", () => {
       const { emitEvent, gateway } = createGatewayHarness({
         request,
       } as unknown as GatewayBrowserClient);
-      const sessions = createSessionCapability(gateway);
+      const sessions = createTestSessionCapability(gateway);
       const reconcile = (archived: boolean, updatedAt: number) => {
         const payload = { ...row, sessionKey: key, reason: "patch", archived, updatedAt };
         if (path === "direct") {
@@ -84,7 +88,7 @@ describe("createSessionCapability", () => {
       });
       const client = { request } as unknown as GatewayBrowserClient;
       const { emitEvent, gateway } = createGatewayHarness(client);
-      const sessions = createSessionCapability(gateway);
+      const sessions = createTestSessionCapability(gateway);
       await sessions.refresh({ agentId: "main", force: true });
       const staleArchive = {
         sessionKey: key,
@@ -128,7 +132,7 @@ describe("createSessionCapability", () => {
     });
     const client = { request } as unknown as GatewayBrowserClient;
     const { gateway } = createGatewayHarness(client, ["sessions.groups.list"]);
-    const sessions = createSessionCapability(gateway);
+    const sessions = createTestSessionCapability(gateway);
 
     await sessions.groupsLoad();
     expect(sessions.state.groups).toEqual([]);
@@ -159,7 +163,7 @@ describe("createSessionCapability", () => {
     });
     const client = { request } as unknown as GatewayBrowserClient;
     const { gateway } = createGatewayHarness(client, ["sessions.groups.list"]);
-    const sessions = createSessionCapability(gateway);
+    const sessions = createTestSessionCapability(gateway);
 
     await sessions.groupsLoad();
 
@@ -174,7 +178,7 @@ describe("createSessionCapability", () => {
     });
     const client = { request } as unknown as GatewayBrowserClient;
     const { gateway } = createGatewayHarness(client);
-    const sessions = createSessionCapability(gateway);
+    const sessions = createTestSessionCapability(gateway);
 
     await sessions.groupsLoad();
     await sessions.groupsLoad();
@@ -192,7 +196,7 @@ describe("createSessionCapability", () => {
     });
     const client = { request } as unknown as GatewayBrowserClient;
     const { gateway } = createGatewayHarness(client);
-    const sessions = createSessionCapability(gateway);
+    const sessions = createTestSessionCapability(gateway);
 
     await expect(sessions.groupsLoad()).resolves.toEqual([{ name: "Research", position: 0 }]);
     expect(request).toHaveBeenCalledOnce();
@@ -209,7 +213,7 @@ describe("createSessionCapability", () => {
     });
     const client = { request } as unknown as GatewayBrowserClient;
     const { gateway } = createGatewayHarness(client, ["sessions.groups.rename"]);
-    const sessions = createSessionCapability(gateway);
+    const sessions = createTestSessionCapability(gateway);
 
     await expect(sessions.groupsRename("Alpha", "Beta")).rejects.toThrow("rename failed");
     expect(sessions.state.error).toBe("rename failed");
@@ -225,7 +229,7 @@ describe("createSessionCapability", () => {
     });
     const client = { request } as unknown as GatewayBrowserClient;
     const { gateway } = createGatewayHarness(client, ["sessions.groups.put"]);
-    const sessions = createSessionCapability(gateway);
+    const sessions = createTestSessionCapability(gateway);
 
     await expect(sessions.groupsPut(["Alpha"])).rejects.toThrow("group catalog rejected");
     expect(sessions.state.error).toBe("group catalog rejected");
@@ -241,7 +245,7 @@ describe("createSessionCapability", () => {
     });
     const client = { request } as unknown as GatewayBrowserClient;
     const { gateway } = createGatewayHarness(client, ["sessions.groups.delete"]);
-    const sessions = createSessionCapability(gateway);
+    const sessions = createTestSessionCapability(gateway);
 
     await expect(sessions.groupsDelete("Alpha")).rejects.toThrow("delete failed");
     expect(sessions.state.error).toBe("delete failed");
@@ -264,7 +268,7 @@ describe("createSessionCapability", () => {
     });
     const client = { request } as unknown as GatewayBrowserClient;
     const { gateway, publish } = createGatewayHarness(client, ["sessions.groups.rename"]);
-    const sessions = createSessionCapability(gateway);
+    const sessions = createTestSessionCapability(gateway);
 
     const operation = sessions.groupsRename("Alpha", "Beta");
     publish(false);
@@ -292,7 +296,7 @@ describe("createSessionCapability", () => {
     });
     const client = { request } as unknown as GatewayBrowserClient;
     const { gateway, publish } = createGatewayHarness(client, ["sessions.groups.put"]);
-    const sessions = createSessionCapability(gateway);
+    const sessions = createTestSessionCapability(gateway);
 
     const operation = sessions.groupsPut(["Alpha"]);
     publish(false);
@@ -321,7 +325,7 @@ describe("createSessionCapability", () => {
       });
       const client = { request } as unknown as GatewayBrowserClient;
       const { gateway, publish } = createGatewayHarness(client, [method]);
-      const sessions = createSessionCapability(gateway);
+      const sessions = createTestSessionCapability(gateway);
 
       const mutation =
         operation === "rename"
@@ -342,7 +346,7 @@ describe("createSessionCapability", () => {
     const request = vi.fn();
     const client = { request } as unknown as GatewayBrowserClient;
     const { gateway } = createGatewayHarness(client, []);
-    const sessions = createSessionCapability(gateway);
+    const sessions = createTestSessionCapability(gateway);
 
     await sessions.groupsLoad();
     await sessions.groupsLoad();
@@ -368,7 +372,7 @@ describe("createSessionCapability", () => {
     });
     const client = { request } as unknown as GatewayBrowserClient;
     const { gateway, emitEvent } = createGatewayHarness(client, ["sessions.groups.list"]);
-    const sessions = createSessionCapability(gateway);
+    const sessions = createTestSessionCapability(gateway);
 
     const firstLoad = sessions.groupsLoad();
     await waitForFast(() => expect(groupsCalls).toBe(1));
@@ -395,7 +399,7 @@ describe("createSessionCapability", () => {
     });
     const client = { request } as unknown as GatewayBrowserClient;
     const { gateway } = createGatewayHarness(client);
-    const sessions = createSessionCapability(gateway);
+    const sessions = createTestSessionCapability(gateway);
 
     await expect(
       sessions.delete(key, { expectedSessionId: "session-before-replacement" }),
@@ -417,14 +421,15 @@ describe("createSessionCapability", () => {
     const rejectedKey = "agent:main:rejected";
     const keptKey = "agent:main:kept";
     const deletedKey = "agent:main:deleted";
+    const error = new GatewayRequestError({
+      code: "INVALID_REQUEST",
+      message: `Session ${rejectedKey} changed before deletion. Retry.`,
+    });
     const request = vi.fn(async (method: string, params?: unknown) => {
       if (method === "sessions.delete") {
         const key = (params as { key?: string } | undefined)?.key;
         if (key === rejectedKey) {
-          throw new GatewayRequestError({
-            code: "INVALID_REQUEST",
-            message: `Session ${key} changed before deletion. Retry.`,
-          });
+          throw error;
         }
         return { ok: true, deleted: key === deletedKey };
       }
@@ -435,7 +440,7 @@ describe("createSessionCapability", () => {
     });
     const client = { request } as unknown as GatewayBrowserClient;
     const { gateway } = createGatewayHarness(client);
-    const sessions = createSessionCapability(gateway);
+    const sessions = createTestSessionCapability(gateway);
     const deletedSnapshots: string[][] = [];
     const unsubscribe = sessions.subscribe((next) => {
       deletedSnapshots.push(next.deletedSessions.map((target) => target.key));
@@ -449,7 +454,7 @@ describe("createSessionCapability", () => {
       ]),
     ).resolves.toEqual({
       deleted: [deletedKey],
-      errors: [`Session ${rejectedKey} changed before deletion. Retry.`],
+      errors: [{ target: { key: rejectedKey }, error }],
       preservedWorktrees: [],
     });
     expect(deletedSnapshots.some((keys) => keys.includes(deletedKey))).toBe(true);
@@ -476,7 +481,7 @@ describe("createSessionCapability", () => {
       return sessionsResult([{ key: "agent:main:listed", kind: "direct", updatedAt: 2 }], 2);
     });
     const client = { request } as unknown as GatewayBrowserClient;
-    const sessions = createSessionCapability({
+    const sessions = createTestSessionCapability({
       snapshot: {
         client,
         phase: "connected" as const,
@@ -518,7 +523,7 @@ describe("createSessionCapability", () => {
     });
     const client = { request } as unknown as GatewayBrowserClient;
     const { gateway, publish } = createGatewayHarness(client);
-    const sessions = createSessionCapability(gateway);
+    const sessions = createTestSessionCapability(gateway);
 
     const staleRefresh = sessions.refresh({ force: true });
     publish(false);
@@ -552,7 +557,7 @@ describe("createSessionCapability", () => {
     });
     const client = { request } as unknown as GatewayBrowserClient;
     const { gateway } = createGatewayHarness(client);
-    const sessions = createSessionCapability(gateway);
+    const sessions = createTestSessionCapability(gateway);
 
     const refresh = sessions.refresh({ force: true });
     expect(sessions.state.loading).toBe(true);
@@ -586,7 +591,7 @@ describe("createSessionCapability", () => {
       throw new Error(`Unexpected request: ${method}`);
     });
     const client = { request } as unknown as GatewayBrowserClient;
-    const sessions = createSessionCapability({
+    const sessions = createTestSessionCapability({
       snapshot: {
         client,
         phase: "connected" as const,
@@ -621,7 +626,7 @@ describe("createSessionCapability", () => {
     });
     const client = { request } as unknown as GatewayBrowserClient;
     const { gateway, publish } = createGatewayHarness(client);
-    const sessions = createSessionCapability(gateway);
+    const sessions = createTestSessionCapability(gateway);
 
     const reset = sessions.reset("agent:main:main");
     publish(false);
@@ -647,7 +652,7 @@ describe("createSessionCapability", () => {
     });
     const client = { request } as unknown as GatewayBrowserClient;
     const { gateway } = createGatewayHarness(client);
-    const sessions = createSessionCapability(gateway);
+    const sessions = createTestSessionCapability(gateway);
 
     await expect(sessions.reset("agent:main:main")).resolves.toBe("uncertain");
     expect(sessions.state.error).toContain("post-commit lifecycle failed");
@@ -665,7 +670,7 @@ describe("createSessionCapability", () => {
       throw new Error(`Unexpected request: ${method}`);
     });
     const client = { request } as unknown as GatewayBrowserClient;
-    const sessions = createSessionCapability({
+    const sessions = createTestSessionCapability({
       snapshot: {
         client,
         phase: "connected" as const,
@@ -727,7 +732,7 @@ describe("createSessionCapability", () => {
       subscribe: () => () => undefined,
       subscribeEvents: () => () => undefined,
     };
-    const sessions = createSessionCapability(gateway);
+    const sessions = createTestSessionCapability(gateway);
     await sessions.refresh({ agentId: "main", force: true });
     const loadingStates: boolean[] = [];
     const stop = sessions.subscribe((state) => loadingStates.push(state.loading));
@@ -771,7 +776,7 @@ describe("createSessionCapability", () => {
       );
     });
     const client = { request } as unknown as GatewayBrowserClient;
-    const sessions = createSessionCapability({
+    const sessions = createTestSessionCapability({
       snapshot: {
         client,
         phase: "connected" as const,
@@ -788,18 +793,30 @@ describe("createSessionCapability", () => {
       sessions.reconcileRunTerminal({
         sessionKeys: ["main"],
         runId: "run-1",
-        status: "done",
+        status: "failed",
+        errorMessage: `Provider failed.\npassword=synthetic-password\n${"x".repeat(180)}`,
         endedAt: 160,
       }),
     ).toBe(true);
+    const lastRunError = `Provider failed. password=[redacted] ${"x".repeat(123)}`;
     expect(sessions.state.result?.sessions[0]).toMatchObject({
       key,
       hasActiveRun: false,
       activeRunIds: [],
-      status: "done",
+      status: "failed",
+      lastRunError,
       endedAt: 160,
       runtimeMs: 60,
     });
+    expect(
+      sessions.reconcileRunTerminal({
+        sessionKeys: ["main"],
+        runId: "run-1",
+        status: "failed",
+        endedAt: 160,
+      }),
+    ).toBe(false);
+    expect(sessions.state.result?.sessions[0]?.lastRunError).toBe(lastRunError);
 
     expect(
       sessions.reconcile({
@@ -810,6 +827,7 @@ describe("createSessionCapability", () => {
         activeRunIds: ["run-2"],
         status: "running",
         startedAt: 200,
+        lastRunError,
       }),
     ).toBe(true);
     expect(
@@ -824,7 +842,21 @@ describe("createSessionCapability", () => {
       hasActiveRun: true,
       activeRunIds: ["run-2"],
       status: "running",
+      lastRunError,
     });
+    expect(
+      sessions.reconcileRunTerminal({
+        sessionKeys: ["main"],
+        runId: "run-2",
+        status: "done",
+        endedAt: 260,
+      }),
+    ).toBe(true);
+    expect(sessions.state.result?.sessions[0]).toMatchObject({
+      hasActiveRun: false,
+      status: "done",
+    });
+    expect(sessions.state.result?.sessions[0]?.lastRunError).toBeUndefined();
 
     expect(
       sessions.reconcile({
@@ -907,7 +939,7 @@ describe("createSessionCapability", () => {
     });
     const client = { request } as unknown as GatewayBrowserClient;
     const { gateway, emitEvent } = createGatewayHarness(client);
-    const sessions = createSessionCapability(gateway);
+    const sessions = createTestSessionCapability(gateway);
 
     await sessions.refresh({ force: true });
     expect(request).toHaveBeenCalledWith(
@@ -946,7 +978,7 @@ describe("createSessionCapability", () => {
     });
     const client = { request } as unknown as GatewayBrowserClient;
     const { gateway, emitEvent } = createGatewayHarness(client);
-    const sessions = createSessionCapability(gateway);
+    const sessions = createTestSessionCapability(gateway);
 
     await sessions.refresh({ force: true });
     const deletedSnapshots: string[][] = [];
@@ -978,7 +1010,7 @@ describe("createSessionCapability", () => {
     });
     const client = { request } as unknown as GatewayBrowserClient;
     const { gateway, emitEvent } = createGatewayHarness(client);
-    const sessions = createSessionCapability(gateway);
+    const sessions = createTestSessionCapability(gateway);
 
     await sessions.refresh({ configuredAgentsOnly: false, force: true, limit: 0 });
     const requestParams = request.mock.calls[0]?.[1];
@@ -1030,7 +1062,7 @@ describe("createSessionCapability", () => {
         return () => undefined;
       },
     };
-    const sessions = createSessionCapability(gateway);
+    const sessions = createTestSessionCapability(gateway);
     await sessions.refresh({ agentId: "main", force: true });
 
     eventListener?.({

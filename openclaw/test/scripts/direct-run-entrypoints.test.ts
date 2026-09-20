@@ -24,6 +24,7 @@ import {
   formatShimResult,
   TSX_SHIM_WRAPPERS,
   withShimFixture,
+  writeEsmPluginFixture,
 } from "./direct-run-entrypoints.test-support.js";
 
 const DIRECT_RUN_SCRIPTS = [
@@ -47,18 +48,6 @@ const EXECUTABLE_ENTRYPOINTS = [
   {
     args: ["2026.4.25"],
     output: "1",
-    script: "scripts/e2e/lib/package-compat.mjs",
-    status: 0,
-  },
-  {
-    args: ["--clawhub-release-security-mode", "2026.6.35"],
-    output: "absent",
-    script: "scripts/e2e/lib/package-compat.mjs",
-    status: 0,
-  },
-  {
-    args: ["--clawhub-release-security-mode", "2026.8.1"],
-    output: "required",
     script: "scripts/e2e/lib/package-compat.mjs",
     status: 0,
   },
@@ -111,7 +100,7 @@ function writeTsxFixture(modulesDir: string, marker: string) {
   mkdirSync(packageDir, { recursive: true });
   writeFileSync(
     path.join(packageDir, "package.json"),
-    JSON.stringify({ name: "tsx", type: "module", exports: "./loader.mjs" }),
+    JSON.stringify({ name: "tsx", type: "module", exports: { "./esm": "./loader.mjs" } }),
   );
   writeFileSync(
     path.join(packageDir, "loader.mjs"),
@@ -165,6 +154,69 @@ function expectShimLoader(result: Awaited<ReturnType<typeof runShimFixture>>, lo
 }
 
 describe("script direct-run entrypoints", () => {
+  it.skipIf(process.platform === "win32")(
+    "lets the Vitest implementation finish cleanup beyond the shim force-kill window",
+    async () => {
+      await withShimFixture("scripts/run-vitest.mjs", async (fixture) => {
+        const { checkoutRoot, fixtureRoot, implementationPath, wrapperPath, runNode } = fixture;
+        const ownerPath = path.join(fixtureRoot, "owner.pid");
+        const settledPath = path.join(fixtureRoot, "cleanup-settled");
+        writeTsxFixture(path.join(checkoutRoot, "node_modules"), "checkout");
+        writeFileSync(
+          implementationPath,
+          `import fs from "node:fs";
+const keepAlive = setInterval(() => {}, 1000);
+process.once("SIGTERM", () => {
+  setTimeout(() => {
+    fs.writeFileSync(${JSON.stringify(settledPath)}, "settled");
+    clearInterval(keepAlive);
+    process.exitCode = 143;
+  }, 5500);
+});
+fs.writeFileSync(${JSON.stringify(ownerPath)}, String(process.ppid));
+`,
+        );
+        const completion = runNode([wrapperPath], process.env, fixtureRoot);
+        const owner = await waitForPidFile(ownerPath, 10_000);
+        process.kill(owner, "SIGTERM");
+        const result = await completion;
+        expect(result.status, formatShimResult(result)).toBe(143);
+        expect(readFileSync(settledPath, "utf8")).toBe("settled");
+        expect(isProcessAlive(owner)).toBe(false);
+      });
+    },
+  );
+
+  it.each(["wrapper", "preload"])(
+    "loads compiled ESM through require from the %s with import-only dependencies",
+    async (entrypoint) => {
+      await withShimFixture(TSX_SHIM_WRAPPERS[0], async (fixture) => {
+        const { fixtureRoot, implementationPath, wrapperPath, runNode } = fixture;
+        writeFileSync(implementationPath, writeEsmPluginFixture(fixtureRoot));
+        const env: NodeJS.ProcessEnv = {
+          ...process.env,
+          PNPM_CONFIG_MODULES_DIR: path.dirname(
+            path.dirname(createRequire(import.meta.url).resolve("tsx/package.json")),
+          ),
+        };
+        delete env.NODE_OPTIONS;
+        const args =
+          entrypoint === "wrapper"
+            ? [wrapperPath]
+            : ["--import", "./scripts/tsx.mjs", implementationPath];
+        const result = await runNode(args, env, process.cwd());
+        expect(result.error, formatShimResult(result)).toBeUndefined();
+        expect(result.status, formatShimResult(result)).toBe(0);
+        expect(JSON.parse(result.stdout)).toEqual({
+          value: "import-only",
+          evaluations: 1,
+          transformed: "transformed",
+          sourceAlias: true,
+        });
+      });
+    },
+  );
+
   it.each([false, true])(
     "preserves preloads when forking into another cwd (equals=%s)",
     async (equals) => {
@@ -377,6 +429,93 @@ process.exitCode = child.status ?? 1;
     expect(output).toContain(entrypoint.output);
   });
 
+  it.runIf(process.platform === "win32")(
+    "runs the checked-out Crabbox wrapper through its Windows Job child",
+    async () => {
+      await withShimFixture("scripts/crabbox-wrapper.mjs", async ({ fixtureRoot, runNode }) => {
+        const fixtureVersion = "0.56.0";
+        const binDir = path.join(fixtureRoot, "fake bin");
+        const home = path.join(fixtureRoot, "home");
+        const state = path.join(fixtureRoot, "state");
+        const invocationLog = path.join(fixtureRoot, "invocations.jsonl");
+        mkdirSync(binDir);
+        mkdirSync(state);
+        // A failed version probe must fail before managed installation can download anything.
+        writeFileSync(
+          path.join(state, "tools"),
+          "managed installation disabled for this fixture\n",
+        );
+        const responses = {
+          "--version": `crabbox ${fixtureVersion}`,
+          "run --help": "provider: ssh\n  -provider string\n",
+          "config show --json": JSON.stringify({ provider: "ssh" }),
+        };
+        writeFileSync(
+          path.join(binDir, "crabbox.cjs"),
+          String.raw`
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+fs.appendFileSync(${JSON.stringify(invocationLog)}, JSON.stringify({ args, pid: process.pid }) + "\n");
+const response = ${JSON.stringify(responses)}[args.join(" ")];
+if (response === undefined) throw new Error("Unexpected fixture command: " + JSON.stringify(args));
+process.stdout.write(response + "\n");
+`,
+        );
+        writeFileSync(
+          path.join(binDir, "crabbox.cmd"),
+          [
+            "@echo off",
+            `"${process.execPath}" "%~dp0crabbox.cjs" %*`,
+            "exit /b %errorlevel%",
+            "",
+          ].join("\r\n"),
+        );
+        const env: NodeJS.ProcessEnv = {
+          SystemRoot: process.env.SystemRoot,
+          ComSpec: process.env.ComSpec,
+          PATH: [binDir, path.dirname(process.execPath), process.env.PATH ?? ""].join(
+            path.delimiter,
+          ),
+          HOME: home,
+          USERPROFILE: home,
+          APPDATA: path.join(home, "AppData", "Roaming"),
+          LOCALAPPDATA: path.join(home, "AppData", "Local"),
+          XDG_CONFIG_HOME: path.join(home, "config"),
+          XDG_STATE_HOME: path.join(home, "state"),
+          OPENCLAW_STATE_DIR: state,
+          TMPDIR: fixtureRoot,
+          TMP: fixtureRoot,
+          TEMP: fixtureRoot,
+          CRABBOX_PROVIDER: "ssh",
+          OPENCLAW_CRABBOX_WRAPPER_IGNORE_REPO_BINARY: "1",
+        };
+        // Keep the checked-out implementation and its Windows worker/native imports intact.
+        const result = await runNode(
+          [path.resolve("scripts/crabbox-wrapper.mjs"), "--version"],
+          env,
+          process.cwd(),
+        );
+        expect(result.error, formatShimResult(result)).toBeUndefined();
+        expect(result.status, formatShimResult(result)).toBe(0);
+        expect(result.stdout).toBe(`crabbox ${fixtureVersion}\n`);
+        const invocations = readFileSync(invocationLog, "utf8")
+          .trim()
+          .split("\n")
+          .map((line) => JSON.parse(line) as { args: string[]; pid: number });
+        expect(invocations.map(({ args }) => args)).toEqual([
+          ["--version"],
+          ["run", "--help"],
+          ["config", "show", "--json"],
+          ["--version"],
+        ]);
+        for (const invocation of invocations) {
+          expect(isProcessAlive(invocation.pid)).toBe(false);
+        }
+        expect(readdirSync(state)).toEqual(["tools"]);
+      });
+    },
+  );
+
   it.each([
     { envKey: "PNPM_CONFIG_MODULES_DIR", mode: "absolute", wrapper: TSX_SHIM_WRAPPERS[0] },
     { envKey: "npm_config_modules_dir", mode: "relative", wrapper: TSX_SHIM_WRAPPERS[1] },
@@ -412,7 +551,7 @@ process.exitCode = child.status ?? 1;
   });
 
   it.each(["hydrated", "primary"] as const)(
-    "resolves implementation dependencies from the %s toolchain without local modules",
+    "requires explicit hydration to bootstrap from %s without local modules",
     async (source) => {
       const result = await runShimFixture(TSX_SHIM_WRAPPERS[0], ({ checkoutRoot, fixtureRoot }) => {
         rmSync(path.join(checkoutRoot, "node_modules"), { recursive: true });
@@ -430,7 +569,16 @@ process.exitCode = child.status ?? 1;
         expect(initialized.status, initialized.stderr).toBe(0);
         return {};
       });
-      expectShimLoader(result, source);
+      if (source === "hydrated") {
+        expectShimLoader(result, source);
+      } else {
+        expect(result.error, formatShimResult(result)).toBeUndefined();
+        expect(result.status, formatShimResult(result)).toBe(1);
+        expect(result.stdout).toBe("");
+        expect(result.stderr).toContain(
+          "Run pnpm install --frozen-lockfile in an independently owned checkout.",
+        );
+      }
     },
   );
 

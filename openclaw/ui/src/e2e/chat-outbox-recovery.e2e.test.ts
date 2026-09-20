@@ -1,5 +1,7 @@
-import { mkdir } from "node:fs/promises";
+import { writeFile } from "node:fs/promises";
 import { expect, it } from "vitest";
+import { createControlUiE2eArtifactDir } from "../test-helpers/control-ui-e2e-artifacts.ts";
+import { takeControlUiViewportScreenshot } from "../test-helpers/control-ui-e2e-screenshot.ts";
 import { controlUiBundledGatewayUrl } from "../test-helpers/control-ui-e2e.ts";
 import {
   controlUiSessionUrl,
@@ -12,16 +14,16 @@ import {
 } from "./chat-flow.test-support.ts";
 
 const suite = createChatFlowE2eSuite();
-const artifacts = ".artifacts/mock-session-owner/outbox-recovery";
+const artifactRoot = ".artifacts/mock-session-owner/outbox-recovery";
 
 suite.define(() => {
   it.each(["retry", "discard", "exact authoritative history proof"] as const)(
     "parks an ACK-lost send for review until %s",
     async (action) => {
-      const artifactDir = process.env.OPENCLAW_UI_E2E_ARTIFACT_DIR?.trim();
-      if (artifactDir) {
-        await mkdir(artifactDir, { recursive: true });
-      }
+      const proofRoot = process.env.OPENCLAW_UI_E2E_ARTIFACT_DIR?.trim();
+      const artifactDir = proofRoot
+        ? createControlUiE2eArtifactDir("chat-outbox-recovery", proofRoot)
+        : undefined;
       await suite.withPage(
         {
           locale: "en-US",
@@ -34,7 +36,12 @@ suite.define(() => {
         async ({ page }) => {
           const captureProof = async (name: string) => {
             if (artifactDir) {
-              await page.screenshot({ path: `${artifactDir}/${name}.png`, fullPage: true });
+              await writeFile(
+                `${artifactDir}/${name}.png`,
+                await takeControlUiViewportScreenshot(page, page.locator(".shell"), [
+                  page.locator(".agent-chat__composer-combobox textarea"),
+                ]),
+              );
             }
           };
           const gateway = await installMockGateway(page, {
@@ -62,17 +69,39 @@ suite.define(() => {
           const firstParams = requireRecord(firstRequest.params);
           const runId = requireString(firstParams.idempotencyKey, "first idempotency key");
 
-          await gateway.closeLatest(1006, "lost ack");
+          await gateway.setOnline(false);
+          const userBubble = page.locator(".chat-group.user").getByText(prompt, { exact: true });
+          const reconnectStatus = page.locator(
+            '.chat-send-status[data-send-state="waiting-reconnect"]',
+          );
+          await userBubble.waitFor();
+          expect(await page.locator(".chat-queue__item").count()).toBe(0);
+          await reconnectStatus.getByText("Waiting for reconnect", { exact: true }).waitFor();
+          expect(await userBubble.count()).toBe(1);
+          expect(await reconnectStatus.getByRole("button", { name: /Retry/ }).count()).toBe(0);
+          await reconnectStatus.getByRole("button", { name: "Discard", exact: true }).waitFor();
+          await captureProof("00-waiting-for-reconnect");
+          await gateway.setOnline(true);
 
           const deliveryStatus = page.locator('.chat-send-status[data-send-state="unconfirmed"]');
           await deliveryStatus.getByText("Delivery unconfirmed").waitFor({ timeout: 10_000 });
           expect(await page.locator(".chat-queue").count()).toBe(0);
-          const userBubble = page.locator(".chat-group.user").getByText(prompt, { exact: true });
           await userBubble.waitFor();
           expect(await gateway.getRequests("chat.send")).toHaveLength(1);
 
           if (action === "exact authoritative history proof") {
             await captureProof("01-delivery-uncertain");
+            const historyReads = (await gateway.getRequests("chat.history")).length;
+            await expectRequestCountStable(gateway, "chat.history", historyReads);
+            for (const event of ["session.message", "sessions.changed"]) {
+              await gateway.emitGatewayEvent(event, {
+                sessionKey: "agent:main:unrelated-conversation",
+                hasActiveRun: true,
+                phase: "message",
+              });
+            }
+            await expectRequestCountStable(gateway, "chat.history", historyReads);
+            await deliveryStatus.getByText("Delivery unconfirmed").waitFor();
 
             await gateway.setHistoryMessages([
               {
@@ -158,7 +187,7 @@ suite.define(() => {
   );
 
   it("keeps a legacy uncertain send unsent until destination confirmation and explicit Retry", async () => {
-    await mkdir(artifacts, { recursive: true });
+    const artifacts = createControlUiE2eArtifactDir("legacy-send", artifactRoot);
     const context = await suite.newBrowserContext({
       locale: "en-US",
       serviceWorkers: "block",
@@ -259,7 +288,7 @@ suite.define(() => {
       const mainKey = sessionKey.endsWith(":workspace") ? "workspace" : "main";
       const gateway = await installMockGateway(page, {
         sessionKey,
-        sessionScope: sessionKey === "global" ? "global" : "agent",
+        sessionScope: sessionKey === "global" ? "global" : "per-sender",
         mainSessionKey: sessionKey === "global" ? "global" : `agent:main:${mainKey}`,
         methodResponses: {
           "agents.list": {
@@ -287,10 +316,16 @@ suite.define(() => {
         const composer = page.locator(".agent-chat__composer-combobox textarea");
         await composer.waitFor();
         await gateway.setOnline(false);
-        await page.locator('.agent-chat__composer-underlaps[data-tone="warn"]').waitFor();
+        await page.locator('.agent-chat__composer-status[data-tone="info"]').waitFor();
         await composer.fill(`retain destination ${sessionKey}`);
         await page.getByRole("button", { name: "Send message" }).click();
         await page.locator(".chat-queue").getByText("Waiting for reconnect").waitFor();
+        expect(
+          await page
+            .locator(".chat-group.user")
+            .getByText(`retain destination ${sessionKey}`)
+            .count(),
+        ).toBe(0);
         await page.goto(controlUiSessionUrl(suite.server.baseUrl, otherKey));
         await gateway.setOnline(true);
         await page.locator(".agent-chat__composer-combobox textarea").waitFor();
@@ -318,6 +353,7 @@ suite.define(() => {
   );
 
   it("recovers an ambiguous IndexedDB attachment draft through rendered controls without sending", async () => {
+    const artifacts = createControlUiE2eArtifactDir("attachment-draft", artifactRoot);
     const context = await suite.newBrowserContext({
       locale: "en-US",
       serviceWorkers: "block",
@@ -327,8 +363,12 @@ suite.define(() => {
     const gateway = await installMockGateway(page);
     const gatewayAddress = controlUiBundledGatewayUrl(suite.server.baseUrl);
     try {
-      await page.goto(`${suite.server.baseUrl}settings`);
-      await page.evaluate(async (gatewayOwner) => {
+      // Seed the legacy database before app boot can open the current version.
+      await page.route("**/outbox-recovery-seed", (route) =>
+        route.fulfill({ contentType: "text/html", body: "Mock recovery seed" }),
+      );
+      await page.goto(`${suite.server.baseUrl}outbox-recovery-seed`);
+      const seededDatabaseVersion = await page.evaluate(async (gatewayOwner) => {
         const request = indexedDB.open("openclaw-control-ui", 1);
         request.addEventListener(
           "upgradeneeded",
@@ -377,7 +417,9 @@ suite.define(() => {
           );
         });
         db.close();
+        return db.version;
       }, gatewayAddress);
+      expect(seededDatabaseVersion).toBe(1);
       await page.goto(controlUiSessionUrl(suite.server.baseUrl, "agent:main:main"));
       const notice = page.locator(".chat-outbox-recovery");
       await notice.locator("summary").click();

@@ -3,19 +3,28 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { afterEach, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js";
+import { runGitWorkerOperation } from "../../infra/git-worker.js";
 import { runCommandWithTimeout } from "../../process/exec.js";
+import { drainGlobalSingletonLifecycleState } from "../../shared/global-singleton.js";
 import {
-  MAX_RECONCILIATION_ENTRIES,
+  parseWorkerWorkspaceReconciliationPlan,
   serializeWorkerWorkspaceManifest,
+  serializeWorkerWorkspaceReconciliationPlan,
   type WorkerWorkspaceManifest,
+  type WorkerWorkspaceReconciliationJournal,
 } from "./workspace-manifest.js";
+import { recoverWorkerWorkspaceReconciliation } from "./workspace-reconcile.js";
 import {
   applyStagedWorkerWorkspaceResult,
+  readStagedWorkerWorkspaceResult,
   workerWorkspaceResultRef,
   workerWorkspaceResultStaging,
 } from "./workspace-result-staging.js";
 
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
+afterEach(async () => {
+  await drainGlobalSingletonLifecycleState();
+});
 
 async function temporaryDirectory(name: string): Promise<string> {
   return tempDirs.make(`openclaw-${name}-`);
@@ -110,6 +119,15 @@ it("recovers the shipped v1 full tree while applying only changed entries", asyn
   });
   await fs.writeFile(path.join(local, "keep.txt"), "local edit\n");
 
+  const artifacts = await runGitWorkerOperation({
+    type: "workspace.artifacts",
+    input: { root: local, ref, previewPath: "changed.txt" },
+  });
+  expect(artifacts.changes).toEqual([
+    { path: "changed.txt", status: "modified", additions: 0, deletions: 0 },
+  ]);
+  expect(Buffer.from(artifacts.preview!).toString()).toBe("worker\n");
+
   const result = await applyStagedWorkerWorkspaceResult({
     root: local,
     stagedResultRef: ref,
@@ -122,12 +140,12 @@ it("recovers the shipped v1 full tree while applying only changed entries", asyn
   await expect(fs.readFile(path.join(local, "keep.txt"), "utf8")).resolves.toBe("local edit\n");
 });
 
-it("recovers a converged shipped v1 deletion above the v2 worst-case record limit", async () => {
+it("recovers a converged shipped v1 deletion above the historical 25,000-record limit", async () => {
   const local = await temporaryDirectory("workspace-staged-v1-converged-local");
   const baseManifest: WorkerWorkspaceManifest = {
     version: 1,
     baseCommit: null,
-    entries: Array.from({ length: MAX_RECONCILIATION_ENTRIES + 1 }, (_, index) => ({
+    entries: Array.from({ length: 25_001 }, (_, index) => ({
       path: `deleted-${index.toString().padStart(5, "0")}.txt`,
       type: "file" as const,
       mode: 0o644,
@@ -177,10 +195,10 @@ it("recovers a converged shipped v1 deletion above the v2 worst-case record limi
   );
 }, 30_000);
 
-it("rejects a directory-only v2 delta above the reconciliation record limit", async () => {
+it("stages a directory-only v2 result above 25,000 reconciliation records", async () => {
   const local = await temporaryDirectory("workspace-directory-entry-limit-local");
   const payload = await temporaryDirectory("workspace-directory-entry-limit-payload");
-  const directoryCount = MAX_RECONCILIATION_ENTRIES / 2 + 1;
+  const directoryCount = 13_000;
   const manifest = (prefix: string) =>
     encodeManifest({
       version: 1,
@@ -194,18 +212,105 @@ it("rejects a directory-only v2 delta above the reconciliation record limit", as
   const base = manifest("base");
   const current = manifest("current");
 
-  await expect(
-    workerWorkspaceResultStaging.stageWorkerWorkspaceResult({
-      root: local,
-      stagingRoot: payload,
-      stagedResultRef: workerWorkspaceResultRef("claim-directory-entry-limit"),
-      baseManifestRef: base.ref,
-      currentManifestRef: current.ref,
-      baseManifestRaw: base.raw,
-      currentManifestRaw: current.raw,
-    }),
-  ).rejects.toThrow(`exceeds the ${MAX_RECONCILIATION_ENTRIES} entry limit`);
+  const stagedResultRef = workerWorkspaceResultRef("claim-directory-entry-limit");
+  await workerWorkspaceResultStaging.stageWorkerWorkspaceResult({
+    root: local,
+    stagingRoot: payload,
+    stagedResultRef,
+    baseManifestRef: base.ref,
+    currentManifestRef: current.ref,
+    baseManifestRaw: base.raw,
+    currentManifestRaw: current.raw,
+  });
+  const staged = await readStagedWorkerWorkspaceResult(local, stagedResultRef);
+  expect(staged.changed).toBe(true);
+  expect(staged.base.directories).toHaveLength(directoryCount);
+  expect(staged.current.directories).toHaveLength(directoryCount);
+  expect(staged.changedEntries).toEqual([]);
 });
+
+it("stages, applies, and recovers 13,000 modified files through a serialized journal", async () => {
+  const local = await temporaryDirectory("workspace-large-modification-local");
+  const payload = await temporaryDirectory("workspace-large-modification-payload");
+  const paths = Array.from(
+    { length: 13_000 },
+    (_, index) => `changed-${index.toString().padStart(5, "0")}.txt`,
+  );
+  for (let offset = 0; offset < paths.length; offset += 64) {
+    await Promise.all(
+      paths
+        .slice(offset, offset + 64)
+        .flatMap((entryPath) => [
+          fs.writeFile(path.join(local, entryPath), "base\n"),
+          fs.writeFile(path.join(payload, entryPath), "worker\n"),
+        ]),
+    );
+  }
+  const manifest = (content: string): WorkerWorkspaceManifest => ({
+    version: 1,
+    baseCommit: null,
+    entries: paths.map((entryPath) => ({
+      path: entryPath,
+      type: "file",
+      mode: 0o644,
+      size: Buffer.byteLength(content),
+      sha256: createHash("sha256").update(content).digest("hex"),
+    })),
+  });
+  const baseManifest = manifest("base\n");
+  const currentManifest = manifest("worker\n");
+  const base = encodeManifest(baseManifest);
+  const current = encodeManifest(currentManifest);
+  const stagedResultRef = workerWorkspaceResultRef("claim-large-modification");
+  await workerWorkspaceResultStaging.stageWorkerWorkspaceResult({
+    root: local,
+    stagingRoot: payload,
+    stagedResultRef,
+    baseManifestRef: base.ref,
+    currentManifestRef: current.ref,
+    baseManifestRaw: base.raw,
+    currentManifestRaw: current.raw,
+  });
+  let serializedJournal: string | undefined;
+  let basePack: Uint8Array | undefined;
+  const committed = vi.fn();
+  const result = await applyStagedWorkerWorkspaceResult({
+    root: local,
+    stagedResultRef,
+    expectedBaseManifestRef: base.ref,
+    journal: {
+      load: () => undefined,
+      begin: (journal) => {
+        serializedJournal = serializeWorkerWorkspaceReconciliationPlan(journal);
+        basePack = Uint8Array.from(journal.basePack);
+      },
+      commit: committed,
+      abort: () => {},
+    },
+  });
+  expect(result.conflictPaths).toEqual([]);
+  expect(result.manifest.entries).toEqual(currentManifest.entries);
+  expect(committed).toHaveBeenCalledWith(current.ref);
+  expect(serializedJournal).toBeDefined();
+  expect(basePack).toBeDefined();
+  const journal: WorkerWorkspaceReconciliationJournal = {
+    ...parseWorkerWorkspaceReconciliationPlan(serializedJournal!),
+    basePack: basePack!,
+  };
+  expect(journal.baseEntries).toHaveLength(paths.length);
+  expect(journal.appliedEntries).toHaveLength(paths.length);
+
+  await recoverWorkerWorkspaceReconciliation({ root: local, journal });
+
+  for (let offset = 0; offset < paths.length; offset += 64) {
+    const contents = await Promise.all(
+      paths
+        .slice(offset, offset + 64)
+        .map((entryPath) => fs.readFile(path.join(local, entryPath), "utf8")),
+    );
+    expect(contents.every((content) => content === "base\n")).toBe(true);
+  }
+}, 120_000);
 
 it("stages only a one-file delta for a 31,274-entry Git baseline", async () => {
   const local = await temporaryDirectory("workspace-large-baseline-local");
@@ -268,6 +373,20 @@ it("stages only a one-file delta for a 31,274-entry Git baseline", async () => {
     currentManifestRef: current.ref,
     baseManifestRaw: base.raw,
     currentManifestRaw: current.raw,
+  });
+
+  const artifacts = await runGitWorkerOperation({
+    type: "workspace.artifacts",
+    input: { root: local, ref, previewPath: "changed.txt" },
+  });
+  expect(artifacts).toEqual({
+    baseManifestRef: base.ref,
+    currentManifestRef: current.ref,
+    base: { baseCommit: baseManifest.baseCommit },
+    current: { baseCommit: currentManifest.baseCommit },
+    changedEntries: [currentManifest.entries[0]],
+    changes: [{ path: "changed.txt", status: "modified", additions: 0, deletions: 0 }],
+    preview: new Uint8Array(currentContent),
   });
 
   const tree = await runCommandWithTimeout(

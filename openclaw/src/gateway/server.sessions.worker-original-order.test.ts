@@ -3,7 +3,10 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, expect, test } from "vitest";
-import { WORKER_EXECUTION_CONTEXT_PROTOCOL_FEATURE } from "../../packages/gateway-protocol/src/schema/worker-admission.js";
+import {
+  WORKER_EXECUTION_AUTHORITY_PROTOCOL_FEATURE,
+  WORKER_EXECUTION_CONTEXT_PROTOCOL_FEATURE,
+} from "../../packages/gateway-protocol/src/schema/worker-admission.js";
 import type { WorkerProvider, WorkerSshEndpoint } from "../plugins/types.js";
 import { runCommandWithTimeout, type CommandOptions, type SpawnResult } from "../process/exec.js";
 import {
@@ -46,7 +49,10 @@ const BUNDLE_HASH = "a".repeat(64);
 const RECEIPT = {
   bundleHash: BUNDLE_HASH,
   openclawVersion: "2026.8.1",
-  protocolFeatures: [WORKER_EXECUTION_CONTEXT_PROTOCOL_FEATURE],
+  protocolFeatures: [
+    WORKER_EXECUTION_CONTEXT_PROTOCOL_FEATURE,
+    WORKER_EXECUTION_AUTHORITY_PROTOCOL_FEATURE,
+  ],
 };
 const INSTALLATION: WorkerInstallationArtifact = {
   install: "bundle",
@@ -375,7 +381,7 @@ test("preserves ordered fallback through restart, workspace sync, and safe sessi
     tunnelManager,
     generateWorkerCredential: () => "original-order-credential",
     liveEvents: {
-      apply: () => ({ ok: true, result: { ackedSeq: 1 } }),
+      apply: async () => ({ ok: true, result: { ackedSeq: 1 } }),
       bindSession: () => true,
       clear: () => {},
       clearEnvironment: () => {},
@@ -414,16 +420,17 @@ test("preserves ordered fallback through restart, workspace sync, and safe sessi
     runnerAvailability: { read: () => undefined, version: () => 0 },
     workspaceOperations: createWorkerWorkspaceOperationCoordinator(),
     runLocalBarrier: async ({ startDispatch }) => startDispatch(),
-    runRecoveryBarrier: async ({ run }) => await run(localWorkspace),
+    runRecoveryBarrier: async ({ run }) => await run({ kind: "local", path: localWorkspace }),
     runActivationBarrier: async ({ activate }) => activate(),
     runMoveBarrier: async ({ begin }) => begin(),
     resolveMoveDestination: async () => undefined,
     runReclaimPreparation: async ({ run, authorize }) => await run(authorize),
-    runReclaimBarrier: async ({ begin, reclaim }) => await reclaim(localWorkspace, begin()),
+    runReclaimBarrier: async ({ begin, reclaim }) =>
+      await reclaim({ kind: "local", path: localWorkspace }, begin()),
     runFailedReclaimBarrier: async ({ reclaim }) => await reclaim(),
-    resolveWorkspacePath: async () => localWorkspace,
+    resolveWorkspace: async () => ({ kind: "local", path: localWorkspace }),
     reportWorkspaceResultConflict: async () => {},
-    resolveWorkspaceResultConflict: async () => undefined,
+    resolveWorkspaceResultConflict: async () => ({ kind: "absent" }),
   });
 
   const active = await dispatch.dispatch({

@@ -24,6 +24,7 @@ import {
 import { captureEnv, setTestEnvValue } from "../test-utils/env.js";
 import { createWorkerConnection } from "../worker/worker-connection.js";
 import type { ResolvedGatewayAuth } from "./auth.js";
+import { GatewayConnectionWork } from "./server-connection-work.js";
 import { MAX_PREAUTH_PAYLOAD_BYTES } from "./server-constants.js";
 import { attachGatewayUpgradeHandler, createGatewayHttpServer } from "./server-http.js";
 import { createPreauthConnectionBudget } from "./server/preauth-connection-budget.js";
@@ -39,6 +40,10 @@ import {
   type GatewayIngressWebSocket,
   type GatewayWsClient,
 } from "./server/ws-types.js";
+import {
+  classifyGatewayStaleInstall,
+  registerGatewayInstallationReplacementHandler,
+} from "./stale-install.js";
 import { testState } from "./test-helpers.runtime-state.js";
 import {
   createGatewaySuiteHarness,
@@ -280,9 +285,11 @@ describe("gateway pre-auth hardening", () => {
     const logGateway = createGatewayWsTestLogger();
     const logHealth = createGatewayWsTestLogger();
     const logWsControl = createGatewayWsTestLogger();
+    const connectionWork = new GatewayConnectionWork();
     attachGatewayWsConnectionHandler({
       wss,
       clients,
+      connectionWork,
       bootId: "preauth-hardening-test-boot",
       preauthConnectionBudget,
       port: 0,
@@ -346,6 +353,8 @@ describe("gateway pre-auth hardening", () => {
       expect(workerConnectionService.admitWorker).toHaveBeenCalledOnce();
     } finally {
       await client.stop();
+      connectionWork.beginClose();
+      await connectionWork.drain();
       await new Promise<void>((resolve) => {
         wss.close(() => resolve());
       });
@@ -523,19 +532,34 @@ describe("gateway pre-auth hardening", () => {
     }
   });
 
-  it("rejects core websocket upgrades during restart drain", async () => {
-    const harness = await createGatewaySuiteHarness();
-    markGatewayRestartDraining();
+  it.each([false, true])(
+    "explains core websocket refusal during restart drain (replacement=%s)",
+    async (replacement) => {
+      const harness = await createGatewaySuiteHarness();
+      const dispose = registerGatewayInstallationReplacementHandler(() => {});
+      if (replacement) {
+        classifyGatewayStaleInstall(
+          Object.assign(new Error("own chunk missing"), {
+            code: "ERR_MODULE_NOT_FOUND",
+            url: new URL("./missing-runtime.mjs", import.meta.url).href,
+          }),
+        );
+      }
+      markGatewayRestartDraining();
 
-    try {
-      await expect(requestUpgradeRejection(harness.port)).resolves.toEqual({
-        status: 503,
-        body: "Gateway websocket admission closed",
-      });
-    } finally {
-      await harness.close();
-    }
-  });
+      try {
+        await expect(requestUpgradeRejection(harness.port)).resolves.toEqual({
+          status: 503,
+          body: replacement
+            ? expect.stringContaining("Installation replaced: running")
+            : "Gateway websocket admission closed",
+        });
+      } finally {
+        dispose();
+        await harness.close();
+      }
+    },
+  );
 
   it("opens only the startup generation core preauth transport during restart drain", async () => {
     const clients = new Set<GatewayWsClient>();

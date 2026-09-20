@@ -142,15 +142,21 @@ export function createFinishedBarrier() {
 export function createStartedCronServiceWithFinishedBarrier(params: {
   storePath: string;
   logger: ReturnType<typeof createNoopLogger>;
-  runSkillCollectionReview?: CronServiceDeps["runSkillCollectionReview"];
+  requestHeartbeatAndWait?: CronServiceDeps["requestHeartbeatAndWait"];
+  resolveHeartbeatTimeoutMs?: CronServiceDeps["resolveHeartbeatTimeoutMs"];
+  onEvent?: CronServiceDeps["onEvent"];
 }): {
   cron: CronService;
   enqueueSystemEvent: MockFn;
   requestHeartbeat: MockFn;
+  requestHeartbeatAndWait: MockFn;
   finished: ReturnType<typeof createFinishedBarrier>;
 } {
   const enqueueSystemEvent = vi.fn();
   const requestHeartbeat = vi.fn();
+  const requestHeartbeatAndWait = vi.fn(
+    params.requestHeartbeatAndWait ?? (async () => ({ status: "ran" as const, durationMs: 1 })),
+  );
   const finished = createFinishedBarrier();
   const cron = new CronService({
     storePath: params.storePath,
@@ -158,13 +164,15 @@ export function createStartedCronServiceWithFinishedBarrier(params: {
     log: params.logger,
     enqueueSystemEvent,
     requestHeartbeat,
+    requestHeartbeatAndWait,
+    resolveHeartbeatTimeoutMs: params.resolveHeartbeatTimeoutMs,
     runIsolatedAgentJob: vi.fn(async () => ({ status: "ok" as const })),
-    ...(params.runSkillCollectionReview
-      ? { runSkillCollectionReview: params.runSkillCollectionReview }
-      : {}),
-    onEvent: finished.onEvent,
+    onEvent: (event) => {
+      finished.onEvent(event);
+      params.onEvent?.(event);
+    },
   });
-  return { cron, enqueueSystemEvent, requestHeartbeat, finished };
+  return { cron, enqueueSystemEvent, requestHeartbeat, requestHeartbeatAndWait, finished };
 }
 
 export async function withCronServiceForTest(
@@ -250,41 +258,17 @@ export function createMockCronStateForJobs(params: {
   nowMs?: number;
 }): CronServiceState {
   const nowMs = params.nowMs ?? Date.now();
-  return {
-    store: { version: 1, jobs: params.jobs },
-    durableNextRunAtMsByJobId: new Map<string, number | undefined>(),
-    running: false,
-    activeTimerTicks: 0,
-    stopped: false,
-    lifecycleGeneration: 0,
-    schedulingPaused: false,
-    schedulerStarted: false,
-    activeManualRunJobIds: new Set<string>(),
-    manualSetupTimeoutNotified: false,
-    runAdmission: { active: 0, waiters: [], capacityListener: null },
-    queuedRunReservationsByJobId: new Map(),
-    timer: null,
-    storeLoadedAtMs: nowMs,
-    op: Promise.resolve(),
-    warnedDisabled: false,
-    warnedInvalidPersistedJobKeys: new Set<string>(),
-    reportedUnavailableReaperAgentIds: new Set<string>(),
-    pendingQuarantineConfigJobs: [],
-    lastQuarantineFailureWarnKey: null,
-    deps: {
-      storePath: "/mock/path",
-      cronEnabled: true,
-      defaultAgentId: "main",
-      nowMs: () => nowMs,
-      enqueueSystemEvent: () => {},
-      requestHeartbeat: () => {},
-      runIsolatedAgentJob: async () => ({ status: "ok" }),
-      log: {
-        debug: () => {},
-        info: () => {},
-        warn: () => {},
-        error: () => {},
-      } as never,
-    },
-  };
+  const state = createCronServiceState({
+    storePath: "/mock/path",
+    cronEnabled: true,
+    defaultAgentId: "main",
+    nowMs: () => nowMs,
+    enqueueSystemEvent: () => {},
+    requestHeartbeat: () => {},
+    runIsolatedAgentJob: async () => ({ status: "ok" }),
+    log: createNoopLogger(),
+  });
+  state.store = { version: 1, jobs: params.jobs };
+  state.storeLoadedAtMs = nowMs;
+  return state;
 }
